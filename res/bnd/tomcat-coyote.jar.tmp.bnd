@@ -24,6 +24,7 @@ Export-Package: \
     org.apache.coyote.http11.filters,\
     org.apache.coyote.http11.upgrade,\
     org.apache.coyote.http2,\
+    org.apache.coyote.http3,\
     org.apache.tomcat.util.bcel.classfile,\
     org.apache.tomcat.util.http,\
     org.apache.tomcat.util.http.fileupload,\
@@ -37,6 +38,7 @@ Export-Package: \
     org.apache.tomcat.util.modeler.modules,\
     org.apache.tomcat.util.net,\
     org.apache.tomcat.util.net.jsse,\
+    org.apache.tomcat.util.net.quic,\
     org.apache.tomcat.util.net.openssl,\
     org.apache.tomcat.util.net.openssl.ciphers
 X-Compile-Source-JDK: ${compile.release}
