@@ -27,7 +27,7 @@
   <!-- OpenSSL support using Tomcat Native -->
   <Listener className="org.apache.catalina.core.AprLifecycleListener" />
   <!-- OpenSSL support using FFM API from Java 22 -->
-  <!-- <Listener className="org.apache.catalina.core.OpenSSLLifecycleListener" /> -->
+  <Listener className="org.apache.catalina.core.OpenSSLLifecycleListener" />
   <!-- Prevent memory leaks due to use of particular java/javax APIs-->
   <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener" />
   <Listener className="org.apache.catalina.mbeans.GlobalResourcesLifecycleListener" />
@@ -91,6 +91,40 @@
         <SSLHostConfig>
             <Certificate certificateKeystoreFile="conf/localhost-rsa.jks"
                          certificateKeystorePassword="changeit" type="RSA" />
+        </SSLHostConfig>
+    </Connector>
+    -->
+
+    <!-- Define an HTTP/1.1 Connector on the TCP side of port 8444 (UDP is
+         served by the HTTP/3 connector below). It announces h3 via the
+         Alt-Svc response header so clients can discover HTTP/3 without any
+         client-side configuration.
+
+         Define an HTTP/3 (QUIC) Connector on port 8444. The QUIC endpoint
+         is selected by the protocol class: use
+         org.apache.coyote.http3.Http3QuicheProtocol instead of
+         Http3OpenSSLProtocol to run on the Cloudflare quiche transport.
+    -->
+    <!--
+    <Connector port="8444" protocol="HTTP/1.1"
+               maxThreads="150" SSLEnabled="true" altService="h3">
+        <UpgradeProtocol className="org.apache.coyote.http2.Http2Protocol" />
+        <SSLHostConfig>
+            <Certificate certificateFile="conf/quic-leaf-cert.pem"
+                         certificateKeyFile="conf/quic-leaf-key.pem"
+                         certificateChainFile="conf/quic-ca-cert.pem"
+                         type="RSA" />
+        </SSLHostConfig>
+    </Connector>
+
+    <Connector port="8444"
+               protocol="org.apache.coyote.http3.Http3OpenSSLProtocol"
+               maxThreads="150" SSLEnabled="true">
+        <SSLHostConfig>
+            <Certificate certificateFile="conf/quic-leaf-cert.pem"
+                         certificateKeyFile="conf/quic-leaf-key.pem"
+                         certificateChainFile="conf/quic-ca-cert.pem"
+                         type="RSA" />
         </SSLHostConfig>
     </Connector>
     -->
