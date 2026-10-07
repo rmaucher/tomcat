@@ -36,6 +36,7 @@ mvn.properties
 .sdkmanrc
 .settings
 .vscode
+__pycache__/
 *.asc
 *.iml
 *.ipr

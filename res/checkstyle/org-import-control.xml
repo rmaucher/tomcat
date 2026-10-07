@@ -100,6 +100,12 @@
     <allow pkg="org.apache.tomcat"/>
     <allow pkg="org.apache.tomcat.jni"/>
     <allow pkg="org.apache.tomcat.util"/>
+    <subpackage name="http3">
+      <disallow pkg="org.apache.tomcat.util.net.openssl.panama"/>
+      <disallow pkg="org.apache.tomcat.util.net.quic.openssl"/>
+      <disallow pkg="org.apache.tomcat.util.net.quic.quiche"/>
+      <disallow pkg="org.apache.tomcat.util.openssl"/>
+    </subpackage>
   </subpackage>
   <subpackage name="el">
     <allow pkg="jakarta.el"/>

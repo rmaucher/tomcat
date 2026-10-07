@@ -1,0 +1,392 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!DOCTYPE document [
+  <!ENTITY project SYSTEM "project.xml">
+]>
+<document url="http3.html">
+
+  &project;
+
+  <properties>
+    <title>The HTTP/3 Protocol</title>
+  </properties>
+
+<body>
+
+<section name="Table of Contents">
+<toc/>
+</section>
+
+<section name="Introduction">
+
+  <p>The <strong>HTTP/3 Protocol</strong> element represents a
+  <strong>Protocol Handler</strong> component that supports the HTTP/3
+  protocol (RFC 9114) over the QUIC transport (RFC 9000).</p>
+
+  <p>Unlike HTTP/2, HTTP/3 is not an upgrade of an existing protocol: it runs
+  directly over UDP and always uses TLS 1.3 (RFC 9001). An HTTP/3 connector
+  is therefore configured as a standalone connector by setting its
+  <code>protocol</code> attribute to one of the HTTP/3 protocol classes and
+  its <code>SSLEnabled</code> attribute to <code>true</code>. The protocol
+  class also selects the QUIC transport implementation:
+  <code>org.apache.coyote.http3.Http3OpenSSLProtocol</code> uses the OpenSSL
+  QUIC endpoint, <code>org.apache.coyote.http3.Http3QuicheProtocol</code>
+  uses the Cloudflare quiche endpoint. Certificates are
+  configured through nested <strong>SSLHostConfig</strong> and
+  <strong>Certificate</strong> elements, as described in the
+  <a href="http.html">HTTP Connector</a> document. The OpenSSL QUIC endpoint
+  accepts PEM files (with the key and certificate chain supplied separately),
+  PKCS#12 files and Java keystores; the quiche endpoint currently loads its
+  certificate from PEM files.</p>
+
+  <p>HTTP/3 support requires the FFM bindings to be compiled into the build
+  (a current JDK) plus a usable QUIC transport: for
+  <code>Http3OpenSSLProtocol</code>, an OpenSSL installation that provides
+  the QUIC API (OpenSSL 4.0 or later) loaded into the JVM via the FFM
+  bindings - see the <code>OpenSSLLifecycleListener</code> configuration in
+  the default <code>conf/server.xml</code>; for
+  <code>Http3QuicheProtocol</code>, a loadable libquiche. The connector
+  fails at bind time when the selected transport is unusable. The sample
+  <code>conf/server.xml</code> also configures a TLS connector on the TCP
+  side of the same port with <code>altService="h3"</code> so that HTTP/3 is
+  discovered by clients through the <code>Alt-Svc</code> response header.</p>
+
+</section>
+
+
+<section name="Attributes">
+
+  <subsection name="HTTP/3 Protocol Attributes">
+
+  <p>The HTTP/3 protocol handler supports the following attributes on the
+  connector:</p>
+
+  <attributes>
+
+    <attribute name="altService" required="false">
+      <p>The alternative service which should be advertised as available to
+      clients via the <code>Alt-Svc</code> response header. The value is a
+      protocol identifier, for example <code>h3</code>; the port advertised
+      is the port of the request the header is added to. An
+      <code>Alt-Svc</code> header set by the application takes precedence.
+      If not specified, no <code>Alt-Svc</code> header is added.</p>
+    </attribute>
+
+    <attribute name="allowSchemeMismatch" required="false">
+      <p>A boolean value which can be used to enable or disable the
+      consistency check for the scheme presented by the user agent in the
+      <code>:scheme</code> pseudo-header and the channel over which the
+      request was received. Since QUIC always uses TLS, the consistent
+      scheme is <code>https</code>. This should only be set to
+      <code>true</code> where a trusted TLS terminating reverse proxy is
+      used. If not specified, this attribute is set to
+      <code>false</code>.</p>
+    </attribute>
+
+    <attribute name="compressibleMimeType" required="false">
+      <p>The value is a comma separated list of MIME types for which HTTP
+      compression may be used.
+      The default value is
+      <code>
+      text/html,text/xml,text/plain,text/css,text/javascript,application/javascript,application/json,application/xml
+      </code>.
+      If you specify a type explicitly, the default is over-ridden.</p>
+    </attribute>
+
+    <attribute name="compression" required="false">
+      <p>The <strong>Connector</strong> may use GZIP compression in an attempt
+      to save server bandwidth. The acceptable values for the parameter is
+      "off" (disable compression), "on" (allow compression, which causes text
+      data to be compressed), "force" (forces compression in all cases), or a
+      numerical integer value (which is equivalent to "on", but specifies the
+      minimum amount of data before the output is compressed). If the
+      content-length is not known and compression is set to "on" or more
+      aggressive, the output will also be compressed. If not specified, this
+      attribute is set to "off".</p>
+      <p>Note that HTTP/3 forbids the <code>Transfer-Encoding</code> header
+      (RFC 9114 Section 4.2). A request whose <code>TE</code> header carries
+      any value other than <code>trailers</code> — including one that asks
+      for compression through <code>TE</code> rather than through
+      <code>Accept-Encoding</code> — is rejected as a malformed field
+      section.</p>
+    </attribute>
+
+    <attribute name="compressionMinSize" required="false">
+      <p>If <strong>compression</strong> is set to "on" then this attribute
+      may be used to specify the minimum amount of data before the output is
+      compressed. If not specified, this attribute is defaults to "2048".
+      Units are in bytes.</p>
+    </attribute>
+
+    <attribute name="continueResponseTiming" required="false">
+      <p>When to respond with a <code>100</code> intermediate response code to
+      a request containing an <code>Expect: 100-continue</code> header.
+      The following values may be used:
+      <ul>
+      <li><code>immediately</code> (the default) - an intermediate 100 status
+      response will be returned as soon as practical</li>
+      <li><code>onRead</code> - an intermediate 100 status response will be
+      returned only when the Servlet reads the request body, allowing the
+      servlet to inspect the headers and possibly respond before the user
+      agent sends a possibly large request body.</li>
+      </ul>
+      </p>
+    </attribute>
+
+    <attribute name="enableConnectProtocol" required="false">
+      <p>A boolean value which controls whether Extended CONNECT (RFC 9220)
+      is permitted. When enabled, the value <code>1</code> is advertised to
+      peers via <code>SETTINGS_ENABLE_CONNECT_PROTOCOL</code> and requests
+      carrying a <code>:protocol</code> pseudo-header are accepted. Note
+      that the tunnel established by Extended CONNECT cannot yet carry
+      application data because HTTP datagrams (RFC 9297) are not yet
+      implemented. If not specified, this attribute is set to
+      <code>false</code>.</p>
+    </attribute>
+
+    <attribute name="h2CompatibleIdentity" required="false">
+      <p>A boolean value which controls whether Tomcat advertises the
+      experimental, unregistered <code>H2_COMPATIBLE_IDENTITY</code> setting
+      (identifier <code>0x22</code>). Peers that do not recognise the
+      setting ignore it. If not specified, this attribute is set to
+      <code>false</code>.</p>
+    </attribute>
+
+    <attribute name="idleTimeoutMs" required="false">
+      <p>The QUIC connection idle timeout in milliseconds (RFC 9000 Section
+      10.1). If no packet is received from the peer for this duration the
+      connection is closed. The value is also advertised to the peer in the
+      TLS transport parameters so that both endpoints agree on the timeout.
+      If not specified, a default of <code>30000</code> (30 seconds) is
+      used.</p>
+    </attribute>
+
+    <attribute name="maxConcurrentStreams" required="false">
+      <p>The maximum number of active request streams permitted for any one
+      connection. If a client attempts to open more active streams than this
+      limit, the additional streams are refused. The effective limit is
+      clamped to the limit the QUIC transport actually advertises to the
+      peer. If not specified, a default of <code>100</code> is used.</p>
+    </attribute>
+
+    <attribute name="maxFieldSectionSize" required="false">
+      <p>The maximum field section size, in bytes, that this endpoint is
+      willing to decode (RFC 9114 Section 4.2.2). The value is advertised to
+      peers via <code>SETTINGS_MAX_FIELD_SECTION_SIZE</code> and enforced on
+      incoming field sections. If not specified, a default of
+      <code>16384</code> is used.</p>
+    </attribute>
+
+    <attribute name="noCompressionEncodings" required="false">
+      <p>A comma-separated list of content encodings that indicate
+      already-compressed content. When the response already has a
+      <code>Content-Encoding</code> header with one of these values,
+      compression will not be applied to prevent double compression. This
+      attribute is only used if <strong>compression</strong> is set to
+      <code>on</code> or <code>force</code>.</p>
+      <p>If not specified, the default value is
+      <code>br,compress,dcb,dcz,deflate,gzip,pack200-gzip,zstd</code>, which
+      includes all commonly used compression algorithms.</p>
+    </attribute>
+
+    <attribute name="noCompressionUserAgents" required="false">
+      <p>The value is a regular expression (using <code>java.util.regex</code>)
+      matching the entire <code>user-agent</code> header of HTTP clients for
+      which compression should not be used, because these clients, although
+      they do advertise support for the feature, have a broken implementation.
+      The default value is an empty String (regexp matching disabled).</p>
+    </attribute>
+
+    <attribute name="qpackBlockedStreams" required="false">
+      <p>The maximum number of request streams per connection that may block
+      waiting for dynamic table entries announced on the peer's QPACK encoder
+      stream (RFC 9204 Section 2.1.2). A positive value is advertised to
+      peers via <code>SETTINGS_QPACK_BLOCKED_STREAMS</code>. A value of
+      <code>0</code> disables stream blocking: field sections that reference
+      entries not yet present in the dynamic table are then treated as a
+      decompression failure. If not specified, a default of <code>0</code>
+      is used.</p>
+    </attribute>
+
+    <attribute name="qpackMaxTableCapacity" required="false">
+      <p>The maximum QPACK dynamic table capacity in bytes. The value is
+      advertised to peers via <code>SETTINGS_QPACK_MAX_TABLE_CAPACITY</code>
+      and the local decoder is sized to match, as required for
+      interoperability (RFC 9204 Section 5). A value of <code>0</code>
+      disables the dynamic table
+       entirely. If not specified, a default of <code>4096</code> is
+      used.</p>
+    </attribute>
+
+    <attribute name="server" required="false">
+      <p>The value used for the <code>Server</code> header in any HTTP/3
+      response created by this connector. If configured, it always
+      overrides any value the application may have set. If not specified,
+      no <code>Server</code> header is set by the connector; an
+      application-provided value stands unless
+      <code>serverRemoveAppProvidedValues</code> is enabled.</p>
+    </attribute>
+
+    <attribute name="serverRemoveAppProvidedValues" required="false">
+      <p>If set to <code>true</code>, any <code>Server</code> header
+      provided by the application is removed from HTTP/3 responses when no
+      <code>server</code> value is configured. If not specified, this
+      attribute is set to <code>false</code>.</p>
+    </attribute>
+
+  </attributes>
+
+  </subsection>
+
+
+  <subsection name="QUIC Endpoint Attributes">
+
+  <p>The following connector attributes are handled by the QUIC endpoint that
+  backs the HTTP/3 protocol handler:</p>
+
+  <attributes>
+
+    <attribute name="maxConnections" required="false">
+      <p>The maximum number of concurrent QUIC connections the endpoint
+      accepts. Connections opened above this limit are refused. If not
+      specified, a default of <code>8192</code> is used.</p>
+    </attribute>
+
+    <attribute name="pollTimeoutMs" required="false">
+      <p>The timeout, in milliseconds, used for each iteration of the
+      endpoint's QUIC poll loop. Smaller values reduce event latency at the
+      cost of more frequent wake-ups. Values outside the range
+      <code>1</code> to <code>60000</code> are rejected with a warning and
+      the previous value is retained. If not specified, a default of
+      <code>10</code> is used.</p>
+    </attribute>
+
+    <attribute name="readBufferSize" required="false">
+      <p>The size, in bytes, of the per-stream read buffer maintained by the
+      endpoint. Values below <code>1</code> are rejected with a warning and
+      the previous value is retained. Stream data is drained in chunks of at
+      most <code>65536</code> bytes by the quiche endpoint, whose native read
+      buffer is capped at the maximum datagram size; the OpenSSL endpoint
+      reads up to the buffer's remaining capacity in a single call. Either
+      way, larger values are filled by repeated reads. If not specified, a
+      default of <code>16384</code> is used.</p>
+    </attribute>
+
+    <attribute name="dueTickFloorMs" required="false">
+      <p>Upper bound, in milliseconds, of the adaptive floor the OpenSSL
+      QUIC endpoint's poll loop applies to due-deadline (timer) ticks: while
+      such ticks fire back-to-back without any reactive work, the floor
+      doubles from <code>20</code> ms up to this value, coalescing the ticks;
+      it resets as soon as the loop performs reactive work. A value of
+      <code>0</code> disables the floor, running every tick the engine
+      reports as due. Values outside the range <code>0</code> to
+      <code>60000</code> are rejected with a warning and the previous value
+      is retained. If not specified, a default of <code>50</code> is used.
+      The quiche endpoint has no due-tick floor and does not support this
+      attribute.</p>
+    </attribute>
+
+  </attributes>
+
+  </subsection>
+
+
+  <subsection name="Shared Attributes">
+
+  <p>The HTTP/3 connector also supports the following attributes, which are
+  documented in the <a href="http.html">HTTP Connector</a> document:</p>
+
+  <ul>
+    <li>allowedTrailerHeaders</li>
+    <li>maxHeaderCount</li>
+    <li>maxThreads</li>
+    <li>relaxedPathChars</li>
+    <li>relaxedQueryChars</li>
+  </ul>
+
+  <p>Note that send file support is not available over QUIC: response
+  bodies are always written through the output buffer as HTTP/3
+  <code>DATA</code> frames.</p>
+
+  </subsection>
+
+</section>
+
+
+<section name="Nested Components">
+
+  <p>An HTTP/3 connector requires at least one nested
+  <strong>SSLHostConfig</strong> element since QUIC mandates TLS 1.3. Each
+  <strong>SSLHostConfig</strong> needs at least one <strong>Certificate</strong>
+  or <strong>PreSharedKey</strong> element. These elements are the same as
+  those used by the <a href="http.html">HTTP Connector</a>.</p>
+
+  <p>TLS 1.3 external pre-shared keys are supported by the OpenSSL QUIC
+  endpoint; the quiche endpoint does not support them. A connection that
+  offers a configured identity is authenticated with the pre-shared key and
+  the server presents no certificate. An <strong>SSLHostConfig</strong> that
+  has both certificates and pre-shared keys serves both: connections with a
+  resolvable identity get a pre-shared key handshake, connections with an
+  unknown identity or with no identity at all get the normal certificate
+  handshake. An <strong>SSLHostConfig</strong> configured with pre-shared keys
+  only presents no certificate; a connection that does not offer a usable
+  identity then fails the handshake.</p>
+
+  <p>Client certificates (mutual TLS) are not supported: the
+  <strong>certificateVerification</strong> attribute of
+  <strong>SSLHostConfig</strong> is ignored by both QUIC endpoints and no
+  client certificate is ever requested during the TLS handshake. The quiche
+  endpoint logs a warning at start-up when the attribute is configured with a
+  value other than <code>none</code>.</p>
+
+  <p>TLS session resumption is supported by both QUIC endpoints through
+  TLS 1.3 session tickets: the server issues a ticket after each handshake
+  and a client offering a ticket from an earlier connection to the same
+  endpoint completes the handshake without a full key exchange. The ticket
+  keys are generated randomly when the endpoint starts, so a ticket is only
+  valid for the running endpoint instance that issued it: after a restart
+  (and, for the quiche endpoint, after a certificate reload, which rebuilds
+  the TLS configuration) older tickets can no longer be decrypted and a
+  client offering one simply performs a full handshake. Ticket keys are not
+  configurable, so tickets do not span separate Tomcat instances. The
+  OpenSSL QUIC endpoint honours the <strong>disableSessionTickets</strong>
+  attribute of <strong>SSLHostConfig</strong>; the quiche endpoint has no
+  equivalent switch and always issues tickets.</p>
+
+</section>
+
+
+<section name="Special Features">
+
+  <p>HTTP/3 connections are discovered by clients through the
+  <code>Alt-Svc</code> response header. The usual arrangement is a
+  TLS connector on the TCP side of the same port with
+  <code>altService="h3"</code> announcing the HTTP/3 endpoint, as shown in
+  the default <code>conf/server.xml</code>. An HTTP/3 connector does not
+  announce itself automatically; set its <code>altService</code> attribute
+  when an announcement from the HTTP/3 side is wanted.</p>
+
+  <p>Response compression is not implemented for HTTP/3. The HTTP/1.1
+  connector's compression configuration does not apply to HTTP/3
+  responses; any content coding must be applied by the application.</p>
+
+</section>
+
+</body>
+
+</document>
