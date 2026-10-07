@@ -322,6 +322,16 @@
         buffer used by the BIO pair. Patch submitted by Lukas Hellebrandt.
         (remm)
       </fix>
+      <add>
+        Add QUIC implementation using OpenSSL 4+. (remm)
+      </add>
+      <add>
+        Add QUIC implementation using quiche 0.30+. This implementation does
+        not have support for SNI or multiple certificates. (remm)
+      </add>
+      <add>
+        Add HTTP/3 protocol support using either QUIC implementations. (remm)
+      </add>
       <!-- Entries for backport and removal before 12.0.0-M1 below this line -->
     </changelog>
   </subsection>
