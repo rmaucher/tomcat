@@ -19,6 +19,8 @@ Bundle-Name: tomcat-coyote-ffm
 Bundle-SymbolicName: org.apache.tomcat-coyote-ffm
 Export-Package: \
     org.apache.tomcat.util.net.openssl.panama,\
+    org.apache.tomcat.util.net.quic.openssl,\
+    org.apache.tomcat.util.net.quic.quiche,\
     org.apache.tomcat.util.openssl
 X-Compile-Source-JDK: ${release.java.version}
 X-Compile-Target-JDK: ${release.java.version}

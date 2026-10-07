@@ -222,6 +222,14 @@
   <!-- The OpenSSL tests cases be disabled by specifying an invalid path here -->
   <property name="test.openssl.path" value="" />
 
+  <!-- Set test.quiche=true (e.g. via the quiche flag of run-http3-tests.sh) -->
+  <!-- to run the tests against the quiche QUIC endpoint instead of the -->
+  <!-- OpenSSL one, by selecting the quiche HTTP/3 protocol class in the -->
+  <!-- test JVM. The quiche native library itself is provided through -->
+  <!-- LD_LIBRARY_PATH or java.library.path, same model as OpenSSL. -->
+  <property name="test.quiche.protocol.class"
+            value="org.apache.coyote.http3.Http3QuicheProtocol" />
+
   <!-- Location of Httpd binary (file name, not directory) -->
   <!-- The Httpd tests cases be disabled by specifying an invalid path here -->
   <property name="test.httpd.path" value="" />
@@ -774,10 +782,14 @@
     <include name="org/apache/tomcat/util/modeler/**" />
     <include name="org/apache/tomcat/util/net/**" />
     <exclude name="org/apache/tomcat/util/net/openssl/panama/**"/>
+    <exclude name="org/apache/tomcat/util/net/quic/openssl/**"/>
+    <exclude name="org/apache/tomcat/util/net/quic/quiche/**"/>
   </patternset>
 
   <patternset id="files.tomcat-coyote-ffm">
     <include name="org/apache/tomcat/util/net/openssl/panama/**"/>
+    <include name="org/apache/tomcat/util/net/quic/openssl/**"/>
+    <include name="org/apache/tomcat/util/net/quic/quiche/**"/>
     <include name="org/apache/tomcat/util/openssl/**"/>
   </patternset>
 
@@ -904,6 +916,7 @@
         <exclude name="nbproject/**"/>
         <exclude name="output/**"/>
         <exclude name="modules/**"/>
+        <exclude name="webapps/**"/>
         <exclude name="test/webapp-fragments/WEB-INF/classes/*.txt"/>
         <exclude name="test/webapp/bug49nnn/*.txt"/>
         <exclude name="test/webapp/bug53257/**/*.txt"/>
@@ -1046,6 +1059,8 @@
       -->
       <classpath refid="compile.classpath" />
       <exclude name="org/apache/tomcat/util/net/openssl/panama/**"/>
+      <exclude name="org/apache/tomcat/util/net/quic/openssl/**"/>
+      <exclude name="org/apache/tomcat/util/net/quic/quiche/**"/>
       <exclude name="org/apache/tomcat/util/openssl/**"/>
     </javac>
     <!-- Compile internal server components that use FFM -->
@@ -1064,6 +1079,8 @@
       -->
       <classpath refid="compile.classpath" />
       <include name="org/apache/tomcat/util/net/openssl/panama/**"/>
+      <include name="org/apache/tomcat/util/net/quic/openssl/**"/>
+      <include name="org/apache/tomcat/util/net/quic/quiche/**"/>
       <include name="org/apache/tomcat/util/openssl/**"/>
     </javac>
     <!-- Copy static resource files -->
@@ -2257,6 +2274,8 @@
           <sysproperty key="tomcat.test.openssl.unimplemented" value="${test.openssl.unimplemented}" />
           <sysproperty key="tomcat.test.relaxTiming" value="${test.relaxTiming}" />
           <sysproperty key="tomcat.test.sslImplementation" value="${test.sslImplementation}" />
+          <sysproperty key="tomcat.test.http3.protocol"
+                       value="${test.quiche.protocol.class}" if:set="test.quiche" />
           <sysproperty key="tomcat.test.http2.loopCount" value="${test.http2.loopCount}" />
 
           <formatter type="${junit.formatter.type}"
