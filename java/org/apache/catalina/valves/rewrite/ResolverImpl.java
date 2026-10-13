@@ -80,6 +80,7 @@ public class ResolverImpl extends Resolver {
      * <li>SERVER_ADMIN</li>
      * <li>API_VERSION</li>
      * <li>IS_SUBREQ</li>
+     * <li>REMOTE_IDENT (no RFC 931 ident protocol support)</li>
      * </ul>
      */
     @Override
@@ -101,7 +102,10 @@ public class ResolverImpl extends Resolver {
             case "REMOTE_HOST" -> request.getRemoteHost();
             case "REMOTE_PORT" -> String.valueOf(request.getRemotePort());
             case "REMOTE_USER" -> request.getRemoteUser();
-            case "REMOTE_IDENT" -> request.getRemoteUser();
+            // REMOTE_IDENT is the RFC 931 ident protocol user name, which
+            // Tomcat does not support. It must not resolve to the remote
+            // user, as that would silently turn ident-based rules into
+            // authentication checks.
             case "REQUEST_METHOD" -> request.getMethod();
             case "SCRIPT_FILENAME" -> request.getServletContext().getRealPath(request.getServletPath());
             case "REQUEST_PATH" -> request.getRequestPathMB().toString();
@@ -121,12 +125,14 @@ public class ResolverImpl extends Resolver {
             case "REQUEST_FILENAME" -> request.getPathTranslated();
             case "HTTPS" -> request.isSecure() ? "on" : "off";
             case "TIME_YEAR" -> String.valueOf(Calendar.getInstance().get(Calendar.YEAR));
-            case "TIME_MON" -> String.valueOf(Calendar.getInstance().get(Calendar.MONTH));
+            // Like mod_rewrite, TIME_MON is 1-12 and TIME_WDAY is 0-6 with Sunday first,
+            // unlike the zero-based Calendar.MONTH and one-based Sunday-first Calendar.DAY_OF_WEEK
+            case "TIME_MON" -> String.valueOf(Calendar.getInstance().get(Calendar.MONTH) + 1);
             case "TIME_DAY" -> String.valueOf(Calendar.getInstance().get(Calendar.DAY_OF_MONTH));
             case "TIME_HOUR" -> String.valueOf(Calendar.getInstance().get(Calendar.HOUR_OF_DAY));
             case "TIME_MIN" -> String.valueOf(Calendar.getInstance().get(Calendar.MINUTE));
             case "TIME_SEC" -> String.valueOf(Calendar.getInstance().get(Calendar.SECOND));
-            case "TIME_WDAY" -> String.valueOf(Calendar.getInstance().get(Calendar.DAY_OF_WEEK));
+            case "TIME_WDAY" -> String.valueOf(Calendar.getInstance().get(Calendar.DAY_OF_WEEK) - 1);
             case "TIME" -> FastHttpDateFormat.getCurrentDate();
             default -> null;
         };

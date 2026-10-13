@@ -99,10 +99,14 @@ public class CompressionConfig {
      * Set compression level.
      *
      * @param compression One of <code>on</code>, <code>force</code>, <code>off</code> or the minimum compression size
-     *                        in bytes which implies <code>on</code>
+     *                        in bytes which implies <code>on</code>. Surrounding whitespace is ignored. An invalid
+     *                        value is logged and disables compression.
      */
     public void setCompression(String compression) {
-        switch (compression) {
+        // Trim the value so that surrounding whitespace in the configuration
+        // does not silently disable compression
+        String value = compression == null ? "" : compression.trim();
+        switch (value) {
             case "on" -> this.compressionLevel = 1;
             case "force" -> this.compressionLevel = 2;
             case "off" -> this.compressionLevel = 0;
@@ -110,9 +114,10 @@ public class CompressionConfig {
                 try {
                     // Try to parse compression as an int, which would give the
                     // minimum compression size
-                    setCompressionMinSize(Integer.parseInt(compression));
+                    setCompressionMinSize(Integer.parseInt(value));
                     this.compressionLevel = 1;
-                } catch (Exception e) {
+                } catch (NumberFormatException e) {
+                    log.warn(sm.getString("compressionConfig.invalidCompressionValue", value));
                     this.compressionLevel = 0;
                 }
             }
@@ -198,8 +203,13 @@ public class CompressionConfig {
      * Sets the comma-separated list of MIME types eligible for compression.
      *
      * @param valueS comma-separated MIME type string
+     *
+     * @throws IllegalArgumentException If the provided value is null
      */
     public void setCompressibleMimeType(String valueS) {
+        if (valueS == null) {
+            throw new IllegalArgumentException(sm.getString("compressionConfig.compressibleMimeTypeNull"));
+        }
         compressibleMimeType = valueS;
         compressibleMimeTypes = null;
     }
