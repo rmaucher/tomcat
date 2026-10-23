@@ -222,7 +222,7 @@
   <!-- The OpenSSL tests cases be disabled by specifying an invalid path here -->
   <property name="test.openssl.path" value="" />
 
-  <!-- Set test.quiche=true (e.g. via the quiche flag of run-http3-tests.sh) -->
+  <!-- Set test.quiche=true -->
   <!-- to run the tests against the quiche QUIC endpoint instead of the -->
   <!-- OpenSSL one, by selecting the quiche HTTP/3 protocol class in the -->
   <!-- test JVM. The quiche native library itself is provided through -->
