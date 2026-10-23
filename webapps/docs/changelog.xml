@@ -421,6 +421,47 @@
         corrected to terminate, since the Java shift distance is evaluated
         modulo 32. (remm)
       </fix>
+      <fix>
+        Correct the selection of multi-release JAR entries by the
+        <code>jar:file:</code> and <code>file:</code> based JAR
+        implementation used when scanning. The entry selected for a class
+        present with multiple versions depended on the order of the entries
+        in the JAR, so an older version, or a version intended for a later
+        runtime, could be scanned instead of the version the runtime would
+        use. The highest applicable version is now selected, independently
+        of the entry order, matching the behaviour of the stream based JAR
+        implementation. (remm)
+      </fix>
+      <fix>
+        Correct the accounting of the count of submitted tasks that
+        <code>ThreadPoolExecutor</code> maintains for <code>TaskQueue</code>.
+        The count was not always adjusted when a submitted task could no
+        longer complete, such as when a rejected execution handler did not
+        throw, or when a queued task was removed. A drifted value caused
+        thread pools with idle threads to create unnecessary threads.
+        (remm)
+      </fix>
+      <fix>
+        Rework <code>maxLocaleCount</code> behavior to ignore extra locales
+        when parsed instead of throwing an ISE, since a request remains
+        functionally coherent. (remm)
+      </fix>
+      <fix>
+        Include an <code>Allow</code> header when <code>HttpServlet</code> sends
+        a 405 response. Based on pull request <pr>1103</pr> by Arturo Bernal.
+        (markt)
+      </fix>
+      <fix>
+        Ensure the DefaultServlet returns the correct Allow header for
+        <code>PATCH</code> and <code>QUERY</code> requests. (markt)
+      </fix>
+      <fix>
+        Correctly parse RFC 850 formatted dates with two digit years where the
+        date appears to be more than 50 years in the future as required by RFC
+        9110. Treat the year as the most recent year in the past that had the
+        same last two digits. Based on pull request <pr>1104</pr> by Arturo
+        Bernal. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Coyote">
@@ -459,16 +500,11 @@
         buffer used by the BIO pair. Patch submitted by Lukas Hellebrandt.
         (remm)
       </fix>
-      <add>
-        Add QUIC implementation using OpenSSL 4+. (remm)
-      </add>
-      <add>
-        Add QUIC implementation using quiche 0.30+. This implementation does
-        not have support for SNI or multiple certificates. (remm)
-      </add>
-      <add>
-        Add HTTP/3 protocol support using either QUIC implementations. (remm)
-      </add>
+      <fix>
+        Ensure the Tomcat Native based OpenSSL <code>SSLContext</code> does not
+        drop TLS 1.3 when rebuilding the list of enabled protocols during
+        initialization. (dsoumis)
+      </fix>
       <!-- Entries for backport and removal before 12.0.0-M1 below this line -->
       <fix>
         Keep the asynchronous timeout in place until the timeout event has
@@ -537,6 +573,57 @@
         closes the entire connection. These frames are already permitted when
         the stream is closed in the other direction. (remm)
       </fix>
+      <fix>
+        The JSON parser now rejects input with a nesting depth greater than
+        1000 with a <code>ParseException</code>. Previously, deeply nested
+        input caused a <code>StackOverflowError</code> since the parser
+        recursed once per nesting level with no limit. RFC 8259 allows
+        implementations to set a limit on the maximum depth of nesting.
+        (remm)
+      </fix>
+      <fix>
+        In the OpenSSL cipher configuration parser, treat an AND expression
+        (<code>+</code>) that contains an unknown term as matching no ciphers
+        and log a warning, rather than silently ignoring the unknown term and
+        using only the known terms. This matches OpenSSL behavior, where such
+        an expression results in no cipher match. (remm)
+      </fix>
+      <fix>
+        In the OpenSSL cipher name conversion, ignore the unimplemented SSLv2
+        ciphers so that names shared with a modern cipher, for example
+        <code>RC4-MD5</code>, resolve to the JSSE name of the modern cipher
+        rather than returning <code>null</code>, and so that names matching
+        only an SSLv2 cipher no longer resolve to a non-standard name.
+        Ambiguous and unknown names still resolve to <code>null</code>; the
+        OpenSSL engine implementations now filter such unmapped names rather
+        than adding <code>null</code> to the lists of cipher suites they
+        expose. (remm)
+      </fix>
+      <fix>
+        Correct the computation of the authentication method passed to a custom
+        <code>X509TrustManager</code> by the FFM based OpenSSL implementation.
+        The key exchange and authentication NIDs of the negotiated cipher were
+        compared against legacy OpenSSL flag values rather than the actual NID
+        constants, so the trust manager received <code>UNKNOWN</code> as the
+        authentication type for almost every cipher suite. The computation now
+        matches the one performed by the JNI based implementation. (remm)
+      </fix>
+      <fix>
+        Correct <code>Asn1Parser.parseLength()</code> to report the actual decoded
+        length instead of a placeholder value when the length is valid but exceeds
+        the available input data, and to use a distinct, accurate message when a
+        length cannot be represented by this implementation due to Java's 32-bit
+        signed <code>int</code> limitation rather than misreporting it as an
+        invalid length. (michaelo)
+      </fix>
+      <fix>
+        Align the OCSP checking performed by the OpenSSL/Panama based
+        implementation of <code>SSLEngine</code> with the behaviour of the
+        JSSE based implementation so that a certificate that is itself a
+        trust anchor (whether a self-signed root or a certificate trusted
+        directly via the configured trust store) is not subject to OCSP
+        checking. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Jasper">
@@ -559,7 +646,8 @@
         Refactor the performance optimisation for
         <code>jakarta.servlet.jsp.el.ImportELResolver</code> to use the new
         marker class,
-        <code>jakarta.el.ELResolver.StandaloneIdentifierMarker</code>. (markt)
+        <code>jakarta.el.ELResolver.StandaloneIdentifierMarker</code>. Further
+        performance optimisation by AngeloRubens. (markt)
       </scode>
       <add>
         Extend the support for relational operators to include
@@ -579,11 +667,122 @@
         an Ant task. (sainadh777)
       </fix>
       <!-- Entries for backport and removal before 12.0.0-M1 below this line -->
+      <fix>
+        Correct the handling of the <code>--</code> argument by
+        <code>jspc</code>. The argument position was advanced past the full
+        stop argument on each iteration while collecting the JSP file
+        arguments, so every second file argument after <code>--</code> was
+        silently omitted from processing. Option parsing now stops at the
+        first full stop argument wherever it appears. (remm)
+      </fix>
+      <fix>
+        When removing white-space only template text nodes from the body of a
+        <code>jsp:attribute</code> action while parsing a JSP document, the
+        node that was shifted into the vacated position is now re-examined.
+        Previously it was skipped, which, for bodies containing adjacent
+        template text nodes such as those produced by CDATA sections, could
+        leave a white-space only text node in the body or prevent the final
+        text node from being trimmed when <code>trim</code> was
+        <code>true</code>. (remm)
+      </fix>
+      <fix>
+        Correct the assignability check <code>GraalBeanELResolver</code> uses
+        when selecting a setter for an EL value. The check was inverted, so a
+        setter whose parameter type was a super-type of the value type, for
+        example a setter taking <code>Object</code> or an interface, was
+        rejected and EL writes to such properties could be silently dropped
+        when running in a GraalVM native image. (remm)
+      </fix>
+      <fix>
+        The tag plugins for <code>c:when</code> and <code>c:otherwise</code>
+        now fall back to the standard tag handlers when the direct parent tag
+        is not a plugin enabled <code>c:choose</code>. Previously, they
+        generated unbalanced Java code for such misplaced tags, for example a
+        <code>c:when</code> nested directly in a <code>c:forEach</code>, which
+        failed the translation of the entire page instead of reporting the
+        illegal nesting at runtime as the reference implementation does.
+        (remm)
+      </fix>
+      <fix>
+        The tag plugins for <code>c:import</code> and <code>c:param</code> now
+        share the working URL of the import tag through the plugin context
+        rather than the page scope attribute <code>url_without_param</code>.
+        The import plugin set that attribute while generating the tag body and
+        removed it afterwards, clobbering an application attribute of the same
+        name, and the fixed name made the exchange prone to interference
+        between nested URL tags. This matches the reference implementation,
+        which keeps the parameters of each tag to itself and never touches
+        page scope attributes. (remm)
+      </fix>
+      <fix>
+        The tag plugin for <code>c:out</code> now uses its body as the
+        fallback for a null value like the standard tag handler does: the
+        body content is captured, trimmed, then written with escaping
+        according to the <code>escapeXml</code> attribute, and the capture
+        is unwound if the body fails. The plugin previously wrote the body
+        inline, including its surrounding whitespace, and did not escape
+        the body content. (remm)
+      </fix>
+      <fix>
+        The tag plugin for <code>c:set</code> now handles a deferred value
+        expression (<code>#{...}</code>) with a <code>var</code> attribute
+        like the standard tag handler does. Such a value is passed to the
+        tag as a value expression object, and it is now stored as a mapping
+        in the variable mapper of the EL context, where it evaluates
+        lazily, rather than being stored as an attribute holding the raw
+        expression object. As in the standard handler, a non-page scope is
+        rejected for a deferred value, and mappings that would shadow a
+        plain attribute are removed. (remm)
+      </fix>
+      <fix>
+        The tag plugin for <code>c:set</code> now falls back to the standard
+        tag handler when the tag has a value but neither a
+        <code>var</code> nor a <code>target</code> attribute, so that the
+        invalid use fails as it does with the handler instead of being
+        silently ignored. (remm)
+      </fix>
+      <fix>
+        The tag plugins for <code>c:url</code> and <code>c:redirect</code>
+        now strip a trailing slash from a <code>context</code> path before
+        joining it with the URL, as the standard tag handlers do, so that a
+        context path ending in a slash no longer produces a resolved path
+        with a doubled slash. Previously only the root context was handled.
+        (remm)
+      </fix>
+      <fix>
+        The tag plugins for <code>c:url</code>, <code>c:redirect</code> and
+        <code>c:param</code> now share the working URL of the URL tag through
+        the plugin context rather than the page scope attribute
+        <code>url_without_param</code>. That fixed name overwrote an
+        application attribute of the same name while the tag body was
+        processed and removed it afterwards, and it let a nested URL tag
+        destroy the outer tag's URL, which then silently rendered as
+        <code>null</code>. This matches the reference implementation, which
+        keeps the parameters of each tag to itself and never touches page
+        scope attributes. (remm)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Cluster">
     <changelog>
       <!-- Entries for backport and removal before 12.0.0-M1 below this line -->
+      <fix>
+        When the cluster receiver automatically binds to a port other than the
+        configured port, retain the configured <code>port</code>,
+        <code>securePort</code> and <code>udpPort</code> values and expose the
+        bound ports via the new read-only <code>boundPort</code>,
+        <code>boundSecurePort</code> and <code>boundUdpPort</code> properties
+        so that the configured values are not lost when the configuration is
+        stored. (markt)
+      </fix>
+      <fix>
+        Preserve the interrupt status of threads that are interrupted while
+        waiting in the cluster code (sender and receiver shutdown, membership
+        start-up and recovery, heartbeat checks and coordinator elections),
+        report an interrupt while waiting for a pooled sender as such rather
+        than as a time out and measure the wait for a pooled sender with a
+        monotonic clock. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="WebSocket">
@@ -615,6 +814,24 @@
         <code>Writer</code> and <code>OutputStream</code>. (markt)
       </fix>
       <!-- Entries for backport and removal before 12.0.0-M1 below this line -->
+      <fix>
+        Make the WebSocket client secure channel wrapper,
+        <code>AsyncChannelWrapperSecure</code>, honor the timeout specified for
+        write operations so a stalled peer cannot block the write thread
+        indefinitely. (remm)
+      </fix>
+      <fix>
+        Correct the calculation of the digest <code>response</code> value by
+        the WebSocket client when the server uses <code>qop="auth-int"</code>.
+        The hash of the (empty) entity body was omitted, resulting in an
+        incorrect response that the server always rejected. (remm)
+      </fix>
+      <fix>
+        Encode the credentials used for basic authentication by the WebSocket
+        client with UTF-8 by default rather than ISO-8859-1, and reject
+        challenges that specify a charset other than UTF-8, the only value
+        RFC 7617 allows. (remm)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Web applications">
@@ -632,6 +849,11 @@
       <fix>
         Host Manager: Host names are now always converted to lower case before
         use. (markt)
+      </fix>
+      <fix>
+        Documentation: Expand the documentation of the
+        <code>maxHttpRequestHeaderSize</code> attribute for the HTTP connector.
+        (markt)
       </fix>
     </changelog>
   </subsection>
@@ -681,6 +903,26 @@
         sent while holding the monitor, removing a potential deadlock
         with membership listeners that call back into the
         interceptor. (remm)
+      </fix>
+      <fix>
+        When a node that is configured with the
+        <code>StaticMembershipInterceptor</code> is also discovered
+        dynamically, the <code>StaticMembershipInterceptor</code> now
+        replaces the statically configured member with the dynamically
+        discovered member if the host and all of the ports (TCP, secure
+        and UDP) match. Previously, the node was a member twice because
+        the unique id of a dynamically discovered member is random and
+        can not match the statically configured unique id, and every
+        message sent to all members was sent to the node twice. If only
+        some of the ports match, the mismatch is logged as a
+        configuration error and the members are not merged. The
+        failure detector is told to forget the statically configured
+        member before the discovered member is announced, so that it is
+        not added again by the member checks. If the dynamically
+        discovered member disappears, the statically configured member
+        is restored. A second statically configured member with the
+        same host and ports as an earlier one is logged as a
+        configuration error and ignored. (markt)
       </fix>
       <fix>
         The <code>TwoPhaseCommitInterceptor</code> now forwards the
@@ -737,6 +979,31 @@
   <subsection name="jdbc-pool">
     <changelog>
       <!-- Entries for backport and removal before 12.0.0-M1 below this line -->
+      <fix>
+        <bug>68436</bug>: Reduce the log level from warning to debug for the
+        message logged when <code>driverClassName</code> is not set, as relying
+        on <code>DriverManager</code> to locate the driver is a valid
+        configuration. Pull request <pr>1084</pr> provided by Raphael Vullriede.
+        (markt)
+      </fix>
+      <fix>
+        <bug>69236</bug>: Reset the interceptors of a new connection in the
+        order they are declared, as is already done for a connection taken from
+        the pool, rather than in reverse order. A failure to reset an
+        interceptor is now reported as an <code>SQLException</code> that names
+        the interceptor and the connection is discarded rather than left
+        borrowed. A connection is also no longer left borrowed if the
+        interceptors cannot be instantiated or the connection proxy cannot be
+        created. Pull request provided by Arturo Bernal. (markt)
+      </fix>
+      <fix>
+        <bug>70269</bug>: Correct a regression in the change that reset the
+        properties of statements cached by the <code>StatementCache</code>
+        interceptor that meant no statements were cached when using JDBC
+        drivers, such as H2 and MariaDB Connector/J, that always report
+        statements as not poolable. Pull request <pr>1083</pr> provided by
+        Raphael Vullriede. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Other">
@@ -766,7 +1033,26 @@
       <update>
         Add directory prefix to embedded ZIP packaging. (schultz)
       </update>
+      <add>
+        Generate a JaCoCo XML coverage report
+        (<code>output/coverage/jacoco.xml</code>) alongside the existing HTML
+        report when the build is run with code coverage enabled. (dsoumis)
+      </add>
       <!-- Entries for backport and removal before 12.0.0-M1 below this line -->
+      <update>
+        <bug>69902</bug>: Change the ZIP distribution to store the same file
+        and directory permissions as the tar.gz distribution so that the
+        scripts in <code>bin</code> are executable when the archive is
+        extracted on a Unix platform.
+      </update>
+      <fix>
+        <bug>70262</bug>: Fix <code>service.bat</code> so <code>install
+        &lt;name&gt; --rename</code> renames the Windows service executables in
+        <code>CATALINA_HOME\bin</code>. <code>remove</code> now restores the
+        default executable names only when the service name differs from the
+        default. Based on pull request <pr>1095</pr> provided by StrongOx.
+        (markt)
+      </fix>
     </changelog>
   </subsection>
 </section>

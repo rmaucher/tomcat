@@ -810,13 +810,22 @@ public class OpenSSLCipherConfigurationParser {
                 add(ciphers, element, orderedAllAddedCiphers);
             } else if (element.contains(AND)) {
                 String[] intersections = element.split("\\" + AND);
-                if (intersections.length > 0 && aliases.containsKey(intersections[0])) {
-                    List<Cipher> result = new ArrayList<>(aliases.get(intersections[0]));
-                    for (int i = 1; i < intersections.length; i++) {
-                        if (aliases.containsKey(intersections[i])) {
-                            result.retainAll(aliases.get(intersections[i]));
-                        }
+                List<Cipher> result = null;
+                for (String intersection : intersections) {
+                    // As in OpenSSL, any unknown term makes the whole AND
+                    // element match nothing
+                    if (!aliases.containsKey(intersection)) {
+                        log.warn(sm.getString("opensslCipherConfigurationParser.unknownElement", intersection));
+                        result = null;
+                        break;
                     }
+                    if (result == null) {
+                        result = new ArrayList<>(aliases.get(intersection));
+                    } else {
+                        result.retainAll(aliases.get(intersection));
+                    }
+                }
+                if (result != null) {
                     add(ciphers, result, orderedAllAddedCiphers);
                 }
             }
@@ -889,21 +898,40 @@ public class OpenSSLCipherConfigurationParser {
      *
      * @param opensslCipherName The OpenSSL name for a cipher
      *
-     * @return The first JSSE name for the specified OpenSSL cipher, or {@code null} if the name is not a known,
-     *             unambiguous OpenSSL cipher name
+     * @return The first JSSE name for the specified OpenSSL cipher, or {@code null} if the name is not a known
+     *             OpenSSL cipher name, if it remains ambiguous once unimplemented SSLv2 ciphers are excluded or if
+     *             only SSLv2 ciphers match
      */
     public static String openSSLToJsse(String opensslCipherName) {
         if (!initialized) {
             init();
         }
         List<Cipher> ciphers = aliases.get(opensslCipherName);
-        if (ciphers == null || ciphers.size() != 1) {
+        if (ciphers == null) {
             // Not an OpenSSL cipher name
             return null;
         }
-        Cipher cipher = ciphers.getFirst();
+        // OpenSSL has not supported SSLv2 for many years and the SSLv2
+        // ciphers here are unimplemented. Excluding them resolves the
+        // ambiguity for the OpenSSL names that an SSLv2 cipher shares with
+        // the equivalent modern cipher.
+        Cipher candidate = null;
+        for (Cipher cipher : ciphers) {
+            if (cipher.getProtocol() == Protocol.SSLv2) {
+                continue;
+            }
+            if (candidate != null) {
+                // Ambiguous name
+                return null;
+            }
+            candidate = cipher;
+        }
+        if (candidate == null) {
+            // Only SSLv2 ciphers matched
+            return null;
+        }
         // Each Cipher always has at least one JSSE name
-        return cipher.getJsseNames().iterator().next();
+        return candidate.getJsseNames().iterator().next();
     }
 
 

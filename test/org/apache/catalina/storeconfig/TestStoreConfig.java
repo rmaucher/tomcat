@@ -17,10 +17,10 @@
 package org.apache.catalina.storeconfig;
 
 import java.io.File;
-import java.io.FileReader;
 import java.io.PrintWriter;
 import java.io.StringReader;
 import java.io.StringWriter;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 
@@ -31,6 +31,7 @@ import org.junit.Test;
 
 import org.apache.catalina.Context;
 import org.apache.catalina.Host;
+import org.apache.catalina.Server;
 import org.apache.catalina.connector.Connector;
 import org.apache.catalina.core.StandardContext;
 import org.apache.catalina.realm.LockOutRealm;
@@ -39,7 +40,6 @@ import org.apache.catalina.startup.Catalina;
 import org.apache.catalina.startup.CatalinaBaseConfigurationSource;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
-import org.apache.catalina.util.IOTools;
 import org.apache.catalina.util.SessionIdGeneratorBase;
 import org.apache.catalina.valves.AccessLogValve;
 import org.apache.tomcat.util.net.SSLHostConfig;
@@ -159,12 +159,7 @@ public class TestStoreConfig extends TomcatBaseTest {
         File serverXml = new File(tomcat.getServer().getCatalinaBase(), Catalina.SERVER_XML);
         Assert.assertTrue(serverXml.canRead());
         addDeleteOnTearDown(serverXml);
-        String serverXmlDump;
-        try (FileReader reader = new FileReader(serverXml);
-                StringWriter writer = new StringWriter()) {
-            IOTools.flow(reader, writer);
-            serverXmlDump = writer.toString();
-        }
+        String serverXmlDump = Files.readString(serverXml.toPath(), StandardCharsets.UTF_8);
         Assert.assertTrue(serverXmlDump.contains("StoreConfigLifecycleListener"));
         Assert.assertTrue(serverXmlDump.contains("UserDatabaseRealm"));
         // The cluster must round-trip the channel start options the test had to restrict, as the
@@ -251,12 +246,7 @@ public class TestStoreConfig extends TomcatBaseTest {
         storeConfigListener.getStoreConfig().storeConfig();
 
         // Read written configuration
-        String serverXmlDump;
-        try (FileReader reader = new FileReader(serverXml);
-                StringWriter writer = new StringWriter()) {
-            IOTools.flow(reader, writer);
-            serverXmlDump = writer.toString();
-        }
+        String serverXmlDump = Files.readString(serverXml.toPath(), StandardCharsets.UTF_8);
         Assert.assertTrue(serverXmlDump.contains("Header comment line"));
         Assert.assertTrue(serverXmlDump.contains("Service comment"));
         Assert.assertTrue(serverXmlDump.contains("Commented out connector"));
@@ -331,12 +321,7 @@ public class TestStoreConfig extends TomcatBaseTest {
         }
 
         // Read written configuration
-        String contextXmlDump;
-        try (FileReader reader = new FileReader(contextXml);
-                StringWriter writer = new StringWriter()) {
-            IOTools.flow(reader, writer);
-            contextXmlDump = writer.toString();
-        }
+        String contextXmlDump = Files.readString(contextXml.toPath(), StandardCharsets.UTF_8);
         Assert.assertTrue(contextXmlDump, contextXmlDump.contains("Context comment"));
         Assert.assertTrue(contextXmlDump, contextXmlDump.contains("watched resources"));
         Assert.assertTrue(contextXmlDump, contextXmlDump.contains("conf/test.txt"));
@@ -620,6 +605,20 @@ public class TestStoreConfig extends TomcatBaseTest {
         Assert.assertTrue(dump, dump.contains("name=\"groups\""));
         Assert.assertTrue(dump, dump.contains("value=\"X25519\""));
 
+        // When multiple groups commands are present, all are user-written because the runtime only adds its derived
+        // command when no groups command is configured. Keep every command, including one that matches the attribute.
+        SSLHostConfig multipleCommands = new SSLHostConfig();
+        multipleCommands.setGroups("secp256r1,secp384r1");
+        multipleCommands.setOpenSslConf(new OpenSSLConf());
+        multipleCommands.getOpenSslConf().addCmd(new OpenSSLConfCmd(OpenSSLConfCmd.GROUPS, "X25519"));
+        multipleCommands.getOpenSslConf()
+                .addCmd(new OpenSSLConfCmd(OpenSSLConfCmd.GROUPS, "secp256r1:secp384r1"));
+        dump = storeToString(desc, multipleCommands);
+        int firstCommand = dump.indexOf("value=\"X25519\"");
+        int secondCommand = dump.indexOf("value=\"secp256r1:secp384r1\"");
+        Assert.assertTrue(dump, firstCommand != -1);
+        Assert.assertTrue(dump, secondCommand > firstCommand);
+
         // Without the attribute, a groups command can only be user-written and must be kept
         SSLHostConfig noAttribute = new SSLHostConfig();
         noAttribute.setGroups(null);
@@ -688,6 +687,36 @@ public class TestStoreConfig extends TomcatBaseTest {
         Assert.assertFalse(storeConfig.store(context));
     }
 
+    /**
+     * Verify that storing a Server whose class has no store description fails without replacing the existing
+     * configuration, and that the MBean operation reports the failure.
+     *
+     * @throws Exception if the test experiences an unexpected error
+     */
+    @Test
+    public void testStoreServerWithoutDescriptionFails() throws Exception {
+        StoreLoader loader = new StoreLoader();
+        loader.load(null);
+        StoreConfig storeConfig = new StoreConfig();
+        storeConfig.setRegistry(loader.getRegistry());
+
+        Server server = (Server) Proxy.newProxyInstance(Server.class.getClassLoader(), new Class<?>[] { Server.class },
+                (proxy, method, args) -> null);
+        Assert.assertNull(loader.getRegistry().findDescription(server.getClass()));
+
+        File serverXml = new File(getTemporaryDirectory(), "server-custom.xml");
+        String original = "<Server port=\"8005\"/>";
+        Files.writeString(serverXml.toPath(), original, StandardCharsets.UTF_8);
+        storeConfig.setServerFilename(serverXml.getAbsolutePath());
+
+        Assert.assertFalse(storeConfig.store(server));
+        Assert.assertEquals(original, Files.readString(serverXml.toPath(), StandardCharsets.UTF_8));
+
+        storeConfig.setServer(server);
+        Assert.assertThrows(IllegalStateException.class, storeConfig::storeConfig);
+        Assert.assertEquals(original, Files.readString(serverXml.toPath(), StandardCharsets.UTF_8));
+    }
+
     private static String storeToString(StoreDescription desc, Object element) throws Exception {
         StringWriter buffer = new StringWriter();
         desc.getStoreFactory().store(new PrintWriter(buffer), -2, element);
@@ -750,12 +779,7 @@ public class TestStoreConfig extends TomcatBaseTest {
         // also flagged
         File generatedClass = new File(generatedCodeLocation, "catalinaembedded/ServerXml.java");
         Assert.assertTrue("Generated code was not created: " + generatedClass, generatedClass.exists());
-        String generatedCode;
-        try (FileReader reader = new FileReader(generatedClass);
-                StringWriter writer = new StringWriter()) {
-            IOTools.flow(reader, writer);
-            generatedCode = writer.toString();
-        }
+        String generatedCode = Files.readString(generatedClass.toPath(), StandardCharsets.UTF_8);
         Assert.assertTrue(generatedCode, generatedCode.contains(".setDeployedFromServerXml(true);"));
     }
 
@@ -881,12 +905,7 @@ public class TestStoreConfig extends TomcatBaseTest {
         // A new context configuration file must have been created instead
         File contextXml = new File(tomcat.getHost().getConfigBaseFile(), "standalone.xml");
         Assert.assertTrue("Context file was not created: " + contextXml, contextXml.exists());
-        String contextXmlDump;
-        try (FileReader reader = new FileReader(contextXml);
-                StringWriter writer = new StringWriter()) {
-            IOTools.flow(reader, writer);
-            contextXmlDump = writer.toString();
-        }
+        String contextXmlDump = Files.readString(contextXml.toPath(), StandardCharsets.UTF_8);
         Assert.assertTrue(contextXmlDump, contextXmlDump.contains("<Context"));
         // The stored configuration must remain well-formed
         SAXParserFactory.newInstance().newSAXParser().getXMLReader()
@@ -940,5 +959,4 @@ public class TestStoreConfig extends TomcatBaseTest {
 
         Assert.assertFalse(new File(tomcat.getHost().getConfigBaseFile(), "skipped.xml").exists());
     }
-
 }

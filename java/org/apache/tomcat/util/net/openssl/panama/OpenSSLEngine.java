@@ -188,13 +188,16 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
             OpenSSLSessionContext sessionContext, boolean alpn, boolean initialized, int certificateVerificationDepth,
             boolean certificateVerificationOptionalNoCA, boolean noOcspCheck, boolean ocspSoftFail, int ocspTimeout,
             int ocspVerifyFlags) {
-        if (sslCtx == null) {
+        if (sslCtx == null || MemorySegment.NULL.equals(sslCtx)) {
             throw new IllegalArgumentException(sm.getString("engine.noSSLContext"));
         }
         engineArena = Arena.ofAuto();
         bufSegment = engineArena.allocate(MAX_ENCRYPTED_PACKET_LENGTH);
         session = new OpenSSLSession();
         var ssl = SSL_new(sslCtx);
+        if (MemorySegment.NULL.equals(ssl)) {
+            throw new IllegalStateException(sm.getString("engine.noSSL", OpenSSLLibrary.getLastError()));
+        }
         // Set ssl_info_callback
         SSL_set_info_callback(ssl, SSL_set_info_callback$cb.allocate(new InfoCallback(), engineArena));
         if (clientMode) {
@@ -251,7 +254,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         final int len = Math.min(src.remaining(), MAX_PLAINTEXT_LENGTH);
         MemorySegment srcSegment = src.isDirect() ? MemorySegment.ofBuffer(src) : bufSegment;
         if (!src.isDirect()) {
-            MemorySegment.copy(src.array(), pos, bufSegment, ValueLayout.JAVA_BYTE, 0, len);
+            MemorySegment.copy(src.array(), src.arrayOffset() + pos, bufSegment, ValueLayout.JAVA_BYTE, 0, len);
         }
         final int sslWrote = SSL_write(ssl, srcSegment, len);
         if (sslWrote > 0) {
@@ -274,7 +277,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         final int len = src.remaining();
         MemorySegment srcSegment = src.isDirect() ? MemorySegment.ofBuffer(src) : bufSegment;
         if (!src.isDirect()) {
-            MemorySegment.copy(src.array(), pos, bufSegment, ValueLayout.JAVA_BYTE, 0, len);
+            MemorySegment.copy(src.array(), src.arrayOffset() + pos, bufSegment, ValueLayout.JAVA_BYTE, 0, len);
         }
         final int netWrote = BIO_write(networkBIO, srcSegment, len);
         if (netWrote > 0) {
@@ -299,7 +302,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         final int sslRead = SSL_read(ssl, dstSegment, len);
         if (sslRead > 0) {
             if (!dst.isDirect()) {
-                MemorySegment.copy(dstSegment, ValueLayout.JAVA_BYTE, 0, dst.array(), pos, sslRead);
+                MemorySegment.copy(dstSegment, ValueLayout.JAVA_BYTE, 0, dst.array(), dst.arrayOffset() + pos,
+                        sslRead);
             }
             dst.position(pos + sslRead);
             return sslRead;
@@ -322,7 +326,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         final int bioRead = BIO_read(networkBIO, dstSegment, pending);
         if (bioRead > 0) {
             if (!dst.isDirect()) {
-                MemorySegment.copy(dstSegment, ValueLayout.JAVA_BYTE, 0, dst.array(), pos, bioRead);
+                MemorySegment.copy(dstSegment, ValueLayout.JAVA_BYTE, 0, dst.array(), dst.arrayOffset() + pos,
+                        bioRead);
             }
             dst.position(pos + bioRead);
             return bioRead;
@@ -1230,8 +1235,13 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
             // No need to check cert->valid, because ssl_verify_OCSP() only
             // is called if OpenSSL already successfully verified the certificate
             // (parameter "ok" in SSL_callback_SSL_verify() must be true).
-            if (X509_check_issued(x509, x509) == X509_V_OK()) {
-                // don't do OCSP checking for valid self-issued certs
+            if (X509_check_issued(x509, x509) == X509_V_OK()
+                    || X509_STORE_CTX_get_error_depth(x509ctx) >= X509_STORE_CTX_get_num_untrusted(x509ctx)) {
+                // Don't do OCSP checking for valid self-issued certs, nor for a certificate that is itself
+                // a trust anchor (present directly in the configured trust store rather than supplied by the
+                // peer). A trust anchor is trusted unconditionally, so its own revocation status is not
+                // checked. This aligns with JSSE's PKIXRevocationChecker, which excludes the trust anchor
+                // of the certification path from revocation checking regardless of whether it is self-signed.
                 X509_STORE_CTX_set_error(x509ctx, X509_V_OK());
             } else {
                 try (var localArena = Arena.ofConfined()) {
@@ -1276,6 +1286,15 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
                                     for (String urlString : urls) {
                                         try {
                                             URL url = (new URI(urlString)).toURL();
+                                            String protocol = url.getProtocol();
+                                            if (!"http".equals(protocol) && !"https".equals(protocol)) {
+                                                // OpenSSLEngine can only talk HTTP/HTTPS to OCSP responders. Other
+                                                // protocol handlers (e.g. file) trigger a ClassCastException below so
+                                                // treat them as invalid and skip to the next URL, as the JNI
+                                                // implementation does when OCSP URL parsing fails.
+                                                log.warn(sm.getString("engine.invalidOCSPURL", urlString));
+                                                continue;
+                                            }
                                             requestAttempted = true;
                                             ocspResponse =
                                                     processOCSPRequest(state, url, issuer, x509, x509ctx, localArena);
@@ -1395,7 +1414,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
                 X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
                 return V_OCSP_CERTSTATUS_UNKNOWN();
             }
-            OCSP_request_add1_nonce(ocspRequest, (char) 0, -1);
+            OCSP_request_add1_nonce(ocspRequest, MemorySegment.NULL, -1);
             MemorySegment ocspRequestDerPointer = localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
             int requestLength = i2d_OCSP_REQUEST(ocspRequest, ocspRequestDerPointer);
             if (requestLength <= 0) {

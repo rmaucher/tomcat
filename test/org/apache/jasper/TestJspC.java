@@ -142,6 +142,76 @@ public class TestJspC {
     }
 
     @Test
+    public void argsNoFullStop() throws Exception {
+        jspc.setArgs(new String[] {"a.jsp", "b.jsp"});
+        Assert.assertEquals(List.of("a.jsp", "b.jsp"), jspc.pages);
+    }
+
+    @Test
+    public void argsFullStop() throws Exception {
+        jspc.setArgs(new String[] {"--", "a.jsp", "b.jsp", "c.jsp"});
+        Assert.assertEquals(List.of("a.jsp", "b.jsp", "c.jsp"), jspc.pages);
+    }
+
+    @Test
+    public void argsFullStopAfterOptions() throws Exception {
+        jspc.setArgs(new String[] {"-compile", "--", "a.jsp", "b.jsp"});
+        Assert.assertTrue(jspc.compile);
+        Assert.assertEquals(List.of("a.jsp", "b.jsp"), jspc.pages);
+    }
+
+    @Test
+    public void argsFullStopFileStartingWithDash() throws Exception {
+        jspc.setArgs(new String[] {"--", "-a.jsp", "b.jsp"});
+        Assert.assertEquals(List.of("-a.jsp", "b.jsp"), jspc.pages);
+    }
+
+    @Test
+    public void argsFullStopAsOptionValue() throws Exception {
+        // The full stop argument takes the place of the missing option value
+        // and must not cause the first file argument to be dropped
+        jspc.setArgs(new String[] {"-d", "--", "a.jsp", "b.jsp"});
+        Assert.assertEquals(List.of("a.jsp", "b.jsp"), jspc.pages);
+    }
+
+    @Test
+    public void argsFullStopInOptionValuePositionStopsOptionParsing()
+            throws Exception {
+        jspc.setArgs(new String[] {"-cache", "--", "-compile", "a.jsp"});
+        Assert.assertFalse(jspc.compile);
+        Assert.assertEquals(List.of("-compile", "a.jsp"), jspc.pages);
+    }
+
+    @Test
+    public void argsTrimSpacesLast() throws Exception {
+        // The setArgs() call must return, applying the default value of TRUE.
+        // Use a thread to avoid the test harness hanging if the option is
+        // ever re-processed in a loop again.
+        Thread thread = new Thread(() -> {
+            try {
+                jspc.setArgs(new String[] {"-trimSpaces"});
+            } catch (JasperException e) {
+                // Ignore
+            }
+        });
+        thread.setDaemon(true);
+        thread.start();
+        thread.join(10000);
+        Assert.assertFalse("setArgs() did not return", thread.isAlive());
+        Assert.assertEquals(TrimSpacesOption.TRUE, jspc.getTrimSpaces());
+        Assert.assertTrue(jspc.pages.isEmpty());
+    }
+
+    @Test
+    public void argsTrimSpacesBeforeFullStop() throws Exception {
+        // The full stop argument takes the place of the missing option value
+        // and must not be added to the list of JSP pages
+        jspc.setArgs(new String[] {"-trimSpaces", "--", "a.jsp", "b.jsp"});
+        Assert.assertEquals(TrimSpacesOption.TRUE, jspc.getTrimSpaces());
+        Assert.assertEquals(List.of("a.jsp", "b.jsp"), jspc.pages);
+    }
+
+    @Test
     public void servletContextUsesAntLog() throws Exception {
         List<String> messages = new ArrayList<>();
         Project project = new Project();

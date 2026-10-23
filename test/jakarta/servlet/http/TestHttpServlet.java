@@ -232,6 +232,27 @@ public class TestHttpServlet extends TomcatBaseTest {
 
 
     @Test
+    public void testMethodNotAllowed() throws Exception {
+        doTestMethodNotAllowed(new OptionsServlet(), "GET, HEAD, OPTIONS");
+    }
+
+
+    @Test
+    public void testMethodNotAllowedSub() throws Exception {
+        doTestMethodNotAllowed(new OptionsServletSub(), "GET, HEAD, POST, OPTIONS");
+    }
+
+
+    /*
+     * An Allow header set by the application before the default doPut() implementation is called must not be replaced.
+     */
+    @Test
+    public void testMethodNotAllowedExistingAllow() throws Exception {
+        doTestMethodNotAllowed(new AllowServlet(), "FOO");
+    }
+
+
+    @Test
     public void testQueryMethod() throws Exception {
         Tomcat tomcat = getTomcatInstance();
 
@@ -360,6 +381,33 @@ public class TestHttpServlet extends TomcatBaseTest {
 
         Assert.assertEquals(HttpServletResponse.SC_OK, rc);
         Assert.assertEquals(expectedAllow, resHeaders.get("Allow").get(0));
+    }
+
+
+    /*
+     * RFC 9110, section 15.5.6: a 405 response must contain an Allow header field that lists the methods supported by
+     * the target resource.
+     */
+    private void doTestMethodNotAllowed(Servlet servlet, String expectedAllow) throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        StandardContext ctx = (StandardContext) getProgrammaticRootContext();
+
+        // Map the test Servlet
+        Tomcat.addServlet(ctx, "servlet", servlet);
+        ctx.addServletMapping("/", "servlet");
+
+        tomcat.start();
+
+        Map<String,List<String>> resHeaders = new HashMap<>();
+        int rc = methodUrl("http://localhost:" + getPort() + "/", new ByteChunk(), DEFAULT_CLIENT_TIMEOUT_MS, null,
+                resHeaders, Method.PUT);
+
+        Assert.assertEquals(HttpServletResponse.SC_METHOD_NOT_ALLOWED, rc);
+        List<String> allow = resHeaders.get("Allow");
+        Assert.assertNotNull(allow);
+        Assert.assertEquals(expectedAllow, allow.get(0));
     }
 
 
@@ -696,6 +744,18 @@ public class TestHttpServlet extends TomcatBaseTest {
         @Override
         protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
             doGet(req, resp);
+        }
+    }
+
+
+    private static class AllowServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doPut(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+            resp.setHeader("Allow", "FOO");
+            super.doPut(req, resp);
         }
     }
 

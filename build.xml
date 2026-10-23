@@ -949,6 +949,7 @@
       <fileset dir="modules/jdbc-pool" >
         <exclude name=".*/**"/>
         <exclude name="**/MANIFEST.MF"/>
+        <exclude name="src/test/**" />
         <patternset refid="text.files" />
         <!-- Exclude developer specific local files -->
         <exclude name="build.properties" />
@@ -984,6 +985,10 @@
         <exclude name="webapp/jsp/encoding/**"/>
         <!-- Exclude OpenSSL index files -->
         <exclude name="**/index.db" />
+      </fileset>
+      <fileset dir="modules/jdbc-pool" >
+        <include name="src/test/**" />
+        <exclude name="**/MANIFEST.MF"/>
       </fileset>
     </checkstyle>
   </target>
@@ -2329,6 +2334,7 @@
         </sourcefiles>
       </structure>
       <html destdir="${coverage.out}"/>
+      <xml destfile="${coverage.out}/jacoco.xml"/>
     </jacoco:report>
 
   </target>
@@ -3256,9 +3262,11 @@ Configured for ${release.asfusername} to release Tomcat ${version.major}.${versi
          modificationtime="${tstamp.iso.release}"
          encoding="UTF8">
       <zipfileset file="${tomcat.dist}" fullpath="${final.name}"/>
-      <zipfileset dir="${tomcat.dist}" prefix="${final.name}">
-        <include name="bin/**"/>
+      <zipfileset dir="${tomcat.dist}" dirmode="700" filemode="600" prefix="${final.name}">
         <include name="conf/**"/>
+      </zipfileset>
+      <zipfileset dir="${tomcat.dist}" dirmode="750" filemode="640" prefix="${final.name}">
+        <include name="bin/**"/>
         <include name="logs/**"/>
         <include name="lib/**"/>
         <include name="webapps/**"/>
@@ -3272,8 +3280,14 @@ Configured for ${release.asfusername} to release Tomcat ${version.major}.${versi
         <include name="BUILDING.txt" />
         <include name="CONTRIBUTING.md"/>
         <exclude name="bin/service.bat"/>
+        <exclude name="bin/*.sh"/>
         <exclude name="bin/*.exe"/>
         <exclude name="bin/*.dll"/>
+      </zipfileset>
+      <!-- These need to be added after the bin directory is added else the  -->
+      <!-- bin directory will pick up the wrong permissions.                 -->
+      <zipfileset dir="${tomcat.dist}" dirmode="750" filemode="750" prefix="${final.name}">
+        <include name="bin/*.sh"/>
       </zipfileset>
     </zip>
 
@@ -3889,6 +3903,15 @@ Configured for ${release.asfusername} to release Tomcat ${version.major}.${versi
       <param name="checksum.enabled" value="${spotbugs.checksum.enabled}"/>
       <param name="checksum.algorithm" value="${spotbugs.checksum.algorithm}"/>
       <param name="checksum.value" value="${spotbugs.checksum.value}"/>
+    </antcall>
+
+    <antcall target="downloadfile">
+      <param name="sourcefile" value="${findsecbugs.loc}"/>
+      <param name="destfile" value="${findsecbugs.jar}"/>
+      <param name="destdir" value="${findsecbugs.home}"/>
+      <param name="checksum.enabled" value="${findsecbugs.checksum.enabled}"/>
+      <param name="checksum.algorithm" value="${findsecbugs.checksum.algorithm}"/>
+      <param name="checksum.value" value="${findsecbugs.checksum.value}"/>
     </antcall>
 
   </target>

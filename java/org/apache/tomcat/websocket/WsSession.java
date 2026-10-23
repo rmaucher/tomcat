@@ -495,6 +495,9 @@ public class WsSession implements Session {
     @Override
     public void setMaxBinaryMessageBufferSize(int max) {
         checkState();
+        if (max < 1) {
+            throw new IllegalArgumentException(sm.getString("wsSession.illegalBufferSize", Integer.valueOf(max)));
+        }
         this.maxBinaryMessageBufferSize = max;
     }
 
@@ -509,6 +512,9 @@ public class WsSession implements Session {
     @Override
     public void setMaxTextMessageBufferSize(int max) {
         checkState();
+        if (max < 1) {
+            throw new IllegalArgumentException(sm.getString("wsSession.illegalBufferSize", Integer.valueOf(max)));
+        }
         this.maxTextMessageBufferSize = max;
     }
 
@@ -692,7 +698,7 @@ public class WsSession implements Session {
         long result = 0;
         Object obj = userProperties.get(Constants.SESSION_CLOSE_TIMEOUT_PROPERTY);
         if (obj instanceof Long) {
-            result = ((Long) obj).intValue();
+            result = ((Long) obj).longValue();
         }
         if (result <= 0) {
             result = Constants.DEFAULT_SESSION_CLOSE_TIMEOUT;

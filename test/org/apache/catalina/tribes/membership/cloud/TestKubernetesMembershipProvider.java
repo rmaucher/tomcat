@@ -47,7 +47,7 @@ public class TestKubernetesMembershipProvider {
         Assume.assumeFalse(Files.exists(
                 FileSystems.getDefault().getPath("/var/run/secrets/kubernetes.io/serviceaccount/token")));
 
-        GroupChannel channel = new GroupChannel();
+        ListenerCountingChannel channel = new ListenerCountingChannel();
         channel.setName("TestKubernetesMembershipProvider-" + System.nanoTime());
 
         CloudMembershipService service = new CloudMembershipService();
@@ -59,6 +59,59 @@ public class TestKubernetesMembershipProvider {
         } catch (IllegalStateException expected) {
             // The start fails closed rather than running without access to the API
             Assert.assertTrue(expected.getCause() instanceof IOException);
+        }
+        // A failed start must not leave the provider registered as a channel listener
+        Assert.assertEquals(0, channel.getListenerCount());
+    }
+
+    /*
+     * A non-positive expiration time expires every member on every heartbeat. Such a configuration must be
+     * rejected when the provider is initialised, and must not leave an uninitialised provider behind.
+     */
+    @Test
+    public void testStartRejectsNonPositiveExpirationTime() throws Exception {
+        for (long expirationTime : new long[] { 0, -5 }) {
+            GroupChannel channel = new GroupChannel();
+            channel.setName("TestKubernetesMembershipProvider-" + System.nanoTime());
+
+            CloudMembershipService service = new CloudMembershipService();
+            service.setChannel(channel);
+            service.setLocalMemberProperties("127.0.0.1", 4007, 0, 0);
+            service.setExpirationTime(expirationTime);
+            try {
+                service.start(CloudMembershipService.MBR_RX);
+                Assert.fail("start() must reject an expiration time of " + expirationTime);
+            } catch (IllegalArgumentException expected) {
+                // The configuration must be rejected before the provider is used
+            }
+            Assert.assertNull(service.getMembershipProvider());
+        }
+    }
+
+    /*
+     * The local member is resolved when the channel receiver starts, or is configured explicitly. Starting the
+     * membership alone, without either, must fail with a clear error rather than a NumberFormatException from a
+     * missing property, and must not leave a provider behind.
+     */
+    @Test
+    public void testStartWithoutLocalMemberPropertiesFails() throws Exception {
+        GroupChannel channel = new GroupChannel();
+        channel.setName("TestKubernetesMembershipProvider-" + System.nanoTime());
+
+        CloudMembershipService service = new CloudMembershipService();
+        service.setChannel(channel);
+        try {
+            service.start(CloudMembershipService.MBR_RX);
+            Assert.fail("start() must fail when the local member properties are not set");
+        } catch (IllegalStateException expected) {
+            // A clear configuration error rather than a NumberFormatException
+        }
+        Assert.assertNull(service.getMembershipProvider());
+    }
+
+    private static class ListenerCountingChannel extends GroupChannel {
+        int getListenerCount() {
+            return channelListeners.size();
         }
     }
 }

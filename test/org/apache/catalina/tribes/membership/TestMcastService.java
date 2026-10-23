@@ -24,6 +24,7 @@ import org.junit.Test;
 
 import org.apache.catalina.tribes.Channel;
 import org.apache.catalina.tribes.ChannelException;
+import org.apache.catalina.tribes.TesterUtil;
 import org.apache.catalina.tribes.group.GroupChannel;
 import org.apache.catalina.tribes.io.ChannelData;
 import org.apache.catalina.tribes.io.XByteBuffer;
@@ -31,18 +32,18 @@ import org.apache.catalina.tribes.io.XByteBuffer;
 public class TestMcastService {
 
     /*
-     * The shutdown message that stop() broadcasts routinely fails when the network device is down
-     * or the socket is already broken. That must not skip leaving the multicast group and closing
-     * the socket, nor prevent the service facade from releasing its implementation.
+     * The shutdown message that stop() broadcasts routinely fails when the network device is down or the socket is
+     * already broken. That must not skip leaving the multicast group and closing the socket, nor prevent the service
+     * facade from releasing its implementation.
      */
     @Test(timeout = 60000)
     public void testStopWithFailingShutdownSendCompletes() throws Exception {
-        int base = 40000 + (int) Math.floorMod(System.nanoTime(), 10000);
+        int mcastPort = TesterUtil.getFreeUdpPort();
         StringBuilder properties = new StringBuilder();
         properties.append("mcastAddress=228.0.0.4\n");
-        properties.append("mcastPort=").append(base).append("\n");
+        properties.append("mcastPort=").append(mcastPort).append("\n");
         properties.append("tcpListenHost=127.0.0.1\n");
-        properties.append("tcpListenPort=").append(base + 1).append("\n");
+        properties.append("tcpListenPort=").append(0).append("\n");
         properties.append("tcpSecurePort=0\n");
         properties.append("udpListenPort=0\n");
         properties.append("mcastFrequency=100\n");
@@ -74,10 +75,9 @@ public class TestMcastService {
     }
 
     /*
-     * The soTimeout and ttl reported through MBean must reflect the configuration, whether it is
-     * supplied through the properties file or through the setters. Previously the getters read
-     * private fields that only the setters wrote, so a property-based configuration that the socket
-     * did apply was reported as the default 0.
+     * The soTimeout and ttl reported through MBean must reflect the configuration, whether it is supplied through the
+     * properties file or through the setters. Previously the getters read private fields that only the setters wrote,
+     * so a property-based configuration that the socket did apply was reported as the default 0.
      */
     @Test
     public void testSoTimeoutAndTtlReflectProperties() throws Exception {
@@ -113,8 +113,8 @@ public class TestMcastService {
     }
 
     /*
-     * When neither the properties nor a setter provides a value, the reported soTimeout and ttl
-     * default to 0, as they did before.
+     * When neither the properties nor a setter provides a value, the reported soTimeout and ttl default to 0, as they
+     * did before.
      */
     @Test
     public void testSoTimeoutAndTtlDefaultToZero() throws Exception {
@@ -124,13 +124,14 @@ public class TestMcastService {
     }
 
     /*
-     * A non-positive send frequency makes the sender spin sending pings without a pause, and a
-     * non-positive drop time expires every member on every cycle. Such configuration must be
-     * rejected when the service starts, before any socket or thread is created.
+     * A non-positive send frequency makes the sender spin sending pings without a pause, and a non-positive drop time
+     * expires every member on every cycle. Such configuration must be rejected when the service starts, before any
+     * socket or thread is created.
      */
     @Test
     public void testStartRejectsNonPositiveTimingProperties() throws Exception {
-        String[] invalid = { "mcastFrequency=0", "mcastFrequency=-1", "memberDropTime=0", "memberDropTime=-5" };
+        String[] invalid = { "mcastFrequency=0", "mcastFrequency=-1", "memberDropTime=0", "memberDropTime=-5",
+                "recoverySleepTime=0", "recoverySleepTime=-1" };
         for (String entry : invalid) {
             String[] property = entry.split("=");
             Properties props = new Properties();
@@ -161,18 +162,18 @@ public class TestMcastService {
     }
 
     /*
-     * The 65535 byte protocol limit of an IP packet includes the IP and UDP headers, so a
-     * broadcast that fits within it can still exceed what the socket is able to send. Such a
-     * broadcast must be rejected by the size check rather than fail later in the send.
+     * The 65535 byte protocol limit of an IP packet includes the IP and UDP headers, so a broadcast that fits within it
+     * can still exceed what the socket is able to send. Such a broadcast must be rejected by the size check rather than
+     * fail later in the send.
      */
     @Test(timeout = 60000)
     public void testBroadcastRejectsPacketsTheSocketCannotCarry() throws Exception {
-        int base = 40000 + (int) Math.floorMod(System.nanoTime(), 10000);
+        int mcastPort = TesterUtil.getFreeUdpPort();
         Properties props = new Properties();
         props.setProperty("mcastAddress", "228.0.0.4");
-        props.setProperty("mcastPort", String.valueOf(base));
+        props.setProperty("mcastPort", String.valueOf(mcastPort));
         props.setProperty("tcpListenHost", "127.0.0.1");
-        props.setProperty("tcpListenPort", String.valueOf(base + 1));
+        props.setProperty("tcpListenPort", "0");
         props.setProperty("tcpSecurePort", "0");
         props.setProperty("udpListenPort", "0");
         props.setProperty("mcastFrequency", "100");
@@ -196,9 +197,8 @@ public class TestMcastService {
             int overhead = XByteBuffer.createDataPackage(probe).length;
             Assert.assertTrue(overhead > 0 && overhead < 128);
             byte[] messageBytes = new byte[McastServiceImpl.MAX_SEND_SIZE + 8 - overhead];
-            Assert.assertEquals(McastServiceImpl.MAX_SEND_SIZE + 8,
-                    XByteBuffer.createDataPackage(new ChannelData(probe.getUniqueId(),
-                            new XByteBuffer(messageBytes, false), 0)).length);
+            Assert.assertEquals(McastServiceImpl.MAX_SEND_SIZE + 8, XByteBuffer.createDataPackage(
+                    new ChannelData(probe.getUniqueId(), new XByteBuffer(messageBytes, false), 0)).length);
 
             ChannelData message = new ChannelData();
             message.setMessage(new XByteBuffer(messageBytes, false));
