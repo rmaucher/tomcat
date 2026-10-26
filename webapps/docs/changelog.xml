@@ -624,6 +624,13 @@
         directly via the configured trust store) is not subject to OCSP
         checking. (markt)
       </fix>
+      <fix>
+        <bug>70286</bug>: Strip the scipt tag in the
+        <code>AcceptLanguage2</code> parser, If the script subtag needs to be
+        preserved, use the standard parser by setting the system property
+        <code>org.apache.tomcat.util.http.parser.StandardAcceptLanguageParser</code>
+        to <code>true</code>. (remm)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Jasper">
@@ -1003,6 +1010,112 @@
         drivers, such as H2 and MariaDB Connector/J, that always report
         statements as not poolable. Pull request <pr>1083</pr> provided by
         Raphael Vullriede. (markt)
+      </fix>
+      <fix>
+        Correct a defect that meant closing the connection pool from a thread
+        that carried an interrupt status, when
+        <code>propagateInterruptState</code> was set to
+        <code>true</code>, looped forever without closing any of the pool's
+        connections. The shutdown drain now always completes and the
+        interrupted status is propagated once it has. (remm)
+      </fix>
+      <fix>
+        Correct a defect that meant a connection borrow that was in flight
+        while the pool was force-closed could be handed a newly created,
+        working connection from the closed pool, leaving that physical
+        connection open indefinitely. The borrow side now honours the closed
+        flag after the physical connect completes, like the return side
+        already did, and disconnects the new connection. (remm)
+      </fix>
+      <fix>
+        Correct two races in the wake-up protocol between releasing and
+        waiting threads in the connection pool. Destroying the last connection
+        while a borrower was about to register as a waiter could leave that
+        borrower blocked although a slot was free (forever when
+        <code>maxWait</code> was set to 0 or less), and releasing an already
+        released connection still injected an extra wake-up placeholder,
+        inflating the pool size and allowing more physical connections than
+        <code>maxActive</code>. (remm)
+      </fix>
+      <fix>
+        Correct a defect that meant <code>rollbackOnReturn</code> and
+        <code>commitOnReturn</code> were silently ignored unless
+        <code>defaultAutoCommit</code> was explicitly set to
+        <code>false</code>, so a connection returned while still in a
+        transaction could be handed to the next borrower inside that
+        transaction. These options now act on the actual transaction state
+        of the connection being returned. (remm)
+      </fix>
+      <fix>
+        Correct a defect in the JDBC connection pool where the cached proxy
+        constructor ignored the connection kind after the first proxy was
+        created, so swapping the data source backing a running pool could
+        proxy later connections of the wrong kind: connections backed by an
+        XA connection no longer implemented <code>XAConnection</code>, and
+        plain connections falsely did, with XA method calls on them failing
+        with a NullPointerException. (remm)
+      </fix>
+      <fix>
+        Correct a defect in the <code>ConnectionState</code> interceptor where
+        the configured connection defaults were restored while the previous
+        borrower's transaction was still open: the isolation level and the
+        read only state are transaction scoped on many drivers, so the
+        restore was refused or deferred and the previous borrower's state
+        reached the next borrower, and restoring auto-commit committed
+        whatever the previous borrower had left pending. The interceptor now
+        terminates the pending transaction before restoring the configured
+        state, and fails the borrow rather than handing out a connection it
+        cannot verify. Pools that configure no defaults, and borrows that
+        need no restore, keep the previous behaviour of leaving the
+        transaction untouched. (remm)
+      </fix>
+      <fix>
+        Correct two defects in the <code>StatementFinalizer</code>
+        interceptor. Tracked statements were only removed in bulk when the
+        connection was returned, so a borrow that closed every statement it
+        created still accumulated one tracking entry per statement created
+        for the whole borrow cycle; and the tracking relied on weak
+        references without a queue, so exactly the statements the
+        interceptor exists for - those an application forgot about - could
+        be garbage collected before being closed, leaking their
+        database-side state to the next borrower. Statements are now
+        tracked with a strong reference in a list guarded against the
+        pool's cleaner thread, and the statement proxy handed to the
+        application removes its tracking entry as soon as the application
+        closes the statement, while a leaked statement is reliably closed
+        when the connection is returned regardless of the garbage
+        collector. (remm)
+      </fix>
+      <fix>
+        Remove the unfinished, experimental
+        <code>MultiLockFairBlockingQueue</code> class together with the
+        unreachable code that referenced it. The class was never
+        selectable - its instantiation in the pool was commented out and
+        no configuration property existed to enable it - while its
+        striped design kept items and waiting threads on unrelated
+        stripes, so enabling it as it stood could hang borrowers while
+        idle connections sat in another stripe, report the pool as
+        exhausted although it was not, lose a connection permanently
+        whenever a waiting thread was interrupted, and silently disable
+        the idle connection sweep because the queue's iterator was
+        always empty. Fair queueing remains available through
+        <code>FairBlockingQueue</code>. (remm)
+      </fix>
+      <fix>
+        Make the JDBC pool fail fast and explicitly when a resource of
+        type <code>javax.sql.XADataSource</code> is not actually backed
+        by an XA data source. XA connections are created by the data
+        source named by the <code>dataSource</code> or
+        <code>dataSourceJNDI</code> attribute, but the documentation
+        presented the resource type alone as enabling XA, so the common
+        <code>driverClassName</code> and <code>url</code> configuration
+        silently produced a pool of plain JDBC connections that looked
+        and behaved exactly like a non-XA pool; the missing XA support
+        only surfaced later, as an opaque generic failure inside the
+        transaction manager when it requested an XA connection. Such a
+        request now fails immediately with a message that names the
+        missing configuration, and the documentation now states the
+        requirement. (remm)
       </fix>
     </changelog>
   </subsection>

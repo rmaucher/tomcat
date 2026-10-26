@@ -97,7 +97,7 @@ public class ConnectionPool {
     /**
      * The thread that is responsible for checking abandoned and idle threads
      */
-    private volatile PoolCleaner poolCleaner;
+    private PoolCleaner poolCleaner;
 
     /**
      * Pool closed flag
@@ -106,9 +106,17 @@ public class ConnectionPool {
 
     /**
      * Since newProxyInstance performs the same operation, over and over
-     * again, it is much more optimized if we simply store the constructor ourselves.
+     * again, it is much more optimized if we simply store the constructor
+     * ourselves. One constructor is cached per proxy kind (with and without
+     * the XAConnection interface), so that a pool whose backing data source
+     * changes kind at runtime keeps proxying each connection correctly.
      */
-    private Constructor<?> proxyClassConstructor;
+    private volatile Constructor<?> proxyClassConstructor;
+
+    /**
+     * Cached constructor for proxies that also implement XAConnection.
+     */
+    private volatile Constructor<?> xaProxyClassConstructor;
 
     /**
      * Executor service used to cancel Futures
@@ -169,16 +177,18 @@ public class ConnectionPool {
                 return new ConnectionFuture(pc);
             }
         }catch (SQLException x) {
-            if (x.getMessage().indexOf("NoWait")<0) {
+            // JDBC exceptions may carry no message at all; a missing
+            // "NoWait" marker must be assumed for those, so that the
+            // original failure reaches the caller instead of a
+            // NullPointerException from dereferencing the message
+            String msg = x.getMessage();
+            if (msg == null || msg.indexOf("NoWait")<0) {
                 throw x;
             }
         }
         //we can only retrieve a future if the underlying queue supports it.
         if (idle instanceof FairBlockingQueue<?>) {
             Future<PooledConnection> pcf = ((FairBlockingQueue<PooledConnection>)idle).pollAsync();
-            return new ConnectionFuture(pcf);
-        } else if (idle instanceof MultiLockFairBlockingQueue<?>) {
-            Future<PooledConnection> pcf = ((MultiLockFairBlockingQueue<PooledConnection>)idle).pollAsync();
             return new ConnectionFuture(pcf);
         } else {
             throw new SQLException("Connection pool is misconfigured, doesn't support async retrieval. Set the 'fair' property to 'true'");
@@ -342,14 +352,14 @@ public class ConnectionPool {
             handler = new StatementFacade(handler);
         }
         try {
-            getProxyConstructor(con.getXAConnection() != null);
+            Constructor<?> proxyConstructor = getProxyConstructor(con.getXAConnection() != null);
             //create the proxy
             //TODO possible optimization, keep track if this connection was returned properly, and don't generate a new facade
             Connection connection = null;
             if (getPoolProperties().getUseDisposableConnectionFacade() ) {
-                connection = (Connection)proxyClassConstructor.newInstance(new Object[] { new DisposableConnectionFacade(handler) });
+                connection = (Connection)proxyConstructor.newInstance(new Object[] { new DisposableConnectionFacade(handler) });
             } else {
-                connection = (Connection)proxyClassConstructor.newInstance(new Object[] {handler});
+                connection = (Connection)proxyConstructor.newInstance(new Object[] {handler});
             }
             //return the connection
             return connection;
@@ -381,8 +391,10 @@ public class ConnectionPool {
     }
 
     /**
-     * Creates and caches a {@link java.lang.reflect.Constructor} used to instantiate the proxy object.
-     * We cache this, since the creation of a constructor is fairly slow.
+     * Creates and caches a {@link java.lang.reflect.Constructor} used to
+     * instantiate the proxy object of the requested kind (with or without
+     * the XAConnection interface). We cache these, since the creation of a
+     * constructor is fairly slow.
      * @param xa Use a XA connection
      * @return constructor used to instantiate the wrapper object
      * @throws NoSuchMethodException Failed to get a constructor
@@ -395,16 +407,22 @@ public class ConnectionPool {
      */
     @SuppressWarnings("deprecation")
     public Constructor<?> getProxyConstructor(boolean xa) throws NoSuchMethodException {
-        //cache the constructor
-        if (proxyClassConstructor == null ) {
+        //cache the constructor per proxy kind
+        Constructor<?> constructor = xa ? xaProxyClassConstructor : proxyClassConstructor;
+        if (constructor == null) {
             Class<?> proxyClass = xa ?
                     Proxy.getProxyClass(ConnectionPool.class.getClassLoader(),
                             new Class[] {Connection.class, javax.sql.PooledConnection.class, XAConnection.class}) :
                     Proxy.getProxyClass(ConnectionPool.class.getClassLoader(),
                             new Class[] {Connection.class, javax.sql.PooledConnection.class});
-            proxyClassConstructor = proxyClass.getConstructor(new Class[] { InvocationHandler.class });
+            constructor = proxyClass.getConstructor(new Class[] { InvocationHandler.class });
+            if (xa) {
+                xaProxyClassConstructor = constructor;
+            } else {
+                proxyClassConstructor = constructor;
+            }
         }
-        return proxyClassConstructor;
+        return constructor;
     }
 
     /**
@@ -421,12 +439,11 @@ public class ConnectionPool {
         //prevent other threads from entering
         this.closed = true;
         //stop background thread
-        if (poolCleaner!=null) {
-            poolCleaner.stopRunning();
-        }
+        terminatePoolCleaner();
 
         /* release all idle connections */
         BlockingQueue<PooledConnection> pool = (!idle.isEmpty())?idle:(force?busy:idle);
+        boolean interrupted = false;
         while (!pool.isEmpty()) {
             try {
                 //retrieve the next connection
@@ -446,13 +463,21 @@ public class ConnectionPool {
                     }
                 } //while
             } catch (InterruptedException ex) {
-                if (getPoolProperties().getPropagateInterruptState()) {
-                    Thread.currentThread().interrupt();
-                }
+                // Do not restore the interrupt status here. A poll on a queue
+                // that checks the status before inspecting its elements would
+                // then throw again immediately, removing no connection, and
+                // the loop would spin without progress. Clear the status so
+                // the polls keep working and remember that we were interrupted
+                // so the status can be propagated once the drain completes.
+                Thread.interrupted();
+                interrupted = true;
             }
             if (pool.isEmpty() && force && pool!=busy) {
                 pool = busy;
             }
+        }
+        if (interrupted && getPoolProperties().getPropagateInterruptState()) {
+            Thread.currentThread().interrupt();
         }
         if (this.getPoolProperties().isJmxEnabled()) {
             this.jmxPool = null;
@@ -489,7 +514,6 @@ public class ConnectionPool {
         //make space for 10 extra in case we flow over a bit
         if (properties.isFairQueue()) {
             idle = new FairBlockingQueue<>();
-            //idle = new MultiLockFairBlockingQueue<PooledConnection>();
             //idle = new LinkedTransferQueue<PooledConnection>();
             //idle = new ArrayBlockingQueue<PooledConnection>(properties.getMaxActive(),false);
         } else {
@@ -591,21 +615,29 @@ public class ConnectionPool {
 
     /**
      * Starts the pool cleaner (evicter) thread if pool sweeper is enabled.
+     * A cleaner that is still running from a previous start is terminated
+     * first, so this call never leaves a replaced task registered on the
+     * shared timer without a reference to stop it.
      *
      * @param properties the pool configuration containing sweeper settings
      */
-    public void initializePoolCleaner(PoolConfiguration properties) {
+    public synchronized void initializePoolCleaner(PoolConfiguration properties) {
         //if the evictor thread is supposed to run, start it now
         if (properties.isPoolSweeperEnabled()) {
+            // never overwrite a running cleaner: the replaced task would
+            // stay registered on the shared timer with no reference left to
+            // stop it, duplicating maintenance work for the pool's lifetime
+            terminatePoolCleaner();
             poolCleaner = new PoolCleaner(this, properties.getTimeBetweenEvictionRunsMillis());
             poolCleaner.start();
         } //end if
     }
 
     /**
-     * Stops the pool cleaner (evicter) thread if it is currently running.
+     * Stops the pool cleaner (evicter) thread if it is currently running
+     * and forgets its reference.
      */
-    public void terminatePoolCleaner() {
+    public synchronized void terminatePoolCleaner() {
         if (poolCleaner!= null) {
             poolCleaner.stopRunning();
             poolCleaner = null;
@@ -682,9 +714,11 @@ public class ConnectionPool {
         if (con == null) {
             return;
         }
+        boolean destroyed;
         try {
             con.lock();
-            if (con.release()) {
+            destroyed = con.release();
+            if (destroyed) {
                 //counter only decremented once
                 size.addAndGet(-1);
                 con.setHandler(null);
@@ -695,8 +729,10 @@ public class ConnectionPool {
         }
         // we've asynchronously reduced the number of connections
         // we could have threads stuck in idle.poll(timeout) that will never be
-        // notified
-        if (waitcount.get() > 0) {
+        // notified. Only a call that actually destroyed a connection opened a
+        // slot; offering a placeholder for a connection that was already
+        // released would run the pool over maxActive.
+        if (destroyed && waitcount.get() > 0) {
             if (!idle.offer(create(true))) {
                 log.warn("Failed to add a new connection to the pool after releasing a connection " +
                         "when at least one thread was waiting for a connection.");
@@ -759,6 +795,22 @@ public class ConnectionPool {
             long timetowait = Math.max(0, maxWait - (System.currentTimeMillis() - now));
             waitcount.incrementAndGet();
             try {
+                // a connection may have been destroyed between the size check
+                // above and the registration of this waiter; such a releasing
+                // thread saw no waiter and will not notify this poll, so
+                // re-check the limit now rather than wait for a notification
+                // that may never arrive. Skip the case where a connection (or
+                // a wake-up placeholder) is already queued to be taken.
+                if (idle.isEmpty() && size.get() < getPoolProperties().getMaxActive()) {
+                    //atomic duplicate check
+                    if (size.addAndGet(1) > getPoolProperties().getMaxActive()) {
+                        //if we got here, two threads passed through the first if
+                        size.decrementAndGet();
+                    } else {
+                        //create a connection, we're below the limit
+                        return createConnection(now, con, username, password);
+                    }
+                }
                 //retrieve an existing connection
                 con = idle.poll(timetowait, TimeUnit.MILLISECONDS);
             } catch (InterruptedException ex) {
@@ -818,6 +870,13 @@ public class ConnectionPool {
             //connect and validate the connection
             con.lock();
             con.connect();
+            if (isClosed()) {
+                // the pool was closed while this physical connection was
+                // being created; the shutdown drain has already passed over
+                // the queues, so neither hand the connection out nor register
+                // it in busy - the error path below disconnects it
+                throw new SQLException("Connection pool closed.");
+            }
             if (con.validate(PooledConnection.VALIDATE_INIT)) {
                 //no need to lock a new one, its not contented
                 con.setTimestamp(now);
@@ -962,15 +1021,16 @@ public class ConnectionPool {
      */
     protected boolean terminateTransaction(PooledConnection con) {
         try {
-            if (Boolean.FALSE.equals(con.getPoolProperties().getDefaultAutoCommit())) {
-                if (this.getPoolProperties().getRollbackOnReturn()) {
-                    boolean autocommit = con.getConnection().getAutoCommit();
-                    if (!autocommit) {
+            // terminate the transaction of any connection that is returned
+            // while still in one; the pool-level defaultAutoCommit property
+            // must not gate this, the connection's own state is what matters
+            boolean doRollback = getPoolProperties().getRollbackOnReturn();
+            boolean doCommit = !doRollback && getPoolProperties().getCommitOnReturn();
+            if (doRollback || doCommit) {
+                if (!con.getConnection().getAutoCommit()) {
+                    if (doRollback) {
                         con.getConnection().rollback();
-                    }
-                } else if (this.getPoolProperties().getCommitOnReturn()) {
-                    boolean autocommit = con.getConnection().getAutoCommit();
-                    if (!autocommit) {
+                    } else {
                         con.getConnection().commit();
                     }
                 }
@@ -1143,7 +1203,13 @@ public class ConnectionPool {
                     long time = con.getTimestamp();
                     long now = System.currentTimeMillis();
                     if (shouldAbandon() && (now - time) > con.getAbandonTimeout()) {
-                        locked.remove();
+                        // claim the connection before acting on it; without
+                        // a real lock the checks above may already be stale,
+                        // and a connection the application returned to the
+                        // pool in the meantime must not be abandoned
+                        if (!busy.remove(con)) {
+                            continue;
+                        }
                         abandon(con);
                         setToNull = true;
                     } else if (sto > 0 && (now - time) > (sto * 1000L)) {
@@ -1201,9 +1267,15 @@ public class ConnectionPool {
                     }
                     long time = con.getTimestamp();
                     if (shouldReleaseIdle(now, con, time)) {
+                        // claim the connection before acting on it; without
+                        // a real lock the checks above may already be stale,
+                        // and a connection a borrower took out of the idle
+                        // queue in the meantime must not be released here
+                        if (!idle.remove(con)) {
+                            continue;
+                        }
                         releasedIdleCount.incrementAndGet();
                         release(con);
-                        unlocked.remove();
                         setToNull = true;
                     } else {
                         //do nothing
@@ -1244,6 +1316,14 @@ public class ConnectionPool {
 
     /**
      * Forces a validation of all idle connections if {@link PoolProperties#testWhileIdle} is set.
+     * <p>
+     * Note: when this method is invoked externally while the per-connection lock is
+     * disabled (sweeper switched off and {@link PoolProperties#getUseLock()} returning
+     * {@code false}), validating and reconnecting a connection can still overlap with a
+     * borrower that just took it out of the idle queue. That overlap is transient and
+     * surfaces to one of the two threads as a connection error; it is sharpest when
+     * {@link PoolProperties#getMaxAge()} is set so that an expired connection may be
+     * reconnected under a borrower mid-use.
      */
     public void testAllIdle() {
         testAllIdle(false);
@@ -1276,8 +1356,14 @@ public class ConnectionPool {
                         release = !reconnectIfExpired(con) || !con.validate(PooledConnection.VALIDATE_IDLE);
                     }
                     if (release) {
+                        // claim the connection before acting on it; without
+                        // a real lock the check above may already be stale,
+                        // and a connection a borrower took out of the idle
+                        // queue in the meantime must not be released here
+                        if (!idle.remove(con)) {
+                            continue;
+                        }
                         releasedIdleCount.incrementAndGet();
-                        unlocked.remove();
                         release(con);
                     }
                 } finally {
@@ -1712,8 +1798,12 @@ public class ConnectionPool {
                             || pool.getPoolProperties().getSuspectTimeout() > 0) {
                         pool.checkAbandoned();
                     }
-                    if (pool.getPoolProperties().getMinIdle() < pool.idle
-                            .size()) {
+                    // the eviction predicate in checkIdle() compares
+                    // against the total pool size, not the idle count: a
+                    // busy pool can be over the min-idle floor while idle
+                    // stays at or below it
+                    if (pool.getPoolProperties().getMinIdle()
+                            < pool.getSize()) {
                         pool.checkIdle();
                     }
                     if (pool.getPoolProperties().isTestWhileIdle()) {

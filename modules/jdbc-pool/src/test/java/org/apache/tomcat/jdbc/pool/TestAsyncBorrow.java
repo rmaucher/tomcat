@@ -23,10 +23,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import org.apache.tomcat.jdbc.JdbcPoolBaseTest;
@@ -53,30 +50,32 @@ class TestAsyncBorrow extends JdbcPoolBaseTest {
         ds.getPoolProperties().setMaxActive(10);
         ds.createPool();
 
-        assertEquals(0, ds.getSize(), "an empty pool must hold no connections");
-        assertEquals(0, ds.getIdle());
-        assertEquals(0, ds.getActive());
-        assertEquals(0, poolSessions(), "the database must not see any session yet");
+        Assertions.assertEquals(0, ds.getSize(), "an empty pool must hold no connections");
+        Assertions.assertEquals(0, ds.getIdle());
+        Assertions.assertEquals(0, ds.getActive());
+        Assertions.assertEquals(0, poolSessions(), "the database must not see any session yet");
 
         ds.getConnection().close();
-        assertEquals(1, ds.getSize(), "the pool must keep the connection it created");
-        assertEquals(1, ds.getIdle());
-        assertEquals(0, ds.getActive());
+        Assertions.assertEquals(1, ds.getSize(), "the pool must keep the connection it created");
+        Assertions.assertEquals(1, ds.getIdle());
+        Assertions.assertEquals(0, ds.getActive());
         awaitSessions(1);
 
         Future<Connection> future = ds.getConnectionAsync();
         try (Connection c = future.get(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-            assertNotNull(c, "the future must hand out a connection");
-            assertEquals(1, ds.getActive(), "an async borrow must count as active");
-            assertEquals(0, ds.getIdle());
-            assertEquals(1, poolSessions(),
+            Assertions.assertNotNull(c, "the future must hand out a connection");
+            Assertions.assertEquals(1, ds.getActive(), "an async borrow must count as active");
+            Assertions.assertEquals(0, ds.getIdle());
+            Assertions.assertEquals(1, poolSessions(),
                     "the async borrow must reuse the pooled connection, not open a second one");
             try (ResultSet rs = c.createStatement().executeQuery("SELECT 1")) {
-                assertTrue(rs.next(), "the asynchronously borrowed connection must work");
+                Assertions.assertTrue(rs.next(),
+                        "the asynchronously borrowed connection must work");
             }
         }
-        assertEquals(0, ds.getActive(), "the returned connection must stop counting as active");
-        assertEquals(1, ds.getIdle());
+        Assertions.assertEquals(0, ds.getActive(),
+                "the returned connection must stop counting as active");
+        Assertions.assertEquals(1, ds.getIdle());
         awaitSessions(1);
     }
 
@@ -88,13 +87,13 @@ class TestAsyncBorrow extends JdbcPoolBaseTest {
         ds.getPoolProperties().setMinIdle(0);
         ds.getPoolProperties().setMaxActive(5);
         ds.createPool();
-        assertEquals(0, poolSessions());
+        Assertions.assertEquals(0, poolSessions());
 
         Future<Connection> future = ds.getConnectionAsync();
         try (Connection c = future.get(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-            assertNotNull(c, "an empty fair pool must create the connection on demand");
+            Assertions.assertNotNull(c, "an empty fair pool must create the connection on demand");
             try (ResultSet rs = c.createStatement().executeQuery("SELECT 1")) {
-                assertTrue(rs.next());
+                Assertions.assertTrue(rs.next());
             }
         }
         awaitSessions(1);
@@ -109,13 +108,79 @@ class TestAsyncBorrow extends JdbcPoolBaseTest {
 
         Connection holder = ds.getConnection();
         try {
-            SQLException error = assertThrows(SQLException.class, ds::getConnectionAsync,
+            SQLException error = Assertions.assertThrows(SQLException.class, ds::getConnectionAsync,
                     "a non-fair queue cannot hand out futures once the pool is exhausted");
-            assertTrue(error.getMessage().toLowerCase().contains("fair"),
+            Assertions.assertTrue(error.getMessage().toLowerCase().contains("fair"),
                     "the failure must name the missing configuration, was: " + error.getMessage());
         } finally {
             holder.close();
         }
+    }
+
+    @Test
+    void asyncBorrowFailureWithoutAMessageStillSurfacesAsSqlException()
+            throws Exception {
+        // A failing connector whose exception carries no message: the pool
+        // wraps it as a message-less SQLException, and the async borrow must
+        // rethrow that failure rather than dereference its missing message
+        DataSource ds = newDataSource();
+        ds.getPoolProperties().setInitialSize(0);
+        ds.setDataSource(new javax.sql.DataSource() {
+            @Override
+            public Connection getConnection() {
+                throw new IllegalStateException();
+            }
+
+            @Override
+            public Connection getConnection(String user, String password) {
+                throw new IllegalStateException();
+            }
+
+            @Override
+            public java.io.PrintWriter getLogWriter() {
+                return null;
+            }
+
+            @Override
+            public void setLogWriter(java.io.PrintWriter out) {
+                // no logging
+            }
+
+            @Override
+            public void setLoginTimeout(int seconds) {
+                // no timeout
+            }
+
+            @Override
+            public int getLoginTimeout() {
+                return 0;
+            }
+
+            @Override
+            public java.util.logging.Logger getParentLogger()
+                    throws java.sql.SQLFeatureNotSupportedException {
+                throw new java.sql.SQLFeatureNotSupportedException();
+            }
+
+            @Override
+            public <T> T unwrap(Class<T> iface) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public boolean isWrapperFor(Class<?> iface) {
+                return false;
+            }
+        });
+
+        SQLException failure = Assertions.assertThrows(SQLException.class,
+                ds::getConnectionAsync,
+                "the borrow failure must reach the caller as a SQLException "
+                        + "even when its message is null");
+        Assertions.assertNull(failure.getMessage(),
+                "the rethrown failure must keep its absent message");
+        Assertions.assertTrue(failure.getCause() instanceof IllegalStateException,
+                "the wrapped connector failure must be preserved as cause");
     }
 
     @Test
@@ -148,10 +213,11 @@ class TestAsyncBorrow extends JdbcPoolBaseTest {
             thread.join(AWAIT_TIMEOUT_MS);
         }
 
-        assertEquals(0, failed.get(), "no async borrower may fail");
-        assertEquals(borrowers, served.get(), "every async borrower must be served");
-        assertEquals(0, ds.getActive());
-        assertEquals(2, ds.getIdle(), "the pool must keep at most maxActive connections");
+        Assertions.assertEquals(0, failed.get(), "no async borrower may fail");
+        Assertions.assertEquals(borrowers, served.get(), "every async borrower must be served");
+        Assertions.assertEquals(0, ds.getActive());
+        Assertions.assertEquals(2, ds.getIdle(),
+                "the pool must keep at most maxActive connections");
         awaitSessions(2);
     }
 }
