@@ -158,6 +158,8 @@ public abstract class JdbcInterceptor implements InvocationHandler {
      * the interceptor can be reused for another connection.
      * <br>
      * This method may be called with null as both arguments when we are closing down the connection.
+     * When called for a shutdown reset, an interceptor that throws is isolated: the exception
+     * is logged and ignored, and the remaining interceptors in the chain are reset as well.
      * @param parent - the connection pool owning the connection
      * @param con - the pooled connection
      */
@@ -167,6 +169,9 @@ public abstract class JdbcInterceptor implements InvocationHandler {
      * Called when {@link java.sql.Connection#close()} is called on the underlying connection.
      * This is to notify the interceptors, that the physical connection has been released.
      * Implementation of this method should be thought through with care, as no actions should trigger an exception.
+     * An interceptor that nevertheless throws is isolated: the exception is logged and
+     * ignored, the remaining interceptors in the chain are still notified, and the
+     * physical connection is closed as it would have been.
      * @param parent - the connection pool that this connection belongs to
      * @param con    - the pooled connection that holds this connection
      * @param finalizing - if this connection is finalizing. True means that the pooled connection will not reconnect the underlying connection

@@ -83,6 +83,14 @@ public class PooledConnection implements PooledConnectionMBean {
      */
     protected volatile javax.sql.XAConnection xaConnection;
     /**
+     * If using a ConnectionPoolDataSource underneath, this is the
+     * javax.sql.PooledConnection handle obtained from it. Per the JDBC
+     * specification, closing the logical connection obtained from that
+     * handle does not close the physical connection, so the handle itself
+     * must be kept in order to close the physical connection.
+     */
+    private volatile javax.sql.PooledConnection cpdsConnection;
+    /**
      * When we track abandon traces, this string holds the thread dump
      */
     private String abandonTrace = null;
@@ -292,10 +300,44 @@ public class PooledConnection implements PooledConnectionMBean {
             }
         } else if (poolProperties.getDataSource() instanceof javax.sql.ConnectionPoolDataSource){
             javax.sql.ConnectionPoolDataSource ds = (javax.sql.ConnectionPoolDataSource)poolProperties.getDataSource();
-            if (usr!=null && pwd!=null) {
-                connection = ds.getPooledConnection(usr, pwd).getConnection();
-            } else {
-                connection = ds.getPooledConnection().getConnection();
+            javax.sql.PooledConnection pooled = (usr!=null && pwd!=null) ?
+                    ds.getPooledConnection(usr, pwd) : ds.getPooledConnection();
+            // Keep the handle before obtaining the logical connection: the
+            // physical connection is only closed when the handle is closed,
+            // so losing the handle here would leak the physical connection.
+            cpdsConnection = pooled;
+            SQLException failure = null;
+            RuntimeException failureRuntime = null;
+            try {
+                connection = pooled.getConnection();
+            } catch (SQLException e) {
+                failure = e;
+            } catch (RuntimeException e) {
+                failureRuntime = e;
+            }
+            if (connection == null && failure == null && failureRuntime == null) {
+                // Contract-violating provider: a handle without a logical
+                // connection is of no use either.
+                failure = new SQLException("ConnectionPoolDataSource "+ds+
+                        " returned a null connection for the pooled connection handle");
+            }
+            if (failure != null || failureRuntime != null) {
+                // Do not strand the handle if the logical connection
+                // could not be obtained.
+                Exception origin = failure != null ? failure : failureRuntime;
+                try {
+                    pooled.close();
+                } catch (SQLException | RuntimeException closeX) {
+                    if (closeX != origin) {
+                        origin.addSuppressed(closeX);
+                    }
+                }
+                cpdsConnection = null;
+                connection = null;
+                if (failureRuntime != null) {
+                    throw failureRuntime;
+                }
+                throw failure;
             }
         } else {
             throw new SQLException("DataSource is of unknown class:"+(poolProperties.getDataSource()!=null?poolProperties.getDataSource().getClass():"null"));
@@ -428,7 +470,22 @@ public class PooledConnection implements PooledConnectionMBean {
         if (connection != null) {
             try {
                 parent.disconnectEvent(this, finalize);
-                if (xaConnection == null) {
+            } catch (Throwable x) {
+                // the event itself isolates each link of the chain, so this
+                // catch only guards against a failure of the walk itself;
+                // an interceptor must not be able to keep the physical
+                // connection from being closed
+                log.warn("Interceptor threw an exception from the "
+                        + "disconnected() event; ignoring it so that the "
+                        + "physical connection can be closed.", x);
+            }
+            try {
+                if (cpdsConnection != null) {
+                    // Closing the handle closes the physical connection
+                    // and invalidates the logical connection; closing the
+                    // logical connection alone would not.
+                    cpdsConnection.close();
+                } else if (xaConnection == null) {
                     connection.close();
                 } else {
                     xaConnection.close();
@@ -441,6 +498,7 @@ public class PooledConnection implements PooledConnectionMBean {
         }
         connection = null;
         xaConnection = null;
+        cpdsConnection = null;
         lastConnected = -1;
         if (finalize) {
             parent.finalize(this);
@@ -792,7 +850,7 @@ public class PooledConnection implements PooledConnectionMBean {
 
     /**
      * Locks the connection only if either {@link PoolConfiguration#isPoolSweeperEnabled()} or
-     * {@link PoolConfiguration#getUseLock()} return true. The per connection lock ensures thread safety is
+     * {@link PoolConfiguration#getUseLock()} return true. The per connection lock ensures thread safety if
      * multiple threads are performing operations on the connection.
      * Otherwise this is a noop for performance
      */
@@ -804,12 +862,18 @@ public class PooledConnection implements PooledConnectionMBean {
     }
 
     /**
-     * Unlocks the connection only if the sweeper is enabled
-     * Otherwise this is a noop for performance
+     * Unlocks the connection if, and only if, this thread currently holds
+     * the lock. The release decision is based on the lock state rather than
+     * on the configuration that {@link #lock()} consulted, because that
+     * configuration is mutable (it can be changed at runtime through JMX)
+     * and may differ between the two calls: deciding by configuration would
+     * either leave the lock write-locked forever (enabled at lock() time,
+     * disabled at unlock() time) or throw IllegalMonitorStateException
+     * (disabled at lock() time, enabled at unlock() time).
      */
     public void unlock() {
-        if (poolProperties.getUseLock() || this.poolProperties.isPoolSweeperEnabled()) {
-          //optimized, only use a lock when there is concurrency
+        if (lock.isWriteLockedByCurrentThread()) {
+            //release only what this thread actually acquired
             lock.writeLock().unlock();
         }
     }
@@ -855,14 +919,30 @@ public class PooledConnection implements PooledConnectionMBean {
      * @param handler the first interceptor in the chain
      */
     public void setHandler(JdbcInterceptor handler) {
-        if (this.handler!=null && this.handler!=handler) {
-            JdbcInterceptor interceptor = this.handler;
-            while (interceptor!=null) {
-                interceptor.reset(null, null);
-                interceptor = interceptor.getNext();
-            }//while
-        }//end if
-        this.handler = handler;
+        try {
+            if (this.handler!=null && this.handler!=handler) {
+                JdbcInterceptor interceptor = this.handler;
+                while (interceptor!=null) {
+                    //read the next link before the callback, as the callback
+                    //is allowed to modify it
+                    JdbcInterceptor next = interceptor.getNext();
+                    try {
+                        interceptor.reset(null, null);
+                    } catch (Throwable t) {
+                        //one broken interceptor must not stop the rest of the
+                        //chain from being reset
+                        log.warn("Interceptor [" + interceptor.getClass().getName()
+                                + "] threw an exception from reset(); "
+                                + "continuing with the rest of the chain.", t);
+                    }
+                    interceptor = next;
+                }//while
+            }//end if
+        } finally {
+            //a released connection must never keep a stale chain,
+            //even if resetting the old one failed
+            this.handler = handler;
+        }
     }
 
     @Override
@@ -906,47 +986,83 @@ public class PooledConnection implements PooledConnectionMBean {
         return oname;
     }
 
+    /**
+     * Returns the physical connection behind this pooled connection. The
+     * connection field is transiently null while a reconnect is in flight
+     * (and after a failed one), during which the per-connection MBean stays
+     * registered, so the JMX-exposed delegation methods must report that
+     * state rather than fail with a {@link NullPointerException}.
+     * @return the live physical connection
+     * @throws SQLException if this pooled connection currently has no
+     *                      physical connection
+     */
+    private java.sql.Connection requireConnection() throws SQLException {
+        java.sql.Connection c = connection;
+        if (c == null) {
+            throw new SQLException("Connection has been disconnected.");
+        }
+        return c;
+    }
+
+    /**
+     * Clears the warnings on the physical connection. A no-op while this
+     * pooled connection has no physical connection, as there is nothing to
+     * clear warnings on. A driver failure to clear the warnings is logged
+     * and swallowed rather than propagated; the operation is JMX-exposed and
+     * therefore declares no exception.
+     */
     @Override
     public void clearWarnings() {
+        java.sql.Connection c = connection;
+        if (c == null) {
+            return;
+        }
         try {
-            connection.clearWarnings();
+            c.clearWarnings();
         } catch (SQLException e) {
-            log.warn("Unable to clear Warnings, connection will be closed.", e);
+            log.warn("Unable to clear warnings on the connection.", e);
         }
     }
 
+    /**
+     * Returns true if this pooled connection is closed: either it currently
+     * has no physical connection or that connection is closed.
+     * @return true if disconnected or the physical connection is closed
+     * @throws SQLException if the physical connection reports a failure
+     */
     @Override
     public boolean isClosed() throws SQLException {
-        return connection.isClosed();
+        java.sql.Connection c = connection;
+        return c == null || c.isClosed();
     }
 
     @Override
     public boolean getAutoCommit() throws SQLException {
-        return connection.getAutoCommit();
+        return requireConnection().getAutoCommit();
     }
 
     @Override
     public String getCatalog() throws SQLException {
-        return connection.getCatalog();
+        return requireConnection().getCatalog();
     }
 
     @Override
     public int getHoldability() throws SQLException {
-        return connection.getHoldability();
+        return requireConnection().getHoldability();
     }
 
     @Override
     public boolean isReadOnly() throws SQLException {
-        return connection.isReadOnly();
+        return requireConnection().isReadOnly();
     }
 
     @Override
     public String getSchema() throws SQLException {
-        return connection.getSchema();
+        return requireConnection().getSchema();
     }
 
     @Override
     public int getTransactionIsolation() throws SQLException {
-        return connection.getTransactionIsolation();
+        return requireConnection().getTransactionIsolation();
     }
 }

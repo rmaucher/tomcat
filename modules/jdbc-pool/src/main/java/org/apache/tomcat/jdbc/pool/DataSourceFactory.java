@@ -287,7 +287,9 @@ public class DataSourceFactory implements ObjectFactory {
     protected static final String PROP_ROLLBACKONRETURN = "rollbackOnReturn";
 
     /**
-     * Property name for useDisposableConnectionFacade.
+     * Property name for useDisposableConnectionFacade. The property is
+     * deprecated and has no effect; the disposable connection facade is
+     * always used.
      */
     protected static final String PROP_USEDISPOSABLECONNECTIONFACADE = "useDisposableConnectionFacade";
 
@@ -622,8 +624,11 @@ public class DataSourceFactory implements ObjectFactory {
 
         value = properties.getProperty(PROP_CONNECTIONPROPERTIES);
         if (value != null) {
-            Properties p = getProperties(value);
-            poolProperties.setDbProperties(p);
+            // Use the canonical setter so that the configured string also
+            // round-trips through getConnectionProperties(); it parses the
+            // pairs into getDbProperties() with the very same parser that
+            // getProperties(value) below used to apply.
+            poolProperties.setConnectionProperties(value);
         } else {
             poolProperties.setDbProperties(new Properties());
         }
@@ -714,7 +719,8 @@ public class DataSourceFactory implements ObjectFactory {
 
         value = properties.getProperty(PROP_USEDISPOSABLECONNECTIONFACADE);
         if (value != null) {
-            poolProperties.setUseDisposableConnectionFacade(Boolean.parseBoolean(value));
+            storeDeprecatedUseDisposableConnectionFacade(poolProperties,
+                    Boolean.parseBoolean(value));
         }
 
         value = properties.getProperty(PROP_LOGVALIDATIONERRORS);
@@ -812,6 +818,21 @@ public class DataSourceFactory implements ObjectFactory {
      */
     protected static Properties getProperties(String propText) {
         return PoolProperties.getProperties(propText,null);
+    }
+
+    /**
+     * Stores the configured value of the deprecated
+     * useDisposableConnectionFacade property. The property has no effect any
+     * more, the disposable connection facade is always used; the value is
+     * stored as configured so that the property keeps showing up the way it
+     * was set, the same as through any other configuration path.
+     * @param poolProperties the properties to store the value on
+     * @param value the configured value
+     */
+    @SuppressWarnings("deprecation")
+    private static void storeDeprecatedUseDisposableConnectionFacade(
+            PoolConfiguration poolProperties, boolean value) {
+        poolProperties.setUseDisposableConnectionFacade(value);
     }
 
 }

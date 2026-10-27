@@ -354,15 +354,15 @@ public class ConnectionPool {
         try {
             Constructor<?> proxyConstructor = getProxyConstructor(con.getXAConnection() != null);
             //create the proxy
-            //TODO possible optimization, keep track if this connection was returned properly, and don't generate a new facade
-            Connection connection = null;
-            if (getPoolProperties().getUseDisposableConnectionFacade() ) {
-                connection = (Connection)proxyConstructor.newInstance(new Object[] { new DisposableConnectionFacade(handler) });
-            } else {
-                connection = (Connection)proxyConstructor.newInstance(new Object[] {handler});
-            }
-            //return the connection
-            return connection;
+            //TODO possible optimization, keep track if this connection was returned properly, and don't generate a new handle and facade
+            // The disposable connection facade is always used; a handle that
+            // its borrower has closed must stay inert, as the interceptor
+            // chain below is cached on the pooled connection and re-armed
+            // for the next borrower. (The useDisposableConnectionFacade
+            // property that used to switch this off is deprecated and no
+            // longer has any effect.)
+            return (Connection)proxyConstructor.newInstance(
+                    new Object[] { new DisposableConnectionFacade(handler) });
         }catch (Exception x) {
             SQLException s = new SQLException();
             s.initCause(x);
@@ -451,10 +451,16 @@ public class ConnectionPool {
                 //close it and retrieve the next one, if one is available
                 while (con != null) {
                     //close the connection
-                    if (pool==idle) {
-                        release(con);
-                    } else {
-                        abandon(con);
+                    try {
+                        if (pool==idle) {
+                            release(con);
+                        } else {
+                            abandon(con);
+                        }
+                    } catch (Throwable x) {
+                        //one failing connection must not leave the
+                        //remaining idle and busy connections undisconnected
+                        log.warn("Unable to close pooled connection.", x);
                     }
                     if (!pool.isEmpty()) {
                         con = pool.poll(1000, TimeUnit.MILLISECONDS);
@@ -1450,8 +1456,19 @@ public class ConnectionPool {
     protected void finalize(PooledConnection con) {
         JdbcInterceptor handler = con.getHandler();
         while (handler!=null) {
-            handler.reset(null, null);
-            handler=handler.getNext();
+            //read the next link before the callback, as the callback
+            //is allowed to modify it
+            JdbcInterceptor next = handler.getNext();
+            try {
+                handler.reset(null, null);
+            } catch (Throwable t) {
+                //one broken interceptor must not stop the rest of the
+                //chain from being reset
+                log.warn("Interceptor [" + handler.getClass().getName()
+                        + "] threw an exception from reset(); "
+                        + "continuing with the rest of the chain.", t);
+            }
+            handler = next;
         }
     }
 
@@ -1463,8 +1480,19 @@ public class ConnectionPool {
     protected void disconnectEvent(PooledConnection con, boolean finalizing) {
         JdbcInterceptor handler = con.getHandler();
         while (handler!=null) {
-            handler.disconnected(this, con, finalizing);
-            handler=handler.getNext();
+            //read the next link before the callback, as the callback
+            //is allowed to modify it
+            JdbcInterceptor next = handler.getNext();
+            try {
+                handler.disconnected(this, con, finalizing);
+            } catch (Throwable t) {
+                //one broken interceptor must not stop the rest of the
+                //chain from being notified
+                log.warn("Interceptor [" + handler.getClass().getName()
+                        + "] threw an exception from disconnected(); "
+                        + "continuing with the rest of the chain.", t);
+            }
+            handler = next;
         }
     }
 
@@ -1595,13 +1623,24 @@ public class ConnectionPool {
          */
         @Override
         public boolean cancel(boolean mayInterruptIfRunning) {
-            if (pc!=null) {
+            //On the async path the pc field is never assigned; once a
+            //connection has been produced it is held in the result field,
+            //so a non-null result means the future is complete and it is
+            //too late to cancel
+            if (pc!=null || result!=null) {
                 return false;
-            } else if ((!cancelled.get()) && cancelled.compareAndSet(false, true)) {
-                //cancel by retrieving the connection and returning it to the pool
-                ConnectionPool.this.cancellator.execute(this);
+            } else if (cancelled.compareAndSet(false, true)) {
+                if (!pcFuture.cancel(mayInterruptIfRunning)) {
+                    //The pooled connection was already handed over to the
+                    //queue future (or is being handed over right now), so
+                    //cancel by retrieving the connection and returning it
+                    //to the pool
+                    ConnectionPool.this.cancellator.execute(this);
+                }
+                return true;
             }
-            return true;
+            //already cancelled
+            return false;
         }
 
         /**

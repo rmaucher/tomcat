@@ -18,6 +18,7 @@ package org.apache.tomcat.jdbc.pool;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Properties;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -70,6 +71,108 @@ class TestPoolProperties {
             }
         }
         Assertions.assertEquals(0, stack.size(), "All brackets should have been closed");
+    }
+
+    @Test
+    void poolNameIsAvailableBeforeThePoolIsCreatedAndAfterClose() {
+        PoolProperties properties = new PoolProperties();
+        properties.setName("test-pool");
+        DataSourceProxy proxy = new DataSourceProxy(properties);
+
+        Assertions.assertEquals("test-pool", proxy.getPoolName(),
+                "getPoolName() must not require a running pool");
+        Assertions.assertEquals(proxy.getName(), proxy.getPoolName(),
+                "getPoolName() and getName() must agree");
+
+        proxy.close();
+
+        Assertions.assertEquals("test-pool", proxy.getPoolName(),
+                "getPoolName() must still work after close()");
+    }
+
+    @Test
+    void setConnectionPropertiesRoundTripsThroughTheProxy() {
+        PoolProperties properties = new PoolProperties();
+        DataSourceProxy proxy = new DataSourceProxy(properties);
+
+        proxy.setConnectionProperties("first=one;second=two");
+
+        Assertions.assertEquals("first=one;second=two", proxy.getConnectionProperties(),
+                "the proxy setter must store the raw string like every other "
+                        + "implementation of the interface does");
+        // the same call must keep parsing the pairs into the driver
+        // properties the pool connects with
+        Assertions.assertEquals("one", properties.getDbProperties().getProperty("first"),
+                "the parsed pairs must still reach the database properties");
+        Assertions.assertEquals("two", properties.getDbProperties().getProperty("second"),
+                "the parsed pairs must still reach the database properties");
+
+        proxy.setConnectionProperties(null);
+        Assertions.assertNull(proxy.getConnectionProperties(),
+                "clearing the configuration must round-trip as well");
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void theDeprecatedFacadePropertyIsStillStoredWhenConfigured() {
+        Properties attrs = new Properties();
+        attrs.setProperty("useDisposableConnectionFacade", "false");
+
+        PoolConfiguration configured =
+                DataSourceFactory.parsePoolProperties(attrs);
+
+        // The property has no effect any more, but existing configuration
+        // must keep loading and keep reading back as it was written.
+        Assertions.assertFalse(configured.getUseDisposableConnectionFacade(),
+                "the deprecated value must still round-trip through the "
+                        + "factory path");
+    }
+
+    @Test
+    void setConnectionPropertiesRoundTripsThroughTheFactory() {
+        Properties attrs = new Properties();
+        attrs.setProperty("connectionProperties", "first=one;second=two");
+
+        PoolConfiguration configured =
+                DataSourceFactory.parsePoolProperties(attrs);
+
+        Assertions.assertEquals("first=one;second=two", configured.getConnectionProperties(),
+                "the factory/JNDI path must store the raw string like every "
+                        + "other implementation of the interface does");
+        // the pairs must still reach the driver properties the pool connects with
+        Assertions.assertEquals("one", configured.getDbProperties().getProperty("first"),
+                "the parsed pairs must still reach the database properties");
+        Assertions.assertEquals("two", configured.getDbProperties().getProperty("second"),
+                "the parsed pairs must still reach the database properties");
+
+        PoolConfiguration without =
+                DataSourceFactory.parsePoolProperties(new Properties());
+        Assertions.assertNull(without.getConnectionProperties(),
+                "an unconfigured attribute must read back null");
+        Assertions.assertTrue(without.getDbProperties().isEmpty(),
+                "an unconfigured attribute must leave the driver properties empty");
+    }
+
+    @Test
+    void nonAsciiValuesInConnectionPropertiesSurviveParsing() {
+        // The escaped e-acute and a-ring below are multi-byte under the UTF-8
+        // default charset every supported JVM ships with, while
+        // Properties.load(InputStream) decodes as ISO-8859-1; parsing must
+        // hand the driver exactly the characters the configuration named,
+        // whatever the platform default charset is. Unicode escapes keep
+        // this source file 7-bit for the ISO-8859-1 Ant build.
+        PoolProperties properties = new PoolProperties();
+        properties.setConnectionProperties("clientInfo=caf\u00e9;clientLocale=de_DE");
+
+        Assertions.assertEquals("caf\u00e9", properties.getDbProperties().getProperty("clientInfo"),
+                "a non-ASCII value must reach the driver properties uncorrupted");
+        Assertions.assertEquals("de_DE", properties.getDbProperties().getProperty("clientLocale"),
+                "the pairs around it must still parse");
+
+        // the static helper the JNDI factory routes through
+        Properties parsed = PoolProperties.getProperties("foo=b\u00e5r", null);
+        Assertions.assertEquals("b\u00e5r", parsed.getProperty("foo"),
+                "a non-ASCII value must survive the factory path as well");
     }
 
     @Test

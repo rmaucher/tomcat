@@ -17,6 +17,7 @@
 package org.apache.tomcat.jdbc.pool.jmx;
 
 import java.lang.management.ManagementFactory;
+import java.lang.reflect.Field;
 import java.sql.Connection;
 import java.util.HashSet;
 import java.util.Properties;
@@ -92,6 +93,17 @@ class TestJmxMonitor extends JdbcPoolBaseTest {
         return count;
     }
 
+    /* The pool-MBean registration handle is a private field; tests reach
+     * it reflectively to pin that a finished lifecycle step drops it. */
+    private static void assertNoRegistrationHandle(DataSource ds)
+            throws Exception {
+        Field handle = DataSource.class.getDeclaredField("oname");
+        handle.setAccessible(true);
+        Assertions.assertNull(handle.get(ds),
+                "the DataSource must not keep an ObjectName as a pool-MBean "
+                        + "registration handle at this point");
+    }
+
     @Test
     void poolMBeanTracksLiveTraffic() throws Exception {
         MBeanServer server = ManagementFactory.getPlatformMBeanServer();
@@ -129,6 +141,7 @@ class TestJmxMonitor extends JdbcPoolBaseTest {
             ds.postDeregister();
             Assertions.assertFalse(server.isRegistered(poolOname),
                     "postDeregister must unregister the pool MBean");
+            assertNoRegistrationHandle(ds);
         }
     }
 
@@ -225,6 +238,88 @@ class TestJmxMonitor extends JdbcPoolBaseTest {
         } finally {
             ds.postDeregister();
         }
+    }
+
+    @Test
+    void theDataSourceBeanSurfaceNeverExposesThePassword() throws Exception {
+        final String secret = "s3cr3t-pool-password";
+        DataSource ds = newDataSource();
+        ds.createPool(); // connect with the fixture credentials first
+        // the pool is already connected; this only records what a real
+        // configuration holds
+        ds.setPassword(secret);
+        ds.setConnectionProperties("appconfigured=yes");
+
+        // The DataSource object doubles as its own MBean/bean surface:
+        // the modeler and reflective exporters read these public getters.
+        // The deliberately masked getPassword() must not be bypassed by a
+        // sibling getter that still hands out the live db-properties.
+        Properties dbProperties = ds.getDbProperties();
+        Assertions.assertNotNull(dbProperties);
+        for (String name : dbProperties.stringPropertyNames()) {
+            Assertions.assertFalse(secret.equals(dbProperties.getProperty(name)),
+                    "the bean view of the driver properties must not carry the"
+                            + " password, property " + name);
+        }
+        Assertions.assertEquals("yes", dbProperties.getProperty("appconfigured"),
+                "the sanitization must still show every other driver property");
+        // The returned view is a copy: writing through it cannot smuggle
+        // values back into the pool configuration.
+        dbProperties.setProperty("injected", "through-the-view");
+        Assertions.assertNull(ds.getPoolProperties().getDbProperties().getProperty("injected"),
+                "the exposed db-properties must be a view, not the live object");
+        // and the pool must still authenticate - the copy is display-side
+        // only, the connect path keeps its own credentials
+        Assertions.assertDoesNotThrow(() -> ds.getConnection().close());
+    }
+
+    @Test
+    void closingThePoolUnregistersItsMBean() throws Exception {
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        DataSource ds = newDataSource();
+        ds.getPoolProperties().setJmxEnabled(true);
+        ds.createPool();
+
+        ObjectName dsName = uniqueDataSourceName("closed");
+        ObjectName poolOname = registerAndFindPoolMBean(server, ds, dsName);
+        Assertions.assertNotNull(poolOname, "an enabled pool must publish its MBean");
+
+        ds.close();
+        Assertions.assertFalse(server.isRegistered(poolOname),
+                "closing the pool must unregister its MBean instead of "
+                        + "letting it report a dead pool");
+        assertNoRegistrationHandle(ds);
+        // the container still deregisters the DataSource itself afterwards;
+        // that must stay a clean no-op
+        Assertions.assertDoesNotThrow(ds::postDeregister);
+    }
+
+    @Test
+    void registrationBeforeThePoolExistsKeepsTheContainerCallback()
+            throws Exception {
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        DataSource ds = newDataSource();
+        ds.getPoolProperties().setJmxEnabled(true);
+        // Deliberately no createPool(): a container may register the
+        // DataSource before the embedder has started the pool. That must
+        // not break the MBeanRegistration callback - preRegister throwing
+        // makes the MBean server abort the whole registration.
+        ObjectName dsName = uniqueDataSourceName("nopool");
+        Set<ObjectName> before = poolMBeans(server);
+        Assertions.assertDoesNotThrow(() -> ds.preRegister(server, dsName),
+                "preRegister must not fail over a pool that does not exist yet");
+        Set<ObjectName> added = new HashSet<>(poolMBeans(server));
+        added.removeAll(before);
+        Assertions.assertTrue(added.isEmpty(),
+                "a pool that does not exist yet must not publish MBeans, added: "
+                        + added);
+        // The registration then completes, so the container will also
+        // deregister later. The pool-side handle postDeregister()
+        // unregisters must not claim a name that was never registered.
+        assertNoRegistrationHandle(ds);
+        Assertions.assertDoesNotThrow(ds::postDeregister,
+                "deregistering a DataSource whose pool MBean was never "
+                        + "published must be a clean no-op");
     }
 
     @Test

@@ -51,6 +51,25 @@ public class DataSource extends DataSourceProxy implements javax.sql.DataSource,
         super(poolProperties);
     }
 
+    /**
+     * Unregisters the connection pool MBean before closing the pool, so a
+     * dead pool does not keep reporting stale statistics under a live
+     * object name (and does not pin the closed pool, its credentials and
+     * its JDBC driver class loader in the MBean server).<br>
+     * {@inheritDoc}
+     */
+    @Override
+    public synchronized void close(boolean all) {
+        // Same monitor as DataSourceProxy.close(boolean), so the
+        // check-and-clear of the registration handle is atomic against a
+        // concurrent close.
+        if (oname != null) {
+            unregisterJmx();
+            oname = null;
+        }
+        super.close(all);
+    }
+
 
 
 
@@ -71,6 +90,7 @@ public class DataSource extends DataSourceProxy implements javax.sql.DataSource,
     public void postDeregister() {
         if (oname!=null) {
             unregisterJmx();
+            oname = null;
         }
     }
 
@@ -107,7 +127,15 @@ public class DataSource extends DataSourceProxy implements javax.sql.DataSource,
                 }
             }
         }catch (MalformedObjectNameException x) {
+            this.oname = null;
             log.error("Unable to create object name for JDBC pool.",x);
+        }catch (RuntimeException x) {
+            // Never break the caller's MBean registration because of
+            // pool-side state (for instance a pool that has not been
+            // created yet); preRegister throwing aborts the whole
+            // registration in the MBean server.
+            this.oname = null;
+            log.error("Unable to register JDBC pool MBean.",x);
         }
         return name;
     }
@@ -134,12 +162,24 @@ public class DataSource extends DataSourceProxy implements javax.sql.DataSource,
     }
 
     /**
-     * Registers the ConnectionPoolMBean under a unique name based on the ObjectName for the DataSource
+     * Registers the ConnectionPoolMBean under a unique name based on the
+     * ObjectName for the DataSource. A pool that has not been created yet
+     * (or was already closed) has no MBean to publish; the registration is
+     * then skipped rather than failing, since the caller of
+     * {@link #preRegister(MBeanServer, ObjectName)} must not see an
+     * exception over pool-side lifecycle state.
      */
     protected void registerJmx() {
-        if (pool.getJmxPool()!=null) {
-            JmxUtil.registerJmx(oname, null, pool.getJmxPool());
+        final ConnectionPool p = pool;
+        if (p == null || p.getJmxPool() == null) {
+            log.warn("JDBC pool MBean [" + oname + "] not registered: the pool "
+                    + "has not been created yet or has already been closed.");
+            // oname is the handle postDeregister() unregisters; do not keep
+            // one that was never registered
+            this.oname = null;
+            return;
         }
+        JmxUtil.registerJmx(oname, null, p.getJmxPool());
     }
 
     /**

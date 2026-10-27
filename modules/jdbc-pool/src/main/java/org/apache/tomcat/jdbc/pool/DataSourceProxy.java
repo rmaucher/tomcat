@@ -20,7 +20,6 @@ import java.io.PrintWriter;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
-import java.util.Iterator;
 import java.util.Properties;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -355,7 +354,7 @@ public class DataSourceProxy implements PoolConfiguration {
 
     @Override
     public String getPoolName() {
-        return pool.getName();
+        return getPoolProperties().getPoolName();
     }
 
 
@@ -560,17 +559,15 @@ public class DataSourceProxy implements PoolConfiguration {
     @Override
     public void setConnectionProperties(String properties) {
         try {
-            Properties prop = DataSourceFactory.getProperties(properties);
-            Iterator<?> i = prop.keySet().iterator();
-            while (i.hasNext()) {
-                String key = (String) i.next();
-                String value = prop.getProperty(key);
-                getPoolProperties().getDbProperties().setProperty(key, value);
-            }
-
-        } catch (Exception x) {
+            // Delegate so the raw string is stored as well as parsed: a
+            // hand-rolled merge into the database properties left
+            // getConnectionProperties() reporting null for a value that
+            // was just set, unlike every other implementation of the
+            // interface (PoolProperties itself and the pool's JMX wrapper).
+            getPoolProperties().setConnectionProperties(properties);
+        } catch (RuntimeException x) {
             log.error("Unable to parse connection properties.", x);
-            throw new RuntimeException(x);
+            throw x;
         }
     }
 
@@ -863,9 +860,20 @@ public class DataSourceProxy implements PoolConfiguration {
     }
 
 
+    /**
+     * Returns a copy of the database properties with the password removed.
+     * This object doubles as its own JMX/bean surface and
+     * {@link #setPassword(String)} stores the password into the database
+     * properties, so returning them as they are would expose the plaintext
+     * password through a getter while {@link #getPassword()} is explicitly
+     * masked - the same protection the pool's own MBean
+     * ({@link org.apache.tomcat.jdbc.pool.jmx.ConnectionPool#getDbProperties()})
+     * already applies.
+     * {@inheritDoc}
+     */
     @Override
     public Properties getDbProperties() {
-        return getPoolProperties().getDbProperties();
+        return PoolUtilities.cloneWithoutPassword(getPoolProperties().getDbProperties());
     }
 
 
@@ -1218,12 +1226,24 @@ public class DataSourceProxy implements PoolConfiguration {
         return getPoolProperties().getRollbackOnReturn();
     }
 
+    /**
+     * {@inheritDoc}
+     * @deprecated The disposable connection facade is always used, so this
+     *             property no longer has any effect.
+     */
     @Override
+    @Deprecated
     public void setUseDisposableConnectionFacade(boolean useDisposableConnectionFacade) {
         getPoolProperties().setUseDisposableConnectionFacade(useDisposableConnectionFacade);
     }
 
+    /**
+     * {@inheritDoc}
+     * @deprecated The disposable connection facade is always used, so this
+     *             property no longer has any effect.
+     */
     @Override
+    @Deprecated
     public boolean getUseDisposableConnectionFacade() {
         return getPoolProperties().getUseDisposableConnectionFacade();
     }

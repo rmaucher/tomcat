@@ -34,10 +34,10 @@ import org.apache.tomcat.jdbc.JdbcPoolBaseTest;
  * for the callers that need it.
  *
  * <p>Scenario harvested from the retired legacy classes
- * {@code MultipleCloseTest} and {@code EqualsHashCodeTest}. Note that
- * the pool's own {@code equals}/{@code hashCode} handling <em>below</em>
- * the facade (with {@code useDisposableConnectionFacade=false}) is not
- * covered here on purpose - see TESTING-PLAN.md.</p>
+ * {@code MultipleCloseTest} and {@code EqualsHashCodeTest}. The same
+ * contract now also holds for configurations that still ask for the
+ * (deprecated, no-effect) {@code useDisposableConnectionFacade=false};
+ * that is pinned in {@link TestFacadeAlwaysUsed}.</p>
  */
 class TestProxyContract extends JdbcPoolBaseTest {
 
@@ -106,6 +106,34 @@ class TestProxyContract extends JdbcPoolBaseTest {
                     "two facades must not share an identity hash");
             Assertions.assertEquals(second.hashCode(), second.hashCode());
         }
+    }
+
+    @Test
+    void equalsAgainstNullOrForeignObjectsIsFalseNotAnException()
+            throws Exception {
+        DataSource ds = newDataSource();
+        ds.createPool();
+
+        Connection pooled = ds.getConnection();
+        Assertions.assertFalse(pooled.equals(null),
+                "Object.equals(null) must answer false, not throw");
+        Assertions.assertFalse(pooled.equals("a foreign object"),
+                "equals against a non-proxy must answer false, not throw");
+        // a proxy that is not the pool's own passes the proxy guard but
+        // must still compare unequal - its handler is not this facade
+        Object foreignProxy = java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(),
+                new Class<?>[] { Runnable.class },
+                (p, m, a) -> null);
+        Assertions.assertFalse(pooled.equals(foreignProxy),
+                "equals against a foreign dynamic proxy must answer false");
+        pooled.close();
+        // the equals branch runs ahead of the disposal guard, so the same
+        // contract must hold on a disposed facade too
+        Assertions.assertFalse(pooled.equals(null),
+                "a disposed facade must keep the equals(null) contract");
+        Assertions.assertFalse(pooled.equals("a foreign object"),
+                "a disposed facade must keep the equals(non-proxy) contract");
     }
 
     @Test

@@ -16,9 +16,9 @@
  */
 package org.apache.tomcat.jdbc.pool;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.Serializable;
+import java.io.StringReader;
 import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Locale;
@@ -148,7 +148,12 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     private volatile boolean commitOnReturn = false;
     /** Whether to rollback on connection return. */
     private volatile boolean rollbackOnReturn = false;
-    /** Whether to use a disposable connection facade. */
+    /**
+     * Whether to use a disposable connection facade.
+     * @deprecated The disposable connection facade is always used, so this
+     *             property no longer has any effect.
+     */
+    @Deprecated
     private volatile boolean useDisposableConnectionFacade = true;
     /** Whether to log validation errors. */
     private volatile boolean logValidationErrors = false;
@@ -431,9 +436,23 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                         String propsAsString = interceptorValues[i].substring(propIndex+1, endIndex);
                         String[] props = propsAsString.split(",");
                         for (int j=0; j<props.length; j++) {
-                            int pidx = props[j].indexOf('=');
-                            String propName = props[j].substring(0,pidx).trim();
-                            String propValue = props[j].substring(pidx+1).trim();
+                            String prop = props[j];
+                            if (prop.trim().isEmpty()) {
+                                // an empty segment comes from Name(), Name(   )
+                                // or a redundant separator: there is no property
+                                // to add, so tolerate it rather than fail the
+                                // whole pool start on a cosmetic spelling
+                                continue;
+                            }
+                            int pidx = prop.indexOf('=');
+                            if (pidx < 0) {
+                                throw new IllegalArgumentException(
+                                        "Invalid interceptor property '" + prop.trim()
+                                        + "', missing '=', in jdbcInterceptors value ["
+                                        + interceptorValues[i] + "]");
+                            }
+                            String propName = prop.substring(0,pidx).trim();
+                            String propValue = prop.substring(pidx+1).trim();
                             definitions[i+1].addProperty(new InterceptorProperty(propName,propValue));
                         }
                     }
@@ -1122,7 +1141,12 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
         }
         if (propText != null) {
             try {
-                props.load(new ByteArrayInputStream(propText.replace(';', '\n').getBytes()));
+                // Load through a Reader: Properties.load(InputStream) decodes as
+                // ISO-8859-1 while encoding the string to bytes uses the platform
+                // charset, silently corrupting any non-ASCII value on a
+                // UTF-8-default JVM. A Reader carries the exact characters, so no
+                // charset conversion takes place at all.
+                props.load(new StringReader(propText.replace(';', '\n')));
             }catch (IOException ioe) {
                 throw new RuntimeException(ioe);
             }
@@ -1161,12 +1185,24 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
         return this.rollbackOnReturn;
     }
 
+    /**
+     * {@inheritDoc}
+     * @deprecated The disposable connection facade is always used, so this
+     *             property no longer has any effect.
+     */
     @Override
+    @Deprecated
     public void setUseDisposableConnectionFacade(boolean useDisposableConnectionFacade) {
         this.useDisposableConnectionFacade = useDisposableConnectionFacade;
     }
 
+    /**
+     * {@inheritDoc}
+     * @deprecated The disposable connection facade is always used, so this
+     *             property no longer has any effect.
+     */
     @Override
+    @Deprecated
     public boolean getUseDisposableConnectionFacade() {
         return useDisposableConnectionFacade;
     }

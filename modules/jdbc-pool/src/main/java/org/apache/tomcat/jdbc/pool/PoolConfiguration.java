@@ -851,17 +851,31 @@ public interface PoolConfiguration {
     boolean getRollbackOnReturn();
 
     /**
-     * If set to <code>true</code>, the connection will be wrapped with facade that will disallow the connection to be used after
-     * {@link java.sql.Connection#close()} is called. If set to <code>true</code>, after {@link java.sql.Connection#close()} all calls except
-     * {@link java.sql.Connection#close()} and {@link java.sql.Connection#isClosed()} will throw an exception.
-     * @param useDisposableConnectionFacade <code>true</code> to use a facade
+     * Stores the value of the deprecated {@code useDisposableConnectionFacade}
+     * property. The pool always wraps the connection handle in a facade that
+     * disallows use of the connection after {@link java.sql.Connection#close()}
+     * has been called, whatever value is stored here.
+     * @param useDisposableConnectionFacade the configured value, retained but
+     *                                      without effect
+     * @deprecated The disposable connection facade is always used, so this
+     *             property no longer has any effect. Setting it to
+     *             <code>false</code> used to hand out connection handles that
+     *             stayed usable, or worse, able to return and drive the
+     *             connection of a later borrower.
      */
+    @Deprecated
     void setUseDisposableConnectionFacade(boolean useDisposableConnectionFacade);
     /**
-     * Returns <code>true</code> if this connection pool is configured to use a connection facade to prevent re-use of connection after
-     * {@link java.sql.Connection#close()} has been invoked
-     * @return <code>true</code> if {@link java.sql.Connection#close()} has been invoked.
+     * Returns the value stored for the deprecated
+     * {@code useDisposableConnectionFacade} property. The pool always wraps the
+     * connection handle in a facade that disallows use of the connection after
+     * {@link java.sql.Connection#close()} has been called, whatever value is
+     * returned here.
+     * @return the configured value, retained but without effect
+     * @deprecated The disposable connection facade is always used, so this
+     *             property no longer has any effect.
      */
+    @Deprecated
     boolean getUseDisposableConnectionFacade();
 
     /**
@@ -910,7 +924,10 @@ public interface PoolConfiguration {
 
     /**
      * Set this to true if you wish to wrap statements in order to enable equals() and hashCode()
-     * methods to be called on the closed statements if any statement proxy is set.
+     * methods to be called on the closed statements if any statement proxy is set. A wrapped
+     * statement also reports the pooled connection it was created from rather than the driver's
+     * own connection, and stops working, along with the result sets read from it, once that
+     * connection has been returned to the pool.
      * @param useStatementFacade set to <code>true</code> to wrap statements
      */
     void setUseStatementFacade(boolean useStatementFacade);
@@ -918,7 +935,9 @@ public interface PoolConfiguration {
     /**
      * Returns <code>true</code> if this connection pool is configured to wrap statements in order
      * to enable equals() and hashCode() methods to be called on the closed statements if any
-     * statement proxy is set.
+     * statement proxy is set. A wrapped statement also reports the pooled connection it was
+     * created from rather than the driver's own connection, and stops working, along with the
+     * result sets read from it, once that connection has been returned to the pool.
      * @return <code>true</code> if the statements are wrapped
      */
     boolean getUseStatementFacade();
