@@ -96,9 +96,14 @@ public class ProxyConnection extends JdbcInterceptor {
     }
 
     /**
-     * Checks whether this proxy wraps the given interface.
+     * Checks whether this interceptor wraps the given interface. This is the
+     * view from the interceptor itself; the contract of the connection handle
+     * the pool hands out - which also implements {@link java.sql.Connection}
+     * and {@link javax.sql.PooledConnection} (and {@link javax.sql.XAConnection}
+     * on XA pools) - is answered by the dispatch in
+     * {@link #invoke(Object, Method, Object[])}.
      * @param iface the interface to check
-     * @return true if this proxy wraps the given interface
+     * @return true if this interceptor wraps the given interface
      */
     public boolean isWrapperFor(Class<?> iface) {
         if (iface == XAConnection.class && connection.getXAConnection()!=null) {
@@ -119,7 +124,14 @@ public class ProxyConnection extends JdbcInterceptor {
         if (iface == PooledConnection.class) {
             return connection;
         }else if (iface == XAConnection.class) {
-            return connection.getXAConnection();
+            javax.sql.XAConnection xa = connection.getXAConnection();
+            if (xa == null) {
+                // The Wrapper contract asks for a failure, not for a silent
+                // null that turns into an unrelated NullPointerException at
+                // the caller's first use of the "unwrapped" value.
+                throw new SQLException("Not a wrapper of " + iface.getName());
+            }
+            return xa;
         } else if (isWrapperFor(iface)) {
             return connection.getConnection();
         } else {
@@ -160,9 +172,35 @@ public class ProxyConnection extends JdbcInterceptor {
             return this.toString();
         } else if (compare(GETCONNECTION_VAL,method) && connection!=null) {
             return connection.getConnection();
-        } else if (method.getDeclaringClass().isAssignableFrom(XAConnection.class) && connection != null) {
+        } else if (method.getDeclaringClass() != Object.class
+                && method.getDeclaringClass().isAssignableFrom(XAConnection.class)
+                && connection != null) {
+            // The Object.class exclusion is defensive: the only Object
+            // methods java.lang.reflect.Proxy routes to an invocation
+            // handler are equals, hashCode and toString, and all three are
+            // answered above. Any other method the branch condition matches
+            // can only be answered by the XA connection wrapper - and that
+            // wrapper exists only when the pool is backed by an XA data
+            // source (and only while the physical connection is still
+            // connected). The condition also matches methods declared by
+            // the interfaces XAConnection extends, javax.sql.PooledConnection
+            // among them, so on a plain pool calls such as
+            // addConnectionEventListener reach this branch without a target;
+            // dispatching them at null would surface a raw
+            // NullPointerException to the application.
+            javax.sql.XAConnection xaConnection = connection.getXAConnection();
+            if (xaConnection == null) {
+                if (isClosed()) {
+                    // The handle was disconnected while borrowed; report it
+                    // the way every other method on this class does, rather
+                    // than blaming the XA configuration.
+                    throw new SQLException("Connection has already been closed.");
+                }
+                throw new SQLException("The pooled connection is not an XA connection; "
+                        + "method [" + method.getName() + "] cannot be dispatched.");
+            }
             try {
-                return method.invoke(connection.getXAConnection(),args);
+                return method.invoke(xaConnection, args);
             }catch (Throwable t) {
                 if (t instanceof InvocationTargetException) {
                     throw t.getCause() != null ? t.getCause() : t;
@@ -175,9 +213,25 @@ public class ProxyConnection extends JdbcInterceptor {
             throw new SQLException("Connection has already been closed.");
         }
         if (compare(UNWRAP_VAL,method)) {
-            return unwrap((Class<?>)args[0]);
+            Class<?> iface = (Class<?>)args[0];
+            if (iface != XAConnection.class && iface.isInstance(proxy)
+                    && !iface.isInstance(connection.getConnection())) {
+                // The Wrapper contract: the handle is a wrapper of every
+                // interface it implements itself. Interfaces the physical
+                // connection behind it also provides - java.sql.Connection
+                // first of all - keep resolving to the physical connection,
+                // as they always have; javax.sql.XAConnection is excluded
+                // because unwrapping to it has always yielded the XA
+                // connection object where one exists, and the unwrap above
+                // reports the not-a-wrapper failure where none does.
+                return proxy;
+            }
+            return unwrap(iface);
         } else if (compare(ISWRAPPERFOR_VAL,method)) {
-            return Boolean.valueOf(this.isWrapperFor((Class<?>)args[0]));
+            Class<?> iface = (Class<?>)args[0];
+            // An object is always a wrapper of the interfaces it implements.
+            return Boolean.valueOf(iface.isInstance(proxy)
+                    || this.isWrapperFor(iface));
         }
         try {
             PooledConnection poolc = connection;

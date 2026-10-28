@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TimeZone;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -39,15 +40,24 @@ import org.apache.tomcat.jdbc.pool.PooledConnection;
 
 /**
  * Slow query report interceptor. Tracks timing of query executions.
+ * <p>
+ * The statistics are published under the pool <em>name</em> (see
+ * {@link #getPoolStats(String)}), registered when a pool starts and
+ * released when the last live pool registered under that name closes.
+ * Pools configured with the same name - possible with
+ * {@code jmxEnabled=false}, which removes the JMX ObjectName clash that
+ * would otherwise catch it - therefore share one statistics map; closing
+ * one of them never takes the shared statistics away from the others.</p>
  */
 public class SlowQueryReport extends AbstractQueryReport  {
     //logger
     private static final Log log = LogFactory.getLog(SlowQueryReport.class);
 
     /**
-     * we will be keeping track of query stats on a per pool basis
+     * we will be keeping track of query stats on a per pool basis, keyed
+     * by pool name; pools registered under one name share the statistics
      */
-    protected static final ConcurrentHashMap<String,ConcurrentHashMap<String,QueryStats>> perPoolStats =
+    protected static final ConcurrentHashMap<String,PoolStatistics> perPoolStats =
             new ConcurrentHashMap<>();
     /**
      * the queries that are used for this interceptor.
@@ -80,10 +90,13 @@ public class SlowQueryReport extends AbstractQueryReport  {
      * @param poolname - the name of the pool we want to retrieve stats for
      * @return a hash map containing the statistics of the monitored queries,
      *         kept near {@code maxQueries} entries by eviction, or
-     *         {@code null} if the pool is not being monitored
+     *         {@code null} if no live pool is registered under that name.
+     *         Pools registered under one name share the map, and it is
+     *         published until the last of them has closed
      */
     public static ConcurrentHashMap<String,QueryStats> getPoolStats(String poolname) {
-        return perPoolStats.get(poolname);
+        PoolStatistics stats = perPoolStats.get(poolname);
+        return stats == null ? null : stats.getQueryStats();
     }
 
     /**
@@ -190,35 +203,89 @@ public class SlowQueryReport extends AbstractQueryReport  {
 
     /**
      * Initializes the query statistics map for the given connection pool.
+     * <p>
+     * The map is registered under the pool name together with the pool
+     * instance itself. If a live pool is already registered under the
+     * name, both pools share one statistics map; that merging is the
+     * pre-existing behaviour, but it is a configuration mistake worth a
+     * warning, so it is logged.</p>
      *
      * @param pool the connection pool that has started
      */
     @Override
     public void poolStarted(ConnectionPool pool) {
         super.poolStarted(pool);
-        //see if we already created a map for this pool
-        queries = perPoolStats.get(pool.getName());
-        if (queries==null) {
-            //create the map to hold our stats
-            //however TODO we need to improve the eviction
-            //selection
-            queries = new ConcurrentHashMap<>();
-            if (perPoolStats.putIfAbsent(pool.getName(), queries)!=null) {
-                //there already was one
-                queries = perPoolStats.get(pool.getName());
-            }
+        //see if we already created a map for this pool - and register
+        //this pool as one of the live pools the map is held for
+        PoolStatistics stats = perPoolStats.compute(pool.getName(),
+                (name, existing) -> {
+                    PoolStatistics registration =
+                            (existing == null) ? new PoolStatistics() : existing;
+                    registration.addLivePool(pool);
+                    return registration;
+                });
+        if (stats.hasOtherLivePools() && log.isWarnEnabled()) {
+            log.warn("Connection pool name [" + pool.getName() + "] is already in use by "
+                    + "another live pool; SlowQueryReport statistics are keyed by pool name, "
+                    + "so both pools report into the same statistics map.");
         }
+        queries = stats.getQueryStats();
     }
 
     /**
-     * Removes the query statistics map for the given connection pool.
+     * Releases the query statistics map for the given connection pool,
+     * unless another live pool is still registered under its name.
+     * <p>
+     * The callback is delivered by {@link ConnectionPool} to a freshly
+     * instantiated interceptor (see {@code ConnectionPool#close(boolean)}),
+     * which has never held a reference to the statistics, so the map to
+     * release can only be identified through the closing pool passed
+     * here, not through this instance's own state. The statistics stay
+     * published as long as one pool registered under the name is alive.</p>
      *
      * @param pool the connection pool that has been closed
      */
     @Override
     public void poolClosed(ConnectionPool pool) {
-        perPoolStats.remove(pool.getName());
+        lastPoolOfNameClosed = releaseStatistics(pool);
         super.poolClosed(pool);
+    }
+
+    /**
+     * Whether the {@link #poolClosed(ConnectionPool)} delivered to this
+     * instance deregistered the closing pool as the last live pool under
+     * its name, meaning everything else registered for that name - the
+     * interceptor's MBean and broadcaster, for instance - can and must
+     * now be released with it. The deciding {@link
+     * #releaseStatistics(ConnectionPool)} call is atomic, so across
+     * concurrent closes of same-named pools and across the interceptor
+     * definitions of one close exactly one caller ever sees {@code true}.
+     */
+    protected boolean lastPoolOfNameClosed = false;
+
+    /**
+     * Deregisters a closed pool from the live pools that the
+     * per-name statistics are held for, and releases the statistics
+     * once no live pool is registered under the name any more.
+     * <p>
+     * The decision is taken inside a {@code compute} on the name, which
+     * atomises it against the concurrent removals of other same-named
+     * pools: exactly one of any number of concurrent {@code poolClosed}
+     * deliveries sees {@code true} returned, so the per-name entries are
+     * never released twice and never left behind.</p>
+     *
+     * @param pool the connection pool that has been closed
+     * @return {@code true} if this call removed the last live pool
+     *         registered under the name
+     */
+    protected static boolean releaseStatistics(ConnectionPool pool) {
+        boolean[] last = new boolean[1];
+        perPoolStats.computeIfPresent(pool.getName(),
+                (name, existing) -> {
+                    last[0] = existing.removeLivePool(pool);
+                    return last[0] ? null : existing;
+                });
+        return last[0];
     }
 
     /**
@@ -302,7 +369,7 @@ public class SlowQueryReport extends AbstractQueryReport  {
     public void reset(ConnectionPool parent, PooledConnection con) {
         super.reset(parent, con);
         if (parent!=null) {
-            queries = perPoolStats.get(parent.getName());
+            queries = getPoolStats(parent.getName());
         } else {
             queries = null;
         }
@@ -378,6 +445,72 @@ public class SlowQueryReport extends AbstractQueryReport  {
 
 
     /**
+     * The query statistics published under one pool name, together with
+     * the live pools registered for that name. ConnectionPool does not
+     * override {@code equals} or {@code hashCode}, so pool membership is
+     * by instance identity. Instances are mutated only from within a
+     * {@code ConcurrentHashMap.compute} on their name key, which
+     * serialises them against each other.
+     */
+    protected static class PoolStatistics {
+        /**
+         * the statistics map shared by all pools registered under the
+         * name, kept near {@code maxQueries} entries by eviction
+         */
+        private final ConcurrentHashMap<String,QueryStats> stats =
+                new ConcurrentHashMap<>();
+        /**
+         * the live pools registered under the name; the statistics are
+         * released once this set runs empty
+         */
+        private final Set<ConnectionPool> livePools =
+                ConcurrentHashMap.newKeySet();
+
+        /**
+         * Registers a pool that started under this name.
+         *
+         * @param pool the connection pool that has started
+         */
+        protected void addLivePool(ConnectionPool pool) {
+            livePools.add(pool);
+        }
+
+        /**
+         * Deregisters a pool that closed.
+         *
+         * @param pool the connection pool that has been closed
+         * @return {@code true} if this was the last live pool registered
+         *         under the name, so the statistics can be released
+         */
+        protected boolean removeLivePool(ConnectionPool pool) {
+            livePools.remove(pool);
+            return livePools.isEmpty();
+        }
+
+        /**
+         * Returns whether pools other than the caller's own are
+         * registered under this name. The caller registers its own pool
+         * before asking, so more than one registration means another
+         * live pool shares the name.
+         *
+         * @return {@code true} if another live pool shares this name
+         */
+        protected boolean hasOtherLivePools() {
+            return livePools.size() > 1;
+        }
+
+        /**
+         * Returns the statistics map published under this name.
+         *
+         * @return the shared query statistics map
+         */
+        protected ConcurrentHashMap<String,QueryStats> getQueryStats() {
+            return stats;
+        }
+    }
+
+
+    /**
      * Holds timing and invocation statistics for a single SQL query.
      */
     public static class QueryStats {
@@ -406,7 +539,7 @@ public class SlowQueryReport extends AbstractQueryReport  {
             "The number of failures for this query",
             "The number of times this query was prepared (prepareStatement/prepareCall)",
             "The total number of milliseconds spent preparing this query",
-            "The date and time of the last invocation"
+            "The date and time of the last invocation or preparation"
         };
 
         static final OpenType<?>[] FIELD_TYPES = new OpenType[] {
@@ -541,14 +674,18 @@ public class SlowQueryReport extends AbstractQueryReport  {
         }
 
         /**
-         * Records the time taken to prepare this query.
+         * Records the time taken to prepare this query. Preparation counts as
+         * activity on the entry, so the last invocation time that orders the
+         * statistics for eviction is updated as well: a statement that is
+         * prepared but never executed must age like any other query instead
+         * of occupying a statistics slot for ever.
          *
          * @param invocationTime the time in milliseconds to prepare the query
          */
         public synchronized void prepare(long invocationTime) {
             prepareCount++;
             prepareTime+=invocationTime;
-
+            lastInvocation = System.currentTimeMillis();
         }
 
         /**

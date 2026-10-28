@@ -310,6 +310,25 @@ the working list.
     and the handle contract for such configurations is pinned by
     `pool/TestFacadeAlwaysUsed`, on top of the facade-level identity
     assertions in `TestProxyContract`.
+  * the rest of `ProxyConnection`'s XA dispatch branch was over-
+    matching the same way: methods declared by interfaces the handle
+    implements but the pool cannot honour – such as
+    `javax.sql.PooledConnection`'s `add`/`removeConnectionEventListener`
+    on a plain pool – were dispatched at a `null` `XAConnection` and
+    escaped as a raw `NullPointerException`. They now fail as an
+    `SQLException` naming the method; `pool/TestXaBranchDispatch`
+    pins that, with an XA-pool control showing the live dispatch
+    still works.
+  * a custom `Validator` that reports its failure by throwing — the
+    only option, since the SPI declares no checked exception — escaped
+    the unguarded call in `PooledConnection.validate()` and stranded the
+    pooled connection between the idle and busy queues on borrow and on
+    `close()` (a permanently lost slot), while aborting each idle sweep.
+    A throw now counts as a failed validation, exactly like the `false`
+    the built-in query/`isValid()` paths already return for any
+    exception; `pool/TestThrowingValidator` pins the borrow, return and
+    idle paths, with the already-safe create path and a plain-`false`
+    validator as controls.
   * a borrow with alternate credentials that the database refuses
     leaves the pool having *closed the healthy idle session it
     already had*: size and server session count drop to 0 and the
@@ -325,6 +344,15 @@ the working list.
   instead of the handle), the cache outliving a `reconnect()` whose
   purge hook was skipped, and the pool-wide `cacheSize` counter skewing
   when caching races `disconnected()`.
+* `TestQueryTimeoutWithStatementCache` (2) pins the ordering dependency
+  between the two: with `StatementCache` listed first, a cache hit skips
+  the rest of the chain and the next borrower of the same SQL gets the
+  timeout the *first* borrower configured or `0` after a recycle reset,
+  not the one it configured - that case is pinned as the documented
+  limitation, with the reset itself pinned first because H2 reports the
+  session-wide value; the supported order (`StatementCache` last) is
+  pinned to keep the configured timeout across a cache hit. Both are
+  javadoc/wording fixes in the shipped code, not behaviour changes.
 * `build.xml` (the Ant release build of this module) still has a
   `build-test` target that compiles `src/test/java` against a JUnit 4 +
   `tomcat-dbcp` + c3p0/derby/mysql classpath it downloads, and ships

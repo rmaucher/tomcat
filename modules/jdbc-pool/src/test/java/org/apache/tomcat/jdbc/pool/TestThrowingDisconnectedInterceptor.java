@@ -33,19 +33,6 @@ import org.apache.tomcat.jdbc.JdbcPoolBaseTest;
  */
 class TestThrowingDisconnectedInterceptor extends JdbcPoolBaseTest {
 
-    public static class BoomInterceptor extends JdbcInterceptor {
-        @Override
-        public void reset(ConnectionPool parent, PooledConnection con) {
-            // empty
-        }
-
-        @Override
-        public void disconnected(ConnectionPool parent, PooledConnection con,
-                boolean finalizing) {
-            throw new IllegalStateException("boom from disconnected()");
-        }
-    }
-
     public static class RecordingInterceptor extends JdbcInterceptor {
         static final AtomicInteger DISCONNECTED_CALLS = new AtomicInteger();
 
@@ -72,10 +59,8 @@ class TestThrowingDisconnectedInterceptor extends JdbcPoolBaseTest {
         // test: an abandoned, unclosed physical connection is otherwise
         // reclaimed by the JDK's socket cleaner and the leaked database
         // sessions would disappear with GC timing instead of staying open
-        java.sql.Connection physicalFirst =
-                ((PooledConnection) first.unwrap(PooledConnection.class)).getConnection();
-        java.sql.Connection physicalSecond =
-                ((PooledConnection) second.unwrap(PooledConnection.class)).getConnection();
+        java.sql.Connection physicalFirst = first.unwrap(PooledConnection.class).getConnection();
+        java.sql.Connection physicalSecond = second.unwrap(PooledConnection.class).getConnection();
         awaitSessions(2);
         first.close();
         second.close();
@@ -98,8 +83,7 @@ class TestThrowingDisconnectedInterceptor extends JdbcPoolBaseTest {
                 BoomInterceptor.class.getName() + ";" + RecordingInterceptor.class.getName());
         Connection con = ds.getConnection();
         // keep the physical connection strongly reachable (see above)
-        java.sql.Connection physical =
-                ((PooledConnection) con.unwrap(PooledConnection.class)).getConnection();
+        java.sql.Connection physical = con.unwrap(PooledConnection.class).getConnection();
         con.close();
         ds.close();
         Assertions.assertEquals(1, RecordingInterceptor.DISCONNECTED_CALLS.get(),

@@ -117,6 +117,10 @@
       <update>
         The minimum Java version has been updated to Java 21. (markt)
       </update>
+      <scode>
+        Switch to using <code>String.strip()</code> rather than
+        <code>String.trim()</code> where appropriate. (markt)
+      </scode>
     </changelog>
   </subsection>
   <subsection name="Catalina">
@@ -462,6 +466,16 @@
         same last two digits. Based on pull request <pr>1104</pr> by Arturo
         Bernal. (markt)
       </fix>
+      <fix>
+        Validate that applications calling
+        <code>HttpServletRequest.upgrade</code> are also setting the
+        <code>upgrade</code> header on the response. Attempted upgrades without
+        this header will now fail. (markt)
+      </fix>
+      <fix>
+        Ensure that requests cannot try to start asynchronous processing and the
+        HTTP upgrade process on the same request. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Coyote">
@@ -630,6 +644,10 @@
         preserved, use the standard parser by setting the system property
         <code>org.apache.tomcat.util.http.parser.StandardAcceptLanguageParser</code>
         to <code>true</code>. (remm)
+      </fix>
+      <fix>
+        Detect and disconnect a mis-behaving HTTP/2 client that sends large
+        numbers of unexpected settings acknowledgement frames. (markt)
       </fix>
     </changelog>
   </subsection>
@@ -1154,6 +1172,78 @@
         an earlier borrow stayed usable and its close returned – or its
         calls drove – the connection a later borrower was still using.
         (remm)
+      </fix>
+      <fix>
+        Keep the abandoned timer alive while a pooled connection is
+        streaming a result set. The <code>ResetAbandonedTimer</code>
+        interceptor only reset the timer while a statement was executing,
+        so a borrower that left a cursor open across a long pause - the
+        usual reason for configuring a fetch size - appeared idle, and a
+        connection that was actively streaming could be reported as
+        abandoned and reclaimed from underneath its borrower. Statement
+        creation and result-set access through a pooled connection now
+        also reset the timer, so the abandoned check only reports a
+        connection that is genuinely making no progress. The
+        <code>jdbcInterceptors</code> documentation, which listed only
+        three of the interceptors bundled with the pool, has been
+        corrected. (remm)
+      </fix>
+      <fix>
+        The <code>SlowQueryReportJmx</code> interceptor MBean now exposes
+        the management surface its metadata declares: the
+        <code>PoolName</code> and <code>PoolNames</code> attributes and
+        the <code>resetStats()</code> operation are reachable through
+        JMX. Previously the MBean interface declared only
+        <code>SlowQueriesCD</code>, so the attributes and the operation
+        did not exist on the registered MBean, and once declared,
+        <code>resetStats()</code> would have thrown an
+        <code>IllegalStateException</code> whenever statistics were
+        present. (remm)
+      </fix>
+      <fix>
+        The <code>CacheSize</code> attribute of the
+        <code>StatementCache</code> interceptor MBean is now a plain
+        <code>int</code>. It used to be a
+        <code>java.util.concurrent.atomic.AtomicInteger</code>, which
+        meant that a client reading the attribute from inside the JVM
+        received the very object the pool uses to enforce its
+        <code>max</code> cache size, and could change the accounting it
+        had only come to observe: inflating it stopped the pool from
+        caching any further statement, deflating it let the cache grow
+        beyond <code>max</code>. A remote client, on the other hand,
+        received a snapshot that its writes could not affect. The value
+        reported by an interceptor instance that is not bound to a pooled
+        connection is now <code>-1</code> instead of no value at all.
+        (remm)
+      </fix>
+      <fix>
+        Pool JMX notifications are now delivered on a dedicated
+        notification thread instead of on the thread that reported the
+        condition. Several of the pool's notifications are raised from
+        the connection lifecycle, some of them while the pool holds the
+        lock of the connection concerned, so a monitoring listener that
+        was slow or blocked stalled the borrow, return and abandon
+        processing of that connection for as long as it held on, and a
+        failed borrow from an exhausted pool repeated that cost on every
+        miss. Listeners observe the notifications in the same order the
+        pool reported them; a listener that stops draining the bounded
+        delivery queue now causes later notifications to be dropped and
+        logged rather than delaying the pool. The result of reporting a
+        notification through the pool MBean now describes that handoff
+        only, and no longer depends on whether a locally registered
+        listener threw. (remm)
+      </fix>
+      <fix>
+        The notification types that the connection pool MBean sends are now
+        declared as constants on the <code>ConnectionPoolMBean</code>
+        interface, the client-facing type for pool management. The types
+        were already discoverable as runtime metadata of the registered
+        MBean, but the interface that a JMX client compiles its listener
+        and notification filter against declared none of them, so client
+        code had to hardcode the type strings or compile against the
+        implementation class. The implementation now inherits the
+        constants from the interface; the notification types and the
+        strings they carry on the wire are unchanged. (remm)
       </fix>
     </changelog>
   </subsection>

@@ -18,6 +18,7 @@ package org.apache.tomcat.jdbc.pool.interceptor;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -38,6 +39,18 @@ import org.apache.tomcat.jdbc.pool.jmx.JmxUtil;
 /**
  * Interceptor that caches {@code PreparedStatement} and/or
  * {@code CallableStatement} instances on a connection.
+ * <p>
+ * A cache hit is answered by this interceptor alone: the rest of the
+ * interceptor chain is not invoked for it, and a statement recycled into
+ * the cache is reset to driver defaults (its query timeout goes back to
+ * zero). Interceptors listed <em>after</em> this one in
+ * {@link org.apache.tomcat.jdbc.pool.PoolConfiguration#setJdbcInterceptors(String)
+ * jdbcInterceptors} therefore do not see reused statements - relevant to
+ * any interceptor whose {@code createStatement} hook performs an action
+ * rather than only wrapping the statement: {@link QueryTimeoutInterceptor}
+ * must be listed before this one to keep its timeout on cached statements,
+ * while wrapping-only interceptors are unaffected because their wrapper is
+ * carried inside the cached proxy.
  */
 public class StatementCache extends StatementDecoratorInterceptor implements StatementCacheMBean {
     private static final Log log = LogFactory.getLog(StatementCache.class);
@@ -105,8 +118,9 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
     }
 
     @Override
-    public AtomicInteger getCacheSize() {
-        return cacheSize;
+    public int getCacheSize() {
+        AtomicInteger size = this.cacheSize;
+        return size == null ? -1 : size.get();
     }
 
     @Override
@@ -237,6 +251,21 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
             if (statement!=null) {
                 //remove it from the cache since it is used
                 removeStatement(statement);
+                if (statement.getAssociatedConnection() != currentPhysicalConnection()) {
+                    // The entry belongs to a connection that has been
+                    // replaced (a statement close that raced a reconnect
+                    // parked it after the disconnect purge ran). It is a
+                    // statement of a dead connection: close it and prepare
+                    // again rather than hand it to this borrower.
+                    closeStatement(statement);
+                    return super.invoke(proxy, method, args);
+                }
+                // The cached proxy carries the connection handle of the
+                // borrower that closed the statement, which by now is a
+                // disposed facade. Re-bind it to the borrower the proxy is
+                // handed to, so that getConnection() on the reused statement
+                // reports a live handle instead of the previous borrower's.
+                statement.setConnection(proxy);
                 return statement.getActualProxy();
             } else {
                 return super.invoke(proxy, method, args);
@@ -278,6 +307,13 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
         }
         if (proxy.getCacheKey()==null) {
             return false;
+        } else if (proxy.getAssociatedConnection() != currentPhysicalConnection()) {
+            // The physical connection the statement was prepared on has
+            // been replaced (typically a close that raced a
+            // disconnect/reconnect, landing after the disconnected() purge
+            // had already run). The statement belongs to a dead connection
+            // and must not be parked in the cache of the new one.
+            return false;
         } else if (cache.containsKey(proxy.getCacheKey())) {
             return false;
         } else if (cacheSize.get()>=maxCacheSize) {
@@ -311,6 +347,17 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
         }
     }
     /*end the actual statement cache*/
+
+    /**
+     * Returns the physical connection behind the pooled connection this
+     * interceptor is bound to, or {@code null} if there is none (yet).
+     *
+     * @return the current physical connection, or null
+     */
+    private Connection currentPhysicalConnection() {
+        PooledConnection pCon = this.pcon;
+        return pCon == null ? null : pCon.getConnection();
+    }
 
     /**
      * Returns the statement cache for the current pooled connection.
@@ -349,6 +396,13 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
          */
         CacheKey key;
         /**
+         * The physical connection this statement was prepared on. Cached
+         * statements are bound to the connection they were prepared on; if
+         * the pooled connection is reconnected, the entries become stale
+         * and must neither be cached nor handed out.
+         */
+        private final Connection associatedConnection;
+        /**
          * Poolable hint set by the application. Tracked here as some drivers
          * (e.g. H2) always return false from {@code isPoolable()}.
          */
@@ -360,6 +414,33 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
          */
         public CachedStatement(PreparedStatement parent, String sql) {
             super(parent, sql);
+            associatedConnection = associatedConnectionOf(parent);
+        }
+
+        /**
+         * Resolves the physical connection a statement belongs to. The
+         * connection the driver reports for the statement itself is
+         * authoritative; only when the driver will not answer does the
+         * pool's own record of the current connection serve as the binding.
+         *
+         * @param statement the statement whose associated connection to
+         *                  determine
+         * @return the physical connection of the statement
+         */
+        private Connection associatedConnectionOf(PreparedStatement statement) {
+            try {
+                return statement.getConnection();
+            } catch (SQLException x) {
+                return currentPhysicalConnection();
+            }
+        }
+
+        /**
+         * Returns the physical connection this statement was prepared on.
+         * @return the connection associated with the statement
+         */
+        public Connection getAssociatedConnection() {
+            return associatedConnection;
         }
 
         @Override
