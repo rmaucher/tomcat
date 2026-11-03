@@ -16,6 +16,10 @@
  */
 package org.apache.tomcat.jdbc.pool.interceptor;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
@@ -66,8 +70,232 @@ import org.apache.tomcat.jdbc.pool.JdbcInterceptor;
  * borrow retries, and closing a pool that never got published must
  * release the name's broadcaster and failure-report bookkeeping along
  * with the slot.</p>
+ * <p>
+ * The release of a name is decided atomically but runs as a later step,
+ * so it must neither tear down a registration that a newly started
+ * same-named pool has taken over, nor stop at anything but the ObjectName
+ * the registration was published under: the registry records the name its
+ * owner registered, and a release that finds a live pool other than the
+ * releasing one under the name leaves the whole name with that pool.</p>
+ * <p>
+ * The notifications themselves must also be deliverable beyond this
+ * JVM: {@code Notification} marshals its source, so the source has to be
+ * serializable - the ObjectName the MBean is registered under, or, when
+ * that name cannot be formed, a string of its shape - or a client behind
+ * a JMX connector never receives the notification at all.</p>
  */
 class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
+
+    /*
+     * The delivery a serialized client sees: javax.management.Notification
+     * writes its source into the stream, so this fails over a source that
+     * is not serializable - exactly what marshalling the notification over
+     * a JMX connector does.
+     */
+    private static Notification roundTrip(Notification notification) throws Exception {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(notification);
+        }
+        try (ObjectInputStream in =
+                new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            return (Notification) in.readObject();
+        }
+    }
+
+    /*
+     * The notification under test is the one a slow query raises, so the
+     * query that must notify has to really run long: the pools here are
+     * configured with a threshold of zero - a negative threshold records
+     * every query as measured and never reports one as slow - and the
+     * query is made slow for a wall-clock reason: the database itself
+     * waits SLOW_WAIT_MILLIS while the WHERE clause is evaluated
+     * (java.lang.Thread.sleep exposed to SQL by an alias), holding the
+     * client's execute() open for at least that long on any hardware.
+     * A CPU-heavy query would scale with the machine; the wait does not.
+     */
+    private static final long SLOW_WAIT_MILLIS = 60;
+
+    /*
+     * The SQL of a query that reports itself under the "SELECT marker"
+     * name the assertions look for, while waiting inside the database.
+     * The alias is registered once per database; IF NOT EXISTS keeps
+     * every call cheap.
+     */
+    private String slowSql(int marker) throws SQLException {
+        try (Connection admin = adminConnection();
+                Statement st = admin.createStatement()) {
+            st.execute("CREATE ALIAS IF NOT EXISTS SLOW_SLEEP FOR "
+                    + "\"java.lang.Thread.sleep(long)\"");
+        }
+        return "SELECT " + marker + " FROM SYSTEM_RANGE(1,1) WHERE SLOW_SLEEP("
+                + SLOW_WAIT_MILLIS + ") IS NULL";
+    }
+
+    @Test
+    void notificationOfEveryConnectionSurvivesSerializationWithItsSource() throws Exception {
+        String poolName = "JmxNotifySource-" + System.nanoTime();
+        DataSource ds = newDataSource();
+        ds.setName(poolName);
+        ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
+                + "(notifyPool=false,threshold=0)");
+        ds.getPoolProperties().setMaxActive(2);
+        ds.getPoolProperties().setInitialSize(0);
+
+        List<Notification> received = new CopyOnWriteArrayList<>();
+        NotificationListener listener = (notification, handback) -> received.add(notification);
+
+        // two concurrent borrows with no pre-created connections means two
+        // physical connections, hence two interceptor instances, and only
+        // one of them can own the MBean registration. The raw notifications
+        // are captured from the emitter itself: a listener attached through
+        // the MBean server could not observe the defect here, because the
+        // JDK replaces the source with the ObjectName exactly and only when
+        // it is the registered instance - and a connector client behind
+        // that path would silently miss every notification an instance
+        // other than the registration owner sent
+        try (Connection first = ds.getConnection();
+                Connection second = ds.getConnection()) {
+            Assertions.assertEquals(2, ds.getNumActive());
+            interceptorOf(first, SlowQueryReportJmx.class)
+                    .addNotificationListener(listener, null, null);
+            try (Statement st1 = first.createStatement();
+                    Statement st2 = second.createStatement()) {
+                st1.execute(slowSql(1));
+                st2.execute(slowSql(2));
+            }
+        }
+
+        List<String> messages = received.stream().map(Notification::getMessage)
+                .collect(Collectors.toList());
+        Assertions.assertEquals(2, messages.size(),
+                "every slow query of every connection must notify, received: " + messages);
+        for (Notification notification : received) {
+            Notification deserialized = roundTrip(notification);
+            Assertions.assertEquals(notification.getType(), deserialized.getType(),
+                    "the type must survive the delivery a serialized client sees");
+            Assertions.assertEquals(notification.getMessage(), deserialized.getMessage(),
+                    "the message must survive that delivery");
+            Assertions.assertEquals(notification.getSequenceNumber(),
+                    deserialized.getSequenceNumber(),
+                    "the sequence number must survive that delivery");
+            Assertions.assertEquals(notification.getSource(), deserialized.getSource(),
+                    "the source must survive that delivery naming the same pool");
+        }
+    }
+
+    @Test
+    void notificationSourceNamesTheRegisteredMBean() throws Exception {
+        String poolName = "JmxSourceOname-" + System.nanoTime();
+        DataSource ds = newDataSource();
+        ds.setName(poolName);
+        ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
+                + "(notifyPool=false,threshold=0)");
+        ds.getPoolProperties().setInitialSize(0);
+
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        ObjectName oname = new ObjectName("tomcat.jdbc:type="
+                + SlowQueryReportJmx.class.getName() + ",name=" + poolName);
+        List<Notification> received = new CopyOnWriteArrayList<>();
+        NotificationListener listener = (notification, handback) -> received.add(notification);
+
+        try (Connection con = ds.getConnection()) {
+            Assertions.assertTrue(server.isRegistered(oname),
+                    "the interceptor MBean must be registered once the pool is in use");
+            interceptorOf(con, SlowQueryReportJmx.class)
+                    .addNotificationListener(listener, null, null);
+            try (Statement st = con.createStatement()) {
+                st.execute(slowSql(1));
+            }
+        }
+
+        Assertions.assertEquals(1, received.size(), "the query must have notified");
+        Assertions.assertEquals(oname, received.get(0).getSource(),
+                "the source must be the ObjectName the MBean is registered under: it is what"
+                        + " a client behind a connector reads, and the only serializable name"
+                        + " this MBean can send - it must come from the name the registration"
+                        + " was published under, not from the emitting instance");
+        Assertions.assertEquals(oname, roundTrip(received.get(0)).getSource(),
+                "and the notification must be deliverable to a serialized client");
+    }
+
+    @Test
+    void notificationSourceHonoursTheConfiguredObjectNameOverride() throws Exception {
+        String poolName = "JmxSourceOverride-" + System.nanoTime();
+        // the grammar of jdbcInterceptors keeps everything after the first
+        // '=' as the property value, so an objectName without a comma is
+        // configurable; a comma-starved multi-property name cannot be,
+        // which is why this override carries a single key property
+        String customName = "tomcat.jdbc:type=SlowQueryOverride_" + System.nanoTime();
+        DataSource ds = newDataSource();
+        ds.setName(poolName);
+        ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
+                + "(notifyPool=false,threshold=0,objectName=" + customName + ")");
+        ds.getPoolProperties().setInitialSize(0);
+
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        ObjectName customOname = new ObjectName(customName);
+        List<Notification> received = new CopyOnWriteArrayList<>();
+        NotificationListener listener = (notification, handback) -> received.add(notification);
+
+        try (Connection con = ds.getConnection()) {
+            Assertions.assertTrue(server.isRegistered(customOname),
+                    "the objectName attribute must decide the name the MBean registers under");
+            interceptorOf(con, SlowQueryReportJmx.class)
+                    .addNotificationListener(listener, null, null);
+            try (Statement st = con.createStatement()) {
+                st.execute(slowSql(1));
+            }
+        }
+
+        Assertions.assertEquals(1, received.size(), "the query must have notified");
+        Assertions.assertEquals(customOname, received.get(0).getSource(),
+                "the source must name the MBean by the configured override it was"
+                        + " registered under, not by the default shape or the instance");
+    }
+
+    @Test
+    void notificationSourceFallsBackToAStringWhenTheObjectNameCannotBeFormed() throws Exception {
+        // a pool name containing a colon cannot be quoted into the
+        // ObjectName the registration would use: registerJmx fails, the
+        // MBean is never registered - so no listener reached through a
+        // connector can exist for it - while local listeners must still
+        // get a source that names the pool and survives serialization
+        String poolName = "JmxSourceMalformed-" + System.nanoTime() + ":x";
+        DataSource ds = newDataSource();
+        ds.setName(poolName);
+        ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
+                + "(notifyPool=false,threshold=0)");
+        ds.getPoolProperties().setInitialSize(0);
+
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        List<Notification> received = new CopyOnWriteArrayList<>();
+        NotificationListener listener = (notification, handback) -> received.add(notification);
+
+        try (Connection con = ds.getConnection()) {
+            Assertions.assertTrue(server.queryNames(new ObjectName("tomcat.jdbc:type="
+                    + SlowQueryReportJmx.class.getName() + ",*"), null).isEmpty(),
+                    "no interceptor MBean may be registered while the name cannot be formed");
+            interceptorOf(con, SlowQueryReportJmx.class)
+                    .addNotificationListener(listener, null, null);
+            try (Statement st = con.createStatement()) {
+                st.execute(slowSql(1));
+            }
+        }
+
+        Assertions.assertEquals(1, received.size(),
+                "an unregistrable pool must still notify its local listeners");
+        Object source = received.get(0).getSource();
+        Assertions.assertInstanceOf(String.class, source,
+                "the source must be a string when no ObjectName can be formed, was "
+                        + (source == null ? "null" : source.getClass().getName()));
+        Assertions.assertEquals("tomcat.jdbc:type=" + SlowQueryReportJmx.class.getName()
+                + ",name=" + poolName, source,
+                "the string must read like the shape of the name the MBean would have"
+                        + " been registered under");
+        Assertions.assertEquals(source, roundTrip(received.get(0)).getSource(),
+                "and it must survive the delivery a serialized client sees");
+    }
 
     @Test
     void notifyPoolFalseDeliversNotificationsOfEveryConnection() throws Exception {
@@ -75,7 +303,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         DataSource ds = newDataSource();
         ds.setName(poolName);
         ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
-                + "(notifyPool=false,threshold=-1)");
+                + "(notifyPool=false,threshold=0)");
         ds.getPoolProperties().setMaxActive(2);
         ds.getPoolProperties().setInitialSize(0);
 
@@ -96,8 +324,8 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
                 Assertions.assertEquals(2, ds.getNumActive());
                 try (Statement st1 = first.createStatement();
                         Statement st2 = second.createStatement()) {
-                    st1.execute("SELECT 1");
-                    st2.execute("SELECT 2");
+                    st1.execute(slowSql(1));
+                    st2.execute(slowSql(2));
                 }
             }
             server.removeNotificationListener(oname, listener);
@@ -120,7 +348,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         DataSource ds = newDataSource();
         ds.setName(poolName);
         ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
-                + "(notifyPool=false,threshold=-1)");
+                + "(notifyPool=false,threshold=0)");
         ds.getPoolProperties().setMaxActive(2);
         ds.getPoolProperties().setInitialSize(0);
         ds.getPoolProperties().setMaxIdle(1);
@@ -149,8 +377,8 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             server.addNotificationListener(oname, listener, null, null);
             try (Statement st1 = ownerConnection.createStatement();
                     Statement st2 = otherConnection.createStatement()) {
-                st1.execute("SELECT 1");
-                st2.execute("SELECT 2");
+                st1.execute(slowSql(1));
+                st2.execute(slowSql(2));
             }
 
             // return the non-owning connection first so it stays within
@@ -170,7 +398,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             // listener that was attached before the eviction
             try (Connection survivor = ds.getConnection();
                     Statement st = survivor.createStatement()) {
-                st.execute("SELECT 3");
+                st.execute(slowSql(3));
             }
 
             List<String> messages = received.stream().map(Notification::getMessage)
@@ -198,7 +426,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         DataSource ds = newDataSource();
         ds.setName(poolName);
         ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
-                + "(notifyPool=false,threshold=-1)");
+                + "(notifyPool=false,threshold=0)");
         ds.getPoolProperties().setInitialSize(0);
 
         MBeanServer server = ManagementFactory.getPlatformMBeanServer();
@@ -224,17 +452,25 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
                 Assertions.assertSame(SlowQueryReportJmx.mbeans.get(poolName),
                         interceptorOf(next, SlowQueryReportJmx.class),
                         "the borrowing connection's interceptor instance must take over the slot");
+                Assertions.assertEquals(oname, interceptorOf(next, SlowQueryReportJmx.class).registeredUnder,
+                        "the taking-over registration must record the ObjectName it was"
+                                + " published under, so its release unregisters exactly that");
             }
         }
     }
 
     /* A live pool that reports every query through the JMX interceptor under the given name. */
     private DataSource reportingPoolNamed(String name) {
+        return reportingPoolNamed(name, "org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
+                + "(notifyPool=false,threshold=0)");
+    }
+
+    /* A live pool whose reporting interceptor is configured by the given string. */
+    private DataSource reportingPoolNamed(String name, String interceptorConfig) {
         DataSource ds = newDataSource(); // jmxEnabled=false removes the
         // pools' own ObjectName clash; the interceptor registers by name
         ds.getPoolProperties().setName(name);
-        ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
-                + "(notifyPool=false,threshold=-1)");
+        ds.setJdbcInterceptors(interceptorConfig);
         ds.getPoolProperties().setInitialSize(0);
         return ds;
     }
@@ -263,9 +499,9 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             server.addNotificationListener(oname, listener, null, null);
 
             try (Statement st = survivorConnection.createStatement()) {
-                st.execute("SELECT 1");
+                st.execute(slowSql(1));
             }
-            Assertions.assertTrue(received.stream().anyMatch(n -> "SELECT 1".equals(n.getMessage())),
+            Assertions.assertTrue(received.stream().anyMatch(n -> n.getMessage().contains("SELECT 1")),
                     "while both pools are live, the sharing pool's queries must reach the "
                             + "listener attached to the owning pool's MBean, received: " + received);
 
@@ -277,9 +513,9 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             awaitSessions(1); // the owner pool's physical session is really gone
 
             try (Statement st = survivorConnection.createStatement()) {
-                st.execute("SELECT 2");
+                st.execute(slowSql(2));
             }
-            Assertions.assertTrue(received.stream().anyMatch(n -> "SELECT 2".equals(n.getMessage())),
+            Assertions.assertTrue(received.stream().anyMatch(n -> n.getMessage().contains("SELECT 2")),
                     "a query of the surviving pool must still reach the listener that "
                             + "subscribed before the other same-named pool closed, received: "
                             + received);
@@ -323,9 +559,9 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         // twice on one pool; each connection's chain then holds two
         // instances of it, only one of which can win the registration
         ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
-                + "(notifyPool=false,threshold=-1);"
+                + "(notifyPool=false,threshold=0);"
                 + "org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
-                + "(notifyPool=false,threshold=-1)");
+                + "(notifyPool=false,threshold=0)");
         ds.getPoolProperties().setInitialSize(0);
 
         MBeanServer server = ManagementFactory.getPlatformMBeanServer();
@@ -358,7 +594,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             Assertions.assertTrue(ownerIsFromThisChain,
                     "the registration must be owned by one of the pool's own instances");
 
-            st.execute("SELECT 1");
+            st.execute(slowSql(1));
         }
 
         // both instances of the chain see the one query; both must notify
@@ -402,7 +638,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         DataSource ds = newDataSource();
         ds.setName(poolName);
         ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
-                + "(notifyPool=false,threshold=-1)");
+                + "(notifyPool=false,threshold=0)");
         ds.getPoolProperties().setInitialSize(0);
 
         MBeanServer server = ManagementFactory.getPlatformMBeanServer();
@@ -412,7 +648,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         Obstacle obstacle = new Obstacle();
         server.registerMBean(obstacle, oname);
         try {
-            try (Connection first = ds.getConnection()) {
+            try (@SuppressWarnings("unused") Connection first = ds.getConnection()) {
                 // The borrow tried to publish and the MBeanServer refused
                 // it: the name was taken outside the per-name registry, so
                 // registry and MBeanServer now disagree.
@@ -485,8 +721,8 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             // later borrows keep retrying behind the freed slot: still
             // refused (the obstacle holds the name), still no latch, and the
             // identical marker keeps their logging throttled
-            try (Connection second = refusingPool.getConnection();
-                    Connection third = refusingPool.getConnection()) {
+            try (@SuppressWarnings("unused") Connection second = refusingPool.getConnection();
+                    @SuppressWarnings("unused") Connection third = refusingPool.getConnection()) {
                 Assertions.assertNull(SlowQueryReportJmx.mbeans.get(poolName),
                         "retried refusals must keep leaving the slot free for the next borrow");
                 Assertions.assertEquals(oname, SlowQueryReportJmx.registrationFailuresLogged.get(poolName),
@@ -499,7 +735,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
                 // must release together with the name even though no MBean
                 // registration of this pool ever succeeded
                 try (Statement st = first.createStatement()) {
-                    st.execute("SELECT 1");
+                    st.execute(slowSql(1));
                 }
                 Assertions.assertNotNull(SlowQueryReportJmx.notifiers.get(poolName),
                         "reporting a query must have created the name's broadcaster");
@@ -525,7 +761,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             // and publishes cleanly - success marks nothing in the throttle
             server.unregisterMBean(oname);
             DataSource revivedPool = reportingPoolNamed(poolName);
-            try (Connection borrowed = revivedPool.getConnection()) {
+            try (@SuppressWarnings("unused") Connection borrowed = revivedPool.getConnection()) {
                 Assertions.assertTrue(server.isRegistered(oname),
                         "the first borrow of a pool started after the obstacle is gone"
                                 + " must publish the MBean");
@@ -614,12 +850,167 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         // merely flagged: a pool restarted under the freed name must be able
         // to re-register, and must release the name again when it closes
         DataSource restarted = reportingPoolNamed(poolName);
-        try (Connection borrowed = restarted.getConnection()) {
+        try (@SuppressWarnings("unused") Connection borrowed = restarted.getConnection()) {
             Assertions.assertTrue(server.isRegistered(oname),
                     "a pool started under the concurrently freed name must re-register the MBean");
         }
         restarted.close();
         Assertions.assertFalse(server.isRegistered(oname),
                 "closing the restarted pool must release the registration again");
+    }
+
+    @Test
+    void theLastReleaseOfTheNameUnregistersTheNameTheRegistrationWasPublishedUnder() throws Exception {
+        String poolName = "JmxOnameOwner-" + System.nanoTime();
+        // the grammar of jdbcInterceptors keeps everything after the first
+        // '=' as the property value, so - as in the override test above -
+        // this single-key-property objectName is configurable
+        String customName = "tomcat.jdbc:type=SlowQueryReleased_" + System.nanoTime();
+        DataSource publishingPool = reportingPoolNamed(poolName,
+                "org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
+                        + "(notifyPool=false,threshold=0,objectName=" + customName + ")");
+        DataSource releasingPool = reportingPoolNamed(poolName);
+
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        ObjectName customOname = new ObjectName(customName);
+        ObjectName defaultOname = new ObjectName("tomcat.jdbc:type="
+                + SlowQueryReportJmx.class.getName() + ",name=" + poolName);
+        try {
+            // the publishing pool's first borrow takes the per-name registry
+            // slot and publishes the MBean under its configured override
+            try (@SuppressWarnings("unused") Connection borrowing = publishingPool.getConnection()) {
+                Assertions.assertTrue(server.isRegistered(customOname),
+                        "the publishing pool's borrow must publish under the configured override");
+            }
+
+            // the sharing pool's instances would name the default ObjectName,
+            // but they never publish - the registry slot is taken
+            Connection sharingConnection = releasingPool.getConnection();
+            Assertions.assertFalse(server.isRegistered(defaultOname),
+                    "the sharing pool's instances must not publish a second MBean");
+            Assertions.assertTrue(server.isRegistered(customOname),
+                    "the registration both pools report through stays published");
+            sharingConnection.close();
+
+            // close the publishing pool while the sharing pool is still live:
+            // the registration stays with the survivor
+            publishingPool.close();
+            Assertions.assertTrue(server.isRegistered(customOname),
+                    "closing one of two live pools of the same name must leave the"
+                            + " registration with the survivor");
+
+            // the survivor is the last live pool of the name; its close
+            // delivers the release on a fresh instance of its own interceptor
+            // definition - a definition that computes the default ObjectName
+            // and published nothing. The release must unregister the ObjectName
+            // the registration was published under, not the one the releasing
+            // instance happens to compute
+            releasingPool.close();
+            Assertions.assertFalse(server.isRegistered(customOname),
+                    "the last close of the name must unregister the ObjectName the"
+                            + " registration was actually published under - the other"
+                            + " pool's configured override - instead of giving up on a"
+                            + " name this pool's own definition computes but never"
+                            + " registered, which leaks the published MBean for ever");
+            Assertions.assertFalse(server.isRegistered(defaultOname),
+                    "and no registration may linger under the default shape either");
+            Assertions.assertNull(SlowQueryReportJmx.mbeans.get(poolName),
+                    "the per-name registry slot must be released");
+        } finally {
+            for (ObjectName candidate : new ObjectName[] { customOname, defaultOname }) {
+                try {
+                    server.unregisterMBean(candidate);
+                } catch (InstanceNotFoundException ignore) {
+                    // nothing registered left to clean up under this name
+                }
+            }
+        }
+    }
+
+    @Test
+    void aLateNameReleaseLeavesAPoolThatTookTheNameOverUntouched() throws Exception {
+        String poolName = "JmxLateRelease-" + System.nanoTime();
+        DataSource oldPool = reportingPoolNamed(poolName);
+
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        ObjectName oname = new ObjectName("tomcat.jdbc:type="
+                + SlowQueryReportJmx.class.getName() + ",name=" + poolName);
+        List<Notification> received = new CopyOnWriteArrayList<>();
+        NotificationListener listener = (notification, handback) -> received.add(notification);
+        try {
+            // the old pool's first borrow publishes the MBean under the name,
+            // a slow query creates the name's broadcaster, and a client
+            // attaches its listener through the registration
+            Connection oldConnection = oldPool.getConnection();
+            SlowQueryReportJmx oldOwner = interceptorOf(oldConnection, SlowQueryReportJmx.class);
+            try (Statement st = oldConnection.createStatement()) {
+                server.addNotificationListener(oname, listener, null, null);
+                st.execute(slowSql(1));
+            }
+            oldConnection.close();
+            Assertions.assertTrue(server.isRegistered(oname),
+                    "the old pool's registration must be published under the name");
+
+            // The old pool's close now decides that it was the last live pool
+            // of the name - exactly the decision SlowQueryReport.poolClosed
+            // takes through releaseStatistics - but the release that follows
+            // the decision has not run yet. That is the state a pool starting
+            // under the name can catch the closing pool in; the window inside
+            // one close call is a thread race that no test can force
+            // deterministically, so the test drives the two decided steps
+            // apart, in the order the race leaves them.
+            Assertions.assertTrue(SlowQueryReport.releaseStatistics(oldPool.getPool()),
+                    "the test's premise: the old pool must have been the last live pool of the name");
+
+            // meanwhile a new pool starts under the name, takes the statistics
+            // back and adopts the still-published registration the way a
+            // same-named sharing pool adopts it; its queries reach the client's
+            // listener through it
+            DataSource newPool = reportingPoolNamed(poolName);
+            try (Connection newConnection = newPool.getConnection();
+                    Statement st = newConnection.createStatement()) {
+                st.execute(slowSql(2));
+                Assertions.assertTrue(received.stream().anyMatch(n -> n.getMessage().contains("SELECT 2")),
+                        "the new pool's queries must reach the listener through the"
+                                + " registration it adopted, received: " + received);
+
+                // the old close now gets to its release, completing the
+                // decided statistics release the way poolClosed does
+                SlowQueryReportJmx lateRelease = new SlowQueryReportJmx();
+                lateRelease.poolName = poolName;
+                lateRelease.releaseJmxRegistration(oldPool.getPool());
+
+                // the name was claimed back before the release ran: the new
+                // pool owns everything registered under it now
+                Assertions.assertTrue(server.isRegistered(oname),
+                        "a release that finds the name taken back by a live pool must"
+                                + " not unregister the MBean the new pool reports through");
+                Assertions.assertSame(SlowQueryReportJmx.mbeans.get(poolName), oldOwner,
+                        "the registry must still hold the registration the new pool adopted");
+                Assertions.assertNotNull(SlowQueryReportJmx.notifiers.get(poolName),
+                        "the broadcaster the new pool's clients are attached to must stay in place");
+
+                st.execute(slowSql(3));
+                Assertions.assertTrue(received.stream().anyMatch(n -> n.getMessage().contains("SELECT 3")),
+                        "the client's listener must still receive the new pool's"
+                                + " notifications after the old pool's late release,"
+                                + " received: " + received);
+            }
+
+            // and the taken-over name stays releasable by its last live pool
+            newPool.close();
+            Assertions.assertFalse(server.isRegistered(oname),
+                    "the last live pool of a taken-over name must still release the registration");
+            Assertions.assertNull(SlowQueryReportJmx.mbeans.get(poolName),
+                    "the registry slot of the taken-over name must be released");
+            Assertions.assertNull(SlowQueryReportJmx.notifiers.get(poolName),
+                    "the broadcaster of the taken-over name must be released");
+        } finally {
+            try {
+                server.removeNotificationListener(oname, listener);
+            } catch (ListenerNotFoundException | InstanceNotFoundException ignore) {
+                // the teardown under test may already have dropped the binding
+            }
+        }
     }
 }

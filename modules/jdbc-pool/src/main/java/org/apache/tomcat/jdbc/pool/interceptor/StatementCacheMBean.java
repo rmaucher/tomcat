@@ -22,33 +22,46 @@ package org.apache.tomcat.jdbc.pool.interceptor;
 public interface StatementCacheMBean {
     /**
      * Checks if prepared statements are being cached.
+     *
      * @return true if prepared statement caching is enabled
      */
     boolean isCachePrepared();
+
     /**
      * Checks if callable statements are being cached.
+     *
      * @return true if callable statement caching is enabled
      */
     boolean isCacheCallable();
+
     /**
      * Returns the maximum size of the statement cache.
+     *
      * @return maximum cache size
      */
     int getMaxCacheSize();
+
     /**
-     * Returns the number of statements currently held in the statement
-     * cache, counted across all connections that belong to the same
-     * connection pool - the value the {@code max} limit is compared
-     * against. The number is a snapshot of the pool's accounting at the
-     * moment of the read; it is not a handle that can be used to change
-     * that accounting.
-     * @return the number of cached statements, or {@code -1} if this
-     *         interceptor instance is not bound to a pooled connection
+     * Returns the number of statements currently held in the statement cache, counted across all connections that
+     * belong to the same connection pool - the value the {@code max} limit is compared against. The number is a
+     * snapshot of the pool's accounting at the moment of the read; it is not a handle that can be used to change that
+     * accounting.
+     *
+     * @return the number of cached statements, or {@code -1} if this interceptor instance is not bound to a pooled
+     *             connection
      */
     int getCacheSize();
+
     /**
-     * Returns the cache size for the current connection.
-     * @return number of cached statements for this connection
+     * Returns the cache size for the current connection: the statements parked
+     * in this connection's cache. Parked statements are physically open until
+     * the cache is disposed, so this is not the number of statements ready to
+     * run. A read against an interceptor that is not bound to a pooled
+     * connection, for instance one made while a disposal is in progress, is
+     * answered quietly rather than logged.
+     *
+     * @return number of cached statements for this connection, or {@code 0} if
+     *             this interceptor instance is not bound to a pooled connection
      */
     int getCacheSizePerConnection();
 }

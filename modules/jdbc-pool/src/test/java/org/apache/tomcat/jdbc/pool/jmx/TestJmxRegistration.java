@@ -21,9 +21,17 @@ import java.lang.reflect.Field;
 import java.sql.Connection;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
+import javax.management.InstanceAlreadyExistsException;
+import javax.management.MBeanRegistration;
 import javax.management.MBeanServer;
 import javax.management.MalformedObjectNameException;
+import javax.management.Notification;
+import javax.management.NotificationListener;
 import javax.management.ObjectName;
 
 import org.junit.jupiter.api.Assertions;
@@ -52,10 +60,22 @@ import org.apache.tomcat.jdbc.pool.interceptor.StatementCache;
  * perfectly well.</p>
  * <p>
  * The contract the first tests pin is that the returned name is this call's own
- * publish, or nothing at all. The last two drive that through a real pool: a
+ * publish, or nothing at all. The last five drive that through a real pool: a
  * {@code StatementCache} whose name is taken must leave the MBean that owns the
  * name registered when its connection is discarded, and it must publish itself
- * at the next borrow once the obstacle is gone.</p>
+ * at the next borrow once the obstacle is gone; the {@code DataSource} one
+ * level up must keep the same books for the pool MBean it publishes, whose
+ * handle it releases at {@code close()}, at the container's
+ * {@code postDeregister()}, and at a registration the MBean server failed -
+ * which, running no {@code postDeregister()} at all, leaves
+ * {@code postRegister(false)} as the only hook that could ever release the
+ * pool's publication.</p>
+ * <p>
+ * The last test steps from what the helper reports to what the pool MBean
+ * itself remembers of its registration: the container writes that name on its
+ * own thread, while the pool raises its notifications on the threads that
+ * borrow, return and clean up connections, so the write has to become visible
+ * to those threads before their notifications can carry the published name.</p>
  */
 class TestJmxRegistration extends JdbcPoolBaseTest {
 
@@ -73,13 +93,59 @@ class TestJmxRegistration extends JdbcPoolBaseTest {
     public static class Probe implements ProbeMBean {
         private final String marker;
 
-        public Probe(String marker) {
+        Probe(String marker) {
             this.marker = marker;
         }
 
         @Override
         public String getMarker() {
             return marker;
+        }
+    }
+
+    /*
+     * A modeler-style wrapper of the kind a container registers in place of a
+     * DataSource. The DataSource is not itself a JMX compliant MBean, so the
+     * MBean server only ever sees a wrapper, and the wrapper forwards all four
+     * registration callbacks to the resource it manages - which is what the
+     * modeler's BaseModelMBean does. This is what lets the server, rather than
+     * a test, drive a DataSource through a registration it is about to fail.
+     */
+    public interface ContainerMBean {
+        String getMarker();
+    }
+
+    public static class Container implements ContainerMBean, MBeanRegistration {
+        private final DataSource ds;
+
+        Container(DataSource ds) {
+            this.ds = ds;
+        }
+
+        @Override
+        public String getMarker() {
+            return "container";
+        }
+
+        @Override
+        public ObjectName preRegister(MBeanServer server, ObjectName name) throws Exception {
+            ds.preRegister(server, name);
+            return name;
+        }
+
+        @Override
+        public void postRegister(Boolean registrationDone) {
+            ds.postRegister(registrationDone);
+        }
+
+        @Override
+        public void preDeregister() throws Exception {
+            ds.preDeregister();
+        }
+
+        @Override
+        public void postDeregister() {
+            ds.postDeregister();
         }
     }
 
@@ -126,6 +192,16 @@ class TestJmxRegistration extends JdbcPoolBaseTest {
         Field handle = StatementCache.class.getDeclaredField("oname");
         handle.setAccessible(true);
         return (ObjectName) handle.get(cache);
+    }
+
+    /*
+     * The pool-MBean handle a DataSource keeps for itself: the same state,
+     * read the same way, one level up.
+     */
+    private static ObjectName handleOf(DataSource ds) throws Exception {
+        Field handle = DataSource.class.getDeclaredField("oname");
+        handle.setAccessible(true);
+        return (ObjectName) handle.get(ds);
     }
 
     /*
@@ -363,6 +439,271 @@ class TestJmxRegistration extends JdbcPoolBaseTest {
             }
             ds.close();
             ds.postDeregister();
+        }
+    }
+
+    @Test
+    void aDataSourceThatWasRefusedItsPoolNameDoesNotUnregisterTheMBeanThatOwnsIt()
+            throws Exception {
+        MBeanServer server = server();
+        DataSource ds = newDataSource();
+        ds.getPoolProperties().setJmxEnabled(true);
+        ds.createPool();
+        ObjectName dsName = uniqueName("datasource");
+        // the exact name the DataSource will ask the server for: createObjectName
+        // is a deterministic mapping of the DataSource's own name, so two data
+        // sources - or a data source and the leftover of one that died without
+        // deregistering - derive the same name from the same keys
+        ObjectName foreign = ds.createObjectName(dsName);
+        server.registerMBean(new Probe("foreign"), foreign);
+        try {
+            // the container registers the DataSource, and the pool MBean the
+            // DataSource publishes from preRegister() is refused its name
+            ds.preRegister(server, dsName);
+            Assertions.assertEquals("foreign", server.getAttribute(foreign, "Marker"),
+                    "a refused publish must not have touched the MBean holding the name");
+            // read the handle before close(): close() clears whatever handle is
+            // held, so after it the read no longer says what the refusal left
+            ObjectName kept = handleOf(ds);
+
+            // the harm, on the DataSource's own lifecycle: close() and the
+            // container's postDeregister() each unregister the handle they hold
+            ds.close();
+            ds.postDeregister();
+            Assertions.assertTrue(server.isRegistered(foreign),
+                    "closing a DataSource whose pool publish was refused must leave the MBean"
+                            + " that owns that name registered: unregistering it takes the"
+                            + " management surface of a component that has done nothing wrong,"
+                            + " and does so silently");
+            Assertions.assertNull(kept,
+                    "a DataSource whose pool publish was refused must not keep the refused"
+                            + " name as its registration handle: that handle is exactly what"
+                            + " close() and postDeregister() unregister, and this data source"
+                            + " never published under it");
+        } finally {
+            if (server.isRegistered(foreign)) {
+                server.unregisterMBean(foreign);
+            }
+            ds.close();
+            ds.postDeregister();
+        }
+    }
+
+    /*
+     * Everything the pool publishes for one DataSource registration: the pool's
+     * own MBean and anything published below it. The uid is carried down from
+     * the DataSource's name into every name derived from it, so it identifies
+     * the publications of this registration and nothing else.
+     */
+    private static Set<ObjectName> publishedFor(MBeanServer server, ObjectName dsName)
+            throws Exception {
+        String uid = dsName.getKeyProperty("uid");
+        Set<ObjectName> found = new HashSet<>();
+        for (ObjectName name : poolMBeans(server)) {
+            if (uid.equals(name.getKeyProperty("uid"))) {
+                found.add(name);
+            }
+        }
+        return found;
+    }
+
+    @Test
+    void aFailedDataSourceRegistrationUnpublishesThePoolMBeanPreRegisterPublished()
+            throws Exception {
+        MBeanServer server = server();
+        DataSource ds = newDataSource();
+        ds.getPoolProperties().setJmxEnabled(true);
+        ds.getPoolProperties().setInitialSize(0);
+        ds.createPool();
+
+        // the container is about to fail registering this DataSource: its name
+        // is held by another MBean, while the pool name derived from it is free
+        // and so preRegister() does publish the pool MBean before the server
+        // notices the conflict
+        ObjectName blocked = uniqueName("failed");
+        ObjectName poolOname = ds.createObjectName(blocked);
+        server.registerMBean(new Probe("owner"), blocked);
+        try {
+            Assertions.assertFalse(server.isRegistered(poolOname));
+            Assertions.assertThrows(InstanceAlreadyExistsException.class,
+                    () -> server.registerMBean(new Container(ds), blocked));
+
+            // what the failed registration leaves behind. The server calls
+            // postRegister(FALSE) and no postDeregister() at all, and a
+            // container that could not register the DataSource will not close
+            // it either, so a pool MBean still published here is published for
+            // good: statistics and notifications of a pool nobody manages,
+            // pinning the pool, its credentials and its driver class loader
+            Assertions.assertFalse(server.isRegistered(poolOname),
+                    "a DataSource whose registration failed must unpublish the pool MBean its"
+                            + " preRegister() published: postRegister(FALSE) is the only hook"
+                            + " that ever runs for a registration that failed, so anything left"
+                            + " registered here outlives every chance to unregister it");
+            Assertions.assertTrue(publishedFor(server, blocked).isEmpty(),
+                    "nothing of a registration the server refused may stay published");
+            Assertions.assertNull(handleOf(ds),
+                    "a failed registration must leave no handle behind: it is what close()"
+                            + " and postDeregister() unregister, and there is nothing left to"
+                            + " unregister");
+            Assertions.assertEquals("owner", server.getAttribute(blocked, "Marker"),
+                    "the cleanup must have released only the pool's own publication");
+
+            // the container gives up on the DataSource and closes it: the
+            // close's own release must ride over the cleanup that already ran
+            ds.close();
+            ds.postDeregister();
+            Assertions.assertTrue(publishedFor(server, blocked).isEmpty(),
+                    "closing a DataSource whose registration failed must publish nothing"
+                            + " retroactively");
+            Assertions.assertEquals("owner", server.getAttribute(blocked, "Marker"),
+                    "a DataSource whose registration was cleaned up must not take the name"
+                            + " the registration failed against when it is later closed");
+        } finally {
+            if (server.isRegistered(blocked)) {
+                server.unregisterMBean(blocked);
+            }
+            ds.close();
+            ds.postDeregister();
+            // test hygiene: take away anything a broken build left published
+            for (ObjectName stale : publishedFor(server, blocked)) {
+                server.unregisterMBean(stale);
+            }
+        }
+    }
+
+    @Test
+    void aSurvivingDataSourcePublishesItsPoolAtTheNextSuccessfulRegistration()
+            throws Exception {
+        MBeanServer server = server();
+        DataSource ds = newDataSource();
+        ds.getPoolProperties().setJmxEnabled(true);
+        ds.getPoolProperties().setInitialSize(0);
+        ds.createPool();
+
+        ObjectName blocked = uniqueName("rebound");
+        ObjectName fresh = uniqueName("rebound-ok");
+        server.registerMBean(new Probe("owner"), blocked);
+        try {
+            Assertions.assertThrows(InstanceAlreadyExistsException.class,
+                    () -> server.registerMBean(new Container(ds), blocked));
+
+            // the failed attempt must not have made the DataSource unmanageable
+            // for good: the same DataSource registered under a free name
+            // publishes its pool, and a cleanup that also ran on a registration
+            // the server accepted would take that publication away again
+            server.registerMBean(new Container(ds), fresh);
+            ObjectName poolOname = ds.createObjectName(fresh);
+            Assertions.assertTrue(server.isRegistered(poolOname),
+                    "a DataSource that survived a failed registration must publish its pool"
+                            + " MBean at the next successful registration");
+            Assertions.assertEquals(poolOname, handleOf(ds),
+                    "the handle kept after a successful registration must be the name the pool"
+                            + " MBean is published under");
+            Assertions.assertEquals(0,
+                    ((Number) server.getAttribute(poolOname, "NumIdle")).longValue(),
+                    "the published pool must answer for the live pool");
+
+            // the container stops the DataSource: the same lifecycle releases
+            // the publication as always, and nothing survives it
+            server.unregisterMBean(fresh);
+            Assertions.assertFalse(server.isRegistered(poolOname),
+                    "a DataSource unregistered by its container must take its pool MBean with"
+                            + " it, after an earlier registration of the same DataSource"
+                            + " failed");
+            Assertions.assertNull(handleOf(ds),
+                    "the deregistration must drop the handle as it always does");
+            Assertions.assertTrue(publishedFor(server, fresh).isEmpty(),
+                    "the pool must publish nothing once its registration has been released");
+        } finally {
+            if (server.isRegistered(fresh)) {
+                server.unregisterMBean(fresh);
+            }
+            if (server.isRegistered(blocked)) {
+                server.unregisterMBean(blocked);
+            }
+            ds.close();
+            ds.postDeregister();
+            // test hygiene: the first, failed registration's publication loses
+            // its handle under the second one, so a broken build would leave it
+            // with no owner at all - take away anything that is still published
+            for (ObjectName stale : publishedFor(server, blocked)) {
+                server.unregisterMBean(stale);
+            }
+        }
+    }
+
+    @Test
+    void aPoolThreadRaisesItsNotificationUnderTheNameTheRegistrationPublished() throws Exception {
+        MBeanServer server = server();
+        DataSource ds = newDataSource();
+        ds.getPoolProperties().setJmxEnabled(true);
+        ds.getPoolProperties().setInitialSize(0);
+        ds.createPool();
+        ConnectionPool jmx = ds.getPool().getJmxPool();
+        Assertions.assertNotNull(jmx, "an enabled pool has a JMX wrapper");
+        Assertions.assertNull(jmx.getObjectName(), "this pool is not registered yet");
+
+        BlockingQueue<Notification> delivered = new LinkedBlockingQueue<>();
+        NotificationListener listener = (n, handback) -> delivered.offer(n);
+        jmx.addListener(listener);
+
+        // A thread of the pool's kind, already running while the container
+        // publishes the pool: the pool raises its notifications on exactly
+        // such threads - the ones that borrow, return and clean up connections
+        // - while the registration handle is written on the thread the MBean
+        // server called preRegister() on. Nothing here may order the read
+        // after the write by thread handoff, since start() and join() alone
+        // would give the write a happens-before edge and hide the visibility
+        // problem this pins; the worker therefore waits by re-reading the
+        // handle, which on a correct build stops as soon as the registration
+        // lands - a bound on the wait, not a stress attempt.
+        AtomicReference<ObjectName> observed = new AtomicReference<>();
+        Thread poolThread = new Thread(() -> {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            ObjectName name;
+            while ((name = jmx.getObjectName()) == null && System.nanoTime() < deadline) {
+                Thread.yield();
+            }
+            if (name != null) {
+                jmx.notify(ConnectionPool.POOL_EMPTY,
+                        "reported by a pool thread once it saw the registration");
+                observed.set(name);
+            }
+        }, "test-pool-thread-before-registration");
+        poolThread.setDaemon(true);
+        poolThread.start();
+
+        ObjectName dsName = uniqueName("notify-thread");
+        ObjectName poolOname = null;
+        try {
+            // the container's registration, on this test's thread: the MBean
+            // server calls the pool wrapper's preRegister() here synchronously
+            ds.preRegister(server, dsName);
+            poolOname = ds.createObjectName(dsName);
+
+            poolThread.join(TimeUnit.SECONDS.toMillis(60));
+            Assertions.assertEquals(poolOname, observed.get(),
+                    "a pool thread that was already running when the container registered the"
+                            + " pool must see the registered name: as long as the registration"
+                            + " never becomes visible to a thread, every notification it raises"
+                            + " keeps carrying the string fallback of an unregistered pool, even"
+                            + " long after the MBean server published the name");
+
+            Notification n = delivered.poll(30, TimeUnit.SECONDS);
+            Assertions.assertNotNull(n, "the pool thread handed its notification off for delivery");
+            Assertions.assertEquals(poolOname, n.getSource(),
+                    "a notification raised on a pool thread must be stamped with the name the"
+                            + " MBean server published the pool under, not with the fallback of"
+                            + " a pool that was never registered");
+        } finally {
+            jmx.removeListener(listener);
+            ds.close();
+            ds.postDeregister();
+            // test hygiene: the publication is released by the close above;
+            // take away anything a regression would have left published
+            for (ObjectName stale : publishedFor(server, dsName)) {
+                server.unregisterMBean(stale);
+            }
         }
     }
 }

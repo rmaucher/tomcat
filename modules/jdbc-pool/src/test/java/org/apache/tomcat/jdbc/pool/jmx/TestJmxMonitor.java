@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 
 import org.apache.tomcat.jdbc.JdbcPoolBaseTest;
 import org.apache.tomcat.jdbc.pool.DataSource;
+import org.apache.tomcat.jdbc.pool.PoolConfiguration;
 
 /**
  * Expected JMX monitoring functionality. A container registers the
@@ -64,8 +65,11 @@ class TestJmxMonitor extends JdbcPoolBaseTest {
 
     /**
      * Publishes an already created pool the way a container does and
-     * returns the single pool MBean that appeared, or {@code null} if
-     * nothing was published.
+     * returns the pool's own MBean that appeared, or {@code null} if
+     * nothing was published. A container's registration publishes the
+     * connections the pool was already holding as well, below the pool's
+     * own name, so the added set can hold several MBeans and the pool's
+     * is the one of them that is not a connection.
      */
     private ObjectName registerAndFindPoolMBean(MBeanServer server, DataSource ds,
             ObjectName dsName) throws Exception {
@@ -73,7 +77,14 @@ class TestJmxMonitor extends JdbcPoolBaseTest {
         ds.preRegister(server, dsName);
         Set<ObjectName> added = new HashSet<>(poolMBeans(server));
         added.removeAll(before);
-        return added.isEmpty() ? null : added.iterator().next();
+        for (ObjectName name : added) {
+            // the connection MBeans repeat the pool's keys and add a
+            // "connections=PooledConnection[n]" key of their own
+            if (name.getKeyProperty("connections") == null) {
+                return name;
+            }
+        }
+        return null;
     }
 
     /** Counts the connection MBeans published below the given pool MBean. */
@@ -151,6 +162,9 @@ class TestJmxMonitor extends JdbcPoolBaseTest {
         DataSource ds = newDataSource();
         ds.getPoolProperties().setJmxEnabled(true);
         ds.getPoolProperties().setMaxActive(2);
+        // two connections the pool pre-creates at startup, so the test has
+        // physical connections it does not have to borrow
+        ds.getPoolProperties().setInitialSize(2);
         ds.createPool();
 
         ObjectName dsName = uniqueDataSourceName("connections");
@@ -158,15 +172,39 @@ class TestJmxMonitor extends JdbcPoolBaseTest {
         ObjectName poolOname = registerAndFindPoolMBean(server, ds, dsName);
         try {
             Assertions.assertNotNull(poolOname);
+
+            // Nothing borrowed yet: the pool pre-created both connections at
+            // startup - before this test's registration gave the pool its MBean
+            // name, which is what they publish below - and publishing them is
+            // the container registration's own job. Pre-fix they appeared only
+            // at a first borrow, so the pool reported its idle size with no
+            // connection MBeans behind it (Bugzilla 63705).
+            Assertions.assertEquals(2, attr(server, poolOname, "NumIdle"));
+            Assertions.assertEquals(2, connectionMBeanCount(server, poolOname),
+                    "every physical connection of an enabled pool must be published"
+                            + " whether or not it has ever been borrowed");
+
             Connection first = ds.getConnection();
             Connection second = ds.getConnection();
             Assertions.assertEquals(2, connectionMBeanCount(server, poolOname),
-                    "every physical connection in use must be published below the pool");
+                    "borrowing a published connection must not publish it a second time");
 
             first.close();
             second.close();
             Assertions.assertEquals(2, connectionMBeanCount(server, poolOname),
                     "returned connections stay published, they are still pooled");
+
+            // An expired max age makes the idle sweep reconnect every
+            // connection: the physical session is replaced, but the pooled
+            // connection and its published MBean survive.
+            ds.getPoolProperties().setMaxAge(1);
+            sleep(10); // now every connection is older than the max age
+            ds.testIdle();
+            Assertions.assertEquals(2, attr(server, poolOname, "NumIdle"),
+                    "the reconnected connections went back to the idle pool");
+            Assertions.assertEquals(2, connectionMBeanCount(server, poolOname),
+                    "a reconnect of a published connection keeps it published, with no"
+                            + " second MBean for it");
         } finally {
             ds.close(); // releases the physical connections
             ds.postDeregister();
@@ -210,6 +248,41 @@ class TestJmxMonitor extends JdbcPoolBaseTest {
             }
         } finally {
             ds.postDeregister();
+        }
+    }
+
+    @Test
+    void theJmxViewOfNullDatabasePropertiesReturnsNull() throws Exception {
+        // The MBean's db-properties getter masks the password by cloning the
+        // live store; the null store the configuration accepts (see
+        // PoolConfiguration#setDbProperties) must pass through as the null
+        // it is instead of being dereferenced by the masking clone. The pool
+        // is built with an initial size of zero, so nothing is connected.
+        DataSource ds = new DataSource();
+        PoolConfiguration props = ds.getPoolProperties();
+        props.setUrl(getUrl());
+        props.setDriverClassName("org.h2.Driver");
+        props.setUsername("sa");
+        props.setPassword("");
+        props.setJmxEnabled(false);
+        props.setInitialSize(0);
+        props.setMinIdle(0);
+        ds.createPool();
+        try {
+            ConnectionPool mbean = new ConnectionPool(ds.getPool());
+
+            props.setDbProperties(null);
+            Assertions.assertDoesNotThrow(mbean::getDbProperties);
+            Assertions.assertNull(mbean.getDbProperties(),
+                    "a configuration with no database properties has nothing to mask");
+
+            Properties live = new Properties();
+            live.setProperty("appconfigured", "yes");
+            props.setDbProperties(live);
+            Assertions.assertEquals("yes", mbean.getDbProperties().getProperty("appconfigured"),
+                    "a live store must still reach the JMX view");
+        } finally {
+            ds.close();
         }
     }
 

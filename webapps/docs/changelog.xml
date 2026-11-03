@@ -476,6 +476,21 @@
         Ensure that requests cannot try to start asynchronous processing and the
         HTTP upgrade process on the same request. (markt)
       </fix>
+      <fix>
+        Align the format of the <code>TIME_MON</code>, <code>TIME_DAY</code>,
+        <code>TIME_HOUR</code>, <code>TIME_MIN</code>, <code>TIME_SEC</code>
+        and <code>TIME</code> server variables in the rewrite valve with
+        mod_rewrite. The first five are now zero padded to two digits and
+        <code>TIME</code> is now of the form <code>yyyyMMddHHmmss</code>
+        rather than an HTTP date.
+      </fix>
+      <fix>
+        Refactor to reduce duplication and improve consistency when working with
+        resources in multi-release JAR files. Versions that include signs,
+        leading zeros or values less than 8 are no longer considered valid. All
+        types of resources, not just class files, are now handled in
+        multi-release JAR files. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Coyote">
@@ -577,7 +592,9 @@
         compliant client must treat as a connection error of type
         <code>FLOW_CONTROL_ERROR</code>. Streams that are left without an
         allocation remain in the back log and are considered again when the
-        next window increment arrives. (remm)
+        next window increment arrives. Any part of the increment left
+        unallocated by the rounding of the proportional shares is allocated to
+        the waiting streams in priority order rather than being lost. (remm)
       </fix>
       <fix>
         Permit the <code>WINDOW_UPDATE</code> and <code>RST_STREAM</code>
@@ -648,6 +665,22 @@
       <fix>
         Detect and disconnect a mis-behaving HTTP/2 client that sends large
         numbers of unexpected settings acknowledgement frames. (markt)
+      </fix>
+      <fix>
+        Fix excessive CPU usage after a client half-closes an upgraded
+        connection while the application keeps the output stream open to finish
+        its response. Stop polling for input at end of stream and ensure that a
+        subsequent <code>WebConnection.close()</code> closes the connection.
+        (markt)
+      </fix>
+      <fix>
+        Fix rejection of large HTTP/2 response headers that fit within a frame
+        after HPACK compression. Allow the encoding workspace to grow to the
+        larger of twice the peer's advertised maximum frame payload size and
+        the peer's dynamic table capacity, so indexed fields remain usable after
+        a frame size reduction. Check the encoded payload against the peer's
+        frame size limit before writing it and close the connection with an
+        <code>INTERNAL_ERROR</code> if a header block can not be written. (markt)
       </fix>
     </changelog>
   </subsection>
@@ -786,6 +819,11 @@
         keeps the parameters of each tag to itself and never touches page
         scope attributes. (remm)
       </fix>
+      <fix>
+        <code>RecordELResolver</code> no longer prevents
+        <code>BeanELResolver</code> from resolving bean-style properties (such
+        as <code>isValid()</code>) on a <code>Record</code>. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Cluster">
@@ -899,7 +937,6 @@
         recorded when a message is queued is now also the length used
         to release the accounting when the send completes. Previously,
         when a downstream interceptor like
-        <code>EncryptInterceptor</code> or
         <code>FragmentationInterceptor</code> replaced or extended the
         message payload while the message was sent, the recorded queue
         size drifted towards negative values and the
@@ -1245,6 +1282,235 @@
         constants from the interface; the notification types and the
         strings they carry on the wire are unchanged. (remm)
       </fix>
+      <fix>
+        Closing the connection pool now also terminates the asynchronous
+        borrows that were still waiting for a connection. A caller blocked in
+        the <code>get()</code> of the future that
+        <code>getConnectionAsync()</code> had returned waited forever on the
+        closed pool: a closed pool never hands another connection to the queue
+        that future waits on, and the waiter itself cannot observe the closed
+        state. The pool now cancels those outstanding polls, so their
+        <code>get()</code> reports a <code>CancellationException</code>. An
+        asynchronous borrow that races the closure is rejected with an
+        <code>SQLException</code>, like a synchronous borrow on a closed pool;
+        a borrow that had registered its waiter just before the closure ran
+        gets a future that reports that cancellation instead. (remm)
+      </fix>
+      <fix>
+        Correct a defect in the asynchronous borrow of the JDBC connection pool
+        that handed one physical connection to two users at once, silently
+        sharing a session between them. The queue delivers the connection it
+        produced to every caller of its <code>get()</code>, and the cancellation
+        of the future that <code>getConnectionAsync()</code> had returned used
+        that same delivery to retrieve the connection and close it, without
+        establishing whether a borrower had taken delivery of it. A
+        <code>cancel()</code> that landed while a borrower was receiving the
+        connection, or was still setting it up, therefore reported a successful
+        cancellation while the borrower was using that connection: it went back
+        to the pool and to the next borrower underneath its owner, or the owner
+        was handed a connection that had already been closed. The connection the
+        queue produces is now claimed once, by whichever of the borrower and the
+        cancellation gets there first. A borrower that won the claim keeps its
+        connection and <code>cancel()</code> reports that nothing was cancelled,
+        the way <code>java.util.concurrent.Future</code> reports nothing
+        cancelled once the work is done; a cancellation that won it returns the
+        connection to the pool exactly once and the future reports a
+        <code>CancellationException</code> to its callers instead of a closed
+        connection. (remm)
+      </fix>
+      <fix>
+        Make a timed-out retrieval from the JDBC pool's fair queue fail
+        terminally instead of leaving its future in a state nobody can
+        complete. (remm)
+      </fix>
+      <fix>
+        A JDBC pool validation that runs its built-in check against the
+        database now terminates a pending transaction with a rollback rather
+        than by committing it, so a health check no longer commits work the
+        application left uncommitted, and a validation whose rollback fails
+        is reported as failed so the connection is taken out of service; the
+        configured <code>commitOnReturn</code> or
+        <code>rollbackOnReturn</code> termination of a returned connection
+        now runs before the return validation that would otherwise override
+        it. (remm)
+      </fix>
+      <fix>
+        Always wrap pooled statements and their result sets in the statement
+        facade, so a statement handle kept past the end of its borrow can no
+        longer execute against the session the next borrower holds, and a
+        statement reports the pooled connection it was created from rather
+        than the driver's. Every result set those handles hand back is sealed
+        with them, whatever the method that returned it was called: a cursor
+        read through <code>getObject()</code>, the way a driver reports a REF
+        cursor or hands out a nested cursor, arrives as a handle too and
+        retires with the borrow, while <code>unwrap()</code> still reaches the
+        driver's own object. The <code>useStatementFacade</code> property that
+        could switch the facade off is deprecated and no longer has any
+        effect, but it is still accepted so existing configurations keep
+        loading. (remm)
+      </fix>
+      <add>
+        Send the JDBC 4.3 request boundary hints on the pooled connections:
+        <code>beginRequest()</code> is now called on the physical connection
+        when the pool hands it to the application and
+        <code>endRequest()</code> when the application returns it, so that a
+        driver which optimises session handling around a unit of work can do
+        so. The hints are looked up reflectively and skipped on a Java runtime
+        that predates JDBC 4.3, and a driver that refuses a hint has the
+        refusal logged rather than the borrow or the return around it failed.
+        Pull request <pr>677</pr> provided by Fernanda Meheust. (remm)
+      </add>
+      <fix>
+        Record the borrow site of a connection borrowed from the JDBC pool
+        with <code>logAbandoned</code> enabled as stack trace elements
+        instead of a formatted thread-dump string, and format the trace only
+        when an abandoned-connection report actually reads it. Every borrow
+        previously formatted - and almost always threw away - a full thread
+        dump; the text reported for a connection that really is abandoned is
+        unchanged. Pull request <pr>1048</pr> provided by sainadh777. (remm)
+      </fix>
+      <fix>
+        <bug>59569</bug>: Unwrap a pooled connection through a driver whose
+        own connection is itself a wrapper around another driver's
+        connection: when the physical connection does not directly implement
+        the requested interface, <code>isWrapperFor()</code> and
+        <code>unwrap()</code> now delegate to it, so the vendor object behind
+        a wrapping driver - like the AWS JDBC wrapper over the PostgreSQL
+        driver - is reachable through the pooled connection. The pool's
+        <code>DataSource</code>, whose implementations of the two methods
+        always answered false and returned null, now recognises itself and
+        the configured <code>dataSource</code>, and reports a failed unwrap
+        as the <code>SQLException</code> that the <code>Wrapper</code>
+        contract requires. Pull request <pr>1077</pr> provided by Shayan
+        Davarzani. (remm)
+      </fix>
+      <fix>
+        <bug>63705</bug>: Publish a JMX MBean for every physical connection
+        held by the JDBC pool, not only for the ones the application has
+        borrowed at least once. The connection MBeans that appear below the
+        pool's MBean as <code>connections=PooledConnection[n]</code> were
+        registered when a connection was borrowed for the first time, so the
+        connections the pool pre-created for its <code>initialSize</code>, and
+        any idle connection that was never borrowed, were counted in the pool's
+        <code>Size</code> and <code>NumIdle</code> attributes while remaining
+        invisible to management. A connection's MBean is now registered as soon
+        as its physical connection is established, and the connections a
+        running pool already holds are published when the pool's own MBean is
+        registered. A connection keeps its registration across a reconnect and
+        releases it, as before, when it leaves the pool.
+        (remm)
+      </fix>
+      <fix>
+        Correct a defect that meant the JNDI factory for the JDBC pool aborted
+        with a <code>NullPointerException</code> when a resource reference
+        carried an attribute with null content, and that made it impossible to
+        give the pool a live <code>javax.sql.DataSource</code> through a
+        reference: an object-valued <code>dataSource</code> attribute was
+        stringified and then rejected with a message contradicting the
+        documented property type. Attributes with null content are now skipped
+        and an object-valued <code>dataSource</code> attribute is used to back
+        the pool, taking precedence over <code>dataSourceJNDI</code>; a string
+        value for that attribute is still rejected, with a message that now
+        points at the supported ways of providing a data source. (remm)
+      </fix>
+      <fix>
+        Do not wait on pool creation when closing a JDBC pool data source.
+        The pool constructor pre-establishes the <code>initialSize</code>
+        connections, and it previously ran under the data source monitor that
+        <code>close()</code> takes, so closing a data source whose initial
+        connections were still being attempted against an unresponsive
+        database parked the shutdown on the driver for an unbounded,
+        uninterruptible time. The construction now runs under a gate that
+        serializes it on its own, outside that monitor, so a close does not
+        wait for an in-flight creation; that creation observes the closure at its
+        publication step and tears down the pool it built rather than
+        publishing it. As before, no database session and no pool cleaner
+        outlives the close, and the closure stays terminal. (remm)
+      </fix>
+      <fix>
+        <bug>50571</bug>: A configured connection state (auto-commit,
+        read-only or catalog) that could not be restored on a pooled
+        connection was logged and ignored, and the connection was handed out
+        in the wrong state: a <code>defaultCatalog</code> naming a database
+        that does not exist, for example, left the application working on the
+        session's original catalog with nothing surfaced to the application.
+        The borrow now fails with an <code>SQLException</code> and the
+        connection is discarded. Restoring the transaction isolation level
+        retains the previously logged-and-ignored behavior. (remm)
+      </fix>
+      <fix>
+        <bug>56586</bug>: An <code>initSQL</code> statement run by the JDBC
+        pool while a connection is established is now committed when the pool
+        runs with auto commit off, so the initialization it performs - a data
+        change or a session setting - persists for the lifetime of the
+        connection. It previously ran inside a transaction that the
+        connect-time validation then rolled back again, so the effects were
+        discarded before the first borrower ever used the connection.
+        Validation queries and the <code>isValid()</code> check keep the
+        opposite rule and still terminate an open transaction with a rollback,
+        so a health check continues to never commit application work. (remm)
+      </fix>
+      <fix>
+        <bug>65929</bug>: Calling <code>abort()</code> on a pooled connection
+        bypassed the pool. The call reached the physical connection while the
+        borrow stayed open: the session remained counted in the busy pool
+        against <code>maxActive</code>, and the handle kept reporting itself
+        open although the specification says a connection is closed once
+        <code>abort()</code> returns, so an application that trusts that and
+        does not call <code>close()</code> afterwards permanently consumed one
+        connection slot per call until the pool reported exhaustion. The pool
+        now intercepts <code>abort()</code>: the call is delegated to the
+        driver, the session is then taken out of service whatever the driver
+        made of it - no borrower may receive a session an abort was attempted
+        on - the slot is freed, and the handle is closed, reporting
+        <code>isClosed()</code> true, <code>isValid()</code> false and an
+        <code>SQLException</code> for any further use. On a handle already
+        closed, <code>abort()</code> is the no-op the specification
+        prescribes. Based on code submitted by Arturo Bernal. (remm)
+      </fix>
+      <fix>
+        Correct a defect in the <code>StatementCache</code> interceptor
+        where an interceptor listed after the cache that wraps statements
+        beneath it - <code>StatementDecoratorInterceptor</code>, for
+        example - silently stopped the cache from caching. The cached
+        statement recorded as its connection whatever that lower wrapper
+        answered for the statement's <code>getConnection()</code> - the
+        pool's handle for the borrow, not the physical connection - so no
+        closed statement ever passed the session check on the way into the
+        cache, every one was closed instead, and the next prepare prepared
+        again, at any log level. The cache now binds a cached statement to
+        the physical session the prepare ran on, using the driver's own
+        answer where it is readable, while a statement prepared on a
+        session that has since been replaced still refuses both caching
+        and reuse, and a park refused for a lost association is now noted
+        once per connection at debug level. (remm)
+      </fix>
+      <fix>
+        Correct a defect where listing the <code>StatementCache</code>
+        interceptor before the <code>StatementFinalizer</code> interceptor in
+        <code>jdbcInterceptors</code> handed the next borrower of a session a
+        cached statement that failed on any use. The finalizer tracked the
+        driver statement beneath the cache and closed every statement still
+        open when the connection was returned, while a statement parked in
+        the cache is deliberately left open, so that return-time close killed
+        the cached statement out from under a live cache entry and the next
+        cache hit served a closed statement. The cache now refuses to park
+        statements when such a tracker is configured beneath it - the close
+        then reaches the statement through the normal path - and the pool
+        warns once at start when the configuration lists the cache before the
+        finalizer, as it already does for the analogous query timeout
+        ordering. (remm)
+      </fix>
+      <fix>
+        Mask the password carried in the <code>user:password@host</code>
+        userinfo section of a JDBC URL, and in the equivalent
+        <code>user/password@host</code> form of the legacy Oracle URLs, in the
+        <code>toString()</code> dump of the pool configuration, where the rest
+        of the dump is masked and the leak gave a false impression that the
+        dump carried no credential. The user name, host, port and the rest of
+        the URL stay readable, and an authority that carries no credential -
+        a bare host or a port - is left untouched. (remm)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Other">
@@ -1294,6 +1560,9 @@
         default. Based on pull request <pr>1095</pr> provided by StrongOx.
         (markt)
       </fix>
+      <update>
+        Update Tomcat Native to 2.0.17. (markt)
+      </update>
     </changelog>
   </subsection>
 </section>

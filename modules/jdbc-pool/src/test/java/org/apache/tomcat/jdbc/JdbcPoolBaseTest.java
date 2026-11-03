@@ -16,6 +16,8 @@
  */
 package org.apache.tomcat.jdbc;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -184,6 +186,40 @@ public abstract class JdbcPoolBaseTest {
     }
 
     /*
+     * An interceptor that drives the documented "close this session when it
+     * is returned" hook through the configured chain rather than by touching
+     * the pooled connection directly: the first isValid() call that passes
+     * through it is delegated as usual - answered by the driver, while the
+     * session is still live - and as it returns the interceptor marks the
+     * connection discarded, leaving the borrower holding a handle whose
+     * session is out of service. It is configured through the
+     * jdbcInterceptors class-name list, so it must stay a public static
+     * class with a no-arg constructor.
+     */
+    public static class DiscardMarkingInterceptor extends JdbcInterceptor {
+        private PooledConnection held;
+        private volatile boolean marked;
+
+        @Override
+        public void reset(ConnectionPool parent, PooledConnection con) {
+            held = con;
+            marked = false;
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args)
+                throws Throwable {
+            Object result = super.invoke(proxy, method, args);
+            if (!marked && "isValid".equals(method.getName())
+                    && held != null) {
+                marked = true;
+                held.setDiscarded(true);
+            }
+            return result;
+        }
+    }
+
+    /*
      * The driver's own object behind a pooled connection's statement. For
      * a prepared statement this is the honest oracle for "the session was
      * not asked to prepare this SQL again": two handles onto the same
@@ -192,6 +228,22 @@ public abstract class JdbcPoolBaseTest {
      */
     protected static Statement driverStatement(Statement pooled) throws SQLException {
         return pooled.unwrap(Statement.class);
+    }
+
+    /*
+     * The object a pooled handle wraps. The statement facade's statement and
+     * result set handles keep what they wrap in a field named "delegate" on
+     * their invocation handler, which lets a test assert on the layer below
+     * the facade - the interceptor's own handle, or the statement the
+     * interceptors pass on. The handler classes live in the pool package and
+     * are not nameable from a test elsewhere, so the field is read here.
+     */
+    protected static Object proxiedObject(Object handle)
+            throws ReflectiveOperationException {
+        Object handler = Proxy.getInvocationHandler(handle);
+        Field field = handler.getClass().getDeclaredField("delegate");
+        field.setAccessible(true);
+        return field.get(handler);
     }
 
     /*
