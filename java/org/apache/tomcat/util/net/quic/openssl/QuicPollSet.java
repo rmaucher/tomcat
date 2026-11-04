@@ -249,8 +249,7 @@ public class QuicPollSet {
             QuicPollItem item = slots[i];
             if (item.isDirty()) {
                 item.resetRevents();
-                MemorySegment.copy(item.getSegment(), 0, nativeArray,
-                        (long) i * STRIDE, ITEM_SIZE);
+                item.writeTo(nativeArray, (long) i * STRIDE);
                 item.clearDirty();
             }
         }

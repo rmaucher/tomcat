@@ -16,13 +16,8 @@
  */
 package org.apache.tomcat.util.net.quic.openssl;
 
-import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-
-import org.apache.juli.logging.Log;
-import org.apache.juli.logging.LogFactory;
-import org.apache.tomcat.util.res.StringManager;
 
 
 /**
@@ -36,29 +31,20 @@ import org.apache.tomcat.util.res.StringManager;
  */
 public class QuicPollItem {
 
-    private static final Log log = LogFactory.getLog(QuicPollItem.class);
-    private static final StringManager sm = StringManager.getManager(QuicPollItem.class);
-
     // SSL_as_poll_descriptor is an inline function; we construct the BIO_POLL_DESCRIPTOR directly
     // rather than calling the C inline.
 
     // ------------------------------------------ Instance fields
 
-    /**
-     * Native memory segment holding the SSL_POLL_ITEM struct.
+    /*
+     * Deliberately no native SSL_POLL_ITEM allocation per item. A busy HTTP/3
+     * connection can create one request stream per request, so an Arena plus a
+     * native segment per stream made every accepted stream pay a SharedSession
+     * acquire and native allocation (and a matching release on close) just to
+     * describe one struct. The poll set has a contiguous native array already;
+     * rebuild() writes the struct for a dirty item directly into its slot. All
+     * access to this item is confined to the QUIC poll thread, as before.
      */
-    private final MemorySegment segment;
-
-    /**
-     * Arena holding the native struct. Closed by {@link #dispose()} so the
-     * struct memory is released as soon as the item leaves the poll set.
-     * All access to this item (native struct and want_events) is confined
-     * to the QUIC poll thread: worker-thread updates of interest are hopped
-     * to the poll thread via submitPollTask(). The {@code arena != null}
-     * checks guard only against a late-queued poll task touching an item
-     * that has already been disposed.
-     */
-    private Arena arena;
 
     /**
      * The SSL* pointer associated with this poll item.
@@ -101,51 +87,47 @@ public class QuicPollItem {
 
 
     /**
-     * Creates a new poll item for the given SSL object. The native
-     * {@code SSL_POLL_ITEM} struct is allocated on a private arena owned by
-     * the item and released by {@link #dispose()} when the item leaves the
-     * poll set.
+     * Creates a new poll item for the given SSL object. No native memory is
+     * allocated here; {@link #writeTo(MemorySegment, long)} materialises the
+     * struct into the poll set's native array when the item is rebuilt.
      *
      * @param ssl    The SSL* pointer (listener, connection, or stream)
      * @param events The events to monitor
      * @param data   Application data associated with this item
      */
     public QuicPollItem(MemorySegment ssl, long events, Object data) {
-        this.arena = Arena.ofShared();
-        this.segment = arena.allocate(QuicPoll.SSL_POLL_ITEM_SIZE);
         this.ssl = ssl;
         this.wantEvents = events;
         this.revents = 0;
         this.appData = data;
         this.dirty = true;
-        initDescriptor(ssl);
-        segment.set(ValueLayout.JAVA_LONG, QuicPoll.EVENTS_OFFSET, events);
     }
+
     /**
-     * Releases the native {@code SSL_POLL_ITEM} struct. Must only be called
-     * once the item is no longer a member of the poll set (the poll set calls
-     * this from its remove()/clear() paths). Safe to call more than once.
+     * Releases this item's resources when it leaves the poll set. The item no
+     * longer owns native memory (see {@link #writeTo(MemorySegment, long)});
+     * this is retained as the lifecycle hook called by the poll set's
+     * remove()/clear() paths and is safe to call more than once.
      */
     public void dispose() {
-        Arena a = arena;
-        if (a != null) {
-            arena = null;
-            try {
-                a.close();
-            } catch (Throwable t) {
-                // The memory may already have been released; log for leak /
-                // use-after-dispose diagnostics rather than swallowing silently.
-                if (log.isDebugEnabled()) {
-                    log.debug(sm.getString("quicPollItem.disposeError"), t);
-                }
-            }
-        }
+        dirty = false;
     }
 
-
-    private void initDescriptor(MemorySegment ssl) {
-        segment.set(ValueLayout.JAVA_INT, QuicPoll.DESC_TYPE_OFFSET, QuicPoll.BIO_POLL_DESCRIPTOR_TYPE_SSL);
-        segment.set(ValueLayout.ADDRESS, QuicPoll.DESC_VALUE_OFFSET, ssl);
+    /**
+     * Writes this item's SSL_POLL_ITEM struct into the poll set's native
+     * array at the given byte offset, zeroing revents. Called by
+     * {@link QuicPollSet#rebuild()} for dirty items only.
+     *
+     * @param array  The poll set's native array
+     * @param offset Byte offset of this item's slot in the array
+     */
+    void writeTo(MemorySegment array, long offset) {
+        array.set(ValueLayout.JAVA_INT, offset + QuicPoll.DESC_TYPE_OFFSET,
+                QuicPoll.BIO_POLL_DESCRIPTOR_TYPE_SSL);
+        array.set(ValueLayout.ADDRESS, offset + QuicPoll.DESC_VALUE_OFFSET, ssl);
+        array.set(ValueLayout.JAVA_LONG, offset + QuicPoll.EVENTS_OFFSET,
+                wantEvents);
+        array.set(ValueLayout.JAVA_LONG, offset + QuicPoll.REVENTS_OFFSET, 0L);
     }
 
 
@@ -158,9 +140,6 @@ public class QuicPollItem {
     public void setSsl(MemorySegment ssl) {
         this.ssl = ssl;
         this.dirty = true;
-        if (arena != null) {
-            segment.set(ValueLayout.ADDRESS, QuicPoll.DESC_VALUE_OFFSET, ssl);
-        }
     }
 
 
@@ -173,9 +152,6 @@ public class QuicPollItem {
     public void setWantEvents(long events) {
         this.wantEvents = events;
         this.dirty = true;
-        if (arena != null) {
-            segment.set(ValueLayout.JAVA_LONG, QuicPoll.EVENTS_OFFSET, events);
-        }
     }
 
 
@@ -274,14 +250,11 @@ public class QuicPollItem {
 
 
     /**
-     * Resets the revents field of the native struct before the next
-     * SSL_poll call so stale event flags are not carried into the native
-     * array.
+     * Resets the revents field before the next SSL_poll call so stale event
+     * flags are not carried into the native array. The array's revents field
+     * is zeroed by {@link #writeTo(MemorySegment, long)} when it is rebuilt.
      */
     public void resetRevents() {
-        if (arena != null) {
-            segment.set(ValueLayout.JAVA_LONG, QuicPoll.REVENTS_OFFSET, 0L);
-        }
         this.revents = 0;
     }
 
@@ -303,16 +276,6 @@ public class QuicPollItem {
      */
     public void setAppData(Object data) {
         this.appData = data;
-    }
-
-
-    /**
-     * Returns the native memory segment for this poll item.
-     *
-     * @return The native SSL_POLL_ITEM segment
-     */
-    public MemorySegment getSegment() {
-        return segment;
     }
 
 
