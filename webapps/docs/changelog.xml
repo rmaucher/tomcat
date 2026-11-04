@@ -854,6 +854,11 @@
         <code>BeanELResolver</code> from resolving bean-style properties (such
         as <code>isValid()</code>) on a <code>Record</code>. (markt)
       </fix>
+      <fix>
+        Fix a JAR file handle leak when a tag file specifies an unsupported
+        <code>pageEncoding</code>. Close the input stream if reader creation
+        fails so that its reference to the JAR is released. (remm)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Cluster">
@@ -1547,6 +1552,54 @@
         dump carried no credential. The user name, host, port and the rest of
         the URL stay readable, and an authority that carries no credential -
         a bare host or a port - is left untouched. (remm)
+      </fix>
+      <fix>
+        Correct a defect in the <code>ResetAbandonedTimer</code> interceptor
+        where a call that was still in flight when its borrow ended, and that
+        completed after the same connection had been handed to the next
+        borrower, reset the timer of that next borrower and cleared its
+        suspect state: the completing call is refused by the pool below, but
+        the interceptor booked its activity from the completion of the call,
+        where the connection looked checked out again, and the borrower the
+        abandoned check was watching read as active. Stamps from calls are now
+        booked only for the borrow the call started under, while the
+        <code>resetTimer()</code> management operation is unchanged. (remm)
+      </fix>
+      <fix>
+        Correct a defect where renaming a running connection pool - the pool's
+        own JMX exposes a <code>setName</code> that rewrites the name property
+        of a live pool - silently detached the <code>SlowQueryReport</code>
+        and <code>SlowQueryReportJmx</code> interceptors from the state their
+        pool had registered under its start-time name: connections borrowed
+        after the rename booked their statistics nowhere and logged a false
+        "Connection has already been closed or abandoned" warning on every
+        execution, a <code>SlowQueryReportJmx</code> borrow registered a
+        second MBean under the new name, and the pool's close released the
+        name it carried at close time rather than the one it had registered,
+        leaving the statistics, the interceptor MBean and with them the whole
+        closed pool's object graph registered forever. A nulling rename made
+        the same release throw and be swallowed, leaking the same way. The
+        registrations are now recorded under the name the pool started with
+        and every lookup of them resolves through that record, so a rename
+        changes what the pool calls itself and nothing else. (remm)
+      </fix>
+      <fix>
+        The <code>SlowQueryReportJmx</code> interceptor now publishes a
+        small, pool-independent resource as the MBean for a pool name,
+        instead of publishing the borrowing connection's own interceptor
+        instance. That instance holds the connection, the pool and the
+        pool's properties, so as long as the MBean was registered the JVM
+        could not reclaim a pool that had been abandoned without being
+        closed - a pool leaked this way kept its connections, its
+        statistics and its MBean alive for the life of the JVM, and a
+        pool that was never closed never released the name either. The
+        MBean also showed the name of whichever pool had borrowed first,
+        and its statistics and <code>resetStats()</code> operation acted
+        on that pool's state long after it had been replaced under the
+        name. The published MBean now resolves the pool currently using
+        its name, so it reports that pool, and an abandoned pool is
+        collected once nothing else refers to it, with its name released
+        by the next pool that takes it over. (remm)
       </fix>
     </changelog>
   </subsection>

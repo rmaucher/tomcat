@@ -24,15 +24,20 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.ConcurrentModificationException;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
@@ -51,6 +56,7 @@ import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.jdbc.pool.interceptor.QueryTimeoutInterceptor;
 import org.apache.tomcat.jdbc.pool.interceptor.StatementCache;
 import org.apache.tomcat.jdbc.pool.interceptor.StatementFinalizer;
+import org.apache.tomcat.jdbc.pool.util.ExceptionUtils;
 import org.apache.tomcat.jdbc.pool.util.MessageFactory;
 
 /**
@@ -126,6 +132,48 @@ public class ConnectionPool {
     private volatile boolean closed = false;
 
     /**
+     * The pool name recorded when this pool started, written by {@link #init(PoolConfiguration)} before anything is
+     * registered for the pool and never rewritten. The {@code name} property is mutable at runtime - the pool's own
+     * JMX exposes a {@code setName} that rewrites it on a running pool - while the registrations made for a pool
+     * (the query statistics and, for the reporting interceptors, the MBean and the broadcaster published under the
+     * name) stay keyed by the name the pool ran under when they were made. Resolving one of those registrations
+     * through the live property would move it away from a renamed pool: the renamed pool would book nothing and
+     * report a false "closed or abandoned" warning on every execution while the entry published at start would
+     * outlive every close, pinned by the registration that could no longer be found to release it. Interceptors
+     * that hold per-name state therefore resolve it through this record rather than through {@link #getName()}.
+     */
+    private volatile String registrationName;
+
+    /**
+     * The interceptor definitions that {@link #init(PoolConfiguration)} told about the pool starting, recorded
+     * before the first of them is instantiated so a start that fails partway through still knows what it told.
+     * The close delivers {@link JdbcInterceptor#poolClosed(ConnectionPool)} to these definitions as configured
+     * then, not to whatever the {@code jdbcInterceptors} property happens to list by the time the pool comes down
+     * - that property is mutable at runtime through {@link PoolProperties#setJdbcInterceptors}. Telling the
+     * start-time definitions is what pairs the two lifecycle notifications: a definition removed from the property
+     * while the pool ran released nothing under the close-the-current-list reading, leaving whatever its start
+     * registered - the per-name query statistics and, for the reporting interceptors, the published MBean - behind
+     * for the life of the JVM. Definitions the property gained after the start are told about the close as well:
+     * a borrow served through such a definition may have registered state under the pool's name that only a close
+     * releases, even though the definition never saw the start.
+     */
+    private volatile PoolProperties.InterceptorDefinition[] startedInterceptors;
+
+    /**
+     * The interceptor definitions a connection chain of this pool was actually built from. The close pairs with
+     * {@link #startedInterceptors} and with the definitions the {@code jdbcInterceptors} property lists at close
+     * time, but neither of those covers a definition the property gained after the start and lost again before the
+     * close: it never saw the start to be recorded there, and by the close it is gone from the list the close reads
+     * - yet a chain was built from it, and what a borrow through that chain registered under the pool's name (the
+     * statistics and, for the reporting interceptors, the published MBean) is only ever taken down by a close.
+     * Recording the definitions at chain construction is what lets the close find that third set. Entries are the
+     * small configuration objects the property parses, one per definition per reconfiguration of a live pool; a
+     * restarted pool is a new instance pairing over its own generation.
+     */
+    private final Set<PoolProperties.InterceptorDefinition> chainDefinitions =
+            ConcurrentHashMap.newKeySet();
+
+    /**
      * Since newProxyInstance performs the same operation, over and over again, it is much more optimized if we simply
      * store the constructor ourselves. One constructor is cached per proxy kind (with and without the XAConnection
      * interface), so that a pool whose backing data source changes kind at runtime keeps proxying each connection
@@ -167,6 +215,11 @@ public class ConnectionPool {
     private final AtomicLong reconnectedCount = new AtomicLong(0);
     private final AtomicLong removeAbandonedCount = new AtomicLong(0);
     private final AtomicLong releasedIdleCount = new AtomicLong(0);
+
+    // Guards the one-per-pool warning that a borrow carried credentials the
+    // configuration will not honour, mirroring how DataSourceProxy issues the
+    // same warning at the application surface.
+    private final AtomicBoolean ignoredBorrowCredentialsWarned = new AtomicBoolean(false);
 
     /**
      * Instantiate a connection pool. This will create connections if initialSize is larger than 0. The
@@ -295,6 +348,20 @@ public class ConnectionPool {
     }
 
     /**
+     * Returns the name this pool was registered under when it started. The registrations made for a pool - its
+     * query statistics and the monitoring MBean the reporting interceptors publish under the name - are keyed by
+     * this name, not by the live {@code name} property, which {@link #getName()} returns and which management can
+     * rewrite on a running pool: a rename then changes what the pool calls itself and moves nothing that was
+     * registered under the old name.
+     *
+     * @return the name recorded at pool start, or {@code null} while the pool has not gotten far enough into its
+     *             start to record one, or if it carried no name when it started
+     */
+    public String getRegistrationName() {
+        return registrationName;
+    }
+
+    /**
      * Return the number of threads waiting for a connection
      *
      * @return number of threads waiting for a connection
@@ -420,6 +487,10 @@ public class ConnectionPool {
             // Set up the interceptor chain
             PoolProperties.InterceptorDefinition[] proxies = getPoolProperties().getJdbcInterceptorsAsArray();
             for (int i = proxies.length - 1; i >= 0; i--) {
+                // Record what this chain was built from: the definitions the
+                // close has to pair with are the ones a chain ran, not only
+                // the ones the property lists when the pool comes down
+                chainDefinitions.add(proxies[i]);
                 try {
                     // Create a new instance
                     JdbcInterceptor interceptor = proxies[i].getInterceptorClass().getConstructor().newInstance();
@@ -515,7 +586,14 @@ public class ConnectionPool {
         } catch (Exception x) {
             SQLException s = new SQLException();
             s.initCause(x);
-            abandonSetup(con, s, false);
+            // The reset walk above has already armed every interceptor of the chain for this borrow, and from here
+            // no close() will ever travel that chain - the handle was never handed out - while the return path does
+            // not walk the chain either. The connection itself is healthy; it is the borrow state that is unusable,
+            // and there is no chain-wide unwind that is safe for arbitrary interceptors, as each keys its disposal
+            // on the reset(null, null) call the release's setHandler(null) makes (StatementCache.reset is one).
+            // So the half-armed chain goes out of service with the connection, the posture the two catches above
+            // take, rather than being parked idle armed for a borrow that never started.
+            abandonSetup(con, s, true);
             throw s;
         }
 
@@ -706,18 +784,115 @@ public class ConnectionPool {
         if (this.getPoolProperties().isJmxEnabled()) {
             this.jmxPool = null;
         }
-        PoolProperties.InterceptorDefinition[] proxies = getPoolProperties().getJdbcInterceptorsAsArray();
-        for (int i = 0; i < proxies.length; i++) {
-            try {
-                JdbcInterceptor interceptor = proxies[i].getInterceptorClass().getConstructor().newInstance();
-                interceptor.setProperties(proxies[i].getProperties());
-                interceptor.poolClosed(this);
-            } catch (Exception x) {
-                if (log.isDebugEnabled()) {
-                    log.debug("Unable to inform interceptor of pool closure.", x);
-                }
+        // Tell the interceptors about the close, each definition once and on a
+        // throwaway instance, as the notification contract describes. The
+        // definitions told about the start come first, as configured then: what
+        // a start registered, the close it is paired with releases - whatever
+        // the mutable property lists by now. The definitions the property has
+        // gained since the start are told as well, so a definition that never
+        // saw a start still takes down - best effort, on a fresh instance that
+        // shares no state with the chains that served the borrows - whatever a
+        // borrow through it registered under the pool's name. The third set the
+        // close has to reach are the definitions those chains were actually
+        // built from: a definition the property gained after the start and lost
+        // again before the close is named by neither of the lists above, yet it
+        // armed the connections that registered state under the pool's name.
+        // A definition the close already told over its start or its current
+        // configuration is not told twice.
+        PoolProperties.InterceptorDefinition[] started = startedInterceptors;
+        if (started != null) {
+            for (int i = 0; i < started.length; i++) {
+                informInterceptorOfPoolClosure(started[i]);
             }
         }
+        PoolProperties.InterceptorDefinition[] proxies = getPoolProperties().getJdbcInterceptorsAsArray();
+        for (int i = 0; i < proxies.length; i++) {
+            if (!isToldAlready(proxies[i], started)) {
+                informInterceptorOfPoolClosure(proxies[i]);
+            }
+        }
+        for (PoolProperties.InterceptorDefinition chainDefinition : chainDefinitions) {
+            if (!isToldAlready(chainDefinition, started) && !isToldAlready(chainDefinition, proxies)) {
+                informInterceptorOfPoolClosure(chainDefinition);
+            }
+        }
+    }
+
+
+    /**
+     * Delivers {@link JdbcInterceptor#poolClosed(ConnectionPool)} to a throwaway instance of the given
+     * definition: the instance shares no state with the chains the connections run or with the instance the
+     * start told, so what the callback releases has to be reachable from the definition's configuration and the
+     * closing pool. A definition whose class cannot be instantiated, and an interceptor that fails the callback,
+     * is reported at debug level and the close moves on.
+     *
+     * @param definition the interceptor definition to tell about the close
+     */
+    private void informInterceptorOfPoolClosure(PoolProperties.InterceptorDefinition definition) {
+        try {
+            JdbcInterceptor interceptor = definition.getInterceptorClass().getConstructor().newInstance();
+            interceptor.setProperties(definition.getProperties());
+            interceptor.poolClosed(this);
+        } catch (Exception x) {
+            if (log.isDebugEnabled()) {
+                log.debug("Unable to inform interceptor of pool closure.", x);
+            }
+        }
+    }
+
+
+    /**
+     * Whether the close of the given definition is already covered by a set of definitions the close has told (or
+     * is telling): the very definition object in that set, or one configured the same way. The parsed list is cached
+     * and only re-parsed when the property is rewritten, so an unchanged list answers by object identity alone.
+     *
+     * @param definition the definition to check
+     * @param told       the definitions already covered by one set of the close's notifications, or {@code null}
+     *            when that set does not exist - a pool whose start told nothing
+     *
+     * @return {@code true} if the close of this definition is already covered by the given set
+     */
+    private static boolean isToldAlready(PoolProperties.InterceptorDefinition definition,
+            PoolProperties.InterceptorDefinition[] told) {
+        if (told == null) {
+            return false;
+        }
+        for (int i = 0; i < told.length; i++) {
+            if (told[i] == definition || isConfiguredTheSame(told[i], definition)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    /**
+     * Whether two definitions name one interceptor class and give it one set of properties: the same property
+     * names carrying the same values. Interceptor properties carry no equality of their own, so the values are
+     * compared directly.
+     *
+     * @param a the first definition
+     * @param b the second definition
+     *
+     * @return {@code true} if the two definitions configure one interceptor the same way
+     */
+    private static boolean isConfiguredTheSame(PoolProperties.InterceptorDefinition a,
+            PoolProperties.InterceptorDefinition b) {
+        if (!a.getClassName().equals(b.getClassName())) {
+            return false;
+        }
+        Map<String, PoolProperties.InterceptorProperty> pa = a.getProperties();
+        Map<String, PoolProperties.InterceptorProperty> pb = b.getProperties();
+        if (pa.size() != pb.size()) {
+            return false;
+        }
+        for (Map.Entry<String, PoolProperties.InterceptorProperty> entry : pa.entrySet()) {
+            PoolProperties.InterceptorProperty other = pb.get(entry.getKey());
+            if (other == null || !Objects.equals(entry.getValue().getValue(), other.getValue())) {
+                return false;
+            }
+        }
+        return true;
     }
 
 
@@ -733,6 +908,12 @@ public class ConnectionPool {
 
         // Make sure the pool is properly configured
         checkPoolConfiguration(properties);
+
+        // Record the name this pool starts under before its MBean or the
+        // interceptors are told about the pool, so that everything the start
+        // registers under the name and everything a later lookup of it
+        // resolves through one record (see the field).
+        registrationName = properties.getPoolName();
 
         // Both queues are unbounded by design: membership is bounded by the
         // maxActive/size bookkeeping, not by queue capacity.
@@ -754,6 +935,10 @@ public class ConnectionPool {
         // Parse and create an initial set of interceptors. Letting them know the pool has started.
         // These interceptors will not get any connection.
         PoolProperties.InterceptorDefinition[] proxies = getPoolProperties().getJdbcInterceptorsAsArray();
+        // Record the definitions this start tells, before telling them: a close
+        // triggered below by a failing start has to deliver the pair of what
+        // the start attempted (see the field).
+        startedInterceptors = proxies;
         for (int i = 0; i < proxies.length; i++) {
             try {
                 if (log.isDebugEnabled()) {
@@ -978,6 +1163,28 @@ public class ConnectionPool {
             poolCleaner.stopRunning();
             poolCleaner = null;
         }
+    }
+
+    /**
+     * Arms a replacement for this pool's maintenance task when the task the pool still holds is the one that lost the
+     * shared timer, and does nothing when it is not. A pool whose cleaner has meanwhile been armed by a configuration
+     * write is served by that task, and one that has been stopped - by a close, or by a configuration that no longer
+     * asks for a sweeper - is served by none on purpose; reviving the spent task would either duplicate the
+     * maintenance work for the pool's lifetime or arm a pool that has given its connections back.
+     *
+     * @param stranded the task that was scheduled on the shared timer that died
+     */
+    synchronized void rearmPoolCleaner(PoolCleaner stranded) {
+        if (poolCleaner != stranded) {
+            return;
+        }
+        // The spent task goes first whatever the configuration now asks for: its
+        // registry entry would otherwise stand for a task that can never run
+        // again, and no close would hand it back. What is armed after it is what
+        // the configuration asks for now, so a pool that has closed in the
+        // meantime, or has had its sweeper switched off, is left as it is.
+        terminatePoolCleaner();
+        initializePoolCleaner(getPoolProperties());
     }
 
     /**
@@ -1244,6 +1451,27 @@ public class ConnectionPool {
             throw new SQLException(MessageFactory.get("connectionPool.poolClosed"));
         }
 
+        if (username != null || password != null) {
+            if (!poolProperties.isAlternateUsernameAllowed()) {
+                // The credentials are not this pool's to honour. DataSourceProxy
+                // already ignores them at the application surface; this is the
+                // same contract at the pool's own, which is also reachable as
+                // getConnection(user,password). Honouring them here would
+                // authenticate a session as the borrower's identity and - since
+                // with alternates disallowed every later borrow is served under
+                // the pool's identity - hand that session to later borrowers as
+                // the identity they never claimed. Dropping them before the
+                // borrow decision below is what makes the decision's premise,
+                // that no session carries another identity, one the pool keeps
+                // rather than one it hopes for.
+                if (ignoredBorrowCredentialsWarned.compareAndSet(false, true)) {
+                    log.warn(MessageFactory.get("connectionPool.alternateUsernameIgnored", username));
+                }
+                username = null;
+                password = null;
+            }
+        }
+
         // Get the current time stamp
         long now = System.currentTimeMillis();
         // See if there is one available immediately
@@ -1496,7 +1724,8 @@ public class ConnectionPool {
             }
 
             // Evaluate username/password change as well as max age functionality
-            boolean forceReconnect = con.shouldForceReconnect(username, password) || con.isMaxAgeExpired();
+            boolean credentialsDiffer = con.shouldForceReconnect(username, password);
+            boolean forceReconnect = credentialsDiffer || con.isMaxAgeExpired();
 
             if (!con.isDiscarded() && !con.isInitialized()) {
                 // Here it states that the connection not discarded, but the connection is null
@@ -1557,8 +1786,20 @@ public class ConnectionPool {
                 setToNull = true;
                 return null;
             }
+            // Whether the reconnect below took on a new session: only a
+            // reconnect that never got that far can have left a session worth
+            // keeping behind it.
+            boolean reconnected = false;
             try {
-                con.reconnect();
+                if (credentialsDiffer) {
+                    // A session the database has not refused is not this
+                    // borrower's to spend, so the new identity is put to the
+                    // database before the session it replaces is given up.
+                    con.reconnectWith(username, password);
+                } else {
+                    con.reconnect();
+                }
+                reconnected = true;
                 reconnectedCount.incrementAndGet();
                 int validationMode = isInitNewConnections() ? PooledConnection.VALIDATE_INIT
                         : PooledConnection.VALIDATE_BORROW;
@@ -1588,8 +1829,31 @@ public class ConnectionPool {
                     // Validation failed.
                     throw new SQLException(MessageFactory.get("connectionPool.failedToValidateNewConnection"));
                 }
-            } catch (Exception x) {
-                release(con);
+            } catch (Throwable x) {
+                // The module's fatal policy runs first, as everywhere else.
+                // What is left is the refused borrow this guard already
+                // reports: the reconnect and the validation above reach the
+                // driver over a connection this borrow has claimed out of the
+                // idle queue, and a throwable that unwound them now would leave
+                // that connection in neither queue - invisible to the abandoned
+                // check, to the sweep and to the close drain alike, and gone
+                // from the budget for the life of the pool. A LinkageError is
+                // an ordinary arrival behind a driver loaded or wrapped through
+                // a web application class loader, and a borrow the driver could
+                // not carry out is what the borrower is owed, as the checked
+                // exception a borrow answers with.
+                ExceptionUtils.handleThrowable(x);
+                if (credentialsDiffer && !reconnected && con.isInitialized() && !con.isDiscarded()) {
+                    // The attempt was refused before it gave up the session
+                    // this connection was holding: that session is open, it
+                    // carries its own still-valid credentials, and it belongs
+                    // to the pool and to every borrower the database does not
+                    // turn away. It goes back to the queue it came from
+                    // instead of paying for a borrow that never used it.
+                    returnToIdle(con);
+                } else {
+                    release(con);
+                }
                 setToNull = true;
                 if (x instanceof SQLException) {
                     throw (SQLException) x;
@@ -1608,14 +1872,48 @@ public class ConnectionPool {
     }
 
     /**
+     * Hands a connection back to the idle queue after a borrow attempt that failed without using the session the
+     * connection holds. The attempt neither handed the session out nor closed it, so the connection is exactly as
+     * usable as it was before the attempt and the pool keeps it: a borrower the database refused is not a reason to
+     * destroy a session, and the slot it stands for.
+     *
+     * @param con the connection to hand back to the idle queue
+     */
+    private void returnToIdle(PooledConnection con) {
+        if (isClosed()) {
+            // A close has drained the queues once already, so a session
+            // handed to the idle queue now would sit there out of reach of
+            // every shutdown path. Retire it instead.
+            release(con);
+        } else if (!idle.offer(con)) {
+            release(con);
+        } else if (isClosed() && idle.remove(con)) {
+            // The closed check above and this offer are not one atomic step:
+            // a close arriving in between has drained the queue this offer
+            // then fills for the last time. Take the connection back out of a
+            // queue that has already been drained past; if it is no longer
+            // there, a taker has taken ownership of it and sees to its
+            // closure.
+            release(con);
+        }
+    }
+
+    /**
      * Returns whether new connections should be initialized by invoking {@link PooledConnection#validate(int)} with
      * {@link PooledConnection#VALIDATE_INIT}.
      *
-     * @return true if pool is either configured to test connections on connect or a non-NULL init SQL has been
-     *             configured
+     * @return true if pool is either configured to test connections on connect or an init SQL that carries a statement
+     *             has been configured
      */
     private boolean isInitNewConnections() {
-        return getPoolProperties().isTestOnConnect() || getPoolProperties().getInitSQL() != null;
+        // The same reading the validation path applies to this setting: a
+        // blank init SQL is the unset value, so it gives a new session
+        // nothing to run. Counting the blank as a configured statement here
+        // would send a freshly re-established session down the init-check
+        // path - which an unset statement makes a check that runs nothing -
+        // instead of the borrow check the configuration did ask for.
+        return getPoolProperties().isTestOnConnect() ||
+                PoolProperties.configuredStatement(getPoolProperties().getInitSQL()) != null;
     }
 
     /**
@@ -1685,6 +1983,20 @@ public class ConnectionPool {
             return true;
         }
         if (isClosed()) {
+            return true;
+        }
+        if (con.hasUnresolvedXaBranches()) {
+            // A branch that was started through this session's XA resource
+            // and never committed, rolled back or forgotten stays attached to
+            // the physical connection, and neither the transaction
+            // termination below nor a plain rollback can resolve it: pooling
+            // the session would hand the branch and every database lock held
+            // for it to the next borrower, while the transaction manager's
+            // late commit would land on a session that does not carry it.
+            // Close the session instead - the resource manager drops the
+            // branch with it, and the manager's late call then fails visibly
+            // against a closed session.
+            log.warn(MessageFactory.get("connectionPool.unresolvedXaBranchReturned", con));
             return true;
         }
         // Terminate the transaction before validating. When the pool is
@@ -1789,7 +2101,17 @@ public class ConnectionPool {
                 if (busy.remove(con)) {
                     try {
                         if (!shouldClose(con, PooledConnection.VALIDATE_RETURN) && reconnectIfExpired(con)) {
-                            con.clearWarnings();
+                            try {
+                                con.clearWarnings();
+                            } catch (SQLException x) {
+                                // The application is done with the session and
+                                // the return must not fail over a warning chain
+                                // the driver refuses to drop; this is the one
+                                // caller for which a refused clear carries no
+                                // outcome anyone can act on, unlike the JMX
+                                // operation, which reports it to its client
+                                log.warn(MessageFactory.get("pooledConnection.unableToClearWarnings"), x);
+                            }
                             con.setStackTrace(null);
                             con.setTimestamp(System.currentTimeMillis());
                             // The application is done with the connection:
@@ -1845,7 +2167,15 @@ public class ConnectionPool {
                             }
                             release(con);
                         }
-                    } catch (RuntimeException x) {
+                    } catch (Throwable x) {
+                        // The module's fatal policy runs first: what a driver
+                        // fails with an Error is the same failed check this
+                        // guard already retires on an unchecked exception, and
+                        // the Error a driver wrapper loaded through a web
+                        // application class loader throws once that context has
+                        // stopped is that loader's ordinary failure, not a sign
+                        // the JVM cannot be carried on.
+                        ExceptionUtils.handleThrowable(x);
                         // Everything above runs after the connection was
                         // claimed from the busy queue and calls into the
                         // driver - a closed check, a transaction termination,
@@ -2090,7 +2420,13 @@ public class ConnectionPool {
                         } else {
                             keep = reconnectIfExpired(con) && con.validate(PooledConnection.VALIDATE_IDLE);
                         }
-                    } catch (RuntimeException x) {
+                    } catch (Throwable x) {
+                        // The module's fatal policy runs first, as everywhere
+                        // else: a non-fatal Error from behind one of the calls
+                        // below is a check that cannot vouch for the session,
+                        // which is what this guard already retires a driver's
+                        // unchecked exception as.
+                        ExceptionUtils.handleThrowable(x);
                         // The checks above swallow every checked driver
                         // failure, but an unchecked throw from behind one of
                         // them - a validation ending a transaction is one
@@ -2673,21 +3009,129 @@ public class ConnectionPool {
         unregisterCleaner(cleaner);
         cleaners.add(cleaner);
         if (poolCleanTimer == null) {
-            ClassLoader loader = Thread.currentThread().getContextClassLoader();
+            poolCleanTimer = newPoolTimer();
+        }
+        try {
+            poolCleanTimer.schedule(cleaner, cleaner.sleepTime, cleaner.sleepTime);
+            return;
+        } catch (IllegalStateException x) {
+            // Two different failures answer with this exception and they call
+            // for opposite handling. A timer cancels itself for good the
+            // moment a task lets a throwable escape it, and every pool this
+            // class loader holds shares the one timer, so a timer that died
+            // refuses every pool that needs a cleaner afterwards for the rest
+            // of the JVM's life - unless it is replaced. The other failure is
+            // the task itself, which has been scheduled once already and no
+            // timer will ever accept again. The replacement is attempted on a
+            // timer built for the attempt, which is a question the second
+            // cause cannot fake: a task the new timer takes was refused by
+            // the old timer's death. Attempted once, because keyed on the
+            // refusal alone the second cause is incurable and the loop spins,
+            // handing out a fresh timer per turn and scheduling nothing on
+            // any of them.
+            Timer replacement = newPoolTimer();
             try {
-                Thread.currentThread().setContextClassLoader(ConnectionPool.class.getClassLoader());
-                // Create the timer thread in a PrivilegedAction so that a
-                // reference to the web application class loader is not created
-                // via Thread.inheritedAccessControlContext
-                poolCleanTimer = new Timer(
-                        "Tomcat JDBC Pool Cleaner[" + System.identityHashCode(ConnectionPool.class.getClassLoader()) +
-                                ":" + System.currentTimeMillis() + "]",
-                        true);
-            } finally {
-                Thread.currentThread().setContextClassLoader(loader);
+                replacement.schedule(cleaner, cleaner.sleepTime, cleaner.sleepTime);
+            } catch (IllegalStateException y) {
+                // The task is the spent one, so nothing is rebuilt. The timer
+                // this call found may well be alive and serving the tasks
+                // registered on it; the one just discarded was never asked to
+                // hold anything, and the registry goes back as this call found
+                // it. The refusal itself goes back to the caller, which is
+                // what starting a spent task has always answered with.
+                cleaners.remove(cleaner);
+                replacement.cancel();
+                log.error(MessageFactory.get("connectionPool.cleanerSchedulingFailed"), y);
+                throw y;
+            }
+            // The diagnosis is the acceptance: every task the registry holds
+            // besides this one was scheduled on the timer that died. A spent
+            // task can never be scheduled again, so replacing the timer
+            // revives nothing by itself - each pool has to build a new task,
+            // and only that pool's monitor can arm it. Pool threads reach
+            // this method's monitor from behind their own, so arming them
+            // from here would cross the two orders; the new timer's thread
+            // holds no pool monitor and takes them one at a time.
+            List<PoolCleaner> stranded = new ArrayList<>(cleaners);
+            stranded.remove(cleaner);
+            poolCleanTimer = replacement;
+            if (!stranded.isEmpty()) {
+                log.error(MessageFactory.get("connectionPool.cleanerTimerReplaced",
+                        Integer.valueOf(stranded.size())), x);
+                try {
+                    replacement.schedule(new CleanerReviver(stranded), 0);
+                } catch (RuntimeException z) {
+                    // The recovery's own step is the one failing here. The pool
+                    // that arrived has its task on the new timer and owes its
+                    // configuration write no failure it did not cause, so this
+                    // is reported rather than thrown back at it; the pools left
+                    // stranded are what the message counts.
+                    log.error(MessageFactory.get("connectionPool.cleanerRearmFailed"), z);
+                }
             }
         }
-        poolCleanTimer.schedule(cleaner, cleaner.sleepTime, cleaner.sleepTime);
+    }
+
+    /**
+     * Builds the timer that carries the maintenance of every pool this class
+     * loader holds. Its thread is created with the pool's own class loader as
+     * the context one, so that a reference to a web application class loader is
+     * not created via Thread.inheritedAccessControlContext.
+     *
+     * @return a timer with no tasks scheduled on it
+     */
+    private static Timer newPoolTimer() {
+        ClassLoader loader = Thread.currentThread().getContextClassLoader();
+        try {
+            Thread.currentThread().setContextClassLoader(ConnectionPool.class.getClassLoader());
+            return new Timer(
+                    "Tomcat JDBC Pool Cleaner[" + System.identityHashCode(ConnectionPool.class.getClassLoader()) +
+                            ":" + System.currentTimeMillis() + "]",
+                    true);
+        } finally {
+            Thread.currentThread().setContextClassLoader(loader);
+        }
+    }
+
+    /**
+     * Arms a fresh maintenance task for each pool whose task was scheduled on
+     * the shared timer that died. The revival cannot reuse those tasks - one
+     * that has been scheduled once is spent - so it asks the pools themselves
+     * through {@link ConnectionPool#rearmPoolCleaner(PoolCleaner)}, which takes
+     * effect only for a pool still holding the spent task.
+     */
+    private static final class CleanerReviver extends TimerTask {
+        private final List<PoolCleaner> stranded;
+
+        CleanerReviver(List<PoolCleaner> stranded) {
+            this.stranded = stranded;
+        }
+
+        @Override
+        public void run() {
+            for (PoolCleaner cleaner : stranded) {
+                try {
+                    ConnectionPool pool = cleaner.pool.get();
+                    if (pool == null) {
+                        // Nothing holds the pool any more. Its task will never
+                        // run again, so it is the one entry in the registry that
+                        // no cleaner will ever stop and no close will ever hand
+                        // back - drop it here, as the task's own run method does
+                        // when it outlives the pool.
+                        unregisterCleaner(cleaner);
+                        continue;
+                    }
+                    pool.rearmPoolCleaner(cleaner);
+                } catch (Throwable x) {
+                    // The module's fatal policy runs first, as everywhere else.
+                    // This is a timer task: a throwable that escaped it would
+                    // take the replacement timer down the way the last one went,
+                    // and the pools further down this list with it.
+                    ExceptionUtils.handleThrowable(x);
+                    log.error(MessageFactory.get("connectionPool.cleanerRearmFailed"), x);
+                }
+            }
+        }
     }
 
     private static synchronized void unregisterCleaner(PoolCleaner cleaner) {
@@ -2789,8 +3233,16 @@ public class ConnectionPool {
                     } else if (pool.getPoolProperties().getMaxAge() > 0) {
                         pool.testAllIdle(true);
                     }
-                } catch (Exception x) {
-                    log.error(x.toString(), x);
+                } catch (Throwable x) {
+                    // The guards on the maintenance paths convert exceptions
+                    // and - since handleThrowable joined them - non-fatal
+                    // Errors, but a throwable can still reach here from a
+                    // path without a guard of its own. The module's fatal
+                    // policy runs first, as everywhere else; losing this
+                    // task's next runs to a timer that dies on a fatal Error
+                    // is borne by the replacement in registerCleaner.
+                    ExceptionUtils.handleThrowable(x);
+                    log.error(MessageFactory.get("connectionPool.poolCleanerFailed"), x);
                 }
             }
         }

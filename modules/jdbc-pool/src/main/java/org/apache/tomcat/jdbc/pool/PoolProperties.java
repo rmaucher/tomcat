@@ -17,6 +17,7 @@
 package org.apache.tomcat.jdbc.pool;
 
 import java.io.IOException;
+import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.io.StringReader;
@@ -42,6 +43,13 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
 
 /**
  * Implementation of {@link PoolConfiguration} that holds the configuration properties for a connection pool.
+ * <p>
+ * The reconfiguring setters publish their changes under this instance's monitor, which makes that monitor the
+ * snapshot boundary of the configuration: {@link #clone()} takes its copy under it, and so does the connect path
+ * when it copies the live {@link #getDbProperties()} collection for the driver. A copy taken under the monitor
+ * therefore always shows one state some setter published, never a mix of two. Setters that reconfigure in place
+ * must keep acquiring this monitor, and a reader that needs a consistent snapshot rather than the momentary view
+ * the unsynchronized getters hand out must take the monitor too.
  */
 public class PoolProperties implements PoolConfiguration, Cloneable, Serializable {
 
@@ -828,9 +836,17 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     }
 
 
+    /**
+     * Stores the validation query through {@link #configuredStatement(String)}:
+     * a blank query is the unset value it means, not a statement. A query that
+     * carries anything is stored verbatim.
+     *
+     * @param validationQuery the query used for validation, or null or a blank
+     *                            string if no validation query is set
+     */
     @Override
     public void setValidationQuery(String validationQuery) {
-        this.validationQuery = validationQuery;
+        this.validationQuery = configuredStatement(validationQuery);
     }
 
 
@@ -858,12 +874,32 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
         } catch (ReflectiveOperationException | IllegalArgumentException | SecurityException e) {
             log.warn(MessageFactory.get("poolProperties.validatorCannotInstantiate", className), e);
         }
+
+        if (validator == null) {
+            // The line above names the cause; this names the consequence,
+            // at the level an operator sees without enabling anything: the
+            // configuration keeps reporting the validator's class name,
+            // while validation in fact runs on the query path. Left at the
+            // warning alone, that disagreement is invisible in the default
+            // log.
+            log.error(MessageFactory.get("poolProperties.validatorNotInEffect", className));
+        }
     }
 
 
+    /**
+     * Stores the init SQL through {@link #configuredStatement(String)}: a
+     * blank init SQL is the unset value it means, not a statement a new
+     * session should be given. A statement that carries anything is stored
+     * verbatim.
+     *
+     * @param initSQL the statement a newly established session is
+     *                    initialized with, or null or a blank string if there
+     *                    is none
+     */
     @Override
     public void setInitSQL(String initSQL) {
-        this.initSQL = initSQL != null && initSQL.trim().length() > 0 ? initSQL : null;
+        this.initSQL = configuredStatement(initSQL);
     }
 
 
@@ -879,6 +915,16 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
      * value. The clear runs under the same lock the parse publishes under, so
      * a parse that started from the previous value of the string can never
      * store its result back after this clear.
+     * <p>
+     * Changing the list on a live pool takes effect for the connections whose
+     * interceptor chains are built after the change; connections that were
+     * built earlier keep their existing chain until they are recycled. The
+     * pool's lifecycle notifications follow the start, not the moment: the
+     * close is delivered for the definitions configured when the pool started,
+     * whatever this property lists by then, so removing a definition from a
+     * live pool does not strand what its registration at the pool's start put
+     * in place.
+     * </p>
      *
      * @param jdbcInterceptors the semicolon separated interceptor configuration,
      *                         may be {@code null} to use none
@@ -979,10 +1025,42 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
 
 
     /**
+     * Returns the statement an SQL setting of the configuration carries, or
+     * {@code null} when it carries none.
+     *
+     * <p>A blank is not a statement. A configuration surface that cannot
+     * express the unset value - a JNDI attribute, a connection-properties
+     * line - is written blank to mean exactly what the unset value means, and
+     * no statement can be blank. Both SQL settings the configuration keeps,
+     * {@link #setValidationQuery(String)} and {@link #setInitSQL(String)},
+     * store through this rule, and everything that later reads them reads them
+     * through it as well: the statements a validation may execute, and the
+     * pool's decision whether a newly established session has an init
+     * statement to run at all. A blank that reaches the pool around a setter
+     * - from a {@link PoolConfiguration} implementation of the caller's own,
+     * or a caller's explicit validation argument - is therefore never executed
+     * as SQL and never counted as a configured statement.</p>
+     *
+     * @param sql the configured or passed statement, may be {@code null}
+     *
+     * @return the statement itself if it carries anything, {@code null} if it
+     *         is null or blank
+     */
+    static String configuredStatement(String sql) {
+        return sql != null && sql.trim().length() > 0 ? sql : null;
+    }
+
+
+    /**
      * Masks the credentials embedded in a raw configuration string so that a
      * password typed into the JDBC URL or the connection properties is not
      * printed in cleartext the way the dedicated password field is masked in
-     * {@link #toString()}. Two shapes are scrubbed.
+     * {@link #toString()}. Beyond that dump, the pool applies this masking
+     * wherever it logs diagnostics about these configuration strings - the
+     * driver-instantiation debug line of
+     * {@link PooledConnection#connectUsingDriver()} is one - so the log and
+     * the dump agree on what a masked configuration looks like. Two shapes
+     * are scrubbed.
      * <p>
      * The value of a pair whose key - at the start of a segment, ignoring
      * case - is one of {@code password}, {@code pass} and {@code pwd}. A
@@ -1025,7 +1103,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
      * @return the string with every recognised credential replaced by the mask,
      *         or the string unchanged when it holds none
      */
-    private static String maskCredentials(String value) {
+    public static String maskCredentials(String value) {
         if (value == null) {
             return null;
         }
@@ -1126,7 +1204,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
      * @return the string with every recognised credential value replaced by
      *         the mask, or the string unchanged when it holds none
      */
-    private static String maskInterceptorCredentials(String value) {
+    public static String maskInterceptorCredentials(String value) {
         if (value == null) {
             return null;
         }
@@ -1182,6 +1260,58 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
             segmentStart = segmentEnd + 1;
         }
         return result.toString();
+    }
+
+
+    /**
+     * Masks the credential values carried by an array of parsed interceptor
+     * definitions, the display counterpart of
+     * {@link #maskInterceptorCredentials(String)} for what
+     * {@link #getJdbcInterceptorsAsArray()} has already parsed out of that
+     * string. Every definition of the array is replaced by a new definition of
+     * the same class name, and every property whose name is one of the keys
+     * {@link #isCredentialKey recognises} by a property holding the mask; the
+     * other property names and values, and the order of the array, are copied as
+     * they stand, so the copy still shows which interceptors are configured and
+     * which properties they carry. The copy is also defensive: it shares no
+     * definition, no property and no array slot with the array it was made from,
+     * so a reader handed the copy cannot reach through it to the definitions the
+     * pool builds its interceptor chains from. Like the masking of the string
+     * this rules out the names this class treats as credentials, not any secret
+     * an interceptor may hold under another name.
+     * <p>
+     * The copy carries the interceptor's class <em>name</em> rather than the
+     * class object a definition may have cached: a display copy is never meant
+     * to instantiate an interceptor, and loading a class is not something a
+     * read of the configuration should do.
+     * </p>
+     *
+     * @param definitions the parsed definitions, may be {@code null}
+     *
+     * @return a masked copy of the array, or {@code null} when the array is
+     *         {@code null}
+     */
+    public static InterceptorDefinition[] maskInterceptorCredentials(InterceptorDefinition[] definitions) {
+        if (definitions == null) {
+            return null;
+        }
+        InterceptorDefinition[] result = new InterceptorDefinition[definitions.length];
+        for (int i = 0; i < definitions.length; i++) {
+            InterceptorDefinition definition = definitions[i];
+            if (definition == null) {
+                // An array this class did not build may hold a hole; a hole is
+                // copied as a hole rather than turned into a failure on the
+                // read of a configuration.
+                continue;
+            }
+            InterceptorDefinition copy = new InterceptorDefinition(definition.getClassName());
+            for (InterceptorProperty property : definition.getProperties().values()) {
+                copy.addProperty(new InterceptorProperty(property.getName(),
+                        isCredentialKey(property.getName()) ? PASSWORD_MASK : property.getValue()));
+            }
+            result[i] = copy;
+        }
+        return result;
     }
 
 
@@ -2018,6 +2148,30 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     private void writeObject(ObjectOutputStream oos) throws IOException {
         synchronized (this) {
             oos.defaultWriteObject();
+        }
+    }
+
+
+    /**
+     * Replays the validator configuration after deserialization. The validator
+     * instance is transient - it is runtime state, an object loaded through
+     * some class loader and carrying whatever that loader can reach - but the
+     * class name it was built from is serialized, and a configuration that
+     * read back the name without rebuilding the instance would validate on the
+     * query path while reporting the validator as configured, which is the
+     * disagreement {@link #setValidatorClassName(String)} was made to log.
+     * Replaying the setter rebuilds the instance in the reading JVM, or
+     * reports - as the original setter did - why it could not be built there.
+     *
+     * @param ois the stream to read the object graph from
+     *
+     * @throws IOException if the stream fails
+     * @throws ClassNotFoundException if a serialized class cannot be found
+     */
+    private void readObject(ObjectInputStream ois) throws IOException, ClassNotFoundException {
+        ois.defaultReadObject();
+        if (validatorClassName != null) {
+            setValidatorClassName(validatorClassName);
         }
     }
 
