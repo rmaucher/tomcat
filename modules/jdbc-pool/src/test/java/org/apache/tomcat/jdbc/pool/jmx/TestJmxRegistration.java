@@ -24,6 +24,7 @@ import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import javax.management.InstanceAlreadyExistsException;
@@ -314,6 +315,58 @@ class TestJmxRegistration extends JdbcPoolBaseTest {
         Assertions.assertFalse(server.isRegistered(cacheName),
                 "unbinding a cache from its connection must release the name it holds");
         return new ReusableCache(ds, cache, cacheName);
+    }
+
+    @Test
+    void releasingThePoolMBeanReleasesTheConnectionAndInterceptorMBeans() throws Exception {
+        MBeanServer server = server();
+        DataSource ds = newDataSource();
+        ds.getPoolProperties().setJmxEnabled(true);
+        ds.setJdbcInterceptors(StatementCache.class.getName() + "(prepared=true,max=5)");
+        ds.getPoolProperties().setInitialSize(0);
+        ds.createPool();
+        ds.preRegister(server, uniqueName("children-released"));
+        ObjectName poolOname = ds.getPool().getJmxPool().getObjectName();
+        Assertions.assertNotNull(poolOname, "precondition: the pool MBean is published");
+
+        ObjectName connectionName;
+        ObjectName cacheName;
+        try (Connection borrowed = ds.getConnection()) {
+            connectionName = connectionMBeanUnder(server, poolOname);
+            cacheName = new ObjectName(connectionName.toString() + ",JdbcInterceptor=StatementCache");
+            Assertions.assertTrue(server.isRegistered(cacheName),
+                    "precondition: the cache of the borrowed connection publishes its MBean");
+        }
+
+        try {
+            ds.postDeregister();
+
+            Assertions.assertFalse(server.isRegistered(poolOname),
+                    "postDeregister must unregister the pool MBean");
+            Assertions.assertFalse(server.isRegistered(connectionName),
+                    "postDeregister must unregister the connection MBean below it");
+            Assertions.assertFalse(server.isRegistered(cacheName),
+                    "postDeregister must unregister the interceptor MBeans below the connection");
+
+            // The pool stays live; registering the DataSource again must
+            // republish the children whose handles the release cleared.
+            ds.preRegister(server, uniqueName("children-republished"));
+            ObjectName republishedPool = ds.getPool().getJmxPool().getObjectName();
+            Assertions.assertNotNull(republishedPool,
+                    "precondition: the DataSource can be registered again");
+            ObjectName republishedConnection = connectionMBeanUnder(server, republishedPool);
+            Assertions.assertNotNull(republishedConnection,
+                    "a connection released by the deregistration must republish itself");
+            try (Connection borrowed = ds.getConnection()) {
+                ObjectName republishedCache = new ObjectName(
+                        republishedConnection.toString() + ",JdbcInterceptor=StatementCache");
+                Assertions.assertTrue(server.isRegistered(republishedCache),
+                        "an interceptor released by the deregistration must republish on the next borrow");
+            }
+        } finally {
+            ds.close();
+            ds.postDeregister();
+        }
     }
 
     @Test
@@ -894,6 +947,111 @@ class TestJmxRegistration extends JdbcPoolBaseTest {
             for (ObjectName stale : publishedFor(server, dsName)) {
                 server.unregisterMBean(stale);
             }
+        }
+    }
+
+    @Test
+    void setJmxEnabledIsOnlyAcceptedBeforeThePoolIsCreated() throws Exception {
+        DataSource ds = newDataSource();
+        // Before the pool exists the property is ordinary configuration.
+        ds.setJmxEnabled(false);
+        Assertions.assertFalse(ds.isJmxEnabled(), "the pre-start write must be stored");
+
+        ds.setJmxEnabled(true);
+        ds.createPool();
+
+        // After creation the MBean decision has been made; a write through the
+        // data source must be refused like the pool MBean's own setter.
+        Assertions.assertThrows(UnsupportedOperationException.class,
+                () -> ds.setJmxEnabled(false),
+                "a post-start write would otherwise be stored without creating or removing anything");
+        Assertions.assertTrue(ds.isJmxEnabled(), "the refused write must not change the configuration");
+
+        ds.close();
+        Assertions.assertThrows(UnsupportedOperationException.class,
+                () -> ds.setJmxEnabled(false),
+                "a closed data source can never create a pool again, so a write there would be"
+                        + " stored without any possible effect");
+        Assertions.assertTrue(ds.isJmxEnabled(),
+                "the refused write on a closed data source must not change the configuration");
+    }
+
+    @Test
+    void aRefusedUnregistrationSucceedsWhenTheCallerAsksAgain() throws Exception {
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        ObjectName name = uniqueName("retry-unregister");
+        RefusingUnregister.REFUSALS.set(1);
+        server.registerMBean(new RefusingUnregister(), name);
+        try {
+            Assertions.assertFalse(JmxUtil.unregisterJmx(name),
+                    "the first refusal must be reported to the caller");
+            Assertions.assertTrue(server.isRegistered(name),
+                    "precondition: the refused unregistration leaves the MBean registered");
+
+            Assertions.assertTrue(JmxUtil.unregisterJmx(name),
+                    "a later call for the same name must try again");
+            Assertions.assertFalse(server.isRegistered(name),
+                    "the second call must take the MBean down");
+        } finally {
+            if (server.isRegistered(name)) {
+                server.unregisterMBean(name);
+            }
+        }
+    }
+
+    @Test
+    void aRefusedUnregistrationIsNotRetriedByAnUnrelatedCall() throws Exception {
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        ObjectName name = uniqueName("no-retry-unregister");
+        RefusingUnregister.REFUSALS.set(1);
+        server.registerMBean(new RefusingUnregister(), name);
+        try {
+            Assertions.assertFalse(JmxUtil.unregisterJmx(name),
+                    "precondition: the first refusal is reported");
+            Assertions.assertTrue(server.isRegistered(name),
+                    "precondition: the refused MBean stays registered");
+
+            // JMX is a best-effort management channel. A refusal is logged for
+            // the operator and is not remembered: a later retry by name could
+            // belong to a replacement MBean that took the name in the meantime.
+            Assertions.assertTrue(JmxUtil.unregisterJmx(null),
+                    "releasing nothing is still the requested end state");
+            Assertions.assertTrue(server.isRegistered(name),
+                    "an unrelated unregistration must not retry the refused name");
+        } finally {
+            if (server.isRegistered(name)) {
+                server.unregisterMBean(name);
+            }
+        }
+    }
+
+    /** Standard MBean interface for {@link RefusingUnregister}. */
+    public interface RefusingUnregisterMBean {
+    }
+
+    /** MBean whose preDeregister refuses the first unregistration. */
+    public static class RefusingUnregister implements RefusingUnregisterMBean, MBeanRegistration {
+
+        static final AtomicInteger REFUSALS = new AtomicInteger();
+
+        @Override
+        public ObjectName preRegister(MBeanServer server, ObjectName name) {
+            return name;
+        }
+
+        @Override
+        public void postRegister(Boolean registrationDone) {
+        }
+
+        @Override
+        public void preDeregister() throws Exception {
+            if (REFUSALS.compareAndSet(1, 0)) {
+                throw new IllegalStateException("simulated unregistration refusal");
+            }
+        }
+
+        @Override
+        public void postDeregister() {
         }
     }
 }

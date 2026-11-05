@@ -395,12 +395,16 @@ public class DataSourceProxy implements PoolConfiguration {
     public ConnectionPool getPool() {
         try {
             return createPool();
-        } catch (SQLException x) {
+        } catch (SQLException | RuntimeException x) {
             if (closed) {
                 // A closed data source legitimately has no pool; this is
                 // a normal lifecycle state, not a creation failure.
                 return null;
             }
+            // A configuration error before the pool is built - a malformed
+            // interceptor value, for example - is a creation failure like any
+            // other to this contract: report it and answer no pool rather than
+            // let it escape from a getter documented to return null.
             log.error(MessageFactory.get("dataSourceProxy.errorCreatingPool"), x);
             return null;
         }
@@ -650,11 +654,12 @@ public class DataSourceProxy implements PoolConfiguration {
         if (p == null) {
             return;
         }
-        // Make sure the pool is properly configured, on the configuration the
-        // calling setter wrote, and then start, stop or re-arm the cleaner to match
-        // what that correction left the configuration asking for.
-        p.checkPoolConfiguration(poolProperties);
-        p.reconcilePoolCleaner(poolProperties);
+        // Validate the configuration the calling setter wrote and bring the
+        // cleaner in line with what that correction left it asking for, as one
+        // step under the pool's monitor: the MBean writes the same configuration
+        // without a monitor, so validating and reconciling in separate calls
+        // would let its write land between them.
+        p.applyConfigurationChange(poolProperties);
     }
 
 
@@ -791,8 +796,24 @@ public class DataSourceProxy implements PoolConfiguration {
     }
 
 
+    /**
+     * Sets whether JMX is enabled, before the pool is created. Whether the pool registers an MBean is decided when
+     * the pool is created, so a write after that point is rejected rather than stored without effect, matching the
+     * pool MBean's own setter. A closed data source is rejected as well: it can never create a pool again, so a write
+     * there would be stored without any possible effect.
+     *
+     * @param enabled whether JMX is enabled
+     *
+     * @throws UnsupportedOperationException if the pool has already been created or this data source has been closed
+     */
     @Override
-    public void setJmxEnabled(boolean enabled) {
+    public synchronized void setJmxEnabled(boolean enabled) {
+        if (closed) {
+            throw new UnsupportedOperationException(MessageFactory.get("dataSourceProxy.jmxEnabledAfterClose"));
+        }
+        if (pool != null) {
+            throw new UnsupportedOperationException(MessageFactory.get("dataSourceProxy.jmxEnabledAfterStart"));
+        }
         this.getPoolProperties().setJmxEnabled(enabled);
     }
 
@@ -885,12 +906,13 @@ public class DataSourceProxy implements PoolConfiguration {
     /**
      * The pool's borrow wait timeout, {@link PoolConfiguration#getMaxWait()}, expressed in whole seconds:
      * {@link javax.sql.DataSource#getLoginTimeout()} is mapped onto that property rather than ignored. A
-     * sub-second <code>maxWait</code> therefore reads back as zero.
+     * sub-second <code>maxWait</code> therefore reads back as zero, and so does a negative one, which the pool reads
+     * as "wait indefinitely"; a negative login timeout is not a legal JDBC value.
      *
-     * @return the timeout in whole seconds
+     * @return the timeout in whole seconds, never negative
      */
     public int getLoginTimeout() {
-        return poolProperties.getMaxWait() / 1000;
+        return Math.max(0, poolProperties.getMaxWait() / 1000);
     }
 
     /**
@@ -1140,16 +1162,24 @@ public class DataSourceProxy implements PoolConfiguration {
     }
 
 
+    /**
+     * Returns the connection properties with any credential they carry masked out, so the data source's own bean/JMX
+     * surface does not expose a password in cleartext. The write is not masked: {@link #setConnectionProperties(String)}
+     * takes the string as it is meant to reach the driver. Use {@link #getPoolProperties()} for the raw value.
+     * {@inheritDoc}
+     */
     @Override
     public String getConnectionProperties() {
-        return getPoolProperties().getConnectionProperties();
+        return PoolProperties.maskCredentials(getPoolProperties().getConnectionProperties());
     }
 
 
     /**
-     * Returns a copy of the database properties with the password removed. This object doubles as its own JMX/bean
-     * surface and {@link #setPassword(String)} puts the password into the database properties, so returning them as
-     * they are would expose the plaintext password through a getter while {@link #getPassword()} is explicitly masked -
+     * Returns a copy of the database properties with the credential entries removed. A credential entry is one whose
+     * key is {@code password}, {@code pass} or {@code pwd}, ignoring case and surrounding whitespace. This object
+     * doubles as its own JMX/bean surface and {@link #setPassword(String)} puts the password into the database
+     * properties, so returning them as they are would expose the plaintext password through a getter while
+     * {@link #getPassword()} is explicitly masked -
      * the same protection the pool's own MBean
      * ({@link org.apache.tomcat.jdbc.pool.jmx.ConnectionPool#getDbProperties()}) already applies. A configuration whose
      * database properties are {@code null} - a state {@link #setPassword(String)} and {@link #setUsername(String)}
@@ -1195,9 +1225,14 @@ public class DataSourceProxy implements PoolConfiguration {
     }
 
 
+    /**
+     * Returns the interceptor configuration with any credential its definitions carry masked out, so the data source's
+     * own bean/JMX surface does not expose a password in cleartext. Use {@link #getPoolProperties()} for the raw value.
+     * {@inheritDoc}
+     */
     @Override
     public String getJdbcInterceptors() {
-        return getPoolProperties().getJdbcInterceptors();
+        return PoolProperties.maskInterceptorCredentials(getPoolProperties().getJdbcInterceptors());
     }
 
 
@@ -1269,9 +1304,14 @@ public class DataSourceProxy implements PoolConfiguration {
     }
 
 
+    /**
+     * Returns the JDBC URL with any credential it carries masked out, so the data source's own bean/JMX surface does
+     * not expose a password in cleartext. The write is not masked: {@link #setUrl(String)} takes the URL as it is meant
+     * to reach the driver. Use {@link #getPoolProperties()} for the raw value. {@inheritDoc}
+     */
     @Override
     public String getUrl() {
-        return getPoolProperties().getUrl();
+        return PoolProperties.maskCredentials(getPoolProperties().getUrl());
     }
 
 
@@ -1394,9 +1434,16 @@ public class DataSourceProxy implements PoolConfiguration {
     }
 
 
+    /**
+     * Returns the parsed interceptor definitions with their credential values masked, the display counterpart of
+     * {@link #getJdbcInterceptors()}. This object doubles as its own JMX/bean surface, so the raw definitions - which
+     * carry the pairs the pool builds its interceptor chains from - stay reachable only through
+     * {@link #getPoolProperties()}. The copy is also defensive: it shares no definition, property or array slot with the
+     * live configuration, so a caller cannot mutate the chain a later connection will build. {@inheritDoc}
+     */
     @Override
     public InterceptorDefinition[] getJdbcInterceptorsAsArray() {
-        return getPoolProperties().getJdbcInterceptorsAsArray();
+        return PoolProperties.maskInterceptorCredentials(getPoolProperties().getJdbcInterceptorsAsArray());
     }
 
 
@@ -1436,6 +1483,14 @@ public class DataSourceProxy implements PoolConfiguration {
     }
 
 
+    /**
+     * Replaces the live database properties with the given set. The write is not masked, and it replaces the whole
+     * collection: a read-modify-write of the masked {@link #getDbProperties()} view hands back a set with the password
+     * removed and takes that credential away from the live configuration. Use {@link #setPassword(String)} and
+     * {@link #setUsername(String)} to change the credentials, as {@link #getDbProperties()} describes.
+     *
+     * @param dbProperties the replacement database properties
+     */
     @Override
     public void setDbProperties(Properties dbProperties) {
         getPoolProperties().setDbProperties(dbProperties);

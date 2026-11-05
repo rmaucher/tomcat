@@ -24,8 +24,8 @@ import java.util.Comparator;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TimeZone;
-import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.management.openmbean.CompositeDataSupport;
 import javax.management.openmbean.CompositeType;
@@ -44,25 +44,23 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
 /**
  * Slow query report interceptor. Tracks timing of query executions.
  * <p>
- * The statistics belong to a pool: a pool registers its own store when it starts and releases it when it closes, and
- * every connection of that pool books its executions into that one store. The store is published under the name the
- * pool started with - see {@link ConnectionPool#getRegistrationName()} - which is how it is read by name
- * (see {@link #getPoolStats(String)}), so renaming a running pool, which the pool's own JMX allows, neither detaches
- * the pool from its statistics nor strands what its start published. A reporting definition the interceptor list gains
- * after the start is not stranded either: the list is mutable at runtime through the pool's own MBean, so its first
- * borrow registers the store its start would have registered, and the close that releases the store is told about that
- * definition as well.
+ * The statistics belong to the pool the interceptor serves: a pool registers its store when it starts and releases it
+ * when it closes, and every connection of that pool books its executions into that one store. The store is read by the
+ * name the pool started with - see {@link ConnectionPool#getRegistrationName()} and {@link #getPoolStats(String)}.
+ * The name identifies the pool, so it must be unique among the live pools of this class loader: Tomcat gives every
+ * pool it manages a name of its own, and a programmatically built pool has a unique default name. A pool that starts
+ * under a name a live pool already holds is a configuration error, reported as such, and its statistics displace the
+ * other pool's store under the shared name.
+ * Renaming a running pool, which the pool's own JMX allows, neither detaches the pool from its statistics nor strands
+ * what its start published.
  * </p>
  * <p>
- * The name is a view over pool-keyed registrations, not the registration itself. Two live pools configured with the
- * same name therefore each keep their own statistics instead of reporting into one another's numbers: the view answers
- * with the store of the pool that started under the name last, and the pool that started there first keeps collecting
- * into its own store, reachable by its own connections and by no name. Sharing a name between live pools is not
- * supported - a container guarantees a container-managed pool a name of its own, so what is left is programmatic
- * configuration - and a pool that starts under a name another live pool holds says so in the log.
+ * A reporting definition the interceptor list gains after the start is not stranded either: the list is mutable at
+ * runtime through the pool's own MBean, so its first borrow registers the store its start would have registered, and
+ * the close that releases the store is told about that definition as well.
  * </p>
  * <p>
- * The registrations hold the pool weakly: a pool abandoned without closing is never pinned by them and can be
+ * The registrations hold the pool only weakly, so a pool abandoned without closing is never pinned by them and can be
  * collected with its open sessions, leaving only the bounded statistics store published under its name until a pool
  * starting under that name takes the name over.
  * </p>
@@ -99,20 +97,12 @@ public class SlowQueryReport extends AbstractQueryReport {
     protected static final String LOG_FAILED = "logFailed";
 
     /**
-     * The view of the statistics stores by the name the owning pool started with. The registration itself is keyed by
-     * pool instance (see {@link #perPoolStatistics}); this map exists for {@link #getPoolStats(String)} and
-     * {@link SlowQueryReportJmxMBean#getPoolNames()}, which address statistics by name. It holds one store per name:
-     * the store of the pool that started under that name last.
+     * The statistics store published under each pool name. The name identifies the pool - a container names the pools
+     * it manages uniquely, and the default name of a programmatically built pool is unique as well - so this one
+     * registry resolves both the store a pool's connections book into and the store {@link #getPoolStats(String)} and
+     * {@link SlowQueryReportJmxMBean#getPoolNames()} read.
      */
     protected static final ConcurrentHashMap<String, PoolStatistics> perPoolStats = new ConcurrentHashMap<>();
-    /**
-     * The statistics store of every live pool, keyed by pool instance: pools are what the statistics belong to, so
-     * two pools configured with the same name keep two stores and never book into each other's numbers. The map is
-     * keyed weakly - a pool the application abandoned without closing must drain out of this JVM-lifetime registry
-     * together with everything it reaches, exactly as it did before the registry keyed anything by pool.
-     */
-    private static final Map<ConnectionPool, PoolStatistics> perPoolStatistics = Collections
-            .synchronizedMap(new WeakHashMap<ConnectionPool, PoolStatistics>());
     /**
      * The statistics store this instance books to, resolved from the pool it serves; {@code null} when that pool has
      * no store. See {@link #reset(ConnectionPool, PooledConnection)}.
@@ -126,9 +116,10 @@ public class SlowQueryReport extends AbstractQueryReport {
     /**
      * Whether this instance has already reported that it cannot resolve a statistics store. One loss of the store is
      * one fact about the session this instance serves, so it is reported once; see
-     * {@link #getQueryStats(String)} for why the report cannot simply be made on every execution.
+     * {@link #getQueryStats(String)} for why the report cannot simply be made on every execution. The atomic compare
+     * and set makes the check and the marking one step, so concurrent executions cannot both report the same loss.
      */
-    private volatile boolean closedOrAbandonedReported;
+    private final AtomicBoolean closedOrAbandonedReported = new AtomicBoolean();
     /**
      * Maximum number of queries we will be storing statistics for. Eviction keeps the number of stored queries near
      * this amount; while queries are being executed concurrently it can briefly be exceeded. This sizes the statistics
@@ -155,17 +146,18 @@ public class SlowQueryReport extends AbstractQueryReport {
     /**
      * Returns the query statistics published under the given pool name.
      * <p>
-     * The name is a view over the pool-keyed registrations (see {@link #perPoolStats}): it publishes the store of the
-     * pool that started under that name last, and is given up with that pool's close. The one store that outlives the
-     * rule is a pool that was abandoned without closing: its bounded statistics stay published under its name until a
-     * pool starting under the name replaces it, because the close that would give them up never ran.
+     * The store is published under the name the pool started with and is given up with that pool's close. The one
+     * store that outlives the rule is a pool that was abandoned without closing: its bounded statistics stay
+     * published under its name until a pool starting under the name replaces it, because the close that would give
+     * them up never ran.
      * </p>
      *
      * @param poolname - the name of the pool we want to retrieve stats for
      *
      * @return a hash map containing the statistics of the monitored queries, kept near {@code maxQueries} entries by
      *             eviction, or {@code null} when no store is published under that name. A {@code null} name is answered
-     *             the same way as a name that holds nothing, since nothing can be registered under it
+     *             the same way as a name that holds nothing, since nothing can be registered under it. The map is the
+     *             live store, not a copy: callers must not modify it
      */
     public static ConcurrentHashMap<String, QueryStats> getPoolStats(String poolname) {
         if (poolname == null) {
@@ -180,13 +172,6 @@ public class SlowQueryReport extends AbstractQueryReport {
 
     /**
      * Returns the statistics store registered for the given pool.
-     * <p>
-     * The name view answers whenever it publishes this pool's own store, which is the case for every pool the
-     * container names and for every programmatic pool whose name no other live pool shares; for those the read is the
-     * one concurrent lookup it has always been. Only a pool whose name a second live pool has taken over - the
-     * configuration {@link #poolStarted(ConnectionPool)} warns about - is reached through the pool-keyed registry,
-     * whose lookup is synchronised. An unsupported configuration pays for itself; the healthy borrow path does not.
-     * </p>
      *
      * @param pool the pool whose store is wanted, possibly {@code null}
      *
@@ -198,13 +183,7 @@ public class SlowQueryReport extends AbstractQueryReport {
             return null;
         }
         String name = pool.getRegistrationName();
-        if (name != null) {
-            PoolStatistics published = perPoolStats.get(name);
-            if (published != null && published.isFor(pool)) {
-                return published;
-            }
-        }
-        return perPoolStatistics.get(pool);
+        return name == null ? null : perPoolStats.get(name);
     }
 
     /**
@@ -363,19 +342,18 @@ public class SlowQueryReport extends AbstractQueryReport {
     /**
      * Registers the statistics store of a pool that has started.
      * <p>
-     * The store belongs to this pool alone and is published twice: in the pool-keyed registration, which is what the
-     * pool's own connections book through, and in the view by the name the pool started with, which is what
-     * {@link #getPoolStats(String)} and the JMX read surface answer from. A name is published by one store at a time,
-     * so a pool that starts under a name another live pool holds takes over that view - it does not merge with the
-     * other pool's statistics, and the warning its start writes says which of the two pools now answers for the name.
+     * The store is published under the name the pool started with, which is what {@link #getPoolStats(String)} and
+     * the JMX read surface answer from. The name identifies the pool, so a start always begins a fresh store: a pool
+     * that starts under a name an abandoned pool left behind does not inherit the abandoned pool's numbers.
      * </p>
      * <p>
-     * A pool that carries no name is refused. The name is not one setting among others here: it is the key of the view
-     * the store is published in and of the ObjectName the JMX subclass publishes its MBean under, and neither can be
-     * keyed under no name. Failing the start with a message that names the setting is therefore the honest outcome,
-     * and it is what the pool reports as the reason its start failed - where the missing key gave a start failure that
-     * said nothing. A container names every pool it starts, so reaching this is a programmatic pool configured without
-     * a name; the check stays as the library's own guarantee that what it registers always has a key.
+     * A pool that carries no name is refused. The name is not one setting among others here: it is the key of the
+     * registry the store is published in and of the ObjectName the JMX subclass publishes its MBean under, and
+     * neither can be keyed under no name. Failing the start with a message that names the setting is therefore the
+     * honest outcome, and it is what the pool reports as the reason its start failed - where the missing key gave a
+     * start failure that said nothing. A container names every pool it starts, so reaching this is a programmatic pool
+     * configured without a name; the check stays as the library's own guarantee that what it registers always has a
+     * key.
      * </p>
      *
      * @param pool the connection pool that has started
@@ -396,55 +374,44 @@ public class SlowQueryReport extends AbstractQueryReport {
             // ConcurrentHashMap would refuse the key before anything else could
             throw new IllegalStateException(MessageFactory.get("slowQueryReport.poolNameRequired"));
         }
-        PoolStatistics own;
-        synchronized (perPoolStatistics) {
-            own = registerStatistics(pool, name);
+        PoolStatistics own = new PoolStatistics(pool, name);
+        synchronized (perPoolStats) {
+            reportDuplicateName(perPoolStats.put(name, own), pool, name);
         }
         this.poolStatistics = own;
         this.queries = own.getQueryStats();
     }
 
     /**
-     * Registers a statistics store for the given pool, unless it holds one already.
-     * <p>
-     * The pool's monitor is the caller's to hold: {@link #poolStarted(ConnectionPool)} takes it for the start, and the
-     * first borrow of a definition that joined the chain after the start takes it for the registration its start never
-     * came. Registering rather than only reading is what keeps that second case alive - the interceptor property is
-     * mutable at runtime, through the pool's own MBean as much as in code, and a reporting definition added to a
-     * running pool has no start left to register with but every right to monitor the pool it was added to.
-     * </p>
-     * <p>
-     * The registration is idempotent per pool: a store that is still publishing is kept, so the two definitions of the
-     * recommended two-thresholds configuration, and every borrow of a late definition, share the one store the first of
-     * them registered instead of each starting a statistics map of its own.
-     * </p>
+     * Reports a pool that takes a name a live pool already holds. The name is the key both the statistics and the JMX
+     * registration are published under, so two live pools sharing it cannot be told apart: the registry, like the
+     * MBeanServer, keeps one of them. That is a configuration error rather than a supported way to share reporting -
+     * Tomcat gives every pool it manages a name of its own - so it is reported at error level. A store whose pool has
+     * been collected is not a live duplicate: a pool that starts under the name an abandoned pool left behind takes
+     * the name over without a report.
      *
-     * @param pool the pool to register a store for
-     * @param name the name the pool started with, which the store is published under in the view
-     *
-     * @return the store of that pool - the one it held, or the one this call registered
+     * @param previous the store the name held before, or {@code null} when it held none
+     * @param pool     the pool that registered the store now
+     * @param name     the name both pools carry
      */
-    private static PoolStatistics registerStatistics(ConnectionPool pool, String name) {
-        PoolStatistics existing = perPoolStatistics.get(pool);
-        if (existing != null && !existing.isReleased()) {
-            return existing;
+    private static void reportDuplicateName(PoolStatistics previous, ConnectionPool pool, String name) {
+        if (previous == null) {
+            return;
         }
-        PoolStatistics own = new PoolStatistics(pool, name);
-        perPoolStatistics.put(pool, own);
-        PoolStatistics displaced = perPoolStats.put(name, own);
-        if (displaced != null && displaced != own && displaced.isLive() && log.isWarnEnabled()) {
-            log.warn(MessageFactory.get("slowQueryReport.poolNameInUse", name));
+        ConnectionPool owner = previous.getPool();
+        if (owner != null && owner != pool) {
+            log.error(MessageFactory.get("slowQueryReport.duplicatePoolName", name));
         }
-        return own;
     }
 
     /**
      * Resolves the store the borrow this instance serves is to book into, registering the pool's store when this
      * instance is the first component of that pool to need one.
      * <p>
-     * The cheap read comes first, and it is the whole cost for a healthy pool: a pool named by its container answers
-     * from the lock-free view. Only a borrow that finds nothing looks further, and only for a pool that is still live
-     * and carries a name to publish under.
+     * The read comes first, and it is the whole cost for a healthy pool. Only a borrow that finds nothing looks
+     * further, and only for a pool that is still live and carries a name to publish under. That second case is a
+     * reporting definition the interceptor list gained after the start: the definition has no start left to register
+     * with, but it still monitors the pool it was added to, and every borrow of it resolves the one store of that pool.
      * </p>
      * <p>
      * The liveness check is read under the registry's monitor, which is the monitor the close of the store's release
@@ -470,11 +437,16 @@ public class SlowQueryReport extends AbstractQueryReport {
             // else; poolStarted says so when the pool has a start to say it at
             return null;
         }
-        synchronized (perPoolStatistics) {
+        synchronized (perPoolStats) {
             if (parent.isClosed()) {
                 return null;
             }
-            return registerStatistics(parent, name);
+            own = perPoolStats.get(name);
+            if (own == null) {
+                own = new PoolStatistics(parent, name);
+                reportDuplicateName(perPoolStats.put(name, own), parent, name);
+            }
+            return own;
         }
     }
 
@@ -484,9 +456,7 @@ public class SlowQueryReport extends AbstractQueryReport {
      * The callback is delivered by {@link ConnectionPool} to a freshly instantiated interceptor (see
      * {@code ConnectionPool#close(boolean)}), which has never held a reference to the statistics, so the store to
      * release can only be identified through the closing pool passed here, not through this instance's own state. The
-     * release is idempotent and needs no decision about anyone else: the store being given up is the closing pool's
-     * own, so a second pool that was configured with the same name never loses anything through it, and every
-     * definition of the closing pool's chain can run the release without consuming a signal a later definition needed.
+     * release is idempotent, and every definition of the closing pool's chain can run it.
      * </p>
      *
      * @param pool the connection pool that has been closed
@@ -498,9 +468,8 @@ public class SlowQueryReport extends AbstractQueryReport {
     }
 
     /**
-     * Gives up the statistics store registered for the given pool: the store stops publishing its statistics, the pool
-     * is taken out of the pool-keyed registration, and the name view is freed unless a later pool has taken the name
-     * over in the meantime.
+     * Gives up the statistics store registered for the given pool: the store stops publishing its statistics and is
+     * taken out of the registry.
      *
      * @param pool the connection pool that has been closed
      *
@@ -511,21 +480,20 @@ public class SlowQueryReport extends AbstractQueryReport {
         // renamed while running - the name property is mutable at runtime -
         // still releases what its start published, and not whatever it
         // happens to be called by the time it closes
-        PoolStatistics own;
-        synchronized (perPoolStatistics) {
-            own = perPoolStatistics.remove(pool);
-        }
-        if (own == null) {
+        String name = pool.getRegistrationName();
+        if (name == null) {
             // The pool never got far enough into its start to record a name, or
             // its close has already been delivered, so nothing is left for it to
             // release
             return null;
         }
-        own.release();
-        // The name view is freed only while it still publishes this pool's own
-        // store: a pool that started under the name later owns the view now, and
-        // this close has no claim on it.
-        perPoolStats.remove(own.getName(), own);
+        PoolStatistics own;
+        synchronized (perPoolStats) {
+            own = perPoolStats.remove(name);
+        }
+        if (own != null) {
+            own.release();
+        }
         return own;
     }
 
@@ -584,11 +552,7 @@ public class SlowQueryReport extends AbstractQueryReport {
      *             reported
      */
     private boolean reportClosedOrAbandoned() {
-        if (closedOrAbandonedReported) {
-            return false;
-        }
-        closedOrAbandonedReported = true;
-        return true;
+        return closedOrAbandonedReported.compareAndSet(false, true);
     }
 
     /**
@@ -605,6 +569,12 @@ public class SlowQueryReport extends AbstractQueryReport {
             sql = "";
         }
         ConcurrentHashMap<String, QueryStats> queries = SlowQueryReport.this.queries;
+        PoolStatistics own = SlowQueryReport.this.poolStatistics;
+        if (own != null && own.isReleased()) {
+            // The pool closed while this session was still borrowed, so the
+            // store is no longer observable: do not book into it.
+            queries = null;
+        }
         if (queries == null) {
             if (reportClosedOrAbandoned() && log.isWarnEnabled()) {
                 log.warn(MessageFactory.get("slowQueryReport.connectionClosedOrAbandoned"));
@@ -614,9 +584,7 @@ public class SlowQueryReport extends AbstractQueryReport {
         // This instance books on a store again, so a later loss is a fresh
         // event - see reportClosedOrAbandoned(). Guarded so that the common,
         // healthy path stays a plain read of the flag.
-        if (closedOrAbandonedReported) {
-            closedOrAbandonedReported = false;
-        }
+        closedOrAbandonedReported.set(false);
         QueryStats qs = queries.get(sql);
         if (qs == null) {
             qs = new QueryStats(sql);
@@ -828,25 +796,23 @@ public class SlowQueryReport extends AbstractQueryReport {
 
 
     /**
-     * The query statistics of one pool: the map its connections book into, the name the map is published under in the
-     * view, and the pool the statistics belong to.
+     * The query statistics of one pool: the map its connections book into and the name the map is published under.
      * <p>
-     * The pool is held with a weak reference: the store outlives the pool only in the sense that the bounded map under
-     * its name stays published, and a store that held its pool strongly would pin an abandoned pool together with
-     * everything it reaches - its queues, its pooled connections and their open physical sessions - which is what the
-     * registrations did before the pool was held weakly. A store's own identity is what the name view is keyed by
-     * (see {@link #perPoolStats}) and what a {@link SlowQueryReportJmx} interceptor's per-pool JMX state hangs from,
-     * so neither has to know the pool to know which pool it is serving.
+     * The store refers to the pool only weakly. The name identifies the pool and must be unique among live pools -
+     * Tomcat names every pool it manages, and the default name of a programmatic pool is unique as well - so the store
+     * can outlive a pool abandoned without closing without pinning that pool, together with everything it reaches: its
+     * queues, its pooled connections and their open physical sessions. The weak reference is what tells a live holder
+     * of the name from an abandoned pool's leftover store.
      * </p>
      */
     protected static class PoolStatistics {
         /**
-         * the pool these statistics belong to, held weakly so that a pool abandoned without closing drains out of the
-         * JVM-lifetime registries that reach this store
+         * the pool this store belongs to, held weakly so that the store never pins a pool abandoned without closing;
+         * used to tell a live pool holding the name from one whose store is all that is left of it
          */
-        private final WeakReference<ConnectionPool> owner;
+        private final WeakReference<ConnectionPool> pool;
         /**
-         * the name this store is published under in the view - the registration name of the pool at its start
+         * the name this store is published under - the registration name of the pool at its start
          */
         private final String name;
         /**
@@ -855,8 +821,7 @@ public class SlowQueryReport extends AbstractQueryReport {
         private final ConcurrentHashMap<String, QueryStats> stats = new ConcurrentHashMap<>();
         /**
          * What the reporting subclass has published for this pool with JMX - its broadcaster and, in the
-         * {@code notifyPool=false} mode, its MBean. The state is 1:1 with this store, which is 1:1 with the pool, which
-         * is why it hangs from here instead of from a registry that would have to tell two pools of one name apart.
+         * {@code notifyPool=false} mode, its MBean. The state is 1:1 with this store.
          */
         private volatile SlowQueryReportJmx.PoolJmx jmxState;
         /**
@@ -869,38 +834,25 @@ public class SlowQueryReport extends AbstractQueryReport {
         /**
          * Creates the statistics store of one pool.
          *
-         * @param pool the pool the statistics belong to
-         * @param name the name the store is published under in the view
+         * @param pool the pool the store belongs to
+         * @param name the name the store is published under
          */
         protected PoolStatistics(ConnectionPool pool, String name) {
-            owner = new WeakReference<>(pool);
+            this.pool = new WeakReference<>(pool);
             this.name = name;
         }
 
         /**
-         * Returns whether this is the store of the given pool.
+         * Returns the pool this store belongs to while it is still reachable.
          *
-         * @param pool the pool to look for
-         *
-         * @return {@code true} if this store belongs to the pool
+         * @return the owning pool, or {@code null} once it has been collected
          */
-        protected boolean isFor(ConnectionPool pool) {
-            return owner.get() == pool;
+        protected ConnectionPool getPool() {
+            return pool.get();
         }
 
         /**
-         * Returns whether the pool this store belongs to is still live - which it is not once the store has been
-         * released with its close, and not once a pool that was abandoned without closing has been collected. A store
-         * whose pool a caller still holds always reads as live: a weak reference to a reachable pool is not cleared.
-         *
-         * @return {@code true} if a live pool still owns this store
-         */
-        protected boolean isLive() {
-            return !released && owner.get() != null;
-        }
-
-        /**
-         * Returns the name this store is published under in the view.
+         * Returns the name this store is published under.
          *
          * @return the pool name recorded when the store was created
          */
@@ -920,10 +872,11 @@ public class SlowQueryReport extends AbstractQueryReport {
         /**
          * Returns what the reporting subclass has published for this pool with JMX.
          *
-         * @return the pool's JMX state, or {@code null} while no borrow of the pool has needed one
+         * @return the pool's JMX state, or {@code null} while no borrow of the pool has needed one or after the store
+         *             has been released with its pool's close
          */
         protected SlowQueryReportJmx.PoolJmx getJmxState() {
-            return jmxState;
+            return released ? null : jmxState;
         }
 
         /**
@@ -1016,7 +969,7 @@ public class SlowQueryReport extends AbstractQueryReport {
          * @return the field names
          */
         public static String[] getFieldNames() {
-            return FIELD_NAMES;
+            return FIELD_NAMES.clone();
         }
 
         /**
@@ -1025,7 +978,7 @@ public class SlowQueryReport extends AbstractQueryReport {
          * @return the field descriptions
          */
         public static String[] getFieldDescriptions() {
-            return FIELD_DESCRIPTIONS;
+            return FIELD_DESCRIPTIONS.clone();
         }
 
         /**
@@ -1034,7 +987,7 @@ public class SlowQueryReport extends AbstractQueryReport {
          * @return the field types
          */
         public static OpenType<?>[] getFieldTypes() {
-            return FIELD_TYPES;
+            return FIELD_TYPES.clone();
         }
 
         @Override
@@ -1208,36 +1161,44 @@ public class SlowQueryReport extends AbstractQueryReport {
         }
 
         /**
-         * Returns the longest time this query took to execute.
+         * Returns the longest time this query took to execute. Until an execution has been booked the value is
+         * {@link Long#MIN_VALUE}; the published views report {@code 0} in that state.
          *
-         * @return the maximum invocation time in milliseconds
+         * @return the maximum invocation time in milliseconds, or {@link Long#MIN_VALUE} while no execution has been
+         *             booked
          */
         public long getMaxInvocationTime() {
             return maxInvocationTime;
         }
 
         /**
-         * Returns the timestamp when the longest query execution occurred.
+         * Returns the timestamp when the longest query execution occurred. Until an execution has been booked the value
+         * is {@code 0}, because no date has been recorded.
          *
-         * @return the timestamp in milliseconds of the maximum invocation
+         * @return the timestamp in milliseconds of the maximum invocation, or {@code 0} while no execution has been
+         *             booked
          */
         public long getMaxInvocationDate() {
             return maxInvocationDate;
         }
 
         /**
-         * Returns the shortest time this query took to execute.
+         * Returns the shortest time this query took to execute. Until an execution has been booked the value is
+         * {@link Long#MAX_VALUE}; the published views report {@code 0} in that state.
          *
-         * @return the minimum invocation time in milliseconds
+         * @return the minimum invocation time in milliseconds, or {@link Long#MAX_VALUE} while no execution has been
+         *             booked
          */
         public long getMinInvocationTime() {
             return minInvocationTime;
         }
 
         /**
-         * Returns the timestamp when the shortest query execution occurred.
+         * Returns the timestamp when the shortest query execution occurred. Until an execution has been booked the value
+         * is {@code 0}, because no date has been recorded.
          *
-         * @return the timestamp in milliseconds of the minimum invocation
+         * @return the timestamp in milliseconds of the minimum invocation, or {@code 0} while no execution has been
+         *             booked
          */
         public long getMinInvocationDate() {
             return minInvocationDate;

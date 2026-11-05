@@ -32,6 +32,7 @@ import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.jdbc.pool.ConnectionPool;
 import org.apache.tomcat.jdbc.pool.PoolProperties;
 import org.apache.tomcat.jdbc.pool.PooledConnection;
+import org.apache.tomcat.jdbc.pool.util.ExceptionUtils;
 import org.apache.tomcat.jdbc.pool.util.MessageFactory;
 
 /**
@@ -45,17 +46,23 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
  * <p>
  * A close that reaches the statement by another route cannot be observed by that removal, so its entry is reclaimed at
  * the connection return: there the renewed close is a no-op on a statement the application had already closed, and the
- * close it still owed on one it had not. A creation still in flight while the connection is returned is the one case
- * that return cannot reach - it registers after the return drained the list - and is closed where it arrives instead of
+ * close it still owed on one it had not. That assumes the swallowed close did not itself recycle the statement into a
+ * cache: a recycling interceptor below this one would have parked it open, and the return-time close would then close
+ * a statement a live cache entry still holds. {@link StatementCache} is the module's recycling interceptor and refuses
+ * to park while it sits below this finalizer, so the ordering is safe for it; a third-party recycling interceptor is
+ * not covered by that guarantee. A creation still in flight while the connection is returned is the one case that
+ * return cannot reach - it registers after the return drained the list - and is closed where it arrives instead of
  * being tracked.
  * <p>
- * Tracked statements are handed to the application as proxies implementing the standard JDBC statement interfaces, as
- * is the statement facade the pool always installs in front of this interceptor and as are the proxies of the other
- * statement-wrapping interceptors; the driver's own statement class is therefore not reachable by casting. The
- * <code>Wrapper</code> methods are delegated to the driver, and <code>unwrap</code> is the supported way to reach
- * driver-specific statement methods. A statement the application reaches that way is still tracked here and is closed,
- * like any other tracked statement, when the connection is returned - unless an interceptor listed after this one
- * recycles the statement instead of closing it, as a statement cache beneath this interceptor does.
+ * Tracked statements are normally handed to the application as proxies implementing the standard JDBC statement
+ * interfaces, as is the statement facade the pool always installs in front of this interceptor and as are the proxies
+ * of the other statement-wrapping interceptors; the driver's own statement class is then not reachable by casting. If
+ * the tracking proxy cannot be created, the raw driver statement is returned instead and the statement stays tracked
+ * until the connection is returned. The <code>Wrapper</code> methods are delegated to the driver, and
+ * <code>unwrap</code> is the supported way to reach driver-specific statement methods. A statement the application
+ * reaches that way is still tracked here and is closed, like any other tracked statement, when the connection is
+ * returned - unless an interceptor listed after this one recycles the statement instead of closing it, as a statement
+ * cache beneath this interceptor does.
  * <p>
  * Tracking covers the statements created through the pooled connection handle. A statement created on the driver's
  * own connection - the object <code>Connection.unwrap(Connection.class)</code> hands back - never reaches this
@@ -212,10 +219,23 @@ public class StatementFinalizer extends AbstractCreateStatementInterceptor {
         // again, so what a failed return-time close left behind gets its
         // last attempt here, before the new borrower runs.
         if (left != null && con != null) {
+            List<StatementEntry> failed = null;
             for (StatementEntry entry : left) {
                 if (!entry.close()) {
+                    if (failed == null) {
+                        failed = new ArrayList<>();
+                    }
+                    failed.add(entry);
                     log.warn(MessageFactory.get("statementFinalizer.unableToCloseStatement"),
                             entry.getAllocationStack());
+                }
+            }
+            if (failed != null) {
+                // The statement may still be open on the session now being
+                // served to the new borrower: keep it for the next attempt,
+                // as the return-time drain does.
+                synchronized (statementsLock) {
+                    statements.addAll(failed);
                 }
             }
         }
@@ -278,10 +298,12 @@ public class StatementFinalizer extends AbstractCreateStatementInterceptor {
             try {
                 shallClose = !statement.isClosed();
                 answered = true;
-            } catch (Exception ignore) {
+            } catch (Throwable ignore) {
                 // A driver that cannot say whether the statement is closed
                 // must not get to skip the close attempt - the statement
-                // may still hold server-side state.
+                // may still hold server-side state. A non-fatal Error is the
+                // same refused answer as an exception.
+                ExceptionUtils.handleThrowable(ignore);
                 shallClose = true;
                 answered = false;
             }
@@ -290,7 +312,11 @@ public class StatementFinalizer extends AbstractCreateStatementInterceptor {
                 try {
                     statement.close();
                     closed = true;
-                } catch (Exception ignore) {
+                } catch (Throwable ignore) {
+                    // The failed close is reported as false so closeInvoked
+                    // keeps the entry for the next attempt; an Error must not
+                    // abort the rest of the drain.
+                    ExceptionUtils.handleThrowable(ignore);
                     if (log.isDebugEnabled()) {
                         log.debug("Unable to close statement upon connection close.", ignore);
                     }

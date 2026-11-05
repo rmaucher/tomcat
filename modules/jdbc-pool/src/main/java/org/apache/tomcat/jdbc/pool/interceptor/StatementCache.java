@@ -23,8 +23,12 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -38,6 +42,7 @@ import org.apache.tomcat.jdbc.pool.JdbcInterceptor;
 import org.apache.tomcat.jdbc.pool.PoolProperties.InterceptorProperty;
 import org.apache.tomcat.jdbc.pool.PooledConnection;
 import org.apache.tomcat.jdbc.pool.jmx.JmxUtil;
+import org.apache.tomcat.jdbc.pool.util.ExceptionUtils;
 import org.apache.tomcat.jdbc.pool.util.MessageFactory;
 
 /**
@@ -54,7 +59,13 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
  * that closes tracked statements at the connection return is affected too: {@link StatementFinalizer} must be listed
  * before this one, because a parked statement is deliberately left open and a tracker beneath the cache would close
  * it out from under a live cache entry; listed after this one, it makes this cache refuse to park at all, and
- * statements are closed normally instead of cached.
+ * statements are closed normally instead of cached. Only {@link StatementFinalizer} and its subclasses are recognised
+ * by that check; a third-party interceptor with the same behaviour is not detected.
+ * <p>
+ * With JMX enabled, a cache publishes an MBean below its connection's MBean. It is released when the connection is
+ * recycled, when the pool closes, or when the pool MBean is deregistered. A pool that is abandoned without being
+ * closed keeps its registrations - and through them the pool, its sessions and its driver class loader - reachable, so
+ * a JMX-enabled pool must be closed before it is dropped.
  */
 public class StatementCache extends StatementDecoratorInterceptor implements StatementCacheMBean {
     private static final Log log = LogFactory.getLog(StatementCache.class);
@@ -130,7 +141,7 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
      * A copy is returned because the arrays a cache matches against are shared
      * by every instance in the class loader; mutating the array behind the
      * accessor would change what every pool in the JVM caches, not just this
-     * one.
+     * one. This is an extension accessor: the pool itself does not read it.
      *
      * @return array of statement type strings
      */
@@ -180,9 +191,16 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
 
     }
 
-    private static ConcurrentHashMap<ConnectionPool, AtomicInteger> cacheSizeMap = new ConcurrentHashMap<>();
+    private static final Map<ConnectionPool, AtomicInteger> cacheSizeMap =
+            Collections.synchronizedMap(new WeakHashMap<ConnectionPool, AtomicInteger>());
 
     private AtomicInteger cacheSize;
+
+    /**
+     * Whether {@link #disconnected(ConnectionPool, PooledConnection, boolean)} is purging this cache. A park that
+     * observes it set refuses to cache; a park that inserted just as the purge started withdraws its own entry.
+     */
+    private volatile boolean draining;
 
     /**
      * Whether a tracker that closes its tracked statements at the connection return sits beneath this interceptor in
@@ -227,13 +245,19 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
 
     @Override
     public void poolStarted(ConnectionPool pool) {
-        cacheSizeMap.putIfAbsent(pool, new AtomicInteger(0));
+        synchronized (cacheSizeMap) {
+            if (!cacheSizeMap.containsKey(pool)) {
+                cacheSizeMap.put(pool, new AtomicInteger(0));
+            }
+        }
         super.poolStarted(pool);
     }
 
     @Override
     public void poolClosed(ConnectionPool pool) {
-        cacheSizeMap.remove(pool);
+        synchronized (cacheSizeMap) {
+            cacheSizeMap.remove(pool);
+        }
         super.poolClosed(pool);
     }
 
@@ -243,20 +267,44 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
         if (parent == null) {
             cacheSize = null;
             this.pcon = null;
-            if (oname != null) {
-                JmxUtil.unregisterJmx(oname);
-                oname = null;
+            synchronized (this) {
+                if (oname != null) {
+                    JmxUtil.unregisterJmx(oname);
+                    oname = null;
+                }
             }
         } else {
-            cacheSize = cacheSizeMap.get(parent);
+            draining = false;
+            synchronized (cacheSizeMap) {
+                cacheSize = cacheSizeMap.get(parent);
+                if (cacheSize == null) {
+                    // A definition added to a running pool did not exist when
+                    // its start registered the counter; create it on the first
+                    // borrow that builds a chain for the definition.
+                    cacheSize = new AtomicInteger(0);
+                    cacheSizeMap.put(parent, cacheSize);
+                }
+            }
             this.pcon = con;
             if (!pcon.getAttributes().containsKey(STATEMENT_CACHE_ATTR)) {
                 ConcurrentHashMap<CacheKey, CachedStatement> cache = new ConcurrentHashMap<>();
                 pcon.getAttributes().put(STATEMENT_CACHE_ATTR, cache);
             }
-            if (oname == null) {
-                String keyprop = ",JdbcInterceptor=" + getClass().getSimpleName();
-                oname = JmxUtil.registerJmx(pcon.getObjectName(), keyprop, this);
+            synchronized (this) {
+                if (oname == null) {
+                    String keyprop = ",JdbcInterceptor=" + getClass().getSimpleName();
+                    oname = JmxUtil.registerJmx(pcon.getObjectName(), keyprop, this);
+                }
+            }
+        }
+    }
+
+    @Override
+    public void unregisterMBean() {
+        synchronized (this) {
+            if (oname != null) {
+                JmxUtil.unregisterJmx(oname);
+                oname = null;
             }
         }
     }
@@ -266,12 +314,31 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
         @SuppressWarnings("unchecked")
         ConcurrentHashMap<CacheKey, CachedStatement> statements = (ConcurrentHashMap<CacheKey, CachedStatement>) con
                 .getAttributes().get(STATEMENT_CACHE_ATTR);
-
+        List<CachedStatement> toClose = null;
+        // Every park is refused from here on. A park that read the flag
+        // before this write and inserted during the walk withdraws its own
+        // entry when it re-reads it, so sweeping until the map is empty closes
+        // exactly the entries the purge owns. Each removal decrements the
+        // counter once; closing runs after the sweep because it reaches the
+        // driver.
+        draining = true;
         if (statements != null) {
-            for (Map.Entry<CacheKey, CachedStatement> p : statements.entrySet()) {
-                closeStatement(p.getValue());
+            do {
+                for (Map.Entry<CacheKey, CachedStatement> entry : statements.entrySet()) {
+                    CachedStatement statement = entry.getValue();
+                    if (statement != null && removeStatementInternal(statement)) {
+                        if (toClose == null) {
+                            toClose = new ArrayList<>();
+                        }
+                        toClose.add(statement);
+                    }
+                }
+            } while (!statements.isEmpty());
+        }
+        if (toClose != null) {
+            for (CachedStatement statement : toClose) {
+                statement.forceClose();
             }
-            statements.clear();
         }
 
         super.disconnected(parent, con, finalizing);
@@ -373,6 +440,20 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
      * @return true if the statement was cached, false otherwise
      */
     public boolean cacheStatement(CachedStatement proxy) {
+        if (draining) {
+            return false;
+        }
+        boolean parked = cacheStatementInternal(proxy);
+        if (parked && draining) {
+            // The purge may have started while this park was in flight. If
+            // the entry is still ours, withdraw it and let the caller close
+            // it; if the purge already removed it, the purge closes it.
+            return !removeStatementInternal(proxy);
+        }
+        return parked;
+    }
+
+    private boolean cacheStatementInternal(CachedStatement proxy) {
         ConcurrentHashMap<CacheKey, CachedStatement> cache = getCache();
         // Read the counter once, like getCacheSize() and closeInvoked() do:
         // a disposal (the reset(null, null) walks) nulls the field, and every
@@ -438,6 +519,10 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
      * @return true if the statement was removed, false otherwise
      */
     public boolean removeStatement(CachedStatement proxy) {
+        return removeStatementInternal(proxy);
+    }
+
+    private boolean removeStatementInternal(CachedStatement proxy) {
         ConcurrentHashMap<CacheKey, CachedStatement> cache = getCache();
         // The counter is read once for the same disposal window as in
         // cacheStatement: a disposal is answered like at the other entry
@@ -494,6 +579,25 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
     private final AtomicBoolean associationLossLogged = new AtomicBoolean();
 
     /**
+     * Renders SQL text for interpolation into a log message. JULI writes message text without newline escaping, and
+     * SQL is application- and user-shaped data, so embedded CR/LF would forge additional log lines. They are replaced
+     * by spaces, keeping the statement readable in the one line the log entry owns.
+     *
+     * @param sql the SQL text, possibly null
+     *
+     * @return the text safe to interpolate into a log message
+     */
+    private static String sqlForLog(String sql) {
+        if (sql == null) {
+            return "null";
+        }
+        if (sql.indexOf('\r') < 0 && sql.indexOf('\n') < 0) {
+            return sql;
+        }
+        return sql.replace('\r', ' ').replace('\n', ' ');
+    }
+
+    /**
      * Logs, at most once per connection, that a park was refused because the connection recorded for the statement
      * is not the current physical one. The usual cause is benign - a close racing a session replacement - but a
      * wrapper beneath this cache that answers the statement's {@code getConnection()} with a value this cache
@@ -507,7 +611,7 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
         // not spend the claim, and the compare-and-set runs second, so of the
         // refusals met while debug is on exactly one logs.
         if (log.isDebugEnabled() && associationLossLogged.compareAndSet(false, true)) {
-            log.debug("Not caching statement [" + proxy.getSql() + "]: the connection recorded for it is "
+            log.debug("Not caching statement [" + sqlForLog(proxy.getSql()) + "]: the connection recorded for it is "
                     + "not the current physical connection. Either the session was replaced while the "
                     + "statement was being closed, or an interceptor listed below "
                     + getClass().getSimpleName() + " answers the statement's getConnection() with a value "
@@ -703,27 +807,34 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
                             shouldClose = false;
                         }
                     }
-                } catch (RuntimeException | ReflectiveOperationException | SQLException x) {
+                } catch (Throwable x) {
                     // The throw always precedes the park attempt in the try
                     // above, so this proxy is not in the cache; the
                     // identity-aware removal is a no-op for it and leaves any
-                    // other statement parked under the same key alone.
+                    // other statement parked under the same key alone. A
+                    // non-fatal Error is the same failed recycle as an
+                    // unchecked exception: close the handle through the normal
+                    // path instead of leaving it open and unretired.
+                    ExceptionUtils.handleThrowable(x);
                     removeStatement(proxy);
                     if (log.isDebugEnabled()) {
-                        log.debug("Unable to recycle statement: " + getSql(), x);
+                        log.debug("Unable to recycle statement: " + sqlForLog(getSql()), x);
                     }
                 }
             }
-            if (shouldClose) {
-                // The physical close belongs to the superclass, and so does the
-                // retirement of this handle: a driver that refuses the close
-                // throws from there and the application hears about it. The
-                // statement never reached the cache in this branch, so nothing
-                // here has to be unwound for it.
-                super.closeInvoked();
+            try {
+                if (shouldClose) {
+                    // The physical close belongs to the superclass, and so does the
+                    // retirement of this handle: a driver that refuses the close
+                    // throws from there and the application hears about it. The
+                    // statement never reached the cache in this branch, so nothing
+                    // here has to be unwound for it.
+                    super.closeInvoked();
+                }
+            } finally {
+                closed = true;
+                delegate = null;
             }
-            closed = true;
-            delegate = null;
         }
 
         @Override
@@ -746,8 +857,11 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
             removeStatement(this);
             try {
                 super.closeInvoked();
-            } catch (SQLException x) {
-                log.warn(MessageFactory.get("statementCache.unableToCloseDiscardedStatement", getSql()), x);
+            } catch (Throwable x) {
+                // A non-fatal Error from the driver's close is a failed close
+                // here, not a reason to abort the remainder of the purge.
+                ExceptionUtils.handleThrowable(x);
+                log.warn(MessageFactory.get("statementCache.unableToCloseDiscardedStatement", sqlForLog(getSql())), x);
             }
         }
 

@@ -111,8 +111,8 @@ public class ConnectionPool {
     private PoolConfiguration poolProperties;
 
     /**
-     * Contains all the connections that are in use TODO - this shouldn't be a blocking queue, simply a list to hold our
-     * objects
+     * Contains all the connections that are in use. Unbounded: membership is bounded by the maxActive/size
+     * bookkeeping, not by the queue capacity.
      */
     private BlockingQueue<PooledConnection> busy;
 
@@ -445,43 +445,13 @@ public class ConnectionPool {
         // Fetch previously cached interceptor proxy - one per connection
         JdbcInterceptor handler = con.getHandler();
         if (handler == null) {
-            // The registration reads the pool's own JMX object itself and does
-            // nothing once close() has given it up; it is not gated on jmxPool
-            // here because checking the field and then calling into the
-            // connection would let close() take it away between the two, and
-            // the resulting failure must not strand the connection - it is
-            // already in busy, so a throw that skips abandonSetup() costs a
-            // physical connection and a maxActive slot until the pool restarts.
-            // A connection that connected while the pool's MBean was already
-            // published registered itself as part of connect() and is a no-op
-            // here; this call is the retry for one that could not - because the
-            // pool's MBean was published only after it connected, or because the
-            // server refused the name, and a refused publish must be retried
-            // once the obstacle is gone rather than count as a registration.
-            try {
-                // Under the connection's own lock, as every connection MBean
-                // registration is (see registerConnectionMBeans). The check
-                // and the publish inside run as one synchronized step, and
-                // the release of the same connection unregisters under that
-                // same monitor - the only lock every configuration shares,
-                // the connection lock being a deliberate no-op unless the
-                // sweeper or useLock is on - so a registration can never slip
-                // in beside a release that had already found no name to take
-                // back and leave an MBean of a dead connection, and the class
-                // loader it pins, registered for the life of the JVM.
-                con.lock();
-                try {
-                    con.createMBean();
-                } finally {
-                    con.unlock();
-                }
-            } catch (Exception x) {
-                SQLException sx = new SQLException(MessageFactory.get("connectionPool.unableToRegisterMBean"));
-                sx.initCause(x);
-                // Nothing has been done to the connection, it can go back to the pool
-                abandonSetup(con, sx, false);
-                throw sx;
-            }
+            // A connection registers its MBean when its physical session is
+            // established, and the pool sweeps the connections it already
+            // holds when its own MBean is published. JMX is best effort, so a
+            // registration that neither path made is not retried on the borrow:
+            // a borrow has no business failing, or doing extra work, because a
+            // management channel is unavailable.
+            //
             // Build the proxy handler
             handler = new ProxyConnection(this, con, getPoolProperties().isUseEquals());
             // Set up the interceptor chain
@@ -500,7 +470,8 @@ public class ConnectionPool {
                     interceptor.setNext(handler);
                     // Configure the last one to be held by the connection
                     handler = interceptor;
-                } catch (Exception x) {
+                } catch (Throwable x) {
+                    ExceptionUtils.handleThrowable(x);
                     SQLException sx = new SQLException(MessageFactory.get("connectionPool.unableToInstantiateInterceptorChain"));
                     sx.initCause(x);
                     // Nothing has been done to the connection, it can go back to the pool
@@ -526,7 +497,8 @@ public class ConnectionPool {
                 next.reset(this, con);
                 next = next.getNext();
             }
-        } catch (Exception x) {
+        } catch (Throwable x) {
+            ExceptionUtils.handleThrowable(x);
             SQLException sx = new SQLException(MessageFactory.get("connectionPool.unableToResetInterceptor",
                     (next != null ? next.getClass().getName() : "unknown")));
             sx.initCause(x);
@@ -583,14 +555,15 @@ public class ConnectionPool {
             invokeRequestHint(BEGIN_REQUEST, con.getConnection());
             // Return the connection
             return connection;
-        } catch (Exception x) {
+        } catch (Throwable x) {
+            ExceptionUtils.handleThrowable(x);
             SQLException s = new SQLException();
             s.initCause(x);
             // The reset walk above has already armed every interceptor of the chain for this borrow, and from here
             // no close() will ever travel that chain - the handle was never handed out - while the return path does
             // not walk the chain either. The connection itself is healthy; it is the borrow state that is unusable,
             // and there is no chain-wide unwind that is safe for arbitrary interceptors, as each keys its disposal
-            // on the reset(null, null) call the release's setHandler(null) makes (StatementCache.reset is one).
+            // on the reset(null, null) call the release's teardown walk makes (StatementCache.reset is one).
             // So the half-armed chain goes out of service with the connection, the posture the two catches above
             // take, rather than being parked idle armed for a borrow that never started.
             abandonSetup(con, s, true);
@@ -833,7 +806,8 @@ public class ConnectionPool {
             JdbcInterceptor interceptor = definition.getInterceptorClass().getConstructor().newInstance();
             interceptor.setProperties(definition.getProperties());
             interceptor.poolClosed(this);
-        } catch (Exception x) {
+        } catch (Throwable x) {
+            ExceptionUtils.handleThrowable(x);
             if (log.isDebugEnabled()) {
                 log.debug("Unable to inform interceptor of pool closure.", x);
             }
@@ -977,7 +951,8 @@ public class ConnectionPool {
                 initialPool[i] = this.borrowConnection(0, null, null); // Don't wait, should be no contention
             }
 
-        } catch (SQLException x) {
+        } catch (Throwable x) {
+            ExceptionUtils.handleThrowable(x);
             log.error(MessageFactory.get("connectionPool.unableToCreateInitialConnections"), x);
             if (!poolProperties.isIgnoreExceptionOnPreLoad()) {
                 org.apache.tomcat.jdbc.pool.jmx.ConnectionPool jmx = jmxPool;
@@ -985,7 +960,12 @@ public class ConnectionPool {
                     jmx.notify(org.apache.tomcat.jdbc.pool.jmx.ConnectionPool.NOTIFY_INIT, getStackTrace(x));
                 }
                 close(true);
-                throw x;
+                if (x instanceof SQLException) {
+                    throw (SQLException) x;
+                }
+                SQLException ex = new SQLException(x.getMessage());
+                ex.initCause(x);
+                throw ex;
             }
         } finally {
             // Return the members as idle to the pool. These hand-backs are
@@ -1088,6 +1068,10 @@ public class ConnectionPool {
     /**
      * Validates and corrects pool configuration values. Ensures that maxActive, initialSize, minIdle, maxIdle, and
      * related values are consistent.
+     * <p>
+     * A running pool's writers must not call this alone: the correction can change the eviction interval the cleaner
+     * runs on, and a change made outside this object's monitor can interleave with another surface's write between
+     * the correction and the cleaner reconciliation. See {@link #applyConfigurationChange(PoolConfiguration)}.
      *
      * @param properties the pool configuration to validate and correct
      */
@@ -1102,6 +1086,14 @@ public class ConnectionPool {
             // can work with at all. Corrected before the rule below reads it.
             log.warn(MessageFactory.get("connectionPool.initialSizeTooSmall"));
             properties.setInitialSize(0);
+        }
+        if (properties.getMinIdle() < 0) {
+            log.warn(MessageFactory.get("connectionPool.minIdleNegative"));
+            properties.setMinIdle(0);
+        }
+        if (properties.getMaxIdle() < 0) {
+            log.warn(MessageFactory.get("connectionPool.maxIdleNegative"));
+            properties.setMaxIdle(0);
         }
         if (properties.getMaxActive() < properties.getInitialSize()) {
             log.warn(MessageFactory.get("connectionPool.initialSizeTooLarge", properties.getMaxActive()));
@@ -1124,6 +1116,24 @@ public class ConnectionPool {
             log.warn(MessageFactory.get("connectionPool.timeBetweenEvictionRunsTooLarge", properties.getMaxAge()));
             properties.setTimeBetweenEvictionRunsMillis((int) properties.getMaxAge());
         }
+    }
+
+    /**
+     * Validates a running pool's configuration and brings the pool cleaner in line with the result as one step under
+     * this pool's monitor.
+     * <p>
+     * The two halves belong together: the validation corrects values the caller did not write - the eviction interval
+     * among them - and the cleaner's period is fixed when its task is built, so validating without then looking the
+     * cleaner over leaves a task on the interval the correction replaced. Running them under one monitor is what makes
+     * the pair atomic against the other management surface: the data source holds its own monitor while it writes the
+     * shared configuration, and the pool's MBean holds none, so this object's monitor is the only thing both writers
+     * are certain to serialise on.
+     *
+     * @param properties the pool configuration to validate and reconcile the cleaner with
+     */
+    public synchronized void applyConfigurationChange(PoolConfiguration properties) {
+        checkPoolConfiguration(properties);
+        reconcilePoolCleaner(properties);
     }
 
     /**
@@ -1318,7 +1328,11 @@ public class ConnectionPool {
             if (destroyed) {
                 // Counter only decremented once
                 size.addAndGet(-1);
-                con.setHandler(null);
+                // The one teardown reset, delivered after the slot has been
+                // freed and before the wake-up placeholder is offered; the
+                // handler is then dropped without resetting it again
+                finalize(con);
+                con.clearHandler();
                 // Counted with the destruction, not with the call: a
                 // connection the abandon path already released can reach
                 // this method once more - a return whose busy.remove lost
@@ -1613,7 +1627,7 @@ public class ConnectionPool {
     /**
      * Creates a JDBC connection and tries to connect to the database.
      *
-     * @param notUsed  Argument not used
+     * @param notUsed  Not used; retained for API compatibility
      * @param username The user name to use for the connection
      * @param password The password for the connection
      *
@@ -1640,7 +1654,6 @@ public class ConnectionPool {
         }
         boolean error = false;
         try {
-            // Connect and validate the connection
             con.lock();
             con.connect();
             if (isClosed()) {
@@ -1679,7 +1692,13 @@ public class ConnectionPool {
                 // and clean up
                 throw new SQLException(MessageFactory.get("connectionPool.validationQueryFailed"));
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // A non-fatal Error from a driver or wrapper (typically a
+            // LinkageError from a stopped web application) is an ordinary
+            // failed creation here. Guarding only Exception would skip the
+            // error flag and the finally block's release, stranding the
+            // connection and the maxActive slot it already owns.
+            ExceptionUtils.handleThrowable(e);
             error = true;
             if (log.isDebugEnabled()) {
                 log.debug("Unable to create a new JDBC connection.", e);
@@ -1692,7 +1711,6 @@ public class ConnectionPool {
                 throw ex;
             }
         } finally {
-            // con can never be null here
             if (error) {
                 release(con);
             }
@@ -2651,12 +2669,38 @@ public class ConnectionPool {
         registerConnectionMBeans(busy);
     }
 
+    /**
+     * Releases the MBeans published for the connections this pool currently holds and for the interceptors of their
+     * chains, when the pool's own MBean is released while the pool stays live. The connections and their sessions are
+     * untouched; a later borrow or reconnect can publish them again.
+     */
+    public void unregisterConnectionMBeans() {
+        unregisterConnectionMBeans(idle);
+        unregisterConnectionMBeans(busy);
+    }
+
+    private void unregisterConnectionMBeans(BlockingQueue<PooledConnection> pool) {
+        for (PooledConnection con : pool) {
+            try {
+                con.unregisterMBean();
+            } catch (Throwable x) {
+                // JMX is best effort: one connection that fails to release
+                // its MBeans must not keep the others registered
+                ExceptionUtils.handleThrowable(x);
+                if (log.isDebugEnabled()) {
+                    log.debug("Unable to unregister connection MBean", x);
+                }
+            }
+        }
+    }
+
     private void registerConnectionMBeans(BlockingQueue<PooledConnection> pool) {
         // The fair queue iterates a snapshot taken under its lock, the default
         // queue a view that tolerates concurrent modification: either way, a
         // connection that is concurrently taken out of or added to the queue
-        // may or may not be seen, and both answers are correct - the one this
-        // pass misses registers itself on the borrow that hands it out.
+        // may or may not be seen. JMX is best effort, so a connection this pass
+        // misses stays unregistered until it reconnects; it does not fail or
+        // delay a borrow.
         for (PooledConnection con : pool) {
             try {
                 // Under the connection's own lock, as every operation acting

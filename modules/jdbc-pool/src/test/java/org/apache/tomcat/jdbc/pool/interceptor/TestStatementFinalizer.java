@@ -501,6 +501,46 @@ class TestStatementFinalizer extends JdbcPoolBaseTest {
                 });
     }
 
+    /* A fake statement whose close fails with a non-fatal Error. */
+    private static Statement fakedErrorStatement() {
+        return (Statement) Proxy.newProxyInstance(
+                TestStatementFinalizer.class.getClassLoader(),
+                new Class<?>[] { Statement.class },
+                (p, m, a) -> {
+                    switch (m.getName()) {
+                        case "close":
+                            throw new NoClassDefFoundError("simulated stopped context in close()");
+                        case "isClosed":
+                            return Boolean.FALSE;
+                        case "equals":
+                            return Boolean.valueOf(p == (a == null || a.length == 0 ? null : a[0]));
+                        case "hashCode":
+                            return Integer.valueOf(System.identityHashCode(p));
+                        default:
+                            return null;
+                    }
+                });
+    }
+
+    @Test
+    void anErrorFromOneCloseDoesNotAbortTheDrain() throws Exception {
+        StatementFinalizer finalizer = new StatementFinalizer();
+        Method create = Connection.class.getMethod("createStatement");
+        finalizer.reset(null, null);
+
+        Statement failing = fakedErrorStatement();
+        Statement following = fakedStatement();
+        finalizer.createStatement(null, create, null, failing, 0L);
+        finalizer.createStatement(null, create, null, following, 0L);
+
+        Assertions.assertDoesNotThrow(finalizer::closeInvoked,
+                "a non-fatal Error from one statement close must not escape the drain");
+        Assertions.assertTrue(closeWasAsked(following),
+                "the statement after the failing one must still be closed");
+        Assertions.assertEquals(1, tracked(finalizer),
+                "the entry whose close failed must stay on the list for the next attempt");
+    }
+
     @Test
     void aCloseTheDriverRefusedStaysOnTheListForANextAttempt() throws Exception {
         // A return-time close the driver refused must not be dropped: the
@@ -550,6 +590,31 @@ class TestStatementFinalizer extends JdbcPoolBaseTest {
                             return null;
                     }
                 });
+    }
+
+    @Test
+    void aRetryCloseFailureDuringTheNextBorrowStaysOnTheList() throws Exception {
+        DataSource ds = finalizerPool();
+        ds.createPool();
+        try (Connection pooled = ds.getConnection()) {
+            StatementFinalizer finalizer = interceptorOf(pooled, StatementFinalizer.class);
+            PooledConnection pcon = (PooledConnection) pooled.unwrap(PooledConnection.class);
+            Method create = Connection.class.getMethod("createStatement");
+
+            finalizer.reset(ds.getPool(), pcon);
+            Statement refusing = fakedRefusingStatement();
+            finalizer.createStatement(null, create, null, refusing, 0L);
+            finalizer.closeInvoked();
+            Assertions.assertEquals(1, tracked(finalizer),
+                    "precondition: the return-time close failed and kept the entry");
+
+            // The next borrow retries, and the driver refuses again. The entry
+            // must survive for the attempt after that; the statement may still
+            // be open on the session the new borrower is using.
+            finalizer.reset(ds.getPool(), pcon);
+            Assertions.assertEquals(1, tracked(finalizer),
+                    "a failed retry close must stay on the list instead of being dropped");
+        }
     }
 
     @Test
@@ -701,10 +766,12 @@ class TestStatementFinalizer extends JdbcPoolBaseTest {
     }
 
     @Test
-    void aCloseThatNeverSucceedsIsGivenItsLastAttemptAtTheNextBorrow() throws Exception {
-        // A driver that cannot close at all must not grow the list across
-        // borrows: the reset at the next borrow is the last attempt, the
-        // pool says so at warn level, and the pool keeps serving.
+    void aCloseThatNeverSucceedsKeepsItsEntryForALaterAttempt() throws Exception {
+        // A driver that cannot close at all must not lose the entry: the
+        // statement may still be open on the session the next borrower is
+        // using, so the failed retry at the borrow keeps it for the return
+        // path, which retries on every return as well. One leaked statement
+        // produces one entry, not one per borrow.
         DataSource ds = finalizerPoolGated();
         ds.createPool();
 
@@ -724,14 +791,15 @@ class TestStatementFinalizer extends JdbcPoolBaseTest {
 
         Connection second = ds.getConnection();
         try {
-            Assertions.assertEquals(0, tracked(finalizer),
-                    "the retry at the borrow is final - a permanently refusing driver must not "
-                            + "accumulate entries across borrows");
+            Assertions.assertEquals(1, tracked(finalizer),
+                    "a failed retry at the borrow must keep the entry: the statement may still be "
+                            + "open on the session the new borrower is using");
             Assertions.assertFalse(rawLeaked.isClosed(), "precondition: the driver never took the close");
         } finally {
             second.close();
         }
-        Assertions.assertEquals(0, tracked(finalizer), "the next return of an empty list stays empty");
+        Assertions.assertEquals(1, tracked(finalizer),
+                "the return-time retry also fails, so the entry stays for the next attempt");
     }
 
     @Test

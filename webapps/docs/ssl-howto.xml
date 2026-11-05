@@ -460,7 +460,9 @@ qualifies if its Extended Key Usage includes
 <code>serverAuth</code> or <code>anyExtendedKeyUsage</code>, or if it has no
 Extended Key Usage extension at all. Certificates whose Extended Key Usage
 excludes both purposes or cannot be parsed are ignored. If no eligible key entry
-is found, connector initialization fails.</p>
+is found, connector initialization fails. This selection does not apply when the
+key manager factory is provided by a FIPS provider. Tomcat does not wrap or alter
+the keys in that case, so the provider chooses which entry is served.</p>
 
 <p>A configured <strong>certificateKeyAlias</strong> is normally used even if its
 certificate is unsuitable for server authentication. The one exception is a
@@ -506,6 +508,14 @@ or re-read <code>server.xml</code>. See the
 <a href="config/listeners.html">listener documentation</a> for the available
 attributes.</p>
 
+<p>The listener checks the certificate Tomcat expects to be served: the one at
+the configured <strong>certificateKeyAlias</strong>, or the Windows-MY numbered
+duplicate that replaced it. When the key manager is not wrapped by Tomcat, for
+example one supplied by a FIPS provider, the key manager chooses the certificate
+for each handshake and this can differ from the configured alias if the key store
+holds several entries. The listener cannot detect that, so ensure that
+<strong>certificateKeyAlias</strong> identifies the certificate that is served.</p>
+
 </section>
 
 <section name="Using the Windows certificate store">
@@ -544,12 +554,13 @@ with a configured alias, ensure that the
 renewed certificate is available under that alias. Reloading does not select a
 different alias or prefer a certificate with a later expiry date.</p>
 
-<p>If the certificate's private key is marked non-exportable, pin the JSSE implementation by adding
+<p>Private keys held in a Windows certificate store are not exposed to Java in
+encoded form, whether or not the key is marked exportable, so the OpenSSL
+implementations cannot use them. Pin the JSSE implementation by adding
 <code>sslImplementationName="org.apache.tomcat.util.net.jsse.JSSEImplementation"</code>
 to the <strong>Connector</strong>. A connector otherwise selects an OpenSSL
 implementation automatically when one is available, and OpenSSL cannot use a
-private key it is unable to read, so initialization fails. An exportable key works
-with either implementation.</p>
+private key it is unable to read, so initialization fails.</p>
 
 <p>Two points to note:</p>
 

@@ -54,7 +54,11 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
  * The factory applies a strict reading of the reference: an attribute whose value is
  * blank leaves its property at the {@link PoolProperties} default, and a value the
  * property cannot take fails the lookup with an exception naming the attribute
- * instead of being silently ignored.
+ * instead of being silently ignored. The legacy settings
+ * {@code numTestsPerEvictionRun}, {@code accessToUnderlyingConnectionAllowed},
+ * {@code poolPreparedStatements} and {@code maxOpenPreparedStatements} are the
+ * exception: they are accepted for configuration compatibility but have no effect,
+ * so a non-blank value is reported with a warning rather than failing the lookup.
  * </p>
  */
 public class DataSourceFactory implements ObjectFactory {
@@ -66,229 +70,139 @@ public class DataSourceFactory implements ObjectFactory {
 
     private static final Log log = LogFactory.getLog(DataSourceFactory.class);
 
-    /**
-     * Property name for defaultAutoCommit.
-     */
+    /** The {@code defaultAutoCommit} property name. */
     protected static final String PROP_DEFAULTAUTOCOMMIT = "defaultAutoCommit";
 
-    /**
-     * Property name for defaultReadOnly.
-     */
+    /** The {@code defaultReadOnly} property name. */
     protected static final String PROP_DEFAULTREADONLY = "defaultReadOnly";
 
-    /**
-     * Property name for defaultTransactionIsolation.
-     */
+    /** The {@code defaultTransactionIsolation} property name. */
     protected static final String PROP_DEFAULTTRANSACTIONISOLATION = "defaultTransactionIsolation";
 
-    /**
-     * Property name for defaultCatalog.
-     */
+    /** The {@code defaultCatalog} property name. */
     protected static final String PROP_DEFAULTCATALOG = "defaultCatalog";
 
-    /**
-     * Property name for driverClassName.
-     */
+    /** The {@code driverClassName} property name. */
     protected static final String PROP_DRIVERCLASSNAME = "driverClassName";
 
-    /**
-     * Property name for password.
-     */
+    /** The {@code password} property name. */
     protected static final String PROP_PASSWORD = "password";
 
-    /**
-     * Property name for url.
-     */
+    /** The {@code url} property name. */
     protected static final String PROP_URL = "url";
 
-    /**
-     * Property name for username.
-     */
+    /** The {@code username} property name. */
     protected static final String PROP_USERNAME = "username";
 
-    /**
-     * Property name for maxActive.
-     */
+    /** The {@code maxActive} property name. */
     protected static final String PROP_MAXACTIVE = "maxActive";
 
-    /**
-     * Property name for maxIdle.
-     */
+    /** The {@code maxIdle} property name. */
     protected static final String PROP_MAXIDLE = "maxIdle";
 
-    /**
-     * Property name for minIdle.
-     */
+    /** The {@code minIdle} property name. */
     protected static final String PROP_MINIDLE = "minIdle";
 
-    /**
-     * Property name for initialSize.
-     */
+    /** The {@code initialSize} property name. */
     protected static final String PROP_INITIALSIZE = "initialSize";
 
-    /**
-     * Property name for maxWait.
-     */
+    /** The {@code maxWait} property name. */
     protected static final String PROP_MAXWAIT = "maxWait";
 
-    /**
-     * Property name for maxAge.
-     */
+    /** The {@code maxAge} property name. */
     protected static final String PROP_MAXAGE = "maxAge";
 
-    /**
-     * Property name for testOnBorrow.
-     */
+    /** The {@code testOnBorrow} property name. */
     protected static final String PROP_TESTONBORROW = "testOnBorrow";
 
-    /**
-     * Property name for testOnReturn.
-     */
+    /** The {@code testOnReturn} property name. */
     protected static final String PROP_TESTONRETURN = "testOnReturn";
 
-    /**
-     * Property name for testWhileIdle.
-     */
+    /** The {@code testWhileIdle} property name. */
     protected static final String PROP_TESTWHILEIDLE = "testWhileIdle";
 
-    /**
-     * Property name for testOnConnect.
-     */
+    /** The {@code testOnConnect} property name. */
     protected static final String PROP_TESTONCONNECT = "testOnConnect";
 
-    /**
-     * Property name for validationQuery.
-     */
+    /** The {@code validationQuery} property name. */
     protected static final String PROP_VALIDATIONQUERY = "validationQuery";
 
-    /**
-     * Property name for validationQueryTimeout.
-     */
+    /** The {@code validationQueryTimeout} property name. */
     protected static final String PROP_VALIDATIONQUERY_TIMEOUT = "validationQueryTimeout";
 
-    /**
-     * Property name for validatorClassName.
-     */
+    /** The {@code validatorClassName} property name. */
     protected static final String PROP_VALIDATOR_CLASS_NAME = "validatorClassName";
 
-    /**
-     * Property name for numTestsPerEvictionRun.
-     */
+    /** The {@code numTestsPerEvictionRun} property name. */
     protected static final String PROP_NUMTESTSPEREVICTIONRUN = "numTestsPerEvictionRun";
 
-    /**
-     * Property name for timeBetweenEvictionRunsMillis.
-     */
+    /** The {@code timeBetweenEvictionRunsMillis} property name. */
     protected static final String PROP_TIMEBETWEENEVICTIONRUNSMILLIS = "timeBetweenEvictionRunsMillis";
 
-    /**
-     * Property name for minEvictableIdleTimeMillis.
-     */
+    /** The {@code minEvictableIdleTimeMillis} property name. */
     protected static final String PROP_MINEVICTABLEIDLETIMEMILLIS = "minEvictableIdleTimeMillis";
 
-    /**
-     * Property name for accessToUnderlyingConnectionAllowed.
-     */
+    /** The {@code accessToUnderlyingConnectionAllowed} property name. */
     protected static final String PROP_ACCESSTOUNDERLYINGCONNECTIONALLOWED = "accessToUnderlyingConnectionAllowed";
 
-    /**
-     * Property name for removeAbandoned.
-     */
+    /** The {@code removeAbandoned} property name. */
     protected static final String PROP_REMOVEABANDONED = "removeAbandoned";
 
-    /**
-     * Property name for removeAbandonedTimeout.
-     */
+    /** The {@code removeAbandonedTimeout} property name. */
     protected static final String PROP_REMOVEABANDONEDTIMEOUT = "removeAbandonedTimeout";
 
-    /**
-     * Property name for logAbandoned.
-     */
+    /** The {@code logAbandoned} property name. */
     protected static final String PROP_LOGABANDONED = "logAbandoned";
 
-    /**
-     * Property name for abandonWhenPercentageFull.
-     */
+    /** The {@code abandonWhenPercentageFull} property name. */
     protected static final String PROP_ABANDONWHENPERCENTAGEFULL = "abandonWhenPercentageFull";
 
-    /**
-     * Property name for poolPreparedStatements.
-     */
+    /** The {@code poolPreparedStatements} property name. */
     protected static final String PROP_POOLPREPAREDSTATEMENTS = "poolPreparedStatements";
 
-    /**
-     * Property name for maxOpenPreparedStatements.
-     */
+    /** The {@code maxOpenPreparedStatements} property name. */
     protected static final String PROP_MAXOPENPREPAREDSTATEMENTS = "maxOpenPreparedStatements";
 
-    /**
-     * Property name for connectionProperties.
-     */
+    /** The {@code connectionProperties} property name. */
     protected static final String PROP_CONNECTIONPROPERTIES = "connectionProperties";
 
-    /**
-     * Property name for initSQL.
-     */
+    /** The {@code initSQL} property name. */
     protected static final String PROP_INITSQL = "initSQL";
 
-    /**
-     * Property name for jdbcInterceptors.
-     */
+    /** The {@code jdbcInterceptors} property name. */
     protected static final String PROP_INTERCEPTORS = "jdbcInterceptors";
 
-    /**
-     * Property name for validationInterval.
-     */
+    /** The {@code validationInterval} property name. */
     protected static final String PROP_VALIDATIONINTERVAL = "validationInterval";
 
-    /**
-     * Property name for jmxEnabled.
-     */
+    /** The {@code jmxEnabled} property name. */
     protected static final String PROP_JMX_ENABLED = "jmxEnabled";
 
-    /**
-     * Property name for fairQueue.
-     */
+    /** The {@code fairQueue} property name. */
     protected static final String PROP_FAIR_QUEUE = "fairQueue";
 
-    /**
-     * Property name for useEquals.
-     */
+    /** The {@code useEquals} property name. */
     protected static final String PROP_USE_EQUALS = "useEquals";
 
-    /**
-     * Property name for useLock.
-     */
+    /** The {@code useLock} property name. */
     protected static final String PROP_USE_LOCK = "useLock";
 
-    /**
-     * Property name for dataSource.
-     */
+    /** The {@code dataSource} property name. */
     protected static final String PROP_DATASOURCE = "dataSource";
 
-    /**
-     * Property name for dataSourceJNDI.
-     */
+    /** The {@code dataSourceJNDI} property name. */
     protected static final String PROP_DATASOURCE_JNDI = "dataSourceJNDI";
 
-    /**
-     * Property name for suspectTimeout.
-     */
+    /** The {@code suspectTimeout} property name. */
     protected static final String PROP_SUSPECT_TIMEOUT = "suspectTimeout";
 
-    /**
-     * Property name for alternateUsernameAllowed.
-     */
+    /** The {@code alternateUsernameAllowed} property name. */
     protected static final String PROP_ALTERNATE_USERNAME_ALLOWED = "alternateUsernameAllowed";
 
-    /**
-     * Property name for commitOnReturn.
-     */
+    /** The {@code commitOnReturn} property name. */
     protected static final String PROP_COMMITONRETURN = "commitOnReturn";
 
-    /**
-     * Property name for rollbackOnReturn.
-     */
+    /** The {@code rollbackOnReturn} property name. */
     protected static final String PROP_ROLLBACKONRETURN = "rollbackOnReturn";
 
     /**
@@ -297,19 +211,13 @@ public class DataSourceFactory implements ObjectFactory {
      */
     protected static final String PROP_USEDISPOSABLECONNECTIONFACADE = "useDisposableConnectionFacade";
 
-    /**
-     * Property name for logValidationErrors.
-     */
+    /** The {@code logValidationErrors} property name. */
     protected static final String PROP_LOGVALIDATIONERRORS = "logValidationErrors";
 
-    /**
-     * Property name for propagateInterruptState.
-     */
+    /** The {@code propagateInterruptState} property name. */
     protected static final String PROP_PROPAGATEINTERRUPTSTATE = "propagateInterruptState";
 
-    /**
-     * Property name for ignoreExceptionOnPreLoad.
-     */
+    /** The {@code ignoreExceptionOnPreLoad} property name. */
     protected static final String PROP_IGNOREEXCEPTIONONPRELOAD = "ignoreExceptionOnPreLoad";
 
     /**
@@ -699,7 +607,7 @@ public class DataSourceFactory implements ObjectFactory {
         }
 
         value = properties.getProperty(PROP_NUMTESTSPEREVICTIONRUN);
-        if (value != null) {
+        if (value != null && !value.trim().isEmpty()) {
             log.warn(MessageFactory.get("dataSourceFactory.invalidSetting", PROP_NUMTESTSPEREVICTIONRUN));
             Integer parsed = parseInteger(PROP_NUMTESTSPEREVICTIONRUN, value);
             if (parsed != null) {
@@ -795,7 +703,7 @@ public class DataSourceFactory implements ObjectFactory {
         }
 
         value = properties.getProperty(PROP_ACCESSTOUNDERLYINGCONNECTIONALLOWED);
-        if (value != null) {
+        if (value != null && !value.trim().isEmpty()) {
             log.warn(MessageFactory.get("dataSourceFactory.invalidSetting", PROP_ACCESSTOUNDERLYINGCONNECTIONALLOWED));
             Boolean b = parseBoolean(PROP_ACCESSTOUNDERLYINGCONNECTIONALLOWED, value);
             if (b != null) {
@@ -828,21 +736,26 @@ public class DataSourceFactory implements ObjectFactory {
         }
 
         value = properties.getProperty(PROP_POOLPREPAREDSTATEMENTS);
-        if (value != null) {
+        if (value != null && !value.trim().isEmpty()) {
             log.warn(MessageFactory.get("dataSourceFactory.invalidSetting", PROP_POOLPREPAREDSTATEMENTS));
         }
 
         value = properties.getProperty(PROP_MAXOPENPREPAREDSTATEMENTS);
-        if (value != null) {
+        if (value != null && !value.trim().isEmpty()) {
             log.warn(MessageFactory.get("dataSourceFactory.invalidSetting", PROP_MAXOPENPREPAREDSTATEMENTS));
         }
 
         value = properties.getProperty(PROP_CONNECTIONPROPERTIES);
-        if (value != null) {
+        if (value != null && !value.trim().isEmpty()) {
             // The canonical setter parses the pairs into the driver
             // properties and keeps the string round-tripping through
             // getConnectionProperties().
             poolProperties.setConnectionProperties(value);
+        } else if (value != null) {
+            // A blank attribute means the default, null: storing "" would
+            // make the configuration dump and the getter report a value that
+            // was never configured.
+            poolProperties.setConnectionProperties(null);
         } else {
             poolProperties.setDbProperties(new Properties());
         }

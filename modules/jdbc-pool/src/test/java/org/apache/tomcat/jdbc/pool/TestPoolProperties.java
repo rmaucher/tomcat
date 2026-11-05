@@ -20,6 +20,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.lang.reflect.Modifier;
 import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.List;
@@ -152,6 +153,90 @@ class TestPoolProperties {
     }
 
     @Test
+    void theMinIdleDefaultIsFixedAtConstruction() {
+        PoolProperties properties = new PoolProperties();
+        int constructedDefault = properties.getMinIdle();
+
+        properties.setInitialSize(2);
+
+        Assertions.assertEquals(2, properties.getInitialSize());
+        Assertions.assertEquals(constructedDefault, properties.getMinIdle(),
+                "minIdle's default is the initialSize value at construction; changing"
+                        + " initialSize later does not move the floor");
+    }
+
+    @Test
+    void toStringShowsThePoolName() {
+        PoolProperties properties = new PoolProperties();
+        properties.setName("myPool");
+
+        Assertions.assertTrue(properties.toString().startsWith("ConnectionPool[name=myPool;"),
+                "the dump must show the pool name its javadoc promises, was: " + properties);
+    }
+
+    @Test
+    void toStringDoesNotPrintTheConfiguredDataSourceObject() {
+        PoolProperties properties = new PoolProperties();
+        Object dataSource = new Object() {
+            @Override
+            public String toString() {
+                return "jdbc:vendor://host/db?user=sa&password=datasource-secret";
+            }
+        };
+        properties.setDataSource(dataSource);
+
+        String dump = properties.toString();
+
+        Assertions.assertFalse(dump.contains("datasource-secret"),
+                "the dump must not call the configured data source object's toString()");
+        Assertions.assertTrue(dump.contains("dataSource=" + dataSource.getClass().getName()),
+                "the dump must still identify the configured data source by class");
+    }
+
+    @Test
+    void aHostileThrowableToStringCostsOnlyItsOwnField() {
+        PoolProperties properties = new PoolProperties() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public String getUrl() {
+                throw new RuntimeException() {
+                    private static final long serialVersionUID = 1L;
+
+                    @Override
+                    public String toString() {
+                        throw new IllegalStateException("hostile toString");
+                    }
+                };
+            }
+        };
+
+        String dump = properties.toString();
+
+        Assertions.assertTrue(dump.contains("url=<error: "),
+                "the failing field must be reported, was: " + dump);
+        Assertions.assertTrue(dump.contains("useStatementFacade="),
+                "a hostile toString() must not truncate the fields that follow it");
+        Assertions.assertTrue(dump.endsWith("]"), "the dump must stay bracket-balanced");
+    }
+
+    @Test
+    void getJdbcInterceptorsAsArrayReturnsACopy() {
+        PoolProperties properties = new PoolProperties();
+        properties.setJdbcInterceptors("ResetAbandonedTimer");
+
+        PoolProperties.InterceptorDefinition[] first = properties.getJdbcInterceptorsAsArray();
+        Assertions.assertTrue(first.length > 0, "precondition: the definition must parse");
+        first[0] = null;
+
+        PoolProperties.InterceptorDefinition[] second = properties.getJdbcInterceptorsAsArray();
+        Assertions.assertNotSame(first, second,
+                "each call must return its own array");
+        Assertions.assertNotNull(second[0],
+                "mutating the returned array must not change the cached definitions");
+    }
+
+    @Test
     void setConnectionPropertiesRoundTripsThroughTheFactory() {
         Properties attrs = new Properties();
         attrs.setProperty("connectionProperties", "first=one;second=two");
@@ -174,6 +259,15 @@ class TestPoolProperties {
                 "an unconfigured attribute must read back null");
         Assertions.assertTrue(without.getDbProperties().isEmpty(),
                 "an unconfigured attribute must leave the driver properties empty");
+
+        Properties blankAttrs = new Properties();
+        blankAttrs.setProperty("connectionProperties", "   ");
+        PoolConfiguration blank =
+                DataSourceFactory.parsePoolProperties(blankAttrs);
+        Assertions.assertNull(blank.getConnectionProperties(),
+                "a blank attribute must read back the default null, not an empty string");
+        Assertions.assertTrue(blank.getDbProperties().isEmpty(),
+                "a blank attribute must leave the driver properties empty");
     }
 
     @Test
@@ -295,6 +389,49 @@ class TestPoolProperties {
     }
 
     @Test
+    void clearingCredentialsReachesValuesSuppliedByADefaultsTable() {
+        Properties defaults = new Properties();
+        defaults.setProperty(PoolUtilities.PROP_USER, DEFAULT_USER);
+        defaults.setProperty(PoolUtilities.PROP_PASSWORD, DEFAULT_PASSWD);
+        PoolProperties properties = new PoolProperties();
+        properties.setDbProperties(new Properties(defaults));
+
+        properties.setPassword(null);
+        properties.setUsername(null);
+
+        Assertions.assertNull(properties.getDbProperties().getProperty(PoolUtilities.PROP_PASSWORD),
+                "clearing the password must remove a value a defaults table supplies");
+        Assertions.assertNull(properties.getDbProperties().getProperty(PoolUtilities.PROP_USER),
+                "clearing the user name must remove a value a defaults table supplies");
+        Assertions.assertNull(
+                PoolUtilities.clone(properties.getDbProperties()).getProperty(PoolUtilities.PROP_PASSWORD),
+                "the copy handed to the driver must not materialize the cleared password");
+        Assertions.assertNull(
+                PoolUtilities.clone(properties.getDbProperties()).getProperty(PoolUtilities.PROP_USER),
+                "the copy handed to the driver must not materialize the cleared user name");
+    }
+
+    @Test
+    void droppingAConnectionPropertyReachesADefaultsTable() {
+        Properties defaults = new Properties();
+        defaults.setProperty("sslmode", "require");
+        PoolProperties properties = new PoolProperties();
+        properties.setDbProperties(new Properties(defaults));
+
+        properties.setConnectionProperties("sslmode=disable");
+        Assertions.assertEquals("disable",
+                PoolUtilities.clone(properties.getDbProperties()).getProperty("sslmode"),
+                "the string's pair must shadow the defaults value");
+
+        properties.setConnectionProperties(null);
+
+        Assertions.assertNull(properties.getDbProperties().getProperty("sslmode"),
+                "clearing the string must remove the pair it contributed");
+        Assertions.assertNull(PoolUtilities.clone(properties.getDbProperties()).getProperty("sslmode"),
+                "the dropped pair must not fall back to the defaults value the driver copy would send");
+    }
+
+    @Test
     void rewritingTheStringAppliesItsCredentialPairAgain() {
         PoolProperties properties = new PoolProperties();
         properties.setConnectionProperties("password=fromstring");
@@ -354,41 +491,6 @@ class TestPoolProperties {
     }
 
     @Test
-    void anErrorFromAPropertyObjectToStringStillProducesADump() {
-        // buf.append(Object) calls the object's toString() directly, so an
-        // Error from the arbitrary dataSource object arrives unwrapped, unlike
-        // one from inside a getter. The dump must not throw over it.
-        PoolProperties properties = new PoolProperties();
-        properties.setDataSource(new Object() {
-            @Override
-            public String toString() {
-                throw new StackOverflowError("boom");
-            }
-        });
-
-        String asString = Assertions.assertDoesNotThrow(properties::toString);
-
-        Assertions.assertTrue(asString.endsWith("]"),
-                "the dump must stay bracket-balanced, was: " + asString);
-        Assertions.assertTrue(asString.contains("dataSource=<error:"),
-                "the failing property must be reported in its own field, was: " + asString);
-    }
-
-    @Test
-    void aFatalErrorFromAPropertyObjectToStringIsPropagated() {
-        PoolProperties properties = new PoolProperties();
-        properties.setDataSource(new Object() {
-            @Override
-            public String toString() {
-                throw new OutOfMemoryError("pretend");
-            }
-        });
-
-        Assertions.assertThrows(OutOfMemoryError.class, properties::toString,
-                "fatal errors are propagated, per the module's handleThrowable convention");
-    }
-
-    @Test
     void aNamelessInterceptorPropertyIsRefusedAtOnce() {
         NullPointerException npe = Assertions.assertThrows(NullPointerException.class,
                 () -> new PoolProperties.InterceptorProperty(null, "value"),
@@ -441,23 +543,24 @@ class TestPoolProperties {
 
     @Test
     void aThrowingPropertyFailsOnlyItsOwnFieldOfTheDump() {
-        PoolProperties properties = new PoolProperties();
-        properties.setUrl("jdbc:h2:mem:shown");
-        properties.setDataSource(new Object() {
+        PoolProperties properties = new PoolProperties() {
+            private static final long serialVersionUID = 1L;
+
             @Override
-            public String toString() {
-                throw new IllegalStateException("hostile dataSource");
+            public String getUrl() {
+                throw new IllegalStateException("hostile getter");
             }
-        });
+        };
+        properties.setDataSourceJNDI("java:comp/env/jdbc/test");
 
         String asString = properties.toString();
 
         Assertions.assertTrue(asString.endsWith("]"),
                 "one throwing property must not truncate the dump, was: " + asString);
-        Assertions.assertTrue(asString.contains("dataSource=<error:"),
+        Assertions.assertTrue(asString.contains("url=<error:"),
                 "the failing property must be reported in its own field, was: " + asString);
-        // dataSourceJNDI is listed after dataSource, so it is lost if the
-        // failure still truncates the dump.
+        // dataSourceJNDI is listed after url, so it is lost if the failure
+        // still truncates the dump.
         Assertions.assertTrue(asString.contains("dataSourceJNDI"),
                 "the properties must keep being listed after the failing one, was: " + asString);
     }
@@ -783,6 +886,23 @@ class TestPoolProperties {
     }
 
     @Test
+    void toStringMasksAnInterceptorCredentialInANestedPropertyList() {
+        PoolProperties properties = new PoolProperties();
+        properties.setJdbcInterceptors(
+                "StatementCache(foo=(password=interceptor-secret),pwd=Shouted-Secret)");
+
+        String asString = properties.toString();
+
+        Assertions.assertFalse(asString.contains("interceptor-secret"),
+                "a credential nested inside another property list must not leak, was: " + asString);
+        Assertions.assertFalse(asString.contains("Shouted-Secret"),
+                "the pair after the nested list must still be masked, was: " + asString);
+        Assertions.assertTrue(asString.contains(
+                        "StatementCache(foo=(password=********),pwd=********)"),
+                "the surrounding structure must stay readable, was: " + asString);
+    }
+
+    @Test
     void toStringMasksAnInterceptorCredentialWrittenAroundSpacesAndLeavesOtherPairsAlone() {
         PoolProperties properties = new PoolProperties();
         properties.setJdbcInterceptors("SlowQueryReport(threshold=1000, Password = spaced-secret );"
@@ -918,6 +1038,18 @@ class TestPoolProperties {
 
         Assertions.assertTrue(none.toString().contains("jdbcInterceptors=null"),
                 "a null string must print as null, was: " + none);
+    }
+
+    @Test
+    void validatorSettersPublishThePairUnderTheInstanceMonitor() throws Exception {
+        Assertions.assertTrue(Modifier.isSynchronized(PoolProperties.class
+                .getMethod("setValidator", Validator.class).getModifiers()),
+                "the validator and its class name are one configuration and must be"
+                        + " published together");
+        Assertions.assertTrue(Modifier.isSynchronized(PoolProperties.class
+                .getMethod("setValidatorClassName", String.class).getModifiers()),
+                "the validator and its class name are one configuration and must be"
+                        + " published together");
     }
 
     /** The implementation a configured validator must be rebuilt to. */

@@ -29,6 +29,17 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
 
 /**
  * Utility class for JMX registration of JDBC pool components.
+ * <p>
+ * JMX is a best-effort management channel, not part of the pool's operation. A registration or an unregistration is
+ * attempted once and a failure is logged; nothing is retried later from this class.
+ * </p>
+ * <p>
+ * Under Catalina the names are unique - the container assigns them, and a name identifies one live component - so a
+ * refused registration is a configuration or server problem that an operator reads from the log, not one the pool
+ * should keep hammering. Retrying a refused unregistration by name would be worse than leaving it: by the time the
+ * retry ran, the name could belong to a replacement MBean, and the retry would silently take down the replacement's
+ * management surface.
+ * </p>
  */
 public class JmxUtil {
 
@@ -90,7 +101,9 @@ public class JmxUtil {
      *             handle regardless, held by nothing for the rest of the JVM's
      *             life (an MBean whose {@code postDeregister()} throws reports
      *             the same failure although the server already took it down;
-     *             the pool's own MBeans never do)
+     *             the pool's own MBeans never do). A refusal is reported here
+     *             and not remembered for a later retry: see the class
+     *             documentation.
      */
     public static boolean unregisterJmx(ObjectName oname) {
         if (oname == null) {
@@ -106,7 +119,9 @@ public class JmxUtil {
             return true;
         } catch (Exception e) {
             // Normally the MBean kept its name and that name is now owned by
-            // nobody: say so, with the name, so an operator can take it down
+            // nobody. Say so, with the name, so an operator can take it down;
+            // this class does not retry it, because the name may already
+            // describe a replacement MBean by the time a retry ran.
             log.error(MessageFactory.get("jmxUtil.jmxUnregistrationRefused", oname), e);
             return false;
         }

@@ -32,6 +32,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 import javax.management.InstanceNotFoundException;
@@ -565,51 +569,49 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
     }
 
     @Test
-    void aSameNamedPoolReportsThroughItsOwnPublicationAndNotTheOtherS() throws Exception {
-        String poolName = "JmxDuplicate-" + System.nanoTime();
-        DataSource ownerPool = reportingPoolNamed(poolName);
-        DataSource otherPool = reportingPoolNamed(poolName);
+    void eachPoolReportsThroughItsOwnPublicationAndNotTheOtherS() throws Exception {
+        String ownerName = "JmxOwner-" + System.nanoTime();
+        String otherName = "JmxOther-" + System.nanoTime();
+        DataSource ownerPool = reportingPoolNamed(ownerName);
+        DataSource otherPool = reportingPoolNamed(otherName);
 
         MBeanServer server = ManagementFactory.getPlatformMBeanServer();
-        ObjectName oname = new ObjectName("tomcat.jdbc:type="
-                + SlowQueryReportJmx.class.getName() + ",name=" + poolName);
+        ObjectName ownerOn = new ObjectName("tomcat.jdbc:type="
+                + SlowQueryReportJmx.class.getName() + ",name=" + ownerName);
+        ObjectName otherOn = new ObjectName("tomcat.jdbc:type="
+                + SlowQueryReportJmx.class.getName() + ",name=" + otherName);
         List<Notification> published = new CopyOnWriteArrayList<>();
-        List<Notification> refused = new CopyOnWriteArrayList<>();
+        List<Notification> otherPublished = new CopyOnWriteArrayList<>();
         NotificationListener publishedListener = (notification, handback) -> published.add(notification);
-        NotificationListener refusedListener = (notification, handback) -> refused.add(notification);
+        NotificationListener otherListener = (notification, handback) -> otherPublished.add(notification);
 
-        // The first pool's borrow publishes the MBean under the name; the
-        // second pool, configured with the same name, cannot publish its own
-        // and is refused by the MBeanServer. It keeps running, and it keeps
-        // reporting - through a broadcaster of its own, because the MBean it
-        // was refused is not its own to report on
+        // Each pool publishes its own MBean under its own name, and its
+        // queries reach only the listeners of that publication.
         Connection ownerConnection = ownerPool.getConnection();
         Connection otherConnection = otherPool.getConnection();
         try {
-            server.addNotificationListener(oname, publishedListener, null, null);
-            interceptorOf(otherConnection, SlowQueryReportJmx.class)
-                    .addNotificationListener(refusedListener, null, null);
+            server.addNotificationListener(ownerOn, publishedListener, null, null);
+            server.addNotificationListener(otherOn, otherListener, null, null);
 
             try (Statement st = ownerConnection.createStatement()) {
                 st.execute(slowSql(1));
             }
             Assertions.assertTrue(published.stream().anyMatch(n -> n.getMessage().contains("SELECT 1")),
-                    "the publishing pool's queries reach the listeners of its MBean, received: "
+                    "the pool's queries reach the listeners of its MBean, received: "
                             + published);
 
             try (Statement st = otherConnection.createStatement()) {
                 st.execute(slowSql(2));
             }
-            Assertions.assertTrue(refused.stream().anyMatch(n -> n.getMessage().contains("SELECT 2")),
-                    "the refused pool must still notify its own listeners, received: " + refused);
+            Assertions.assertTrue(otherPublished.stream().anyMatch(n -> n.getMessage().contains("SELECT 2")),
+                    "the other pool must notify its own listeners, received: " + otherPublished);
             Assertions.assertFalse(published.stream().anyMatch(n -> n.getMessage().contains("SELECT 2")),
                     "and it must not report into the other pool's MBean: a client listening to the"
                             + " name would otherwise read another pool's queries as its own,"
                             + " received: " + published);
 
-            // Close the pool that was refused. It published nothing, so it has
-            // nothing to give up, and it must not take the other pool's
-            // publication down on its way out
+            // Closing one pool gives up its own publication and leaves the
+            // other pool's publication alone.
             otherConnection.close();
             otherConnection = null;
             otherPool.close();
@@ -617,9 +619,10 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             try (Statement st = ownerConnection.createStatement()) {
                 st.execute(slowSql(3));
             }
-            Assertions.assertTrue(server.isRegistered(oname),
-                    "closing a pool that was refused the name must leave the pool that holds it"
-                            + " published");
+            Assertions.assertFalse(server.isRegistered(otherOn),
+                    "closing a pool gives up its own publication");
+            Assertions.assertTrue(server.isRegistered(ownerOn),
+                    "closing one pool must leave the other pool's publication standing");
             Assertions.assertTrue(published.stream().anyMatch(n -> n.getMessage().contains("SELECT 3")),
                     "and its clients' listeners must still be served, received: " + published);
         } finally {
@@ -639,11 +642,16 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             }
             ownerPool.close();
             try {
-                server.removeNotificationListener(oname, publishedListener);
+                server.removeNotificationListener(ownerOn, publishedListener);
             } catch (ListenerNotFoundException | InstanceNotFoundException ignore) {
                 // the teardown under test may already have dropped the binding
             }
-            Assertions.assertFalse(server.isRegistered(oname),
+            try {
+                server.removeNotificationListener(otherOn, otherListener);
+            } catch (ListenerNotFoundException | InstanceNotFoundException ignore) {
+                // the teardown under test may already have dropped the binding
+            }
+            Assertions.assertFalse(server.isRegistered(ownerOn),
                     "closing the pool that published the MBean gives it up");
         }
     }
@@ -785,9 +793,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
                                 + " the name is formed and a Registration built to lose the"
                                 + " slot race: parsing a full ObjectName and allocating a"
                                 + " publication that cannot happen on every borrow of a"
-                                + " perfectly registered pool is cost with no possible use -"
-                                + " and a refused registration still leaves the slot free, so"
-                                + " the retry semantics of a failed publish are untouched");
+                                + " perfectly registered pool is cost with no possible use");
             }
         } finally {
             ds.close();
@@ -795,8 +801,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
     }
 
     @Test
-    void aRefusedPublicationKeepsRetryingAndAPublishTheServerTookStandsUntilTheClose()
-            throws Exception {
+    void aRefusedPublicationIsNotRetriedByALaterBorrow() throws Exception {
         String poolName = "JmxRegFail-" + System.nanoTime();
         DataSource ds = newDataSource();
         ds.setName(poolName);
@@ -821,31 +826,24 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
                 SlowQueryReportJmx.PoolJmx state = SlowQueryReportJmx.jmxStateFor(pool);
                 Assertions.assertNull(state.publishedUnder(),
                         "a publish the MBeanServer refused must not leave the pool claiming an"
-                                + " MBean that was never published - every later borrow would find"
-                                + " the pool published and never retry");
-
-                // With the obstacle gone, a later borrow must still get the
-                // MBean published: the refused attempt must not have latched
-                // anything for the life of the pool.
-                server.unregisterMBean(oname);
-                try (@SuppressWarnings("unused") Connection next = ds.getConnection()) {
-                    Assertions.assertTrue(server.isRegistered(oname),
-                            "the borrow after the obstacle was removed must publish the MBean");
-                    // the attribute of the interceptor's MBean interface,
-                    // answered by the registered resource: not the obstacle,
-                    // which exposes no such attribute
-                    Assertions.assertDoesNotThrow(() -> server.getAttribute(oname, "SlowQueriesCD"),
-                            "the published MBean must be the interceptor's, answering its statistics query");
-                    Assertions.assertEquals(oname,
-                            SlowQueryReportJmx.jmxStateFor(pool).publishedUnder(),
-                            "the retrying borrow must have recorded what it published");
-                }
+                                + " MBean that was never published");
             }
+
+            // JMX is best effort. With the obstacle gone, a later borrow does
+            // not repeat the attempt: the refusal was reported once for the
+            // operator, and retrying by name could collide with yet another
+            // component that took it.
+            server.unregisterMBean(oname);
+            try (@SuppressWarnings("unused") Connection next = ds.getConnection()) {
+                Assertions.assertFalse(server.isRegistered(oname),
+                        "a later borrow must not retry a refused publication");
+                Assertions.assertNull(SlowQueryReportJmx.jmxStateFor(pool).publishedUnder(),
+                        "the pool must still not claim a publication it never made");
+            }
+
             ds.close();
-            Assertions.assertFalse(server.isRegistered(oname),
-                    "closing the pool must release the registration the retry published");
             Assertions.assertNull(SlowQueryReportJmx.jmxStateFor(pool),
-                    "and give up the JMX state it hung from");
+                    "closing the pool must give up the JMX state it hung from");
         } finally {
             // remove the obstacle if the test never got as far as removing
             // it itself; on the green path nothing is registered any more
@@ -858,7 +856,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
     }
 
     @Test
-    void persistentPublicationRefusalKeepsRetryingAndCleansUpOnClose() throws Exception {
+    void aRefusedPublicationIsReportedOnceAndCleanedUpOnClose() throws Exception {
         String poolName = "JmxRegRefuse-" + System.nanoTime();
         DataSource refusingPool = reportingPoolNamed(poolName);
 
@@ -871,36 +869,27 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         List<Notification> received = new CopyOnWriteArrayList<>();
         NotificationListener listener = (notification, handback) -> received.add(notification);
         try {
-            // The first refused borrow: nothing is published for the pool, and
-            // the failure is marked as reported - the loud report of this pool
-            // (warn/error) has gone out, its repeats ride at debug without
-            // a stack trace (not asserted: the module's test infrastructure
-            // captures no log, so the throttle is pinned through its
-            // bookkeeping only)
+            // The first borrow attempts the publication and is refused:
+            // nothing is published for the pool, and the refusal is reported
+            // once by registerJmx().
             Connection first = refusingPool.getConnection();
             ConnectionPool pool = refusingPool.getPool();
             SlowQueryReportJmx.PoolJmx state = SlowQueryReportJmx.jmxStateFor(pool);
             Assertions.assertNull(state.publishedUnder(),
                     "a refused publication must not leave the pool claiming an MBean");
-            Assertions.assertEquals(oname, state.failureMarker(),
-                    "the first refusal of this ObjectName must be marked as reported for the"
-                            + " throttle");
             interceptorOf(first, SlowQueryReportJmx.class)
                     .addNotificationListener(listener, null, null);
 
-            // Later borrows keep retrying: still refused (the obstacle holds
-            // the name), still nothing published, and the identical marker
-            // keeps their logging throttled
+            // Later borrows do not retry the publication; the obstacle keeps
+            // the name and nothing is published for this pool, but its own
+            // broadcaster still serves its listeners.
             try (@SuppressWarnings("unused") Connection second = refusingPool.getConnection();
                     @SuppressWarnings("unused") Connection third = refusingPool.getConnection()) {
                 Assertions.assertNull(state.publishedUnder(),
-                        "retried refusals must leave the pool unpublished, so that the next borrow"
-                                + " can try again");
-                Assertions.assertEquals(oname, state.failureMarker(),
-                        "repeated refusals of the same ObjectName must not re-mark it loudly");
+                        "later borrows must not retry a refused publication");
                 Assertions.assertEquals("registration-obstacle",
                         server.getAttribute(oname, "HeldBy"),
-                        "the retried publishes must still be colliding with the obstacle");
+                        "the name must still belong to the obstacle");
                 // A slow query of the refused pool still reaches the pool's own
                 // broadcaster - state the close has to give up even though no
                 // publication of this pool ever succeeded
@@ -915,9 +904,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
             first.close();
 
             // Close a pool that never got published: its close gives up the
-            // state it reported through - broadcaster and throttle marker and
-            // all - so neither outlives the pool, and a later pool under the
-            // same name starts its own failure cycle marked loudly again
+            // state it reported through, so it does not outlive the pool.
             refusingPool.close();
             Assertions.assertNull(SlowQueryReportJmx.jmxStateFor(pool),
                     "the close of the pool gives up the JMX state it published nothing from");
@@ -925,18 +912,17 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
                     server.getAttribute(oname, "HeldBy"),
                     "and the name still belongs to the obstacle: the refused pool never took it");
 
-            // the name stayed retryable through every refusal: once the
-            // obstacle is gone, a fresh pool under the name publishes at once
-            // and publishes cleanly - success marks nothing in the throttle
+            // A fresh pool under a freed name makes its own attempt and
+            // publishes cleanly.
             server.unregisterMBean(oname);
             DataSource revivedPool = reportingPoolNamed(poolName);
             try (@SuppressWarnings("unused") Connection borrowed = revivedPool.getConnection()) {
                 Assertions.assertTrue(server.isRegistered(oname),
                         "the first borrow of a pool started after the obstacle is gone"
                                 + " must publish the MBean");
-                Assertions.assertNull(SlowQueryReportJmx.jmxStateFor(revivedPool.getPool())
-                                .failureMarker(),
-                        "a succeeding publication must not leave a throttle marker behind");
+                Assertions.assertEquals(oname,
+                        SlowQueryReportJmx.jmxStateFor(revivedPool.getPool()).publishedUnder(),
+                        "the published MBean must be the revived pool's");
             }
             revivedPool.close();
             Assertions.assertFalse(server.isRegistered(oname),
@@ -989,39 +975,37 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
     }
 
     @Test
-    void concurrentClosesOfSameNamedPoolsLeaveNothingBehind() throws Exception {
-        String poolName = "JmxRace-" + System.nanoTime();
-        DataSource first = reportingPoolNamed(poolName);
-        DataSource second = reportingPoolNamed(poolName);
-        DataSource third = reportingPoolNamed(poolName);
+    void concurrentClosesOfDistinctPoolsLeaveNothingBehind() throws Exception {
+        String[] names = { "JmxRace0-" + System.nanoTime(), "JmxRace1-" + System.nanoTime(),
+                "JmxRace2-" + System.nanoTime() };
+        DataSource[] sources = new DataSource[names.length];
+        ObjectName[] onames = new ObjectName[names.length];
 
         MBeanServer server = ManagementFactory.getPlatformMBeanServer();
-        ObjectName oname = new ObjectName("tomcat.jdbc:type="
-                + SlowQueryReportJmx.class.getName() + ",name=" + poolName);
-
-        Connection one = first.getConnection();
-        Connection two = second.getConnection();
-        Connection three = third.getConnection();
-        Assertions.assertTrue(server.isRegistered(oname),
-                "the MBean must be registered while the same-named pools run - published by the"
-                        + " first of them to borrow");
-        ConnectionPool[] pools = { first.getPool(), second.getPool(), third.getPool() };
+        Connection[] connections = new Connection[names.length];
+        for (int i = 0; i < names.length; i++) {
+            sources[i] = reportingPoolNamed(names[i]);
+            onames[i] = new ObjectName("tomcat.jdbc:type="
+                    + SlowQueryReportJmx.class.getName() + ",name=" + names[i]);
+            connections[i] = sources[i].getConnection();
+            Assertions.assertTrue(server.isRegistered(onames[i]),
+                    "the MBean must be registered while the pool runs");
+        }
+        ConnectionPool[] pools = { sources[0].getPool(), sources[1].getPool(), sources[2].getPool() };
         // return every connection first, so the concurrent closes race only
         // on the registries, not on pooled connections
-        one.close();
-        two.close();
-        three.close();
+        for (Connection connection : connections) {
+            connection.close();
+        }
 
         // a start gate releases all three closes together: each of them gives
-        // up its own pool's store and its own publication, and the name view
-        // is freed by the close that still holds it - none of which may block
-        // on, fail because of, or miss what one of the others is doing
+        // up its own pool's store and its own publication - none of which may
+        // block on, fail because of, or miss what one of the others is doing
         CountDownLatch startGate = new CountDownLatch(1);
-        final DataSource[] closing = {first, second, third};
-        Throwable[] failures = new Throwable[closing.length];
-        Thread[] closers = new Thread[closing.length];
-        for (int i = 0; i < closing.length; i++) {
-            final DataSource pool = closing[i];
+        Throwable[] failures = new Throwable[sources.length];
+        Thread[] closers = new Thread[sources.length];
+        for (int i = 0; i < sources.length; i++) {
+            final DataSource pool = sources[i];
             final int slot = i;
             closers[i] = new Thread(() -> {
                 try {
@@ -1030,7 +1014,7 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
                 } catch (Throwable x) {
                     failures[slot] = x;
                 }
-            }, "same-named-pool-closer-" + i);
+            }, "pool-closer-" + i);
             closers[i].start();
         }
         startGate.countDown();
@@ -1046,26 +1030,25 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         }
 
         awaitSessions(0); // every physical session of every pool is really gone
-        Assertions.assertFalse(server.isRegistered(oname),
-                "the close of the pool that published the MBean must release it, whatever the"
-                        + " other same-named closes were doing at the time");
-        for (ConnectionPool pool : pools) {
-            Assertions.assertNull(SlowQueryReportJmx.jmxStateFor(pool),
+        for (int i = 0; i < names.length; i++) {
+            Assertions.assertFalse(server.isRegistered(onames[i]),
+                    "every close must release its own pool's MBean");
+            Assertions.assertNull(SlowQueryReportJmx.jmxStateFor(pools[i]),
                     "and every one of the closes must have given up its own pool's JMX state");
+            Assertions.assertNull(SlowQueryReport.getPoolStats(names[i]),
+                    "the statistics of every name must be freed with its pool's close");
         }
-        Assertions.assertNull(SlowQueryReport.getPoolStats(poolName),
-                "the statistics view of the name must be freed with the closes");
 
         // the name was really freed, not merely flagged: a pool restarted under
         // it must be able to publish, and must release the publication again
         // when it closes
-        DataSource restarted = reportingPoolNamed(poolName);
+        DataSource restarted = reportingPoolNamed(names[0]);
         try (@SuppressWarnings("unused") Connection borrowed = restarted.getConnection()) {
-            Assertions.assertTrue(server.isRegistered(oname),
+            Assertions.assertTrue(server.isRegistered(onames[0]),
                     "a pool started under the concurrently freed name must publish its MBean");
         }
         restarted.close();
-        Assertions.assertFalse(server.isRegistered(oname),
+        Assertions.assertFalse(server.isRegistered(onames[0]),
                 "closing the restarted pool must release the publication again");
     }
 
@@ -1196,14 +1179,34 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
 
 
     @Test
+    void aReleasedStoreAnswersNoJmxState() throws Exception {
+        String poolName = "JmxReleasedState-" + System.nanoTime();
+        DataSource ds = reportingPoolNamed(poolName,
+                "org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
+                        + "(notifyPool=false,threshold=-1)");
+        ds.createPool();
+        try (Connection ignored = ds.getConnection()) {
+            // the borrow publishes the state
+            Assertions.assertNotNull(SlowQueryReportJmx.jmxStateFor(ds.getPool()),
+                    "precondition: the borrow must have published the pool's state");
+        }
+        SlowQueryReport.PoolStatistics statistics = SlowQueryReport.statisticsFor(ds.getPool());
+        Assertions.assertNotNull(statistics, "precondition: the pool has a statistics store");
+
+        ds.close();
+
+        Assertions.assertTrue(statistics.isReleased(), "the close must release the store");
+        Assertions.assertNull(statistics.getJmxState(),
+                "a released store must not answer the state it gave up");
+    }
+
+    @Test
     void aMalformedObjectNameOverrideFailsOnlyTheRegistration() throws Exception {
         // An override value that is not an ObjectName at all (no domain
         // separator) fails the name formation on every borrow, before the
-        // registry slot and its refusal throttle are reachable - the failure
-        // is reported each time (see the acceptability comment in
-        // registerJmx). What must stay true while it is: the failure touches
-        // nothing but the monitoring, never latches the slot, and leaves
-        // nothing under the name behind.
+        // registry slot and its refusal throttle are reachable. The first
+        // failure is reported with its stack trace; later retries stay at
+        // debug level, and the failure touches nothing but monitoring.
         String poolName = "JmxMalformedOname-" + System.nanoTime();
         DataSource ds = reportingPoolNamed(poolName,
                 "org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx"
@@ -1212,21 +1215,51 @@ class TestSlowQueryJmxNotifications extends JdbcPoolBaseTest {
         MBeanServer server = ManagementFactory.getPlatformMBeanServer();
         Set<ObjectName> registeredBefore = server.queryNames(new ObjectName("tomcat.jdbc:type="
                 + SlowQueryReportJmx.class.getName() + ",*"), null);
-        try (@SuppressWarnings("unused") Connection first = ds.getConnection()) {
-            // the borrow itself served: a failed name formation cannot fail
-            // the pool's operation, only its monitoring
-            Assertions.assertEquals(registeredBefore, server.queryNames(new ObjectName("tomcat.jdbc:type="
-                    + SlowQueryReportJmx.class.getName() + ",*"), null),
-                    "no registration may appear while the name cannot be formed");
+        Logger logger = Logger.getLogger(SlowQueryReportJmx.class.getName());
+        Level originalLevel = logger.getLevel();
+        List<LogRecord> records = new CopyOnWriteArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {
+                // no buffering
+            }
+
+            @Override
+            public void close() {
+                // nothing to release
+            }
+        };
+        logger.addHandler(handler);
+        logger.setLevel(Level.ALL);
+        try {
+            try (@SuppressWarnings("unused") Connection first = ds.getConnection()) {
+                // the borrow itself served: a failed name formation cannot fail
+                // the pool's operation, only its monitoring
+                Assertions.assertEquals(registeredBefore, server.queryNames(new ObjectName("tomcat.jdbc:type="
+                        + SlowQueryReportJmx.class.getName() + ",*"), null),
+                        "no registration may appear while the name cannot be formed");
+            }
+            try (@SuppressWarnings("unused") Connection second = ds.getConnection()) {
+                SlowQueryReportJmx.PoolJmx state = SlowQueryReportJmx.jmxStateFor(ds.getPool());
+                Assertions.assertNull(state.publishedUnder(),
+                        "a name that cannot be formed must never leave the pool claiming a publication");
+            }
+        } finally {
+            logger.removeHandler(handler);
+            logger.setLevel(originalLevel);
         }
-        try (@SuppressWarnings("unused") Connection second = ds.getConnection()) {
-            SlowQueryReportJmx.PoolJmx state = SlowQueryReportJmx.jmxStateFor(ds.getPool());
-            Assertions.assertNull(state.publishedUnder(),
-                    "a name that cannot be formed must never leave the pool claiming a publication");
-            Assertions.assertNull(state.failureMarker(),
-                    "and a failure that cannot form its ObjectName has no name to mark as"
-                            + " reported, so it is reported on every borrow of such a pool");
-        }
+
+        long noDataErrors = records.stream()
+                .filter(r -> r.getLevel().intValue() >= Level.SEVERE.intValue()
+                        && r.getMessage() != null && r.getMessage().contains("no JMX data will be exposed"))
+                .count();
+        Assertions.assertEquals(1, noDataErrors,
+                "a permanently malformed name must be reported once, not on every borrow");
 
         ConnectionPool pool = ds.getPool();
         ds.close();

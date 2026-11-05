@@ -777,6 +777,50 @@ public class TestNamingFactory extends JdbcPoolBaseTest {
                 "the default must survive an address with no content");
     }
 
+    @Test
+    void traceLoggingDoesNotIncludeThePropertyValue() throws Exception {
+        Logger logger = Logger.getLogger(
+                GenericNamingResourcesFactory.class.getName());
+        Level originalLevel = logger.getLevel();
+        final List<LogRecord> records = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+            @Override
+            public void flush() {
+                // no buffering
+            }
+            @Override
+            public void close() {
+                // nothing to release
+            }
+        };
+        logger.addHandler(handler);
+        logger.setLevel(Level.FINEST);
+        try {
+            Reference ref = new Reference(NamingTarget.class.getName(),
+                    null, null);
+            ref.add(new StringRefAddr("name", "s3cr3t-value"));
+
+            Object result = new GenericNamingResourcesFactory().getObjectInstance(
+                    ref, new CompositeName("test/trace"), null, null);
+            Assertions.assertEquals("s3cr3t-value",
+                    ((NamingTarget) result).getName(),
+                    "the property must still be applied");
+        } finally {
+            logger.removeHandler(handler);
+            logger.setLevel(originalLevel);
+        }
+        for (LogRecord record : records) {
+            Assertions.assertFalse(record.getMessage() != null &&
+                    record.getMessage().contains("s3cr3t-value"),
+                    "the trace line must not log the configured value: "
+                            + record.getMessage());
+        }
+    }
+
     /** Target with the numeric and character setters BeanFactory supports. */
     public static class WideTarget {
         private short small;
@@ -1186,6 +1230,55 @@ public class TestNamingFactory extends JdbcPoolBaseTest {
         }
         public boolean isPropsInvoked() {
             return propsInvoked;
+        }
+    }
+
+    @Test
+    void convertibleSetterOverloadsAreChosenDeterministically() throws Exception {
+        Reference ref = new Reference(AmbiguousOverloadTarget.class.getName(),
+                null, null);
+        ref.add(new StringRefAddr("port", "1527"));
+        ref.add(new StringRefAddr("ratio", "1.5"));
+
+        AmbiguousOverloadTarget.last = null;
+        Object result = new GenericNamingResourcesFactory().getObjectInstance(
+                ref, new CompositeName("test/ambiguous"), null, null);
+
+        Assertions.assertInstanceOf(AmbiguousOverloadTarget.class, result);
+        AmbiguousOverloadTarget target = (AmbiguousOverloadTarget) result;
+        Assertions.assertEquals("int", target.getPortSetter(),
+                "the int overload must win over the long one for an integral value");
+        Assertions.assertEquals("double", target.getRatioSetter(),
+                "the double overload must win over the float one for a decimal value");
+    }
+
+    /** Target with several convertible setters for the same property. */
+    public static class AmbiguousOverloadTarget {
+        static AmbiguousOverloadTarget last;
+        private String portSetter;
+        private String ratioSetter;
+
+        public AmbiguousOverloadTarget() {
+            last = this;
+        }
+
+        public void setPort(int port) {
+            portSetter = "int";
+        }
+        public void setPort(long port) {
+            portSetter = "long";
+        }
+        public String getPortSetter() {
+            return portSetter;
+        }
+        public void setRatio(float ratio) {
+            ratioSetter = "float";
+        }
+        public void setRatio(double ratio) {
+            ratioSetter = "double";
+        }
+        public String getRatioSetter() {
+            return ratioSetter;
         }
     }
 

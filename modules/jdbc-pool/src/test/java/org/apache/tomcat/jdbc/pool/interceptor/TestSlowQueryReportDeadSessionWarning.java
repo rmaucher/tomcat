@@ -21,6 +21,8 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -47,9 +49,8 @@ import org.apache.tomcat.jdbc.pool.DataSource;
  * filled the log with it.
  * <p>
  * The tests drive the release the way the pool itself delivers it -
- * {@code reset(null, null)} on the interceptor link, the call
- * {@code PooledConnection.setHandler(null)} walks a released chain with -
- * onto the live interceptor instance of a connection that is still borrowed,
+ * {@code reset(null, null)} on the interceptor link, which the teardown walk
+ * calls - onto the live interceptor instance of a connection that is still borrowed,
  * which is also the state a borrow racing the close of the pool's last live
  * same-named pool lands in. One loss of the store now earns one WARN per
  * interceptor instance; a booking made on a recovered store re-arms the
@@ -159,6 +160,45 @@ class TestSlowQueryReportDeadSessionWarning extends JdbcPoolBaseTest {
                 logs.assertDeadSessionWarnings(2,
                         "a second loss of the statistics store must be reported again");
             }
+        }
+    }
+
+    @Test
+    void concurrentLossesAreReportedOnce() throws Exception {
+        DataSource ds = newDataSource();
+        ds.setName("DeadSessionConcurrent-" + System.nanoTime());
+        ds.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReport"
+                + "(threshold=60000,logSlow=false,logFailed=false)");
+        ds.getPoolProperties().setInitialSize(0);
+
+        Connection con = ds.getConnection();
+        SlowQueryReport report = reportOf(con);
+        try (DeadSessionLogCapture logs = new DeadSessionLogCapture()) {
+            releaseStatisticsOf(report);
+
+            int threads = 16;
+            CyclicBarrier barrier = new CyclicBarrier(threads);
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread[] workers = new Thread[threads];
+            for (int i = 0; i < threads; i++) {
+                workers[i] = new Thread(() -> {
+                    try {
+                        barrier.await();
+                        report.getQueryStats("SELECT concurrent-loss");
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    }
+                }, "dead-session-report-" + i);
+                workers[i].start();
+            }
+            for (Thread worker : workers) {
+                worker.join(AWAIT_TIMEOUT_MS);
+            }
+            Assertions.assertNull(failure.get(), () -> "the reporters must not fail: " + failure.get());
+            logs.assertDeadSessionWarnings(1,
+                    "concurrent executions on a lost store must still report the loss once");
+        } finally {
+            con.close();
         }
     }
 

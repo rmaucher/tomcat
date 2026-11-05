@@ -55,6 +55,11 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
  * {@link org.apache.tomcat.jdbc.pool.PoolConfiguration#setRemoveAbandonedTimeout(int)} that is fairly low, and you
  * want to reset the abandoned time each time any operation on the connection is performed. This is useful for batch
  * processing programs that use connections for extensive amount of times.
+ * <p>
+ * With JMX enabled, the interceptor publishes an MBean below its connection's MBean. It is released when the
+ * connection is recycled, when the pool closes, or when the pool MBean is deregistered. A pool that is abandoned
+ * without being closed keeps its registrations - and through them the pool, its sessions and its driver class loader -
+ * reachable, so a JMX-enabled pool must be closed before it is dropped.
  */
 public class ResetAbandonedTimer extends AbstractQueryReport implements ResetAbandonedTimerMBean {
 
@@ -161,9 +166,26 @@ public class ResetAbandonedTimer extends AbstractQueryReport implements ResetAba
                     // level, with the exception behind it. A refused name is
                     // not claimed here, so it stays the property of whoever
                     // holds it and the next borrow tries again.
-                    String keyprop = ",JdbcInterceptor=" + getClass().getSimpleName();
+                    String simpleName = getClass().getSimpleName();
+                    if (simpleName.isEmpty()) {
+                        // An anonymous subclass has no simple name; fall back
+                        // to the base class's name so the JMX key is never
+                        // empty.
+                        simpleName = ResetAbandonedTimer.class.getSimpleName();
+                    }
+                    String keyprop = ",JdbcInterceptor=" + simpleName;
                     oname = JmxUtil.registerJmx(pcon.getObjectName(), keyprop, this);
                 }
+            }
+        }
+    }
+
+    @Override
+    public void unregisterMBean() {
+        synchronized (this) {
+            if (oname != null) {
+                JmxUtil.unregisterJmx(oname);
+                oname = null;
             }
         }
     }
@@ -231,6 +253,15 @@ public class ResetAbandonedTimer extends AbstractQueryReport implements ResetAba
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
         final long epoch = borrowEpoch;
+        if (compare(ABORT_VAL, method)) {
+            // abort ends the borrow before the driver call and before the
+            // pool's release walk clears this binding. Take the flag down
+            // first, so the JMX resetTimer() operation cannot stamp a
+            // connection whose borrow has already ended.
+            synchronized (this) {
+                this.checkedOut = false;
+            }
+        }
         try {
             return super.invoke(proxy, method, args);
         } finally {
