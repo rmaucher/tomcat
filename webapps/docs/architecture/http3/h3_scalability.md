@@ -7,16 +7,18 @@ after the OpenSSL poll-loop rework (EXPLICIT event-handling
 mode, zero-event scan skip, protocol-data mark set), then the
 same day again after the quiche re-arm indexing and the
 stream→socket-wrapper back-pointer, then once more after the
-quiche UDP GSO/GRO poll-loop work (section 4) - the quiche
-figures below are that final re-measurement; the OpenSSL
-column is unchanged by all of it (no code is shared). This file now
-documents the **current** state of both endpoints.
-Historical quiche figures and the September OpenSSL
+quiche UDP GSO/GRO poll-loop work (section 4). The OpenSSL
+column was re-measured on November 6, 2026 after commit
+`1ba321e21d` removed the per-item shared arena from
+`QuicPollItem` (section 4) - the earlier October OpenSSL
+figures in this file predate that fix and are obsolete.
+This file now documents the **current** state of all three
+endpoints. Historical quiche figures and the September OpenSSL
 figures have been dropped; for the older campaign and the
 OpenSSL upstream watchlist, `quic_scalability.md` remains the
 reference.
 
-The two backends of the HTTP/3 connector:
+The three backends of the HTTP/3 connector:
 
 - `org.apache.tomcat.util.net.quic.openssl.QuicOpenSSLEndpoint`
   (OpenSSL 4 QUIC, the default backend), and
@@ -24,7 +26,7 @@ The two backends of the HTTP/3 connector:
   (Cloudflare quiche 0.30.0 via FFM, opt-in), and
 - `org.apache.tomcat.util.net.quic.ngtcp2.Ngtcp2Endpoint`
   (ngtcp2 1.16 via FFM, backed by the system OpenSSL 3.5+ TLS stack;
-  initial evaluation in section 9).
+  evaluation and request-path rework in section 9).
 
 ## 1. Method
 
@@ -51,7 +53,9 @@ The two backends of the HTTP/3 connector:
   poller-seconds per completed request - the host-independent
   metric. Raw shards in `h3bench/out.*`; the current quiche
   column is the `item3` tag (post re-arm indexing and
-  back-pointer), the OpenSSL column the October rework runs.
+  back-pointer), the OpenSSL column the November 6
+  re-measurement after the November 4 poll-item rework, and
+  the ngtcp2 column the November 6 rework run (section 9).
 
 Harness hygiene, learned the hard way and worth repeating:
 
@@ -66,20 +70,20 @@ Harness hygiene, learned the hard way and worth repeating:
 
 ## 2. Idle fleet (percent of one poll core)
 
-The OpenSSL column is October 5, after the OpenSSL rework;
-the quiche column is the October 5 re-measurement after the
-re-arm indexing and back-pointer. The UDP GSO/GRO work does
-not move this table (idle traffic carries nothing worth
-merging or batching): the 2000-connection cell re-measured
-0.62 % on the GSO/GRO build.
+The OpenSSL column is the November 6 re-measurement after the
+November 4 poll-item rework (section 4); the quiche column is
+the October 5 re-measurement after the re-arm indexing and
+back-pointer. The UDP GSO/GRO work does not move this table
+(idle traffic carries nothing worth merging or batching): the
+2000-connection cell re-measured 0.62 % on the GSO/GRO build.
 
 | idle conns, kept alive @12 s | OpenSSL | errs | quiche | errs |
 |---|---|---|---|---|
 | 100 | 0.26 | 0 | 0.20 | 0 |
-| 1000 | 5.09 | 0 | 0.45 | 0 |
-| 2000 | 35.80 | 0 | 0.65 | 0 |
-| 4000 | 86.74 | 894 | 1.15 | 0 |
-| 8000 | 94.00 | 12512 | 1.42 | 0 |
+| 1000 | 2.57 | 0 | 0.45 | 0 |
+| 2000 | 5.55 | 0 | 0.65 | 0 |
+| 4000 | 29.12 | 0 | 1.15 | 0 |
+| 8000 | 81.45 | 1323 | 1.42 | 0 |
 
 - Quiche is flat: ~0.0002 %/conn (0.2 % at 100 is a
   small-sample floor - a couple of timer passes over the
@@ -89,14 +93,13 @@ merging or batching): the 2000-connection cell re-measured
   the previous run reported ~25 retries. A connection idle
   between its 12 s ping and its 30 s idle timeout is swept
   ~twice per 12 s, not thousands of times.
-- OpenSSL's October rework (section 4) roughly halves the idle
-  cost again at every size up to the knee - 1000 conns went
-  from ~8.2 to ~5.1 % of a core, 2000 from ~44 to ~36 % - and
-  the churn errors the September run reported at 2000
-  connections are gone (the shortened iterations now keep up
-  with keepalive processing). The knee still sits between 2000
-  and 4000 connections and ~1 core is exhausted at 4000: what
-  is left is transport-side. Every arriving datagram and every
+- OpenSSL's November 4 poll-item rework (section 4) removes
+  the per-request shared arena and native `SSL_POLL_ITEM`
+  allocation: 1000 idle conns fell from 5.09 to 2.57 % of a
+  core, 2000 from 35.80 to 5.55 %, and 4000 from 86.74 % (894
+  churn errors) to 29.12 % with zero errors. The knee has
+  moved from between 2000-4000 to between 4000-8000; what is
+  left is transport-side. Every arriving datagram and every
   due engine timer costs one shared-engine tick - a walk of
   every channel of the listener inside libssl (`ossl_quic_port
   _subtick`) - and one `SSL_poll()` readout that takes the
@@ -104,9 +107,10 @@ merging or batching): the 2000-connection cell re-measured
   connection fleet is the quadratic; no endpoint-side work can
   move it. Upstream watchlist in `quic_scalability.md`.
 - OpenSSL's per-connection idle cost still grows with the
-  fleet (the quadratic above); quiche remains cheaper per idle
-  connection at every measured size, by ~11x at 1000
-  connections and ~55-75x at 2000-8000 (at 100 connections the
+  fleet (the quadratic above), but the endpoint-side constant
+  is gone: quiche remains cheaper per idle connection at every
+  measured size, by ~5.7x at 1000 connections, ~8.5x at 2000,
+  ~25x at 4000 and ~57x at 8000 (at 100 connections the
   small-sample floor makes the ratio ~1.3x - the absolute
   figure there is noise, not scaling).
 
@@ -162,40 +166,43 @@ us/req** - within a point of the 1x32-solo cost (24.0 %,
 load-serving cost (the poll loop only ever sweepes
 connections an event touched).
 
-### OpenSSL (October, post-rework)
+### OpenSSL (November 6, after the poll-item rework)
 
 | shape | rps | p50 ms | poller % | us/req |
 |---|---|---|---|---|
-| 1x1 | 288 | 3.88 | 5.0 | 174.5 |
-| 1x32 | 13805 (cc) | 2.38 | 29.6 | 21.4 |
-| 8x25 | 18187 | 12.09 | 39.9 | 22.0 |
-| 8x100 | 15281 | 54.1 | 38.2 | 25.0 |
-| 32x32 | 14783 | 32.7 | 41.6 | 28.1 |
+| 1x1 | 277 | 4.54 | 5.2 | 186.6 |
+| 1x32 | 18472 (cc) | 2.08 | 25.6 | 13.8 |
+| 8x25 | 97301 | 2.47 | 99.4 | 10.2 |
+| 8x100 | 96659 | 9.52 | 99.0 | 10.2 |
+| 16x16 | 60330 (cc) | 5.20 | 76.0 | 12.6 |
+| 32x32 | 84857 | 7.02 | 98.7 | 11.6 |
 
-Against the September baseline (13421 rps / 34.9 us/req / 46.8
-% on 8x25; 113 ms p50 on 32x32) the rework moves ~19-44 % more
-throughput at ~40 % less poller time per request, with wide
-shapes gaining most (8x100 p50 70 -> 54 ms, 32x32 p50 113 ->
-33 ms; the 32x32 p99 stays ~1 s - stream-count serialization,
-below). The ~15-18k rps aggregate wall still arrives with the
-poller only ~40 % busy: the wall is per-connection
-single-threaded stream handling inside the one poll thread and
-the shared engine tick, not CPU (extra poller headroom is
-unusable; raising streams/conn only raises p50/p99). 1x1 is
-unchanged - its 288 rps is the client's 1/p50 over sequential
-pipelined requests with neither endpoint nor client CPU
-saturated; that p50 remains ~25x quiche's.
+Against the October column in earlier revisions of this file
+(18,187 rps / 22.0 us/req on 8x25; 14,783 / 28.1 on 32x32;
+15,281 / 25.0 on 8x100), the November 4 poll-item rework
+moves 8x25 to 97,301 rps / 10.2 us/req, 32x32 to 84,857 /
+11.6 and 8x100 to 96,659 / 10.2 - roughly 5x the throughput
+at less than half the per-request poller cost. The wide shapes
+are now poller-saturated (~99 %): the aggregate ceiling is the
+shared-engine tick (`ossl_quic_port_subtick`, one channel walk
+per arriving datagram) and the per-item `SSL_poll()` readout,
+plus per-connection stream serialization on the poll thread.
+The 32x32 p99 fell from ~1 s in October to ~103 ms. 1x32 also
+improves to 18,472 rps / 13.8 us/req (client-capped at 96 %).
+1x1 is essentially unchanged - its 277 rps is the client's
+1/p50 over sequential pipelined requests with neither endpoint
+nor client CPU saturated; that p50 remains ~28x quiche's.
 
 ### The mixed shape (OpenSSL)
 
-Same 1x32 against the settled 2000-connection fleet: **3973
-rps, p50 8.1 ms, 88 % poller, 221 us/req** - 9.3x the pre-
-rework measurement on this host (408 rps, p50 86 ms, 98 %
-poller, 2412 us/req). An idle fleet still taxes the load
-heavily on this backend: each request datagram wakes the
-shared engine, whose tick walks every channel of the listener
-(section 2). Quiche serves the same shape within a point of
-its solo cost.
+Same 1x32 against the settled 2000-connection fleet: **16,120
+rps, p50 2.34 ms, 97.7 % poller, 60.6 us/req** - about 4x the
+pre-poll-item-rework mixed figure (3973 rps, p50 8.1 ms, 88 %
+poller, 221 us/req). An idle fleet still taxes this backend:
+each request datagram wakes the shared engine, whose tick
+walks every channel of the listener (section 2), so the mixed
+cost remains ~4.4x the solo 1x32 poller cost. Quiche serves
+the same shape within a point of its solo cost.
 
 ## 4. The poll loops (how each backend scales)
 
@@ -302,7 +309,7 @@ instead of O(live connections):
   unchanged; there is no new configuration.
 
 The OpenSSL poll loop reached for the same properties where
-libssl's API allows it (October rework):
+libssl's API allows it (October rework, extended November 4):
 
 - **EXPLICIT event handling.** Accepted connections - and,
   through OpenSSL's parent-chain inheritance, every stream of
@@ -336,6 +343,18 @@ libssl's API allows it (October rework):
   tick per iteration instead of per poll item, the O(1)
   engine-merged next-deadline read (`SSL_get_event_timeout` on
   the listener), and the adaptive due-tick floor.
+- **No per-item native poll structure** (November 4).
+  `QuicPollItem` used to own an `Arena.ofShared()` plus a native
+  `SSL_POLL_ITEM`, so every accepted request stream paid a
+  `SharedSession` acquire, a native allocation and a release on
+  close just to describe one poll entry. Items now carry only
+  the `SSL*`, wanted events and revents; `QuicPollSet.rebuild()`
+  writes dirty items directly into the poll set's contiguous
+  native array. This removed the last per-request endpoint-side
+  constant factor: 8x25 moved from 18,187 to 97,301 rps and
+  22.0 to 10.2 us/req, while idle 2000 fell from 35.80 to
+  5.55 % and idle 4000 from 86.74 % (894 churn errors) to
+  29.12 % (zero).
 
 What remains OpenSSL-side is inside libssl and no endpoint-
 side work can move it: the O(channels) `ossl_quic_port_subtick`
@@ -412,39 +431,48 @@ The 8000-connection idle case is also an 8000-handshake ramp
 
 | | established | churn/retry errs |
 |---|---|---|
+| OpenSSL (November 6, 300 s ramp budget) | 8000 | 1323 |
 | OpenSSL (October, 300 s ramp budget) | 8000 | 12512 |
 | OpenSSL (September, 60 s budget) | 7045 | 20077 |
 | quiche (October re-run, 300 s budget) | 8000 | 0 |
 
-Quiche absorbs the full burst essentially clean. The faster
-October iterations let OpenSSL's 8000-connection ramp settle
-completely (within a generous budget) where September's lost
-the late handshakes to its pre-crypto pending-queue overflow,
-but the ramp still churns 12.5k retries and a short budget
-still drops the tail. Both need `socket.rxBufSize` sizing
-and/or a slower client ramp for real 8k bursts; neither
-parallelises handshakes off the poll thread.
+Quiche absorbs the full burst essentially clean. OpenSSL still
+settles all 8000 within a generous budget, but the ramp churns
+~1.3k retries - down from 12.5k in October after the poll-item
+rework, and far below September's 20k at a short budget - so a
+short budget can still drop the tail. Both need
+`socket.rxBufSize` sizing and/or a slower client ramp for real
+8k bursts; neither parallelises handshakes off the poll thread.
 
 ## 7. Recommendations
 
 - **Default/shipped path stays OpenSSL** (distribution and the
-  JUnit-proven backend), planned at <= ~1000 connections (an
-  idle fleet of 2000 is affordable at ~36 % of a core, but it
-  still taxes serving connections) and ~15-18k rps per
-  connector instance; scale horizontally.
-- **quiche is the scale endpoint**: ~4-5x OpenSSL's aggregate
-  throughput (~71-79k vs ~15-18k rps, with bulk transfers
-  additionally paying ~10 points less poller for the bytes
-  they move), ~55-75x cheaper idle
-  scaling (full harness range on ~1.4 % of one core), the
-  better accept-burst citizen (8000-handshake ramp, zero
-  churn), and an idle fleet that costs the load essentially
-  nothing. Worth the opt-in wherever a single instance must
-  carry heavy HTTP/3 load or many mostly-idle connections, at
-  the cost of a self-distributed native library (Rust+BoringSSL
-  static, no packages); the ~150-streams/conn ceiling it used
+  JUnit-proven backend). After the November 4 poll-item rework
+  it is the fastest backend on the measured request shapes:
+  ~97k rps on 8x25 and ~85k on 32x32 at ~10-12 us/req, with
+  wide shapes poller-saturated. Its remaining weakness is idle
+  scaling: ~5.6 % of a core at 2000 settled connections, ~29 %
+  at 4000 and ~81 % at 8000 (with ramp churn), so plan at
+  <= ~2000 idle connections per instance and scale
+  horizontally beyond that.
+- **quiche remains the idle-heavy and accept-burst choice**:
+  ~79k rps / ~12.6-14.0 us/req on the wide shapes (slightly
+  below current OpenSSL), but only ~0.45 % / ~1.15 % / ~1.42 %
+  of a core at 1000/4000/8000 settled connections, zero
+  accept-ramp churn, and an idle fleet that costs the load
+  essentially nothing. Worth the opt-in where a single
+  instance must carry many mostly-idle connections, at the
+  cost of a self-distributed native library (Rust+BoringSSL
+  static, no packages). The ~150-streams/conn ceiling it used
   to carry (section 5) is gone since the October 6 claim-retry
   fix.
+- **ngtcp2 is the system-OpenSSL alternative**: ~82k rps on
+  8x25 and ~76k on 32x32 at ~12-13 us/req (on par with
+  quiche), idle cost between quiche and OpenSSL, and it needs
+  only the system ngtcp2 1.16 plus OpenSSL 3.5+, not the
+  OpenSSL 4 QUIC API. Viable wherever the system TLS stack is
+  preferred, but currently ~10-16 % behind OpenSSL on request
+  throughput.
 - Verification bar on the current build: full JUnit suite green
   on the OpenSSL backend (315 run, 0 failures, 0 errors) across
   three consecutive runs; the quiche backend is green on the
@@ -529,14 +557,17 @@ parallelises handshakes off the poll thread.
   those lists, plus a client fleet that is not itself the
   bottleneck.
 - OpenSSL: the endpoint-side constant factors are now gone
-  (section 4); what is left scales with the fleet per engine
-  tick and per `SSL_poll()` readout and lives inside libssl -
-  the engine tick, the shared engine lock, and the invisible
-  per-tick channel-touch set that blocks a work-gated poll-set
-  scan. Upstream watchlist in `quic_scalability.md`.
-- OpenSSL 32x32 p99 (~1 s): stream acceptance serialised on the
-  poll thread at high per-connection concurrency.
-- OpenSSL 1x1 p50 (~3.9 ms): per-request round-trip cost,
+  (section 4, including the November 4 poll-item rework); what
+  is left scales with the fleet per engine tick and per
+  `SSL_poll()` readout and lives inside libssl - the engine
+  tick, the shared engine lock, and the invisible per-tick
+  channel-touch set that blocks a work-gated poll-set scan.
+  Upstream watchlist in `quic_scalability.md`.
+- OpenSSL 32x32 p99: improved from ~1 s in October to ~103 ms
+  after the November 4 poll-item rework. The remaining tail is
+  still stream acceptance serialised on the poll thread at high
+  per-connection concurrency; much reduced, not eliminated.
+- OpenSSL 1x1 p50 (~4.5 ms): per-request round-trip cost,
   unexplained by either CPU; worth a forensic pass.
 
 
@@ -620,8 +651,10 @@ problems, all in the ngtcp2 adapter rather than in libngtcp2:
 | 4000 | 3.90 | 0 |
 | 8000 | 7.20 | 0 |
 
-ngtcp2 remains much cheaper than OpenSSL's shared-engine idle path and has
-no OpenSSL-style knee at 4000 connections. It is still somewhat more
+ngtcp2 remains cheaper than OpenSSL's shared-engine idle path at every
+measured size after OpenSSL's November 4 poll-item rework (1.20 % vs
+2.57 % at 1000; 3.90 % vs 29.12 % at 4000; 7.20 % vs 81.45 % at 8000) and
+has no OpenSSL-style knee at 4000 connections. It is still somewhat more
 expensive per idle connection than quiche (which is ~0.45 % at 1000 and
 ~1.15 % at 4000), but the 8000-connection ramp no longer shows churn (the
 earlier 16.22 % / 65-error row was an accept-ramp artifact; the reworked
@@ -642,20 +675,22 @@ comparable).
 | 32x32 | 76,078 | 11.74 | 52.78 | 98.1 (poller-saturated) | 12.9 | 0 |
 
 The wide shapes are now poller-saturated, so the endpoint has reached the
-same kind of ceiling as quiche rather than the earlier per-request latency
-wall. For reference, the same harness measured quiche at 78,691 rps /
-12.6 us/req (8x25) and 72,853 / 13.6 (32x32), and OpenSSL at 18,187 /
-22.0 (8x25) and 14,783 / 28.1 (32x32). The reworked ngtcp2 endpoint is
-therefore slightly ahead of the quiche baseline on this host and roughly
-4-5x the OpenSSL QUIC endpoint, with 1x1 poller cost within ~20 % of
+same kind of ceiling as quiche and OpenSSL rather than the earlier
+per-request latency wall. For reference, the same harness measured quiche
+at 78,691 rps / 12.6 us/req (8x25) and 72,853 / 13.6 (32x32), and OpenSSL
+(after its November 4 poll-item rework) at 97,301 / 10.2 (8x25) and
+84,857 / 11.6 (32x32). The reworked ngtcp2 endpoint is therefore slightly
+ahead of the quiche baseline on this host and about 84-90 % of the current
+OpenSSL throughput (10-16 % behind), with 1x1 poller cost within ~20 % of
 quiche (38.7 vs 32.4 us/req; that row is client-bound either way).
 
 ### Conclusion
 
 The ngtcp2 backend is now a viable scale endpoint on the same order as
-quiche, while keeping its advantages: the system OpenSSL 3.5+ TLS stack,
-SNI/multi-host certificates, PEM/PKCS#12/JKS sources, TLS 1.3 PSK
-configuration and full HTTP/3 test coverage. The remaining poller work is
-per-request socket-wrapper construction and the poll loop's per-iteration
+quiche and OpenSSL, while keeping its advantages: the system OpenSSL 3.5+
+TLS stack, SNI/multi-host certificates, PEM/PKCS#12/JKS sources, TLS 1.3
+PSK configuration and full HTTP/3 test coverage. The remaining poller work
+is per-request socket-wrapper construction and the poll loop's per-iteration
 work-set bookkeeping, not libngtcp2 scaling; the idle path is event-gated
-and linear.
+and linear. On this host the ranking is OpenSSL > ngtcp2 ~= quiche for
+request throughput, and quiche > ngtcp2 > OpenSSL for idle cost.
