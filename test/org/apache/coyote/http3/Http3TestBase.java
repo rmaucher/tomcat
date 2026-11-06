@@ -123,11 +123,17 @@ public abstract class Http3TestBase extends TomcatBaseTest {
     private static final String QUICHE_PROTOCOL_CLASS =
             Http3QuicheProtocol.class.getName();
 
+    private static final String NGTCP2_PROTOCOL_CLASS =
+            Http3Ngtcp2Protocol.class.getName();
+
     private static final String PROTOCOL_CLASS = System.getProperty(
             "tomcat.test.http3.protocol", OPENSSL_PROTOCOL_CLASS);
 
     private static final boolean QUICHE_SELECTED =
             QUICHE_PROTOCOL_CLASS.equals(PROTOCOL_CLASS);
+
+    private static final boolean NGTCP2_SELECTED =
+            NGTCP2_PROTOCOL_CLASS.equals(PROTOCOL_CLASS);
 
     /*
      * Whether the quiche FFM bindings compiled and found a loadable
@@ -144,6 +150,18 @@ public abstract class Http3TestBase extends TomcatBaseTest {
                     .getMethod("isAvailable").invoke(null);
         } catch (ReflectiveOperationException | LinkageError e) {
             // FFM bindings not compiled or no libquiche available
+            return false;
+        }
+    }
+
+    private static final boolean NGTCP2_AVAILABLE = checkNgtcp2Available();
+
+    private static boolean checkNgtcp2Available() {
+        try {
+            return (boolean) Class.forName(
+                            "org.apache.tomcat.util.net.quic.ngtcp2.Ngtcp2Endpoint")
+                    .getMethod("isAvailable").invoke(null);
+        } catch (ReflectiveOperationException | LinkageError e) {
             return false;
         }
     }
@@ -332,8 +350,12 @@ public abstract class Http3TestBase extends TomcatBaseTest {
     protected static boolean isQuicSupported() {
         if (QUICHE_SELECTED) {
             // No cross-transport fallback: tests skip when the selected
-            // quiche endpoint is not usable, even if OpenSSL QUIC would be.
+            // quiche endpoint is not usable, even if another transport
+            // would be.
             return QUICHE_AVAILABLE;
+        }
+        if (NGTCP2_SELECTED) {
+            return NGTCP2_AVAILABLE;
         }
         return QUIC_AVAILABLE;
     }
@@ -354,6 +376,16 @@ public abstract class Http3TestBase extends TomcatBaseTest {
 
 
     /**
+     * Whether the ngtcp2 endpoint is selected for this test run.
+     *
+     * @return {@code true} if the ngtcp2 endpoint is in use
+     */
+    protected static boolean endpointIsNgtcp2() {
+        return NGTCP2_SELECTED;
+    }
+
+
+    /**
      * Creates an instance of the HTTP/3 protocol class selected for this
      * test run, for tests that exercise the protocol without a connector.
      *
@@ -362,6 +394,9 @@ public abstract class Http3TestBase extends TomcatBaseTest {
     protected static AbstractHttp3Protocol newHttp3Protocol() {
         if (QUICHE_SELECTED) {
             return new Http3QuicheProtocol();
+        }
+        if (NGTCP2_SELECTED) {
+            return new Http3Ngtcp2Protocol();
         }
         return new Http3OpenSSLProtocol();
     }

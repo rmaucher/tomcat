@@ -25,8 +25,10 @@ import java.nio.ByteBuffer;
  * application protocol implementation (HTTP/3 in practice) depends on. The
  * concrete transport implementation is provided in a separate package (the
  * OpenSSL QUIC implementation in
- * {@code org.apache.tomcat.util.net.quic.openssl} or the Cloudflare quiche
- * implementation in {@code org.apache.tomcat.util.net.quic.quiche}) and
+ * {@code org.apache.tomcat.util.net.quic.openssl}, the Cloudflare quiche
+ * implementation in {@code org.apache.tomcat.util.net.quic.quiche} or the
+ * ngtcp2 implementation in {@code org.apache.tomcat.util.net.quic.ngtcp2})
+ * and
  * must not be referenced by application protocol code.
  * <p>
  * Implementations must use identity semantics (must not override

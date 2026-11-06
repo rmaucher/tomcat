@@ -37,6 +37,7 @@ import org.apache.tomcat.util.net.openssl.panama.CertificateLoader;
 import org.apache.tomcat.util.net.quic.QuicProtocol;
 import org.apache.tomcat.util.openssl.openssl_h;
 import org.apache.tomcat.util.openssl.openssl_h_Compatibility;
+import org.apache.tomcat.util.openssl.openssl_h_Macros;
 import org.apache.tomcat.util.res.StringManager;
 
 /**
@@ -55,7 +56,7 @@ import org.apache.tomcat.util.res.StringManager;
  * unbind; the certificate snapshot is swapped in on the endpoint's poll
  * thread so it is serialized with the SNI callback.
  */
-class QuicCertificateManager {
+public class QuicCertificateManager {
 
     private static final Log log =
             LogFactory.getLog(QuicCertificateManager.class);
@@ -101,6 +102,8 @@ class QuicCertificateManager {
     private final Supplier<QuicProtocol> protocolSupplier;
     private final Function<String, SSLHostConfig> hostResolver;
 
+    private final MemorySegment sslMethod;
+
 
     /**
      * Creates the certificate manager for an endpoint.
@@ -113,12 +116,31 @@ class QuicCertificateManager {
      *                         {@link SSLHostConfig}, returning {@code null}
      *                         when no host resolves
      */
-    QuicCertificateManager(Supplier<String> nameSupplier,
+    public QuicCertificateManager(Supplier<String> nameSupplier,
             Supplier<QuicProtocol> protocolSupplier,
             Function<String, SSLHostConfig> hostResolver) {
+        this(nameSupplier, protocolSupplier, hostResolver, null);
+    }
+
+
+    /**
+     * Creates a certificate manager using an explicit SSL method.
+     *
+     * @param nameSupplier     Supplies the endpoint name for logging
+     * @param protocolSupplier Supplies the application protocol whose ALPN
+     *                         identifiers are negotiated
+     * @param hostResolver     Maps an SNI host name to its host configuration
+     * @param sslMethod        The SSL method to use, or {@code null} for the
+     *                         OpenSSL QUIC server method
+     */
+    public QuicCertificateManager(Supplier<String> nameSupplier,
+            Supplier<QuicProtocol> protocolSupplier,
+            Function<String, SSLHostConfig> hostResolver,
+            MemorySegment sslMethod) {
         this.nameSupplier = nameSupplier;
         this.protocolSupplier = protocolSupplier;
         this.hostResolver = hostResolver;
+        this.sslMethod = sslMethod;
     }
 
 
@@ -133,7 +155,7 @@ class QuicCertificateManager {
      *
      * @throws Exception If the context or a callback could not be created
      */
-    void initialize(QuicCertConfig initialConfig)
+    public void initialize(QuicCertConfig initialConfig)
             throws Exception {
         certConfig = initialConfig;
         createNativeSslContext();
@@ -147,7 +169,7 @@ class QuicCertificateManager {
      * @return The native SSL_CTX, or {@link MemorySegment#NULL} before
      *         {@link #initialize} has run
      */
-    MemorySegment getSslCtx() {
+    public MemorySegment getSslCtx() {
         return sslCtx;
     }
 
@@ -161,13 +183,21 @@ class QuicCertificateManager {
      * @throws Exception If the context or a callback could not be created
      */
     private void createNativeSslContext() throws Exception {
-        MemorySegment quicMethod = QuicBindings.OSSL_QUIC_server_method();
+        MemorySegment method = sslMethod != null ? sslMethod : QuicBindings.OSSL_QUIC_server_method();
 
-        sslCtx = openssl_h.SSL_CTX_new(quicMethod);
+        sslCtx = openssl_h.SSL_CTX_new(method);
         if (sslCtx.equals(MemorySegment.NULL)) {
             throw new java.io.IOException(
                     sm.getString("quicEndpoint.contextCreateError"));
         }
+
+        // ngtcp2 uses a normal TLS_server_method context; QUIC mandates TLS
+        // 1.3, so constrain the protocol range explicitly. This is harmless
+        // for the OpenSSL QUIC method as well.
+        openssl_h_Macros.SSL_CTX_set_min_proto_version(sslCtx,
+                openssl_h.TLS1_3_VERSION());
+        openssl_h_Macros.SSL_CTX_set_max_proto_version(sslCtx,
+                openssl_h.TLS1_3_VERSION());
 
         // Enable partial writes on every stream this context produces: the
         // mode set here is inherited by each connection's default mode and
@@ -265,7 +295,7 @@ class QuicCertificateManager {
      * @param newConfig The configuration to install
      * @param reason    A short description of what triggered the reload
      */
-    void swapConfig(QuicCertConfig newConfig, String reason) {
+    public void swapConfig(QuicCertConfig newConfig, String reason) {
         QuicCertConfig oldConfig = certConfig;
         certConfig = newConfig;
         if (oldConfig != null) {
@@ -290,7 +320,7 @@ class QuicCertificateManager {
      * endpoint's bind-resource cleanup after the poll thread has stopped, so
      * no handshake can be applying certificates concurrently.
      */
-    void release() {
+    public void release() {
         if (sslCtx != null && !sslCtx.equals(MemorySegment.NULL)) {
             try {
                 openssl_h.SSL_CTX_free(sslCtx);

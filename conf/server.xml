@@ -102,8 +102,9 @@
 
          Define an HTTP/3 (QUIC) Connector on port 8444. The QUIC endpoint
          is selected by the protocol class: use
-         org.apache.coyote.http3.Http3QuicheProtocol instead of
-         Http3OpenSSLProtocol to run on the Cloudflare quiche transport.
+         org.apache.coyote.http3.Http3QuicheProtocol to run on the Cloudflare
+         quiche transport, or org.apache.coyote.http3.Http3Ngtcp2Protocol to
+         run on ngtcp2 (system libngtcp2 + libngtcp2_crypto_ossl).
     -->
     <!--
     <Connector port="8444" protocol="HTTP/1.1"

@@ -29,11 +29,12 @@ import org.apache.tomcat.util.net.AbstractEndpoint;
  * interface, keeping the dependency direction protocol-to-QUIC.
  * <p>
  * Concrete implementations provide the transport binding (the OpenSSL QUIC
- * implementation in {@code org.apache.tomcat.util.net.quic.openssl} and the
+ * implementation in {@code org.apache.tomcat.util.net.quic.openssl}, the
  * Cloudflare quiche implementation in
- * {@code org.apache.tomcat.util.net.quic.quiche}) while everything the
- * application protocol layer needs is defined by this class and the QUIC
- * interfaces of this package.
+ * {@code org.apache.tomcat.util.net.quic.quiche} and the ngtcp2
+ * implementation in {@code org.apache.tomcat.util.net.quic.ngtcp2}) while
+ * everything the application protocol layer needs is defined by this class
+ * and the QUIC interfaces of this package.
  *
  * @param <U> The type of the listener socket handle the transport uses to
  *            accept connections

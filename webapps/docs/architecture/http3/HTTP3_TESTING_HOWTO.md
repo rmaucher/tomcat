@@ -500,3 +500,30 @@ level-re-arms write readiness from `quiche_conn_stream_capacity`
 (including OPEN_WRITE dispatch for async write listeners), and retries
 event deliveries whose processing claim was busy instead of dropping
 them.
+
+### 11. The ngtcp2 backend
+
+The third transport is selected with:
+
+```xml
+<Connector port="8444"
+           protocol="org.apache.coyote.http3.Http3Ngtcp2Protocol"
+           SSLEnabled="true">
+```
+
+It uses the system ngtcp2 1.16 series (`libngtcp2`) and
+`libngtcp2_crypto_ossl`, backed by the system OpenSSL 3.5+ TLS stack. Unlike
+the OpenSSL QUIC endpoint, it does not require OpenSSL 4.0's `OSSL_QUIC_*`
+API. At run time keep the system OpenSSL libraries first on the loader path;
+do not mix them with the OpenSSL 4 build used by `Http3OpenSSLProtocol`,
+because ngtcp2's crypto helper is linked against the system `libssl.so.3`.
+
+Run the JUnit suite with:
+
+```sh
+./run-http3-tests.sh --ngtcp2
+```
+
+or directly with `-Dtest.ngtcp2=true`. The curl and browser checks from
+sections 2-9 work unchanged; the server log confirms the selection with
+`using ngtcp2 [1.16.0]`.

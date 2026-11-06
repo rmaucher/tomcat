@@ -104,6 +104,7 @@
       <disallow pkg="org.apache.tomcat.util.net.openssl.panama"/>
       <disallow pkg="org.apache.tomcat.util.net.quic.openssl"/>
       <disallow pkg="org.apache.tomcat.util.net.quic.quiche"/>
+      <disallow pkg="org.apache.tomcat.util.net.quic.ngtcp2"/>
       <disallow pkg="org.apache.tomcat.util.openssl"/>
     </subpackage>
   </subpackage>

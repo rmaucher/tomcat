@@ -420,7 +420,7 @@ public class QuicConnectionWrapper implements QuicConnection {
      * @return the SNI host name, in lower case, or {@code null} if the client
      *         sent no SNI
      */
-    static String readSniHostNameNative(MemorySegment ssl) {
+    public static String readSniHostNameNative(MemorySegment ssl) {
         MemorySegment namePtr = QuicBindings.SSL_get_servername(
                 ssl, QuicBindings.TLSEXT_NAMETYPE_HOST_NAME);
         if (namePtr.equals(MemorySegment.NULL)) {

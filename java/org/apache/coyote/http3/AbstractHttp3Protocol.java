@@ -63,8 +63,8 @@ import org.apache.tomcat.util.res.StringManager;
  * (it only depends on the QUIC interfaces of {@code org.apache.tomcat.util.net}).
  * The concrete transports are selected by the concrete subclasses, each of
  * which instantiates its own endpoint:
- * {@link Http3OpenSSLProtocol} (OpenSSL QUIC) and
- * {@link Http3QuicheProtocol} (Cloudflare quiche). The connector
+ * {@link Http3OpenSSLProtocol} (OpenSSL QUIC), {@link Http3QuicheProtocol}
+ * (Cloudflare quiche) and {@link Http3Ngtcp2Protocol} (ngtcp2). The connector
  * {@code protocol} attribute names the subclass to use, following the
  * pattern earlier Tomcat releases used to select the TCP endpoint for
  * HTTP/1.1 (e.g. {@code Http11NioProtocol}).

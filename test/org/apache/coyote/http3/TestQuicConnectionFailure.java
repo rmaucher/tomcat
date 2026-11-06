@@ -178,7 +178,7 @@ public class TestQuicConnectionFailure extends Http3TestBase {
         // is observable at all - a client-side fact of RFC 9000 Section
         // 10.1, not a server close. Skip the assertion when the idle
         // timeout is honestly advertised.
-        if (!endpointIsQuiche()) {
+        if (!endpointIsQuiche() && !endpointIsNgtcp2()) {
             Assert.assertNull("The idle connection must not have been closed "
                     + "by the client with an error",
                     output.getConnectionError());

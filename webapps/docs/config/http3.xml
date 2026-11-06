@@ -46,7 +46,9 @@
   class also selects the QUIC transport implementation:
   <code>org.apache.coyote.http3.Http3OpenSSLProtocol</code> uses the OpenSSL
   QUIC endpoint, <code>org.apache.coyote.http3.Http3QuicheProtocol</code>
-  uses the Cloudflare quiche endpoint. Certificates are
+  uses the Cloudflare quiche endpoint, and
+  <code>org.apache.coyote.http3.Http3Ngtcp2Protocol</code> uses the ngtcp2
+  transport. Certificates are
   configured through nested <strong>SSLHostConfig</strong> and
   <strong>Certificate</strong> elements, as described in the
   <a href="http.html">HTTP Connector</a> document. The OpenSSL QUIC endpoint
@@ -60,7 +62,11 @@
   the QUIC API (OpenSSL 4.0 or later) loaded into the JVM via the FFM
   bindings - see the <code>OpenSSLLifecycleListener</code> configuration in
   the default <code>conf/server.xml</code>; for
-  <code>Http3QuicheProtocol</code>, a loadable libquiche. The connector
+  <code>Http3QuicheProtocol</code>, a loadable libquiche; for
+  <code>Http3Ngtcp2Protocol</code>, a system libngtcp2 from the 1.16 series
+  plus libngtcp2_crypto_ossl backed by the system OpenSSL 3.5 or later
+  (ngtcp2 uses a normal TLS server context rather than the OpenSSL QUIC API).
+  The connector
   fails at bind time when the selected transport is unusable. The sample
   <code>conf/server.xml</code> also configures a TLS connector on the TCP
   side of the same port with <code>altService="h3"</code> so that HTTP/3 is
@@ -336,8 +342,8 @@
   or <strong>PreSharedKey</strong> element. These elements are the same as
   those used by the <a href="http.html">HTTP Connector</a>.</p>
 
-  <p>TLS 1.3 external pre-shared keys are supported by the OpenSSL QUIC
-  endpoint; the quiche endpoint does not support them. A connection that
+  <p>TLS 1.3 external pre-shared keys are supported by the OpenSSL QUIC and
+  ngtcp2 endpoints; the quiche endpoint does not support them. A connection that
   offers a configured identity is authenticated with the pre-shared key and
   the server presents no certificate. An <strong>SSLHostConfig</strong> that
   has both certificates and pre-shared keys serves both: connections with a
@@ -349,12 +355,12 @@
 
   <p>Client certificates (mutual TLS) are not supported: the
   <strong>certificateVerification</strong> attribute of
-  <strong>SSLHostConfig</strong> is ignored by both QUIC endpoints and no
+  <strong>SSLHostConfig</strong> is ignored by all QUIC endpoints and no
   client certificate is ever requested during the TLS handshake. The quiche
   endpoint logs a warning at start-up when the attribute is configured with a
   value other than <code>none</code>.</p>
 
-  <p>TLS session resumption is supported by both QUIC endpoints through
+  <p>TLS session resumption is supported by all QUIC endpoints through
   TLS 1.3 session tickets: the server issues a ticket after each handshake
   and a client offering a ticket from an earlier connection to the same
   endpoint completes the handshake without a full key exchange. The ticket
