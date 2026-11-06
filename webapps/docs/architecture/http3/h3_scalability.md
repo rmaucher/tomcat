@@ -1,4 +1,4 @@
-# HTTP/3 QUIC endpoint scalability review: OpenSSL vs quiche
+# HTTP/3 QUIC endpoint scalability review: OpenSSL vs quiche vs ngtcp2
 
 Initial head-to-head review: September 28, 2026. Reworked
 October 5, 2026 after the quiche poll-loop rework (work-gated
@@ -21,7 +21,10 @@ The two backends of the HTTP/3 connector:
 - `org.apache.tomcat.util.net.quic.openssl.QuicOpenSSLEndpoint`
   (OpenSSL 4 QUIC, the default backend), and
 - `org.apache.tomcat.util.net.quic.quiche.QuicheEndpoint`
-  (Cloudflare quiche 0.30.0 via FFM, opt-in).
+  (Cloudflare quiche 0.30.0 via FFM, opt-in), and
+- `org.apache.tomcat.util.net.quic.ngtcp2.Ngtcp2Endpoint`
+  (ngtcp2 1.16 via FFM, backed by the system OpenSSL 3.5+ TLS stack;
+  initial evaluation in section 9).
 
 ## 1. Method
 
@@ -535,3 +538,79 @@ parallelises handshakes off the poll thread.
   poll thread at high per-connection concurrency.
 - OpenSSL 1x1 p50 (~3.9 ms): per-request round-trip cost,
   unexplained by either CPU; worth a forensic pass.
+
+
+## 9. ngtcp2 backend (initial evaluation, November 6, 2026)
+
+### Method
+
+Tree: commit `33268d6bfc` plus the two benchmark follow-ups (recycle
+client bidirectional stream credit with `MAX_STREAMS`; treat ngtcp2's
+no-timer value as "no deadline" instead of converting it to an overflowed
+past deadline). JDK 26.0.2; system ngtcp2 1.16.0; system OpenSSL 3.5.5.
+Server: the benchmark `tomcat-http3/output/build` tree with the freshly
+built ngtcp2 jars, connector protocol
+`org.apache.coyote.http3.Http3Ngtcp2Protocol`, `maxThreads=150`, 30 s idle
+timeout, default stream cap 100, UDP-only HTTP/3 connector on 8444. The
+`OpenSSLLifecycleListener` was disabled for the run: ngtcp2 uses a normal
+`TLS_server_method` context and must not be forced through OpenSSL 4's
+`OSSL_QUIC_server_method` listener.
+
+Clients and timing are the same harness as sections 2-3: warm 1x32 run,
+3 s warm-up, 12 s load window; idle settle 35 s, 12 s keepalive, 40 s
+poller sample. `us/req` is poller-seconds per completed request.
+
+### Idle fleet
+
+| idle conns, kept alive @12 s | ngtcp2 poller % | errs |
+|---|---|---|
+| 100 | 0.37 | 0 |
+| 1000 | 1.25 | 0 |
+| 2000 | 3.62 | 0 |
+| 4000 | 3.90 | 0 |
+| 8000 | 16.22 | 65 |
+
+ngtcp2 is much cheaper than OpenSSL's shared-engine idle path and avoids
+its 4000-connection knee, but it is 3-8x more expensive per idle connection
+than quiche on this host. The 8000 row also shows the first real accept-ramp
+churn (65 client-side retry errors) and a nonlinear jump, so the practical
+single-poller idle wall is currently between 4000 and 8000 settled
+connections. 4000 is within noise of 2000 for the sample.
+
+### Request load
+
+| shape | rps | p50 ms | p99 ms | poller % | us/req | errs |
+|---|---|---|---|---|---|---|
+| 1x1 | 1153 | 0.89 | 3.02 | 88.3 | 766.0 | 0 |
+| 1x32 | 2391 | 14.16 | 46.27 | 89.7 | 374.9 | 0 |
+| 8x25 | 6220 | 34.03 | 122.81 | 64.7 | 104.0 | 0 |
+| 16x16 | 6763 | 37.02 | 257.36 | 60.4 | 89.3 | 0 |
+| 32x32 | 7945 | 107.20 | 1799.02 | 49.5 | 62.3 | 0 |
+
+The first matrix attempt was invalid as a capability measurement: every
+connection completed exactly 100 sequential requests and then stopped.
+That was the default `initial_max_streams_bidi` credit not being recycled;
+the endpoint now extends `MAX_STREAMS` as each client stream closes. The
+rows above are after that fix.
+
+The current ngtcp2 endpoint is **not competitive with quiche on request
+throughput**: its aggregate ceiling is about 8k rps here versus quiche's
+71-79k, and its per-request poller cost is 2-60x higher. Unlike OpenSSL,
+the wide shapes do not saturate the poller (about 50-65%), while the
+whole-JVM figure is ~140-150%; the wall is therefore the per-request
+transport/event path, not a single shared engine tick. The `1x1` p50 is
+about 5.5x quiche's (0.89 ms vs 0.16 ms) and the per-request poller cost is
+about 24x. This is actionable endpoint work (per-datagram callback/FFM
+overhead and the stream send/ack path), not an ngtcp2 library scaling
+limit: the idle fleet is event-gated and scales roughly linearly.
+
+### Preliminary conclusion
+
+ngtcp2 already gives a usable OpenSSL-3.5-based backend with SNI,
+certificate sources, PSK configuration and full HTTP/3 test coverage, and
+its idle cost sits between quiche and OpenSSL. It needs a request-path
+optimization pass before it can be recommended as the scale endpoint:
+the immediate wins to investigate are reducing per-datagram Java callback
+and allocation work, batching the adapter's stream-data handoff, and
+avoiding per-packet native-vector/build churn. The idle and accept-ramp
+results are good enough to keep as the baseline for that work.

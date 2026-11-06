@@ -324,6 +324,9 @@ public final class Ngtcp2Bindings {
     private static final MethodHandle ngtcp2ConnExtendMaxOffset$handle = createHandle(
             "ngtcp2_conn_extend_max_offset",
             FunctionDescriptor.ofVoid(openssl_h.C_POINTER, ValueLayout.JAVA_LONG));
+    private static final MethodHandle ngtcp2ConnExtendMaxStreamsBidi$handle = createHandle(
+            "ngtcp2_conn_extend_max_streams_bidi",
+            FunctionDescriptor.ofVoid(openssl_h.C_POINTER, ValueLayout.JAVA_LONG));
     private static final MethodHandle ngtcp2ConnExtendMaxStreamOffset$handle = createHandle(
             "ngtcp2_conn_extend_max_stream_offset",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, openssl_h.C_POINTER,
@@ -1484,6 +1487,14 @@ public final class Ngtcp2Bindings {
         }
     }
 
+    private static void extendMaxStreamsBidi(MemorySegment conn) {
+        try {
+            ngtcp2ConnExtendMaxStreamsBidi$handle.invokeExact(conn, 1L);
+        } catch (Throwable t) {
+            // Ignore: the peer will simply reopen after the next close.
+        }
+    }
+
     private static void extendFlowControl(ConnState st, long id, int n) {
         try {
             ngtcp2ConnExtendMaxStreamOffset$handle.invokeExact(st.conn, id, (long) n);
@@ -1585,6 +1596,13 @@ public final class Ngtcp2Bindings {
             StreamState ss = st.stream(Long.valueOf(id));
             ss.closed = true;
             ss.writableReported = true;
+            if ((id & 0x03) == 0) {
+                // Recycle the client-initiated bidirectional stream credit.
+                // Without this the peer stops after initial_max_streams_bidi
+                // sequential requests (the default is 100), which looks like
+                // a connection stall at exactly the configured stream cap.
+                extendMaxStreamsBidi(conn);
+            }
             if ((flags & 1) != 0) {
                 ss.resetRemote = true;
                 ss.resetRemoteDelivered = false;

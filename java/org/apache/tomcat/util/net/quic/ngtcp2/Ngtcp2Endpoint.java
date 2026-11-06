@@ -2175,7 +2175,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      */
     private void refreshTimerDeadline(Ngtcp2ConnectionWrapper conn) {
         long t = Ngtcp2Bindings.ngtcp2_conn_timeout_as_millis(conn.getConn());
-        conn.setTimerDeadline(t < 0 ? Long.MAX_VALUE :
+        conn.setTimerDeadline(t < 0 || t == Long.MAX_VALUE ? Long.MAX_VALUE :
                 System.currentTimeMillis() + t);
         timerHeap.add(new TimerEntry(conn.getTimerDeadlineMs(),
                 conn.getTimerSeq(), conn));
@@ -2297,7 +2297,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             long current) {
         for (Ngtcp2ConnectionWrapper conn : conns) {
             long t = Ngtcp2Bindings.ngtcp2_conn_timeout_as_millis(conn.getConn());
-            if (t < 0) {
+            if (t < 0 || t == Long.MAX_VALUE) {
                 // u64::MAX through the signed read: ngtcp2 reports this when
                 // the connection has no timer armed (ffi.rs maps a None
                 // timeout to u64::MAX). Folding it in would drive the wait to
