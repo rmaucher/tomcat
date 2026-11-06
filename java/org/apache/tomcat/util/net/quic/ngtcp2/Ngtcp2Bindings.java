@@ -35,8 +35,11 @@ import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -171,7 +174,7 @@ public final class Ngtcp2Bindings {
     private static final long CONN_REF_GET_CONN = 0;
     private static final long CONN_REF_USER_DATA = 8;
 
-    private static final long VERSION_CID_SIZE = 40;
+    static final long VERSION_CID_SIZE = 40;
     private static final long VERSION_CID_VERSION = 0;
     private static final long VERSION_CID_DCID = 8;
     private static final long VERSION_CID_DCIDLEN = 16;
@@ -558,7 +561,30 @@ public final class Ngtcp2Bindings {
         final MemorySegment path;
         final Arena arena;
 
+        /*
+         * Per-connection scratch for the send path. The poll thread (and,
+         * during a graceful stop, the stop thread after the poll loop has
+         * exited) is the only caller, so the buffers can be reused for every
+         * packet instead of allocating a fresh Arena per call.
+         */
+        final MemorySegment sendVecs;
+        final MemorySegment datalenSeg;
+        final MemorySegment ccerr;
+
         final Map<Long, StreamState> streams = new ConcurrentHashMap<>();
+
+        /*
+         * Ready work sets. Scanning the stream map for every packet and
+         * sweep made the hot path O(live + completed streams), and the map
+         * accumulates one entry per request, so a long-lived connection
+         * degraded linearly. The queues carry exactly the streams that have
+         * work and are only touched by the poll thread.
+         */
+        final PriorityQueue<StreamState> readableQueue =
+                new PriorityQueue<>(Comparator.comparingLong(ss -> ss.id));
+        final ArrayDeque<StreamState> sendQueue = new ArrayDeque<>();
+        /** No packet could be produced in the last send pass (credit/CC). */
+        boolean sendBlocked;
 
         volatile Ngtcp2ConnectionWrapper wrapper;
         volatile boolean closed;
@@ -596,6 +622,9 @@ public final class Ngtcp2Bindings {
             this.remoteSockaddr = remote;
             this.remoteSockaddrLen = remoteLen;
             this.path = path;
+            this.sendVecs = arena.allocate(64L * VEC_SIZE);
+            this.datalenSeg = arena.allocate(ValueLayout.JAVA_LONG);
+            this.ccerr = arena.allocate(CCERR_SIZE);
         }
 
         StreamState stream(long id) {
@@ -606,7 +635,13 @@ public final class Ngtcp2Bindings {
     static final class StreamState {
         final long id;
         final ArrayDeque<ReadChunk> reads = new ArrayDeque<>();
-        final ArrayDeque<SendChunk> sends = new ArrayDeque<>();
+        final ArrayList<SendChunk> sends = new ArrayList<>();
+        /** Index of the first chunk not fully handed to ngtcp2. */
+        int sendVecIndex;
+        /** Index of the first chunk not fully acknowledged by the peer. */
+        int ackIndex;
+        boolean inReadQueue;
+        boolean inSendQueue;
         long queuedOffset;
         long sentOffset;
         long ackedOffset;
@@ -619,7 +654,6 @@ public final class Ngtcp2Bindings {
         boolean closed;
         boolean nativeOpen;
         boolean readReported;
-        boolean writableReported;
 
         StreamState(long id) {
             this.id = id;
@@ -687,6 +721,42 @@ public final class Ngtcp2Bindings {
         return System.nanoTime();
     }
 
+    private static void queueRead(ConnState st, StreamState ss) {
+        if (!ss.inReadQueue && ss.readable()) {
+            ss.inReadQueue = true;
+            st.readableQueue.add(ss);
+        }
+    }
+
+    private static void queueSend(ConnState st, StreamState ss) {
+        if (!ss.inSendQueue && ss.hasWritable()) {
+            ss.inSendQueue = true;
+            st.sendQueue.addLast(ss);
+        }
+    }
+
+    /*
+     * Drops a fully closed and drained stream from the map. ngtcp2 calls
+     * stream_close only after all receive data was consumed by the
+     * application and all transmitted data (including the FIN) was
+     * acknowledged, so the common request path reclaims immediately here;
+     * the residual predicates cover reset/early-close paths and defer
+     * reclamation to the later callback that removes the last state.
+     */
+    private static void tryReclaim(ConnState st, StreamState ss) {
+        if (!ss.closed || !ss.reads.isEmpty() || !ss.sends.isEmpty() ||
+                ss.inReadQueue || ss.inSendQueue) {
+            return;
+        }
+        if (ss.finReceived && !ss.finDelivered) {
+            return;
+        }
+        if (ss.resetRemote && !ss.resetRemoteDelivered) {
+            return;
+        }
+        st.streams.remove(Long.valueOf(ss.id));
+    }
+
     private static void writeCid(MemorySegment cid, long offset, MemorySegment data,
             long len) {
         cid.set(ValueLayout.JAVA_LONG, offset + CID_DATALEN, (long) len);
@@ -728,6 +798,8 @@ public final class Ngtcp2Bindings {
             MemorySegment localSockaddr, int localSockaddrLen,
             MemorySegment peerSockaddr, int peerSockaddrLen,
             MemorySegment sslCtx) {
+        // Shared because the stop path flushes GOAWAY/close packets from the
+        // thread that stops the connector, not only from the poll thread.
         Arena arena = Arena.ofShared();
         try {
             MemorySegment connPtr = arena.allocate(ValueLayout.ADDRESS);
@@ -831,9 +903,10 @@ public final class Ngtcp2Bindings {
     static int ngtcp2_header_info(MemorySegment pkt, long len, int scidBufLen,
             MemorySegment versionOut, MemorySegment typeOut, MemorySegment scidOut,
             MemorySegment scidLenInOut, MemorySegment dcidOut,
-            MemorySegment dcidLenInOut, MemorySegment tokenOut, MemorySegment tokenLenInOut) {
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment vc = arena.allocate(VERSION_CID_SIZE);
+            MemorySegment dcidLenInOut, MemorySegment tokenOut, MemorySegment tokenLenInOut,
+            MemorySegment vcScratch) {
+        try {
+            MemorySegment vc = vcScratch;
             int rc = (int) ngtcp2PktDecodeVersionCid$handle.invokeExact(vc, pkt, len,
                     (long) scidBufLen);
             if (rc != 0) {
@@ -901,22 +974,25 @@ public final class Ngtcp2Bindings {
         if (st == null) {
             return -1;
         }
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment path = arena.allocate(PATH_SIZE);
+        try {
             MemorySegment from = recvInfo.get(openssl_h.C_POINTER, RECV_INFO_FROM);
             int fromLen = recvInfo.get(ValueLayout.JAVA_INT, RECV_INFO_FROM_LEN);
             MemorySegment to = recvInfo.get(openssl_h.C_POINTER, RECV_INFO_TO);
             int toLen = recvInfo.get(ValueLayout.JAVA_INT, RECV_INFO_TO_LEN);
-            path.set(openssl_h.C_POINTER, PATH_LOCAL_ADDR, to);
-            path.set(ValueLayout.JAVA_INT, PATH_LOCAL_LEN, toLen);
-            path.set(openssl_h.C_POINTER, PATH_REMOTE_ADDR, from);
-            path.set(ValueLayout.JAVA_INT, PATH_REMOTE_LEN, fromLen);
-            int rc = (int) ngtcp2ConnReadPkt$handle.invokeExact(conn, path,
+            // ngtcp2 copies the addresses into its own path storage during
+            // the call, so the per-connection path can be reused for every
+            // datagram instead of allocating a fresh one per receive.
+            st.path.set(openssl_h.C_POINTER, PATH_LOCAL_ADDR, to);
+            st.path.set(ValueLayout.JAVA_INT, PATH_LOCAL_LEN, toLen);
+            st.path.set(openssl_h.C_POINTER, PATH_REMOTE_ADDR, from);
+            st.path.set(ValueLayout.JAVA_INT, PATH_REMOTE_LEN, fromLen);
+            int rc = (int) ngtcp2ConnReadPkt$handle.invokeExact(conn, st.path,
                     NGTCP2_PKT_INFO_V1, MemorySegment.NULL, buf, (long) len, now());
             if (rc != 0) {
                 noteError(st, rc);
                 return rc;
             }
+            st.sendBlocked = false;
             return len;
         } catch (Throwable t) {
             return -1;
@@ -935,8 +1011,7 @@ public final class Ngtcp2Bindings {
         try {
             if (st.closeQueued) {
                 try (Arena arena = Arena.ofConfined()) {
-                    MemorySegment ccerr = arena.allocate(CCERR_SIZE);
-                    ngtcp2CcerrDefault(ccerr);
+                    ngtcp2CcerrDefault(st.ccerr);
                     byte[] reason = st.closeReason == null ? null :
                             st.closeReason.getBytes(StandardCharsets.UTF_8);
                     MemorySegment reasonSeg = reason == null ? MemorySegment.NULL :
@@ -945,15 +1020,15 @@ public final class Ngtcp2Bindings {
                         reasonSeg.asByteBuffer().put(reason);
                     }
                     if (st.closeApp) {
-                        ngtcp2CcerrSetApp(ccerr, st.closeError,
+                        ngtcp2CcerrSetApp(st.ccerr, st.closeError,
                                 reasonSeg, reason == null ? 0 : reason.length);
                     } else {
-                        ngtcp2CcerrSetTransport(ccerr, st.closeError,
+                        ngtcp2CcerrSetTransport(st.ccerr, st.closeError,
                                 reasonSeg, reason == null ? 0 : reason.length);
                     }
                     long n = (long) ngtcp2ConnWriteClose$handle.invokeExact(conn,
                             st.path, NGTCP2_PKT_INFO_V1, MemorySegment.NULL, dest,
-                            destLen, ccerr, now());
+                            destLen, st.ccerr, now());
                     if (n > 0) {
                         st.closeQueued = false;
                         st.closed = true;
@@ -965,44 +1040,51 @@ public final class Ngtcp2Bindings {
                 }
             }
 
-            // Try stream data first.
-            streamLoop:
-            for (StreamState ss : st.streams.values()) {
-                if (!ss.hasWritable()) {
-                    continue;
-                }
-                long capacity = capacity(st, ss);
-                if (capacity <= 0) {
-                    continue;
-                }
-                try (Arena arena = Arena.ofConfined()) {
-                    int chunkCount = 0;
+            // Try stream data first. Only streams with queued output are
+            // visited, and each candidate is tried once per call so a
+            // flow-control-blocked head cannot mask a sendable stream.
+            if (!st.sendQueue.isEmpty()) {
+                int candidates = st.sendQueue.size();
+                for (int i = 0; i < candidates; i++) {
+                    StreamState ss = st.sendQueue.pollFirst();
+                    if (ss == null) {
+                        break;
+                    }
+                    ss.inSendQueue = false;
+                    if (!ss.hasWritable()) {
+                        continue;
+                    }
+                    long capacity = capacity(st, ss);
+                    if (capacity <= 0) {
+                        queueSend(st, ss);
+                        continue;
+                    }
                     long remaining = ss.queuedOffset - ss.sentOffset;
                     int maxVec = (int) Math.min(64, (remaining + 1023) / 1024 + 1);
-                    MemorySegment vecs = arena.allocate((long) Math.max(1, maxVec) * VEC_SIZE);
                     long cursor = ss.sentOffset;
                     int vi = 0;
-                    for (SendChunk c : ss.sends) {
-                        long end = c.start + c.len;
-                        if (end <= cursor) {
+                    int idx = ss.sendVecIndex;
+                    while (idx < ss.sends.size() && vi < maxVec) {
+                        SendChunk c = ss.sends.get(idx);
+                        long cend = c.start + c.len;
+                        if (cend <= cursor) {
+                            idx++;
                             continue;
                         }
                         int off = (int) Math.max(0, cursor - c.start);
                         int n = c.len - off;
                         if (n <= 0) {
+                            idx++;
                             continue;
                         }
-                        if (vi >= maxVec) {
-                            break;
-                        }
-                        vecs.set(openssl_h.C_POINTER, vi * VEC_SIZE + VEC_BASE,
+                        st.sendVecs.set(openssl_h.C_POINTER, vi * VEC_SIZE + VEC_BASE,
                                 c.segment.asSlice(off, n));
-                        vecs.set(ValueLayout.JAVA_LONG, vi * VEC_SIZE + VEC_LEN, n);
+                        st.sendVecs.set(ValueLayout.JAVA_LONG, vi * VEC_SIZE + VEC_LEN, n);
                         vi++;
                         cursor += n;
+                        idx++;
                     }
-                    MemorySegment datalenSeg = arena.allocate(ValueLayout.JAVA_LONG);
-                    datalenSeg.set(ValueLayout.JAVA_LONG, 0, -1L);
+                    st.datalenSeg.set(ValueLayout.JAVA_LONG, 0, -1L);
                     int flags = NGTCP2_WRITE_STREAM_FLAG_NONE;
                     boolean fin = ss.finQueued && ss.sentOffset >= ss.queuedOffset;
                     if (fin) {
@@ -1010,33 +1092,53 @@ public final class Ngtcp2Bindings {
                     }
                     long n = (long) ngtcp2ConnWritevStream$handle.invokeExact(conn,
                             st.path, NGTCP2_PKT_INFO_V1, MemorySegment.NULL, dest,
-                            destLen, datalenSeg, flags, ss.id, vecs, (long) vi, now());
+                            destLen, st.datalenSeg, flags, ss.id, st.sendVecs,
+                            (long) vi, now());
                     if (n > 0) {
-                        long accepted = datalenSeg.get(ValueLayout.JAVA_LONG, 0);
+                        long accepted = st.datalenSeg.get(ValueLayout.JAVA_LONG, 0);
                         if (accepted >= 0) {
                             ss.sentOffset += accepted;
                             if (fin && ss.sentOffset >= ss.queuedOffset) {
                                 ss.finQueued = false;
                             }
+                            while (ss.sendVecIndex < ss.sends.size()) {
+                                SendChunk c = ss.sends.get(ss.sendVecIndex);
+                                if (c.start + c.len > ss.sentOffset) {
+                                    break;
+                                }
+                                ss.sendVecIndex++;
+                            }
                         }
+                        st.sendBlocked = false;
+                        queueSend(st, ss);
                         updatePktTxTime(st.conn);
                         fillSendInfo(st, sendInfo);
                         return n;
                     }
                     if (n == 0) {
                         // No packet can be produced right now. ACKs for
-                        // received data may still be pending, so fall through
-                        // to the control-packet write before declaring the
-                        // send pass done.
-                        break streamLoop;
+                        // received data may still be pending, so fall
+                        // through to the control-packet write before
+                        // declaring the send pass done.
+                        st.sendBlocked = true;
+                        queueSend(st, ss);
+                        break;
                     }
                     if (n == NGTCP2_ERR_STREAM_DATA_BLOCKED ||
-                            n == NGTCP2_ERR_STREAM_SHUT_WR ||
                             n == NGTCP2_ERR_STREAM_NOT_FOUND) {
+                        st.sendBlocked = true;
+                        queueSend(st, ss);
+                        continue;
+                    }
+                    if (n == NGTCP2_ERR_STREAM_SHUT_WR) {
+                        ss.resetLocal = true;
                         continue;
                     }
                     noteError(st, (int) n);
                     return n;
+                }
+                if (st.sendQueue.isEmpty()) {
+                    st.sendBlocked = false;
                 }
             }
 
@@ -1095,6 +1197,7 @@ public final class Ngtcp2Bindings {
         }
         if (ss.resetRemote && !ss.resetRemoteDelivered) {
             ss.resetRemoteDelivered = true;
+            tryReclaim(st, ss);
             return NGTCP2_ERR_STREAM_RESET;
         }
         if (ss.reads.isEmpty()) {
@@ -1129,6 +1232,9 @@ public final class Ngtcp2Bindings {
         if (n > 0) {
             extendFlowControl(st, id, n);
         }
+        if (ss.reads.isEmpty()) {
+            tryReclaim(st, ss);
+        }
         return n;
     }
 
@@ -1159,20 +1265,26 @@ public final class Ngtcp2Bindings {
         }
         if (len > 0) {
             try {
-                Arena arena = Arena.ofShared();
+                // Poll-thread confined: the chunk is created, handed to
+                // ngtcp2 and freed from that same thread (stream_send,
+                // acked_stream_data and stream_close all run on it). A shared
+                // arena here cost one VM-wide thread handshake per closed
+                // chunk, which showed up as a third of the poll thread's CPU
+                // budget in HandshakeAllThreads.
+                Arena arena = Arena.ofConfined();
                 MemorySegment seg = arena.allocate(len);
                 MemorySegment.copy(data, 0, seg, 0, len);
-                ss.sends.addLast(new SendChunk(arena, seg, ss.queuedOffset, len));
+                ss.sends.add(new SendChunk(arena, seg, ss.queuedOffset, len));
                 ss.queuedOffset += len;
-                ss.writableReported = false;
             } catch (Throwable t) {
                 return NGTCP2_ERR_INVALID_STREAM_STATE;
             }
         }
         if (fin) {
             ss.finQueued = true;
-            ss.writableReported = false;
         }
+        st.sendBlocked = false;
+        queueSend(st, ss);
         if (errOut != null) {
             errOut.set(ValueLayout.JAVA_LONG, 0, 0L);
         }
@@ -1181,15 +1293,8 @@ public final class Ngtcp2Bindings {
 
     static boolean ngtcp2_conn_has_pending_send(MemorySegment conn) {
         ConnState st = state(conn);
-        if (st == null || st.closed) {
-            return false;
-        }
-        for (StreamState ss : st.streams.values()) {
-            if (ss.hasWritable() && capacity(st, ss) > 0) {
-                return true;
-            }
-        }
-        return false;
+        return st != null && !st.closed && !st.sendBlocked &&
+                !st.sendQueue.isEmpty();
     }
 
     static long ngtcp2_conn_stream_capacity(MemorySegment conn, long id) {
@@ -1224,36 +1329,15 @@ public final class Ngtcp2Bindings {
         if (st == null) {
             return -1;
         }
-        StreamState best = null;
-        for (StreamState ss : st.streams.values()) {
-            if (!ss.readReported && ss.readable() &&
-                    (best == null || ss.id < best.id)) {
-                best = ss;
+        while (!st.readableQueue.isEmpty()) {
+            StreamState ss = st.readableQueue.poll();
+            ss.inReadQueue = false;
+            if (ss.readReported || !ss.readable()) {
+                tryReclaim(st, ss);
+                continue;
             }
-        }
-        if (best != null) {
-            best.readReported = true;
-            return best.id;
-        }
-        return -1;
-    }
-
-    static long ngtcp2_conn_stream_writable_next(MemorySegment conn) {
-        ConnState st = state(conn);
-        if (st == null) {
-            return -1;
-        }
-        StreamState best = null;
-        for (StreamState ss : st.streams.values()) {
-            if (!ss.writableReported && ss.hasWritable() &&
-                    capacity(st, ss) > 0 &&
-                    (best == null || ss.id < best.id)) {
-                best = ss;
-            }
-        }
-        if (best != null) {
-            best.writableReported = true;
-            return best.id;
+            ss.readReported = true;
+            return ss.id;
         }
         return -1;
     }
@@ -1278,7 +1362,7 @@ public final class Ngtcp2Bindings {
             StreamState ss = st.streams.get(Long.valueOf(id));
             if (ss != null) {
                 ss.resetLocal = true;
-                ss.writableReported = false;
+                ss.inSendQueue = false;
                 if (ss.closed) {
                     return 0;
                 }
@@ -1310,6 +1394,7 @@ public final class Ngtcp2Bindings {
         }
         try {
             int rc = (int) ngtcp2ConnHandleExpiry$handle.invokeExact(conn, now());
+            st.sendBlocked = false;
             if (rc != 0) {
                 noteError(st, rc);
             }
@@ -1497,7 +1582,15 @@ public final class Ngtcp2Bindings {
 
     private static void extendFlowControl(ConnState st, long id, int n) {
         try {
-            ngtcp2ConnExtendMaxStreamOffset$handle.invokeExact(st.conn, id, (long) n);
+            // The stream handle returns int; invokeExact must see that exact
+            // return type or it throws WrongMethodTypeException (which the
+            // old statement-form call did on every read, silently skipping
+            // the stream-window extension).
+            int rc = (int) ngtcp2ConnExtendMaxStreamOffset$handle.invokeExact(
+                    st.conn, id, (long) n);
+            if (rc != 0) {
+                return;
+            }
             ngtcp2ConnExtendMaxOffset$handle.invokeExact(st.conn, (long) n);
         } catch (Throwable t) {
             // Ignore: flow-control extension is best-effort here.
@@ -1553,6 +1646,7 @@ public final class Ngtcp2Bindings {
         if (fin) {
             ss.finReceived = true;
         }
+        queueRead(st, ss);
         return 0;
     }
 
@@ -1564,19 +1658,25 @@ public final class Ngtcp2Bindings {
         }
         StreamState ss = st.stream(Long.valueOf(id));
         ss.ackedOffset = Math.max(ss.ackedOffset, offset + datalen);
-        while (!ss.sends.isEmpty()) {
-            SendChunk c = ss.sends.peekFirst();
+        while (ss.ackIndex < ss.sends.size()) {
+            SendChunk c = ss.sends.get(ss.ackIndex);
             if (c.start + c.len > ss.ackedOffset) {
                 break;
             }
-            ss.sends.pollFirst();
             try {
                 c.arena.close();
             } catch (Throwable t) {
                 // Ignore
             }
+            ss.ackIndex++;
         }
-        ss.writableReported = false;
+        if (ss.ackIndex > 0 &&
+                (ss.ackIndex >= 256 || ss.ackIndex >= ss.sends.size())) {
+            ss.sends.subList(0, ss.ackIndex).clear();
+            ss.sendVecIndex -= ss.ackIndex;
+            ss.ackIndex = 0;
+        }
+        tryReclaim(st, ss);
         return 0;
     }
 
@@ -1595,7 +1695,6 @@ public final class Ngtcp2Bindings {
         if (st != null) {
             StreamState ss = st.stream(Long.valueOf(id));
             ss.closed = true;
-            ss.writableReported = true;
             if ((id & 0x03) == 0) {
                 // Recycle the client-initiated bidirectional stream credit.
                 // Without this the peer stops after initial_max_streams_bidi
@@ -1617,6 +1716,13 @@ public final class Ngtcp2Bindings {
                 }
             }
             ss.sends.clear();
+            ss.sendVecIndex = 0;
+            ss.ackIndex = 0;
+            ss.inSendQueue = false;
+            if (ss.readable()) {
+                queueRead(st, ss);
+            }
+            tryReclaim(st, ss);
         }
         return 0;
     }
@@ -1629,6 +1735,7 @@ public final class Ngtcp2Bindings {
             ss.resetRemote = true;
             ss.resetRemoteDelivered = false;
             ss.readReported = false;
+            queueRead(st, ss);
         }
         return 0;
     }
@@ -1639,7 +1746,7 @@ public final class Ngtcp2Bindings {
         if (st != null) {
             StreamState ss = st.stream(Long.valueOf(id));
             ss.resetLocal = true;
-            ss.writableReported = false;
+            ss.inSendQueue = false;
         }
         return 0;
     }

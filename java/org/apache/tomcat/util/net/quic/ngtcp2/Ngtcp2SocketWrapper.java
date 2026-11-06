@@ -118,13 +118,14 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
     public Ngtcp2SocketWrapper(Ngtcp2StreamWrapper stream, Ngtcp2Endpoint endpoint) {
         super(stream, endpoint);
         this.endpoint = endpoint;
-        // The write staging buffer is sized well above the 8 KiB
-        // application output buffer chunks: the real send buffer is the
-        // ngtcp2 transmit queue, so a larger staging buffer lets many
-        // framed chunks accumulate before one poll-thread hop is needed.
+        // The write staging buffer only feeds doWrite(), which forwards to
+        // the ngtcp2 transmit queue; a per-request 64 KiB buffer was pure
+        // allocation churn for the common small response (HTTP/3 streams are
+        // created per request). Match the configured application write
+        // buffer instead; large responses simply take more staging rounds.
         this.socketBufferHandler = new SocketBufferHandler(
                 endpoint.getSocketProperties().getAppReadBufSize(),
-                Math.max(65536, endpoint.getSocketProperties().getAppWriteBufSize()),
+                Math.max(8192, endpoint.getSocketProperties().getAppWriteBufSize()),
                 false);
         Ngtcp2ConnectionWrapper conn = stream.getConnection();
         if (conn != null) {

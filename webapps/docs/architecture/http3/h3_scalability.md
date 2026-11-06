@@ -540,77 +540,122 @@ parallelises handshakes off the poll thread.
   unexplained by either CPU; worth a forensic pass.
 
 
-## 9. ngtcp2 backend (initial evaluation, November 6, 2026)
+## 9. ngtcp2 backend (initial evaluation and request-path rework, November 6, 2026)
 
 ### Method
 
-Tree: commit `33268d6bfc` plus the two benchmark follow-ups (recycle
-client bidirectional stream credit with `MAX_STREAMS`; treat ngtcp2's
-no-timer value as "no deadline" instead of converting it to an overflowed
-past deadline). JDK 26.0.2; system ngtcp2 1.16.0; system OpenSSL 3.5.5.
-Server: the benchmark `tomcat-http3/output/build` tree with the freshly
-built ngtcp2 jars, connector protocol
-`org.apache.coyote.http3.Http3Ngtcp2Protocol`, `maxThreads=150`, 30 s idle
-timeout, default stream cap 100, UDP-only HTTP/3 connector on 8444. The
-`OpenSSLLifecycleListener` was disabled for the run: ngtcp2 uses a normal
-`TLS_server_method` context and must not be forced through OpenSSL 4's
-`OSSL_QUIC_server_method` listener.
+Tree: the ngtcp2 endpoint commit `33268d6bfc`, the benchmark follow-ups
+(recycle client bidirectional stream credit with `MAX_STREAMS`; treat
+ngtcp2's no-timer value as "no deadline" instead of converting it to an
+overflowed past deadline), and the request-path rework described below.
+JDK 26.0.2; system ngtcp2 1.16.0; system OpenSSL 3.5.5. Server: the
+benchmark `tomcat-http3/output/build` tree with the freshly built ngtcp2
+jars, connector protocol `org.apache.coyote.http3.Http3Ngtcp2Protocol`,
+`maxThreads=150`, 30 s idle timeout, default stream cap 100, UDP-only
+HTTP/3 connector on 8444. The `OpenSSLLifecycleListener` was disabled for
+the run: ngtcp2 uses a normal `TLS_server_method` context and must not be
+forced through OpenSSL 4's `OSSL_QUIC_server_method` listener.
 
 Clients and timing are the same harness as sections 2-3: warm 1x32 run,
 3 s warm-up, 12 s load window; idle settle 35 s, 12 s keepalive, 40 s
 poller sample. `us/req` is poller-seconds per completed request.
 
+### Bottlenecks found and fixed
+
+The first measurement of this endpoint was ~8k rps on the wide shapes and
+~1.2k on 1x1. Profiling the poll thread (JFR execution samples, VM
+operations, per-thread CPU from `/proc`) identified six independent
+problems, all in the ngtcp2 adapter rather than in libngtcp2:
+
+1. **Completed stream state was never reclaimed, and every packet scanned
+   the whole stream map.** The adapter keeps a `StreamState` per ngtcp2
+   stream; a long-lived connection accumulated one entry per completed
+   request, and `ngtcp2_conn_send`, `stream_readable_next`,
+   `stream_writable_next` and `has_pending_send` walked that map per
+   packet. The map reached tens of thousands of dead entries within a
+   benchmark window, so cost grew linearly with requests served. The
+   adapter now reclaims a stream when ngtcp2's `stream_close` reports it
+   drained and acknowledged, and the three scans were replaced by work
+   queues (`readableQueue` ordered by stream ID, `sendQueue` round-robin).
+2. **Closing a shared `Arena` per response chunk triggered one VM-wide
+   thread handshake.** Each application write was copied into
+   `Arena.ofShared()` and freed when acked. `SharedSession.close()` cost a
+   `HandshakeAllThreads` VM operation: ~8,000/s from the poll thread, and
+   the VM Thread burned ~60 % of a core. The chunks are created, read and
+   freed on the poll thread (or on the stop thread after the poll loop has
+   exited), so they now use a confined arena. This one fix moved 8x25 from
+   ~13k to ~62k rps.
+3. **Per-datagram and per-packet arena churn.** `ngtcp2_conn_recv`,
+   `ngtcp2_header_info` and `ngtcp2_conn_send` allocated a fresh confined
+   arena for a 40-byte path, a 40-byte parse result and the send vectors
+   on every call. The receive path now reuses the connection's path
+   storage, header parsing uses a poll-loop scratch segment, and the send
+   vectors/`datalen`/`ccerr` are per-connection scratch.
+4. **Flow-control extension threw `WrongMethodTypeException` on every
+   read.** `ngtcp2_conn_extend_max_stream_offset` returns `int`, but the
+   statement-form `invokeExact` expected `void`; the exception was caught
+   and ignored, so the stream window was never extended. The return value
+   is now consumed (the connection-level extension only runs after a
+   successful stream extension).
+5. **Per-request allocation dominated the remaining poller time.** The
+   request stream's pre-read buffer was 16 KiB (it only needs to hold the
+   first frames before the handler reads directly from ngtcp2), and the
+   socket staging buffer was 64 KiB (the ngtcp2 transmit queue is the real
+   send buffer). They are now 1 KiB and the configured application write
+   buffer respectively. The two-level `(connection, stream)` socket-wrapper
+   map was also redundant - every sweep already had a stream back-pointer
+   to its wrapper - and removing it eliminated two `ConcurrentHashMap`
+   operations and two `Long` boxes per request; this was worth ~25 % on
+   the wide shapes on its own.
+6. **`ngtcp2_conn_stream_writable_next` was O(streams^2) per sweep.** Each
+   call re-walked every stream to return one readable result. The
+   level-triggered re-arm already walks only streams with a parked writer
+   or latched write interest, so the edge-triggered loop was removed.
+
 ### Idle fleet
 
 | idle conns, kept alive @12 s | ngtcp2 poller % | errs |
 |---|---|---|
-| 100 | 0.37 | 0 |
-| 1000 | 1.25 | 0 |
-| 2000 | 3.62 | 0 |
+| 1000 | 1.20 | 0 |
 | 4000 | 3.90 | 0 |
-| 8000 | 16.22 | 65 |
+| 8000 | 7.20 | 0 |
 
-ngtcp2 is much cheaper than OpenSSL's shared-engine idle path and avoids
-its 4000-connection knee, but it is 3-8x more expensive per idle connection
-than quiche on this host. The 8000 row also shows the first real accept-ramp
-churn (65 client-side retry errors) and a nonlinear jump, so the practical
-single-poller idle wall is currently between 4000 and 8000 settled
-connections. 4000 is within noise of 2000 for the sample.
+ngtcp2 remains much cheaper than OpenSSL's shared-engine idle path and has
+no OpenSSL-style knee at 4000 connections. It is still somewhat more
+expensive per idle connection than quiche (which is ~0.45 % at 1000 and
+~1.15 % at 4000), but the 8000-connection ramp no longer shows churn (the
+earlier 16.22 % / 65-error row was an accept-ramp artifact; the reworked
+build takes 8000 settled connections with zero errors).
 
 ### Request load
 
+`cc` marks client-process-capped rows (`aioquic` saturates before the
+server does; the rps figure is then a lower bound, `us/req` remains
+comparable).
+
 | shape | rps | p50 ms | p99 ms | poller % | us/req | errs |
 |---|---|---|---|---|---|---|
-| 1x1 | 1153 | 0.89 | 3.02 | 88.3 | 766.0 | 0 |
-| 1x32 | 2391 | 14.16 | 46.27 | 89.7 | 374.9 | 0 |
-| 8x25 | 6220 | 34.03 | 122.81 | 64.7 | 104.0 | 0 |
-| 16x16 | 6763 | 37.02 | 257.36 | 60.4 | 89.3 | 0 |
-| 32x32 | 7945 | 107.20 | 1799.02 | 49.5 | 62.3 | 0 |
+| 1x1 | 6483 | 0.18 | 0.37 | 25.1 (cc, client 87.9 %) | 38.7 | 0 |
+| 1x32 | 7184 (cc) | 5.58 | 5.81 | 72.1 | 100.3 | 0 |
+| 8x25 | 82,176 | 2.91 | 4.86 | 98.3 (poller-saturated) | 12.0 | 0 |
+| 16x16 | 30,861 (cc) | 10.25 | 11.99 | 99.0 | 32.1 | 0 |
+| 32x32 | 76,078 | 11.74 | 52.78 | 98.1 (poller-saturated) | 12.9 | 0 |
 
-The first matrix attempt was invalid as a capability measurement: every
-connection completed exactly 100 sequential requests and then stopped.
-That was the default `initial_max_streams_bidi` credit not being recycled;
-the endpoint now extends `MAX_STREAMS` as each client stream closes. The
-rows above are after that fix.
+The wide shapes are now poller-saturated, so the endpoint has reached the
+same kind of ceiling as quiche rather than the earlier per-request latency
+wall. For reference, the same harness measured quiche at 78,691 rps /
+12.6 us/req (8x25) and 72,853 / 13.6 (32x32), and OpenSSL at 18,187 /
+22.0 (8x25) and 14,783 / 28.1 (32x32). The reworked ngtcp2 endpoint is
+therefore slightly ahead of the quiche baseline on this host and roughly
+4-5x the OpenSSL QUIC endpoint, with 1x1 poller cost within ~20 % of
+quiche (38.7 vs 32.4 us/req; that row is client-bound either way).
 
-The current ngtcp2 endpoint is **not competitive with quiche on request
-throughput**: its aggregate ceiling is about 8k rps here versus quiche's
-71-79k, and its per-request poller cost is 2-60x higher. Unlike OpenSSL,
-the wide shapes do not saturate the poller (about 50-65%), while the
-whole-JVM figure is ~140-150%; the wall is therefore the per-request
-transport/event path, not a single shared engine tick. The `1x1` p50 is
-about 5.5x quiche's (0.89 ms vs 0.16 ms) and the per-request poller cost is
-about 24x. This is actionable endpoint work (per-datagram callback/FFM
-overhead and the stream send/ack path), not an ngtcp2 library scaling
-limit: the idle fleet is event-gated and scales roughly linearly.
+### Conclusion
 
-### Preliminary conclusion
-
-ngtcp2 already gives a usable OpenSSL-3.5-based backend with SNI,
-certificate sources, PSK configuration and full HTTP/3 test coverage, and
-its idle cost sits between quiche and OpenSSL. It needs a request-path
-optimization pass before it can be recommended as the scale endpoint:
-the immediate wins to investigate are reducing per-datagram Java callback
-and allocation work, batching the adapter's stream-data handoff, and
-avoiding per-packet native-vector/build churn. The idle and accept-ramp
-results are good enough to keep as the baseline for that work.
+The ngtcp2 backend is now a viable scale endpoint on the same order as
+quiche, while keeping its advantages: the system OpenSSL 3.5+ TLS stack,
+SNI/multi-host certificates, PEM/PKCS#12/JKS sources, TLS 1.3 PSK
+configuration and full HTTP/3 test coverage. The remaining poller work is
+per-request socket-wrapper construction and the poll loop's per-iteration
+work-set bookkeeping, not libngtcp2 scaling; the idle path is event-gated
+and linear.

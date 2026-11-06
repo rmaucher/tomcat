@@ -81,7 +81,7 @@ import org.apache.tomcat.util.threads.LimitLatch;
  * transmits its output ({@code ngtcp2_conn_send()} until DONE, sent via
  * {@code sendmsg()} with the source address pinned from
  * {@code ngtcp2_send_info}). Stream readiness is discovered by the
- * {@code stream_readable_next()} / {@code stream_writable_next()} sweeps
+ * {@code stream_readable_next()} queues and the writable re-arm sweeps
  * instead of an event poll set.
  * <p>
  * Threading follows the OpenSSL endpoint exactly: one poll thread owns every
@@ -115,6 +115,16 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
     private static final StringManager baseSm = StringManager.getManager(AbstractEndpoint.class);
 
     private static final int DEFAULT_READ_BUFFER_SIZE = 16384;
+
+    /**
+     * Pre-read buffer for a bidirectional request stream. The poll thread
+     * drains a little data ahead of the handler so the first read (and any
+     * FIN) is visible without another hop; the handler reads the rest
+     * directly from ngtcp2 into its socket buffer, so this does not need to
+     * be the full application read size. Keeping it small removes an 8 KiB
+     * zeroed allocation from every request.
+     */
+    private static final int STREAM_PRE_READ_BUFFER_SIZE = 1024;
     private static final int MIN_READ_BUFFER_SIZE = 1;
 
     private static final long DEFAULT_POLL_TIMEOUT_MS = 10;
@@ -281,6 +291,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
     private MemorySegment hdrDcidLen;
     private MemorySegment hdrToken;
     private MemorySegment hdrTokenLen;
+    private MemorySegment hdrVersionCid;
     private MemorySegment mintedScid;
     private MemorySegment toLenOut;
     private MemorySegment errCode;
@@ -337,12 +348,6 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      */
     private final ConcurrentHashMap<CidKey, Ngtcp2ConnectionWrapper> cidMap =
             new ConcurrentHashMap<>();
-
-    /**
-     * Socket wrappers: connection address to stream ID to wrapper.
-     */
-    private final ConcurrentHashMap<Long, ConcurrentHashMap<Long, Ngtcp2SocketWrapper>>
-            streamWrappers = new ConcurrentHashMap<>();
 
     /**
      * Connections a request handler still owned when {@link #stopInternal()}
@@ -569,6 +574,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         // unbind() (bindWithCleanup), like the OpenSSL endpoint.
         initialiseSsl();
         createUdpSocket();
+        allocateLoopScratch();
 
         if (log.isInfoEnabled()) {
             log.info(sm.getString("ngtcp2Endpoint.bind", getName(),
@@ -715,7 +721,6 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
 
             try {
                 // Allocate the poll-loop scratch now the socket exists.
-                allocateLoopScratch();
 
                 // Wake primitive for the poll loop: the loop waits on this
                 // socket together with an eventfd, and the mailbox kicks that
@@ -945,8 +950,8 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
 
 
     /**
-     * Allocates all poll-loop native scratch buffers from the (shared) loop
-     * arena. Runs once, at bind, before the poll loop starts.
+     * Allocates all poll-loop native scratch buffers from the loop arena.
+     * Runs once, at bind, before the poll loop starts.
      */
     private void allocateLoopScratch() {
         Arena a = loopArena;
@@ -961,6 +966,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         recvInfo = a.allocate(Ngtcp2Bindings.RECV_INFO_SIZE);
         sendInfo = a.allocate(Ngtcp2Bindings.SEND_INFO_SIZE);
         hdrVersion = a.allocate(ValueLayout.JAVA_INT);
+        hdrVersionCid = a.allocate(Ngtcp2Bindings.VERSION_CID_SIZE);
         hdrType = a.allocate(ValueLayout.JAVA_BYTE);
         hdrScid = a.allocate(Ngtcp2Bindings.NGTCP2_MAX_CONN_ID_LEN);
         hdrScidLen = a.allocate(ValueLayout.JAVA_LONG);
@@ -1239,7 +1245,6 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         connections.clear();
         pendingConns.clear();
         cidMap.clear();
-        streamWrappers.clear();
         // Poll-thread confined sweep state: the poll loop is stopped (the
         // guard at the top of this section refuses to proceed otherwise),
         // so clearing here races with nothing.
@@ -2502,7 +2507,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         hdrTokenLen.set(ValueLayout.JAVA_LONG, 0, MAX_DATAGRAM_SIZE);
         int rc = Ngtcp2Bindings.ngtcp2_header_info(curPkt, len, SERVER_CID_LEN,
                 hdrVersion, hdrType, hdrScid, hdrScidLen, hdrDcid, hdrDcidLen,
-                hdrToken, hdrTokenLen);
+                hdrToken, hdrTokenLen, hdrVersionCid);
         int typeByte = hdrType.get(ValueLayout.JAVA_BYTE, 0) & 0xFF;
         if (rc < 0) {
             // Either malformed for its version (ngtcp2 rejects, for example,
@@ -3375,10 +3380,9 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
 
 
     /**
-     * Writable sweep: {@code ngtcp2_conn_stream_writable_next()} replaces
-     * the OpenSSL poll-set W events. Buffered server-uni writes get their
-     * retry from the per-iteration flush below; bidi wrappers with parked
-     * write waiters or buffered writes are served here.
+     * Writable sweep: buffered server-uni writes get their retry from the
+     * per-iteration flush below; bidi wrappers with parked write waiters or
+     * latched write interest are served by the level-triggered re-arm.
      */
     private void sweepWritable(Ngtcp2ConnectionWrapper conn) {
         // Server unidirectional streams with buffered data (SETTINGS, GOAWAY,
@@ -3391,18 +3395,11 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 flushServerUniStreamWrite(conn, stream);
             }
         }
-        int guard = 0;
-        while (guard++ < SWEEP_BUDGET) {
-            long id = Ngtcp2Bindings.ngtcp2_conn_stream_writable_next(conn.getConn());
-            if (id < 0) {
-                break;
-            }
-            Ngtcp2SocketWrapper wrapper = getSocketWrapper(conn.getConnAddress(), id);
-            if (wrapper == null) {
-                continue;
-            }
-            notifyWriteReady(wrapper, conn.getStreams().get(Long.valueOf(id)));
-        }
+        // The level-triggered re-arm below walks only the streams that
+        // actually have a parked writer or latched write interest. The
+        // former edge-triggered writable_next loop walked every stream for
+        // each result, which made a sweep O(streams^2) and dominated the
+        // poll thread on wide connections.
         rearmWriteWaiters(conn);
     }
 
@@ -3651,32 +3648,23 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         Ngtcp2StreamWrapper stream = conn.getStreams().computeIfAbsent(
                 Long.valueOf(streamId),
                 id -> new Ngtcp2StreamWrapper(id.longValue(), conn,
-                        ByteBuffer.allocate(readBufferSize)));
+                        ByteBuffer.allocate(STREAM_PRE_READ_BUFFER_SIZE)));
         if (stream.isFreed() || stream.isDeregistered()) {
             return;
         }
 
-        long addr = conn.getConnAddress();
-        ConcurrentHashMap<Long, Ngtcp2SocketWrapper> perConn =
-                streamWrappers.computeIfAbsent(Long.valueOf(addr),
-                        k -> new ConcurrentHashMap<>());
-        Ngtcp2SocketWrapper wrapper = perConn.computeIfAbsent(Long.valueOf(streamId),
-                id -> {
-                    Ngtcp2SocketWrapper w = new Ngtcp2SocketWrapper(stream, this);
-                    // Wire the connector-configured socket timeouts into the
-                    // wrapper so its blocking reads and writes honour them,
-                    // as the NIO endpoints do for their stream/socket
-                    // wrappers.
-                    w.setReadTimeout(getConnectionTimeout());
-                    w.setWriteTimeout(getConnectionTimeout());
-                    // Back-pointer so the re-arm sweeps, which hold the
-                    // stream, reach the wrapper without the two-level map
-                    // walk. The write lands before the mapping function
-                    // publishes w into the map, so any thread that sees the
-                    // wrapper in the map also sees the link.
-                    stream.setSocketWrapper(w);
-                    return w;
-                });
+        Ngtcp2SocketWrapper wrapper = stream.getSocketWrapper();
+        if (wrapper == null) {
+            wrapper = new Ngtcp2SocketWrapper(stream, this);
+            // Wire the connector-configured socket timeouts into the wrapper
+            // so its blocking reads and writes honour them, as the NIO
+            // endpoints do for their stream/socket wrappers.
+            wrapper.setReadTimeout(getConnectionTimeout());
+            wrapper.setWriteTimeout(getConnectionTimeout());
+            // Back-pointer for the dispatch/sweep paths; it replaces the
+            // former two-level (connection, stream) wrapper map.
+            stream.setSocketWrapper(wrapper);
+        }
 
         if (!known) {
             state.incrementActiveStreams();
@@ -4529,38 +4517,34 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         setConnectionProtocolDataPending(conn, false);
 
         QuicConnectionManager connManager = conn.getQuicConnectionManager();
-        ConcurrentHashMap<Long, Ngtcp2SocketWrapper> wrappers = streamWrappers.remove(Long.valueOf(addr));
-        if (wrappers != null) {
-            QuicConnectionManager.ConnectionState state =
-                    (connManager != null) ? connManager.getState(conn) : null;
-            for (Ngtcp2SocketWrapper wrapper : wrappers.values()) {
-                wrapper.signalReadWaiter();
-                wrapper.signalWriteWaiter();
-                Ngtcp2StreamWrapper stream = wrapper.getSocket();
-                if (stream == null) {
-                    continue;
-                }
-                if (state != null && stream.getStreamType() == Ngtcp2StreamWrapper.TYPE_BIDI) {
-                    state.decrementActiveStreams();
-                }
-                stream.setDeregistered();
-                // Wake-up (OPEN_READ) plus terminal (ERROR) dispatch for every
-                // live wrapper (port of the OpenSSL connection-close
-                // dispatches): a pending Read Listener parked on a
-                // non-blocking async read holds no processing claim, and
-                // gating on it would abandon the listener without
-                // onError/onAllDataRead. Completed requests have closed their
-                // wrapper and are skipped; a handler that claimed the stream
-                // observes the closed stream through its read in flight.
-                if (!wrapper.isClosed()) {
-                    // Scheduled (claim-retrying) dispatches: a single CAS
-                    // attempt would silently drop both events while a slow
-                    // dispatch still holds the claim, leaving a pending read
-                    // listener with no EOF/error report.
-                    scheduleStreamDispatch(wrapper, stream, SocketEvent.OPEN_READ);
-                    scheduleStreamDispatch(wrapper, stream,
-                            SocketEvent.ERROR);
-                }
+        QuicConnectionManager.ConnectionState state =
+                (connManager != null) ? connManager.getState(conn) : null;
+        for (Ngtcp2StreamWrapper stream : conn.getStreams().values()) {
+            Ngtcp2SocketWrapper wrapper = stream.getSocketWrapper();
+            if (wrapper == null) {
+                continue;
+            }
+            wrapper.signalReadWaiter();
+            wrapper.signalWriteWaiter();
+            if (state != null && stream.getStreamType() == Ngtcp2StreamWrapper.TYPE_BIDI) {
+                state.decrementActiveStreams();
+            }
+            stream.setDeregistered();
+            // Wake-up (OPEN_READ) plus terminal (ERROR) dispatch for every
+            // live wrapper (port of the OpenSSL connection-close
+            // dispatches): a pending Read Listener parked on a non-blocking
+            // async read holds no processing claim, and gating on it would
+            // abandon the listener without onError/onAllDataRead. Completed
+            // requests have closed their wrapper and are skipped; a handler
+            // that claimed the stream observes the closed stream through its
+            // read in flight.
+            if (!wrapper.isClosed()) {
+                // Scheduled (claim-retrying) dispatches: a single CAS
+                // attempt would silently drop both events while a slow
+                // dispatch still holds the claim, leaving a pending read
+                // listener with no EOF/error report.
+                scheduleStreamDispatch(wrapper, stream, SocketEvent.OPEN_READ);
+                scheduleStreamDispatch(wrapper, stream, SocketEvent.ERROR);
             }
         }
         conn.closeAllStreams();
@@ -4590,13 +4574,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         }
         stream.setDeregistered();
         conn.getStreams().remove(Long.valueOf(stream.getStreamId()));
-        long addr = conn.getConnAddress();
-        ConcurrentHashMap<Long, Ngtcp2SocketWrapper> wrappers =
-                streamWrappers.get(Long.valueOf(addr));
-        Ngtcp2SocketWrapper wrapper = null;
-        if (wrappers != null) {
-            wrapper = wrappers.remove(Long.valueOf(stream.getStreamId()));
-        }
+        Ngtcp2SocketWrapper wrapper = stream.getSocketWrapper();
         if (wrapper != null) {
             wrapper.signalReadWaiter();
             wrapper.signalWriteWaiter();
@@ -4631,9 +4609,6 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             }
         }
         stream.setFreed();
-        if (wrappers != null && wrappers.isEmpty()) {
-            streamWrappers.remove(Long.valueOf(addr), wrappers);
-        }
     }
 
 
@@ -4720,13 +4695,6 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
 
 
     // ------------------------------------- Dispatch machinery
-
-    private Ngtcp2SocketWrapper getSocketWrapper(long connAddr, long streamId) {
-        ConcurrentHashMap<Long, Ngtcp2SocketWrapper> perConn =
-                streamWrappers.get(Long.valueOf(connAddr));
-        return perConn == null ? null : perConn.get(Long.valueOf(streamId));
-    }
-
 
     /**
      * Dispatches the given event for the stream to the protocol executor,
