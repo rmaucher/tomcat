@@ -48,24 +48,16 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
 /**
  * Interceptor that caches {@code PreparedStatement} and/or {@code CallableStatement} instances on a connection.
  * <p>
- * A cache hit is answered by this interceptor alone: the rest of the interceptor chain is not invoked for it, and a
- * statement recycled into the cache is reset to driver defaults (its query timeout goes back to zero). Interceptors
- * listed <em>after</em> this one in {@link org.apache.tomcat.jdbc.pool.PoolConfiguration#setJdbcInterceptors(String)
- * jdbcInterceptors} therefore do not see reused statements - relevant to any interceptor whose {@code createStatement}
- * hook performs an action rather than only wrapping the statement: {@link QueryTimeoutInterceptor} must be listed
- * before this one to keep its timeout on cached statements, while wrapping-only interceptors are unaffected: their
- * wrapper is carried inside the cached proxy, and the cache binds a cached statement to the physical session the
- * prepare ran on rather than to whatever connection a wrapper beneath it reports for the statement. An interceptor
- * that closes tracked statements at the connection return is affected too: {@link StatementFinalizer} must be listed
- * before this one, because a parked statement is deliberately left open and a tracker beneath the cache would close
- * it out from under a live cache entry; listed after this one, it makes this cache refuse to park at all, and
- * statements are closed normally instead of cached. Only {@link StatementFinalizer} and its subclasses are recognised
- * by that check; a third-party interceptor with the same behaviour is not detected.
+ * A cache hit is answered by this interceptor alone: the rest of the chain is not invoked for it, and a recycled
+ * statement is reset to driver defaults. Interceptors listed after this one therefore do not see reused statements, so
+ * {@link QueryTimeoutInterceptor} and {@link StatementFinalizer} must be listed before the cache. A tracker such as
+ * {@link StatementFinalizer} beneath the cache would close a parked statement at connection return, so the cache then
+ * refuses to park at all.
  * <p>
- * With JMX enabled, a cache publishes an MBean below its connection's MBean. It is released when the connection is
- * recycled, when the pool closes, or when the pool MBean is deregistered. A pool that is abandoned without being
- * closed keeps its registrations - and through them the pool, its sessions and its driver class loader - reachable, so
- * a JMX-enabled pool must be closed before it is dropped.
+ * With JMX enabled, a cache publishes an MBean below its connection's MBean. It is released when the connection goes
+ * out of service (the chain teardown {@code reset(null, null)}), when the pool closes, or when the pool MBean is
+ * deregistered - not on an ordinary return and re-borrow. A pool abandoned without closing keeps its registrations,
+ * and through them the pool, its sessions and its driver class loader reachable.
  */
 public class StatementCache extends StatementDecoratorInterceptor implements StatementCacheMBean {
     private static final Log log = LogFactory.getLog(StatementCache.class);
@@ -112,11 +104,14 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
     public StatementCache() {
     }
 
+    // Written during chain construction, before the connection publishes the
+    // handler, and never changed afterwards.
     private boolean cachePrepared = true;
     private boolean cacheCallable = false;
     private int maxCacheSize = 50;
-    private PooledConnection pcon;
-    private String[] types;
+    // Re-armed on every borrow and read from management/close threads.
+    private volatile PooledConnection pcon;
+    private volatile String[] types;
 
     private ObjectName oname = null;
 
@@ -194,7 +189,7 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
     private static final Map<ConnectionPool, AtomicInteger> cacheSizeMap =
             Collections.synchronizedMap(new WeakHashMap<ConnectionPool, AtomicInteger>());
 
-    private AtomicInteger cacheSize;
+    private volatile AtomicInteger cacheSize;
 
     /**
      * Whether {@link #disconnected(ConnectionPool, PooledConnection, boolean)} is purging this cache. A park that
@@ -380,9 +375,7 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
         boolean process = process(this.types, method, false);
         if (process && args.length > 0 && args[0] instanceof String) {
             CachedStatement statement = isCached(method, args);
-            if (statement != null) {
-                // Remove it from the cache since it is used
-                removeStatement(statement);
+            if (statement != null && removeStatement(statement)) {
                 if (statement.getAssociatedConnection() != currentPhysicalConnection()) {
                     // The entry belongs to a connection that has been
                     // replaced (a statement close that raced a reconnect
@@ -399,9 +392,11 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
                 // reports a live handle instead of the previous borrower's.
                 statement.setConnection(proxy);
                 return statement.getActualProxy();
-            } else {
-                return super.invoke(proxy, method, args);
             }
+            // No entry, or another thread won the removal (a disconnect purge
+            // closed it): prepare a fresh statement rather than hand out an
+            // entry this call does not own.
+            return super.invoke(proxy, method, args);
         } else {
             return super.invoke(proxy, method, args);
         }
@@ -759,6 +754,12 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
             // same way rather than dereference the field.
             AtomicInteger size = cacheSize;
             boolean shouldClose = true;
+            PreparedStatement delegate = getDelegate();
+            if (delegate == null) {
+                // A concurrent forceClose() already retired this handle; there
+                // is nothing left to reset or park.
+                return;
+            }
             if (size != null && size.get() < maxCacheSize && !trackerBelow()) {
                 // A tracker beneath this cache (see trackerBelow) would close a
                 // parked statement at the connection return, so the park is
@@ -770,34 +771,34 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
                 // that second question too, while the prepare-time binding
                 // still names the session the statement was prepared on for
                 // the session check in cacheStatement.
-                CachedStatement proxy = new CachedStatement(getDelegate(), getSql(), associatedConnection);
+                CachedStatement proxy = new CachedStatement(delegate, getSql(), associatedConnection);
                 proxy.setCacheKey(getCacheKey());
                 try {
                     // Only cache if statement has been marked as poolable and not close on completion
-                    if (poolable && !getDelegate().isCloseOnCompletion()) {
+                    if (poolable && !delegate.isCloseOnCompletion()) {
                         // Clear Resultset
-                        ResultSet result = getDelegate().getResultSet();
+                        ResultSet result = delegate.getResultSet();
                         if (result != null && !result.isClosed()) {
                             result.close();
                         }
                         // Clear parameter
-                        getDelegate().clearParameters();
+                        delegate.clearParameters();
                         // Clear batch
-                        getDelegate().clearBatch();
+                        delegate.clearBatch();
                         // Clear warnings
-                        getDelegate().clearWarnings();
+                        delegate.clearWarnings();
                         // Reset the timeout
-                        getDelegate().setQueryTimeout(0);
+                        delegate.setQueryTimeout(0);
                         // Reset fetch direction
-                        getDelegate().setFetchDirection(ResultSet.FETCH_FORWARD);
+                        delegate.setFetchDirection(ResultSet.FETCH_FORWARD);
                         // Reset max field size
-                        getDelegate().setMaxFieldSize(0);
+                        delegate.setMaxFieldSize(0);
                         // Reset max rows
-                        getDelegate().setMaxRows(0);
+                        delegate.setMaxRows(0);
                         // Reset fetchsize
-                        getDelegate().setFetchSize(0);
+                        delegate.setFetchSize(0);
                         // Reset the escape processing
-                        getDelegate().setEscapeProcessing(true);
+                        delegate.setEscapeProcessing(true);
                         // Create a new facade
                         Object actualProxy = getConstructor().newInstance(new Object[] { proxy });
                         proxy.setActualProxy(actualProxy);

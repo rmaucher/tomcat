@@ -598,7 +598,7 @@ class TestStatementFinalizer extends JdbcPoolBaseTest {
         ds.createPool();
         try (Connection pooled = ds.getConnection()) {
             StatementFinalizer finalizer = interceptorOf(pooled, StatementFinalizer.class);
-            PooledConnection pcon = (PooledConnection) pooled.unwrap(PooledConnection.class);
+            PooledConnection pcon = (PooledConnection) internalOf(pooled);
             Method create = Connection.class.getMethod("createStatement");
 
             finalizer.reset(ds.getPool(), pcon);
@@ -822,6 +822,7 @@ class TestStatementFinalizer extends JdbcPoolBaseTest {
         Assertions.assertNotNull(finalizer);
 
         StatementGateInterceptor.holdFirstClose();
+        @SuppressWarnings("unused")
         Statement leaked = first.createStatement(); // its return-time close is the parking post
 
         CountDownLatch createEntered = new CountDownLatch(1);
@@ -888,7 +889,7 @@ class TestStatementFinalizer extends JdbcPoolBaseTest {
                     "the next borrow must start with an empty tracker");
             try (ResultSet rs = ((PreparedStatement) rawLate).executeQuery()) {
                 Assertions.fail("the statement that raced the return still executes: "
-                        + (rs.next() ? rs.getInt(1) : "?"));
+                        + (rs.next() ? Integer.valueOf(rs.getInt(1)) : "?"));
             } catch (SQLException expected) {
                 // a closed statement refuses use - the point of the assertion
             }

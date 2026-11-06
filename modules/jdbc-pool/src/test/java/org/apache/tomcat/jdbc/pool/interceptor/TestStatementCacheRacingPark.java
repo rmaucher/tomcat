@@ -167,7 +167,7 @@ class TestStatementCacheRacingPark extends JdbcPoolBaseTest {
         Connection shared = ds.getConnection();
         try {
             StatementCache cache = interceptorOf(shared, StatementCache.class);
-            PooledConnection pcon = (PooledConnection) shared.unwrap(PooledConnection.class);
+            PooledConnection pcon = (PooledConnection) internalOf(shared);
             GatedParkMap gated = new GatedParkMap();
             pcon.getAttributes().put(StatementCache.STATEMENT_CACHE_ATTR, gated);
 
@@ -230,7 +230,7 @@ class TestStatementCacheRacingPark extends JdbcPoolBaseTest {
             StatementCache cache = interceptorOf(shared, StatementCache.class);
             // getCache() re-reads the map from the attributes on every
             // call, so this swap is what the next closes will meet
-            PooledConnection pcon = (PooledConnection) shared.unwrap(PooledConnection.class);
+            PooledConnection pcon = (PooledConnection) internalOf(shared);
             ParkRendezvousMap parkPoint = new ParkRendezvousMap();
             pcon.getAttributes().put(StatementCache.STATEMENT_CACHE_ATTR, parkPoint);
 
@@ -303,7 +303,7 @@ class TestStatementCacheRacingPark extends JdbcPoolBaseTest {
             // must have closed it. Pre-fix both closes believed they had
             // parked, neither closed its delegate, and the overwritten one
             // stayed open with nothing left that could ever reach it.
-            Assertions.assertNotEquals(aClosed, bClosed,
+            Assertions.assertNotEquals(Boolean.valueOf(aClosed), Boolean.valueOf(bClosed),
                     "exactly one of the two racing statements may stay open: "
                             + "the winner of the park, not the loser (pre-fix "
                             + "both stayed open and the loser leaked); " + observed);
