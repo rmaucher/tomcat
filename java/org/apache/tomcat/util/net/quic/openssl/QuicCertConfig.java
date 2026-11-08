@@ -125,15 +125,18 @@ public class QuicCertConfig {
             Map<String, OpenSSLPreSharedKeySelector> pskByHost,
             OpenSSLPreSharedKeySelector defaultPskSelector, boolean pskOnly, Arena arena) {
         // The snapshot is handed to the native SNI/PSK callbacks and read
-        // while a later reload swaps in a new instance; wrap the collections
-        // so the documented immutability cannot be violated by a caller.
+        // while a later reload swaps in a new instance; copy and wrap the
+        // collections so the documented immutability cannot be violated by a
+        // caller and the input map is not mutated.
         this.defaultHostName = defaultHostName;
+        Map<String, List<CertificateEntry>> certsCopy = new HashMap<>();
         for (Map.Entry<String, List<CertificateEntry>> host : certsByHost.entrySet()) {
-            host.setValue(Collections.unmodifiableList(host.getValue()));
+            certsCopy.put(host.getKey(),
+                    Collections.unmodifiableList(host.getValue()));
         }
         this.defaultCerts = Collections.unmodifiableList(defaultCerts);
-        this.certsByHost = Collections.unmodifiableMap(certsByHost);
-        this.pskByHost = Collections.unmodifiableMap(pskByHost);
+        this.certsByHost = Collections.unmodifiableMap(certsCopy);
+        this.pskByHost = Collections.unmodifiableMap(new HashMap<>(pskByHost));
         this.defaultPskSelector = defaultPskSelector;
         this.pskOnly = pskOnly;
         this.arena = arena;

@@ -17,7 +17,6 @@
 package org.apache.coyote.http3;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 
 import org.apache.tomcat.util.res.StringManager;
 
@@ -425,11 +424,16 @@ final class Qpack {
     /**
      * The size of a field line / dynamic table entry: RFC 9204 Section
      * 3.2.1 (entry size) and RFC 9114 Section 4.2.2 (field section limit)
-     * use the same accounting - 32 bytes of overhead plus the UTF-8 byte
-     * lengths of the name and the value (a null value counts as zero).
-     * Shared by the dynamic table / field section limit accounting in
-     * QpackDecoder and the response field section size accounting in
-     * Http3Processor so the two cannot drift.
+     * use the same accounting - 32 bytes of overhead plus the byte lengths
+     * of the name and the value (a null value counts as zero).
+     * <p>
+     * Tomcat represents header values as ISO-8859-1 characters and the
+     * decoder produces one character per wire byte, so the byte length is
+     * the Java string length. Counting UTF-8 bytes here would overstate
+     * entries containing obs-text and reject field sections that fit the
+     * configured limit. Shared by the dynamic table / field section limit
+     * accounting in QpackDecoder and the response field section size
+     * accounting in Http3Processor so the two cannot drift.
      *
      * @param name  Field line name
      * @param value Field line value, possibly null
@@ -437,8 +441,7 @@ final class Qpack {
      * @return The size in bytes
      */
     public static int entrySize(String name, String value) {
-        return 32 + name.getBytes(StandardCharsets.UTF_8).length +
-                (value != null ? value.getBytes(StandardCharsets.UTF_8).length : 0);
+        return 32 + name.length() + (value != null ? value.length() : 0);
     }
 
 

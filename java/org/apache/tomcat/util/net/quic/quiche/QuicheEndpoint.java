@@ -116,6 +116,14 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
     private static final int DEFAULT_READ_BUFFER_SIZE = 16384;
     private static final int MIN_READ_BUFFER_SIZE = 1;
+    /**
+     * Pre-read buffer for a bidirectional request stream. The poll thread
+     * drains a little data ahead of the handler so the first read (and any
+     * FIN) is visible without another hop; the handler reads the rest
+     * directly from quiche into its socket buffer, so this does not need to
+     * be the full application read size.
+     */
+    private static final int STREAM_PRE_READ_BUFFER_SIZE = 1024;
 
     private static final long DEFAULT_POLL_TIMEOUT_MS = 10;
     private static final long MIN_POLL_TIMEOUT_MS = 1;
@@ -449,11 +457,11 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      */
     private final SecureRandom cidRandom = new SecureRandom();
 
-    private int maxConnections = DEFAULT_MAX_CONNECTIONS;
+    private volatile int maxConnections = DEFAULT_MAX_CONNECTIONS;
     private long lastMaxConnectionsLogMs = 0;
     private long lastPausedLogMs = 0;
-    private long pollTimeoutMs = DEFAULT_POLL_TIMEOUT_MS;
-    private int readBufferSize = DEFAULT_READ_BUFFER_SIZE;
+    private volatile long pollTimeoutMs = DEFAULT_POLL_TIMEOUT_MS;
+    private volatile int readBufferSize = DEFAULT_READ_BUFFER_SIZE;
 
 
     // ------------------------------------- Properties
@@ -627,6 +635,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             try {
                 wakeup.close();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error closing QUIC wakeup during bind cleanup", t);
                 }
@@ -643,6 +652,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             try {
                 arena.close();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error closing QUIC loop arena during bind cleanup", t);
                 }
@@ -791,10 +801,14 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      */
     private int bindUdpSocket(Arena localArena, InetAddress bindAddr, int port,
             boolean dualStack) throws DualStackUnavailable, IOException {
+        // A previous socket may have enabled GRO; this candidate starts with
+        // its own, not-yet-probed state.
+        groReceive = false;
         boolean isIPv6 = bindAddr instanceof java.net.Inet6Address;
         int af = isIPv6 ? QuicheBindings.AF_INET6 : QuicheBindings.AF_INET;
         int sockFd = QuicheBindings.socket(af,
-                QuicheBindings.SOCK_DGRAM | QuicheBindings.SOCK_NONBLOCK, 0);
+                QuicheBindings.SOCK_DGRAM | QuicheBindings.SOCK_NONBLOCK |
+                        QuicheBindings.SOCK_CLOEXEC, 0);
         if (sockFd < 0) {
             int errno = QuicheBindings.errno();
             if (dualStack && errno == QuicheBindings.EAFNOSUPPORT) {
@@ -1079,12 +1093,19 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 try {
                     conn.freeConnOnce();
                 } catch (Throwable t) {
+                    ExceptionUtils.handleThrowable(t);
                     log.warn(sm.getString("quicheEndpoint.connectionFreeError",
                             Long.toHexString(conn.getConnAddress())), t);
                 }
                 iterator.remove();
             }
         }
+        // A late handler from the previous generation may have queued a mark
+        // for a retained connection after the stop path cleared the queue;
+        // those connections are not part of this generation's sweep set, so
+        // drop the marks instead of letting them drive work against wrappers
+        // that are no longer registered.
+        hopInterest.clear();
         // Re-open the mailbox and drop any task left over from a previous
         // generation's stop before the new poll thread can drain it.
         mailbox.open();
@@ -1101,6 +1122,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             try {
                 pollLoop();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 log.error(sm.getString("quicheEndpoint.pollLoopCrashed"), t);
             }
         }, getName() + "-Poller");
@@ -1167,6 +1189,24 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         drainWhile(System.currentTimeMillis() + ACTIVE_HANDLER_SHUTDOWN_WAIT_MS,
                 this::hasActiveRequestHandlers);
 
+        // shutdownExecutor() uses shutdownNow() for the internal executor:
+        // queued dispatch tasks are discarded without running their finally
+        // block, so balance the active-handler references they hold. Without
+        // this, hasActiveHandlers() stays true forever and the connection is
+        // retained permanently. An external executor is not shut down here,
+        // so its tasks may still run and must not be balanced.
+        if (getExecutor() == null) {
+            for (QuicheConnectionWrapper conn : connections.values()) {
+                conn.discardQueuedDispatches();
+            }
+            for (QuicheConnectionWrapper conn : pendingConns.values()) {
+                conn.discardQueuedDispatches();
+            }
+            for (QuicheConnectionWrapper conn : stoppedBusyConnections) {
+                conn.discardQueuedDispatches();
+            }
+        }
+
         // Clean up HTTP/3 connection managers.
         for (QuicheConnectionWrapper conn : connections.values()) {
             QuicConnectionManager connManager = conn.getQuicConnectionManager();
@@ -1204,6 +1244,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             try {
                 conn.freeConnOnce();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 log.warn(sm.getString("quicheEndpoint.connectionFreeError",
                         Long.toHexString(conn.getConnAddress())), t);
             }
@@ -1231,6 +1272,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             try {
                 conn.freeConnOnce();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error freeing pending connection at stop", t);
                 }
@@ -1305,6 +1347,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                     flushSend(conn);
                 }
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error announcing go-away on connection 0x" +
                             Long.toHexString(conn.getConnAddress()), t);
@@ -1333,6 +1376,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                     sweepWritable(conn);
                     flushSend(conn);
                 } catch (Throwable t) {
+                    ExceptionUtils.handleThrowable(t);
                     if (log.isDebugEnabled()) {
                         log.debug("Error driving connection during shutdown drain", t);
                     }
@@ -1364,6 +1408,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                     flushSend(conn);
                 }
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error queuing connection close on shutdown", t);
                 }
@@ -1430,9 +1475,10 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
 
     /*
-     * Required override (AbstractEndpoint's abstract contract), reached only
-     * through AbstractEndpoint.processSocket() - which no QUIC code path
-     * calls; see the QuicSocketProcessor comment for the dispatch reality.
+     * Required override (AbstractEndpoint's abstract contract). Async
+     * servlet events reach it through SocketWrapperBase.processSocket() ->
+     * AbstractEndpoint.processSocket(); see the QuicSocketProcessor comment
+     * for the dispatch reality.
      */
     @Override
     protected SocketProcessorBase<QuicStream> createSocketProcessor(
@@ -2230,10 +2276,10 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
     /**
      * Computes the wait bound: queued work shortens it to the pending-task
-     * cadence; otherwise pollTimeoutMs (idle endpoints use the idle
-     * cadence), capped by the earliest quiche timer deadline (the timer-heap
-     * head for established connections, a small linear scan of the bounded
-     * pending set) and by the stop-responsiveness cap.
+     * cadence; otherwise the idle cadence, capped by the earliest quiche
+     * timer deadline (the timer-heap head for established connections, a
+     * small linear scan of the bounded pending set), the deferred-replay /
+     * protocol-data service cadence and the stop-responsiveness cap.
      */
     private long computeWait(boolean recvBudgetExhausted) {
         if (recvBudgetExhausted) {
@@ -2241,8 +2287,11 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         }
         long wait = PENDING_TASK_POLL_TIMEOUT_MS;
         if (!mailbox.hasPollTasks()) {
-            wait = (connections.isEmpty() && pendingConns.isEmpty())
-                    ? IDLE_POLL_TIMEOUT_MS : pollTimeoutMs;
+            // No queued work: the socket fd wakes the loop for every datagram
+            // and the timer heap / pending scan caps the wait to the earliest
+            // quiche deadline, so an idle fleet does not need the busy 10 ms
+            // service cadence.
+            wait = IDLE_POLL_TIMEOUT_MS;
         }
         TimerEntry head = heapPeekFresh();
         if (head != null) {
@@ -2626,15 +2675,25 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 curPkt.asSlice(dcidOff, dcidLen), dcidLen,
                 sendBuf, sendBuf.byteSize());
         if (out > 0) {
+            // Pin the reply's source to the address the datagram arrived on.
+            // A wildcard/multi-homed bind otherwise lets the kernel pick a
+            // different local address, which address-validating clients may
+            // discard.
+            int pktToLen = toLenOut.get(ValueLayout.JAVA_INT, 0);
+            MemorySegment from = pktToLen > 0 ? saTo : MemorySegment.NULL;
             QuicheBindings.sendDatagram(socketFd, sendBuf, (int) out,
                     saFrom, QuicheBindings.sockaddrLength(saFrom),
-                    MemorySegment.NULL, scratchSend);
+                    from, scratchSend);
         }
     }
 
 
     private int pendingLimit() {
-        return Math.max(PENDING_LIMIT_FLOOR, maxConnections * 2);
+        // Use long arithmetic: maxConnections * 2 overflows for very large
+        // limits and would silently fall back to the floor.
+        long limit = Math.max((long) PENDING_LIMIT_FLOOR,
+                (long) maxConnections * 2L);
+        return (int) Math.min(Integer.MAX_VALUE, limit);
     }
 
 
@@ -2796,22 +2855,29 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         if (connPtr.equals(MemorySegment.NULL)) {
             return;
         }
-        // Feed the triggering datagram first (see the javadoc): without a
-        // processed packet the close is never transmittable.
-        int pktToLen = toLenOut.get(ValueLayout.JAVA_INT, 0);
-        if (pktToLen > 0) {
-            recvIntoConn(connPtr, len, saTo, pktToLen);
-        } else {
-            // The reject path always fills saBind with bindAddress (the
-            // helper's local argument), so it is the fallback destination.
-            recvIntoConn(connPtr, len, saBind,
-                    QuicheBindings.sockaddrLength(saBind));
+        try {
+            // Feed the triggering datagram first (see the javadoc): without a
+            // processed packet the close is never transmittable.
+            int pktToLen = toLenOut.get(ValueLayout.JAVA_INT, 0);
+            if (pktToLen > 0) {
+                recvIntoConn(connPtr, len, saTo, pktToLen);
+            } else {
+                // The reject path always fills saBind with bindAddress (the
+                // helper's local argument), so it is the fallback destination.
+                recvIntoConn(connPtr, len, saBind,
+                        QuicheBindings.sockaddrLength(saBind));
+            }
+            QuicheBindings.quiche_conn_close(connPtr, false,
+                    QuicheBindings.QUICHE_TRANSPORT_CONNECTION_REFUSED,
+                    MemorySegment.NULL, 0);
+            sendLoop(null, connPtr, saFrom, peerLen);
+        } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
+            log.error(sm.getString("quicheEndpoint.connectionError",
+                    Long.toHexString(connPtr.address())), t);
+        } finally {
+            QuicheBindings.quiche_conn_free(connPtr);
         }
-        QuicheBindings.quiche_conn_close(connPtr, false,
-                QuicheBindings.QUICHE_TRANSPORT_CONNECTION_REFUSED,
-                MemorySegment.NULL, 0);
-        sendLoop(null, connPtr, saFrom, peerLen);
-        QuicheBindings.quiche_conn_free(connPtr);
     }
 
 
@@ -2877,11 +2943,17 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             // "call on_timeout whenever timeout_as_millis reports zero"; the
             // call is cheap and a no-op when no timer has elapsed).
             QuicheBindings.quiche_conn_on_timeout(conn.getConn());
+            processRetiredScids(conn);
             if (conn.isProtocolDataPending()) {
                 flushProtocolData(conn);
             }
             if (flushSend(conn)) {
                 sweepRetryConns.add(conn);
+            }
+            if (conn.isFreed()) {
+                // A send-side error can tear the connection down inside
+                // flushSend(); do not touch the native pointer after that.
+                return;
             }
             detectClose(conn);
         } catch (Throwable t) {
@@ -2906,10 +2978,14 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 // See processConnection(): unconditional covers draining.
                 QuicheBindings.quiche_conn_on_timeout(conn.getConn());
                 flushSend(conn);
+                if (conn.isFreed()) {
+                    continue;
+                }
                 if (QuicheBindings.quiche_conn_is_closed(conn.getConn())) {
                     discardPending(conn);
                 }
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error processing pending connection", t);
                 }
@@ -2940,67 +3016,112 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             // Already accepted (or discarded) by a racing path.
             return;
         }
-        QuicProtocol protocol = getQuicProtocol();
-        if (protocol == null) {
-            discardPending(conn);
-            return;
-        }
-        String alpn = readAlpnProtocol(conn);
-        conn.setNegotiatedProtocol(alpn);
-        // Eagerly read (and cache) the SNI host name on the poll thread;
-        // the wrapper's own read is the lazy fallback for worker threads.
-        conn.getSniHostName();
+        try {
+            QuicProtocol protocol = getQuicProtocol();
+            if (protocol == null) {
+                discardPending(conn);
+                return;
+            }
+            String alpn = readAlpnProtocol(conn);
+            conn.setNegotiatedProtocol(alpn);
+            // Eagerly read (and cache) the SNI host name on the poll thread;
+            // the wrapper's own read is the lazy fallback for worker threads.
+            conn.getSniHostName();
 
-        if (!isServedProtocol(alpn)) {
-            log.warn(sm.getString("quicheEndpoint.alpnNotServed",
-                    Long.toHexString(conn.getConnAddress()), String.valueOf(alpn)));
+            if (!isServedProtocol(alpn)) {
+                log.warn(sm.getString("quicheEndpoint.alpnNotServed",
+                        Long.toHexString(conn.getConnAddress()), String.valueOf(alpn)));
+                connections.put(conn.getConnAddress(), conn);
+                failConnection(conn, NO_APPLICATION_PROTOCOL_ERROR,
+                        "Negotiated application protocol is not served");
+                // failConnection only queues the CONNECTION_CLOSE; transmitting
+                // it needs a sweep of this connection. The caller evaluated
+                // pendingConns.containsKey() as true before this method removed
+                // the entry, so its "established" else-branch (which would have
+                // marked the connection touched) does not run, and the connection
+                // is otherwise invisible to the work sets, the timer heap and the
+                // flag-only close scan. Schedule the sweep explicitly so the close
+                // leaves the socket this iteration (and close detection reclaims
+                // the connection) instead of waiting for the peer's next datagram
+                // or its own idle timeout - mirroring the served path below.
+                sweepTouchedConns.add(conn);
+                return;
+            }
+
+            QuicConnectionManager connManager = protocol.createQuicConnectionManager();
+            conn.setQuicConnectionManager(connManager);
+            connManager.connectionOpen(conn);
+
+            QuicConnectionManager.ConnectionState state = connManager.getState(conn);
+            long configured = protocol.getMaxConcurrentStreams();
+            // With quiche the advertised initial_max_streams_bidi IS the
+            // configured value: the reconciliation degenerates to
+            // set-if-configured (no mismatch warning needed, unlike OpenSSL).
+            // A configured value of 0 or less means "use the transport
+            // default"; quiche's own default is zero streams (which would
+            // advertise a limit of no bidirectional streams at all), so the
+            // config build floors the advertised value to one — mirror the
+            // same floor here to keep enforcement in step with what the peer
+            // observes.
+            if (state != null) {
+                state.setMaxConcurrentStreams(Math.max(configured, 1));
+            }
+
             connections.put(conn.getConnAddress(), conn);
-            failConnection(conn, NO_APPLICATION_PROTOCOL_ERROR,
-                    "Negotiated application protocol is not served");
-            // failConnection only queues the CONNECTION_CLOSE; transmitting
-            // it needs a sweep of this connection. The caller evaluated
-            // pendingConns.containsKey() as true before this method removed
-            // the entry, so its "established" else-branch (which would have
-            // marked the connection touched) does not run, and the connection
-            // is otherwise invisible to the work sets, the timer heap and the
-            // flag-only close scan. Schedule the sweep explicitly so the close
-            // leaves the socket this iteration (and close detection reclaims
-            // the connection) instead of waiting for the peer's next datagram
-            // or its own idle timeout - mirroring the served path below.
+            createServerUniStreams(conn);
+            issueAdditionalScid(conn);
+            // The freshly established connection has server-uni stream writes
+            // (SETTINGS etc.) and possibly the first request already buffered:
+            // schedule its sweep for this iteration (and its first timer-heap
+            // entry via the sweep's refresh).
             sweepTouchedConns.add(conn);
+            if (log.isDebugEnabled()) {
+                log.debug("Accepted connection 0x" + Long.toHexString(conn.getConnAddress()) +
+                        " alpn=" + alpn + " from " + conn.getRemoteAddress());
+            }
+        } catch (Throwable t) {
+            // The connection was already removed from pendingConns, so a
+            // setup failure would otherwise leave it reachable only through
+            // cidMap - never swept, never freed.
+            ExceptionUtils.handleThrowable(t);
+            log.error(sm.getString("quicheEndpoint.acceptConnectionError",
+                    Long.toHexString(conn.getConnAddress())), t);
+            if (!conn.isFreed()) {
+                teardownConnection(conn);
+            }
+        }
+    }
+
+
+    /*
+     * Removes source connection IDs retired by quiche from the demux map.
+     * quiche queues a retired SCID when the peer sends RETIRE_CONNECTION_ID;
+     * without this the stale CID keeps mapping to the connection (and the map
+     * would grow if CID rotation is ever added).
+     */
+    private void processRetiredScids(QuicheConnectionWrapper conn) {
+        long retired = QuicheBindings.quiche_conn_retired_scids(conn.getConn());
+        if (retired <= 0) {
             return;
         }
-
-        QuicConnectionManager connManager = protocol.createQuicConnectionManager();
-        conn.setQuicConnectionManager(connManager);
-        connManager.connectionOpen(conn);
-
-        QuicConnectionManager.ConnectionState state = connManager.getState(conn);
-        long configured = protocol.getMaxConcurrentStreams();
-        // With quiche the advertised initial_max_streams_bidi IS the
-        // configured value: the reconciliation degenerates to
-        // set-if-configured (no mismatch warning needed, unlike OpenSSL).
-        // A configured value of 0 or less means "use the transport
-        // default"; quiche's own default is zero streams (which would
-        // advertise a limit of no bidirectional streams at all), so the
-        // config build floors the advertised value to one — mirror the
-        // same floor here to keep enforcement in step with what the peer
-        // observes.
-        if (state != null) {
-            state.setMaxConcurrentStreams(Math.max(configured, 1));
+        MemorySegment iter = QuicheBindings.quiche_conn_retired_scid_iter(conn.getConn());
+        if (iter.equals(MemorySegment.NULL)) {
+            return;
         }
-
-        connections.put(conn.getConnAddress(), conn);
-        createServerUniStreams(conn);
-        issueAdditionalScid(conn);
-        // The freshly established connection has server-uni stream writes
-        // (SETTINGS etc.) and possibly the first request already buffered:
-        // schedule its sweep for this iteration (and its first timer-heap
-        // entry via the sweep's refresh).
-        sweepTouchedConns.add(conn);
-        if (log.isDebugEnabled()) {
-            log.debug("Accepted connection 0x" + Long.toHexString(conn.getConnAddress()) +
-                    " alpn=" + alpn + " from " + conn.getRemoteAddress());
+        try (Arena localArena = Arena.ofConfined()) {
+            MemorySegment out = localArena.allocate(ValueLayout.ADDRESS);
+            MemorySegment outLen = localArena.allocate(ValueLayout.JAVA_LONG);
+            while (QuicheBindings.quiche_connection_id_iter_next(iter, out, outLen)) {
+                MemorySegment data = out.get(ValueLayout.ADDRESS, 0);
+                long len = outLen.get(ValueLayout.JAVA_LONG, 0);
+                if (!data.equals(MemorySegment.NULL) && len > 0 &&
+                        len <= QuicheBindings.QUICHE_MAX_CONN_ID_LEN) {
+                    byte[] cid = data.reinterpret(len).toArray(ValueLayout.JAVA_BYTE);
+                    cidMap.remove(new CidKey(cid), conn);
+                }
+            }
+        } finally {
+            QuicheBindings.quiche_connection_id_iter_free(iter);
         }
     }
 
@@ -3113,10 +3234,11 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      * dispatch.
      */
     private void sweepReadable(QuicheConnectionWrapper conn) {
-        int guard = 0;
-        while (guard++ < SWEEP_BUDGET) {
+        boolean exhausted = true;
+        for (int guard = 0; guard < SWEEP_BUDGET; guard++) {
             long id = QuicheBindings.quiche_conn_stream_readable_next(conn.getConn());
             if (id < 0) {
+                exhausted = false;
                 break;
             }
             if ((id & 0x02) != 0) {
@@ -3128,9 +3250,16 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 processAcceptedBidi(conn, id);
             }
         }
+        if (exhausted) {
+            // The budget ran out with the readable set possibly non-empty.
+            // Do not wait for an unrelated event: force another sweep of this
+            // connection on the next iteration.
+            sweepRetryConns.add(conn);
+        }
         rearmPendingUniStreamDrains(conn);
         rearmReadWaiters(conn);
         rearmPendingReadDispatches(conn);
+        rearmBufferedBidiReads(conn);
     }
 
 
@@ -3238,25 +3367,96 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         // stream is indexed before the waiter parks and the pump kicks the
         // loop), so the guard bounds latency to one iteration rather than
         // losing the signal.
-        if (!conn.hasReadRearm()) {
-            return;
+        if (conn.hasReadRearm()) {
+            for (QuicheStreamWrapper stream : conn.readRearmStreams()) {
+                long id = stream.getStreamId();
+                // Client-initiated unidirectional streams are processed on the
+                // poll thread itself; only bidirectional request streams park
+                // workers.
+                if ((id & 0x02) != 0) {
+                    continue;
+                }
+                if (stream.isDeregistered() || stream.isFreed()) {
+                    continue;
+                }
+                QuicheSocketWrapper wrapper = stream.getSocketWrapper();
+                if (wrapper != null && wrapper.hasReadWaiter() &&
+                        QuicheBindings.quiche_conn_stream_readable(conn.getConn(), id)) {
+                    wrapper.signalReadWaiter();
+                }
+            }
         }
-        for (QuicheStreamWrapper stream : conn.readRearmStreams()) {
-            long id = stream.getStreamId();
-            // Client-initiated unidirectional streams are processed on the
-            // poll thread itself; only bidirectional request streams park
-            // workers.
-            if ((id & 0x02) != 0) {
+
+        // Async read listeners: a bounded read that left data buffered
+        // latches read interest; deliver another OPEN_READ while the stream
+        // remains readable and the processing claim is free.
+        for (QuicheStreamWrapper stream : conn.readInterestRearmStreams()) {
+            if (stream.isDeregistered() || stream.isFreed()) {
+                conn.removeReadInterestRearm(stream);
                 continue;
             }
-            if (stream.isDeregistered() || stream.isFreed()) {
+            if (!stream.hasReadInterest()) {
+                conn.removeReadInterestRearm(stream);
+                continue;
+            }
+            if (!QuicheBindings.quiche_conn_stream_readable(conn.getConn(),
+                    stream.getStreamId())) {
                 continue;
             }
             QuicheSocketWrapper wrapper = stream.getSocketWrapper();
-            if (wrapper != null && wrapper.hasReadWaiter() &&
-                    QuicheBindings.quiche_conn_stream_readable(conn.getConn(), id)) {
-                wrapper.signalReadWaiter();
+            if (wrapper == null || wrapper.isClosed()) {
+                conn.removeReadInterestRearm(stream);
+                continue;
             }
+            if (!stream.compareAndSetProcessing(false, true)) {
+                continue;
+            }
+            stream.clearReadInterest();
+            conn.removeReadInterestRearm(stream);
+            dispatchToExecutor(wrapper, stream, SocketEvent.OPEN_READ, true);
+        }
+    }
+
+
+    /*
+     * Level-trigger replay for bidirectional streams that still have data
+     * buffered after a bounded per-call drain. The readable edge is consumed
+     * by the readable_next pop, and a handler that read its buffer full and
+     * returned without latching async interest would otherwise wait for a new
+     * network edge even though bytes are already available.
+     */
+    private void rearmBufferedBidiReads(QuicheConnectionWrapper conn) {
+        if (conn.isClosed() || conn.isFreed()) {
+            return;
+        }
+        int guard = 0;
+        boolean exhausted = false;
+        for (QuicheStreamWrapper stream : conn.getStreams().values()) {
+            if (guard++ >= SWEEP_BUDGET) {
+                exhausted = true;
+                break;
+            }
+            long id = stream.getStreamId();
+            if ((id & 0x03) != 0 || stream.isFreed() || stream.isDeregistered()) {
+                continue;
+            }
+            QuicheSocketWrapper wrapper = stream.getSocketWrapper();
+            if (wrapper == null || wrapper.isClosed()) {
+                continue;
+            }
+            if (!QuicheBindings.quiche_conn_stream_readable(conn.getConn(), id)) {
+                continue;
+            }
+            if (!stream.compareAndSetProcessing(false, true)) {
+                continue;
+            }
+            dispatchToExecutor(wrapper, stream, SocketEvent.OPEN_READ, true);
+        }
+        if (exhausted) {
+            // More streams were not examined (the map is larger than the
+            // budget); schedule another pass instead of waiting for an
+            // unrelated event to re-drive this connection.
+            sweepRetryConns.add(conn);
         }
     }
 
@@ -3363,9 +3563,18 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             if ((id & 0x02) != 0) {
                 continue;
             }
+            if (stream.isDeregistered() || stream.isFreed()) {
+                // A late registerWriteInterest() can add the entry after
+                // setDeregistered() released it; nothing else ever clears it.
+                conn.removeWriteRearm(stream);
+                continue;
+            }
             boolean latched = stream.hasWriteInterest();
             QuicheSocketWrapper wrapper = stream.getSocketWrapper();
             if (wrapper == null) {
+                // setDeregistered() already cleared the back-pointer, so this
+                // entry can never be served (and has no waiter to notify).
+                conn.removeWriteRearm(stream);
                 continue;
             }
             boolean parked = wrapper.hasWriteWaiter() && wrapper.hasBufferedWrites();
@@ -3538,7 +3747,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         QuicheStreamWrapper stream = conn.getStreams().computeIfAbsent(
                 Long.valueOf(streamId),
                 id -> new QuicheStreamWrapper(id.longValue(), conn,
-                        ByteBuffer.allocate(readBufferSize)));
+                        ByteBuffer.allocate(STREAM_PRE_READ_BUFFER_SIZE)));
         if (stream.isFreed() || stream.isDeregistered()) {
             return;
         }
@@ -3670,8 +3879,10 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 // the same index would spin the loop.
                 break;
             }
+            // Server-initiated unidirectional streams are write-only; do not
+            // allocate a read buffer that is never used.
             QuicheStreamWrapper stream = new QuicheStreamWrapper(streamId, conn,
-                    ByteBuffer.allocate(readBufferSize));
+                    ByteBuffer.allocate(0));
             conn.registerServerUniStream(index, stream);
             conn.getStreams().put(Long.valueOf(streamId), stream);
 
@@ -3771,7 +3982,9 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 return UniStreamWriteResult.DONE;
             }
             if (written == QuicheBindings.QUICHE_ERR_FLOW_CONTROL ||
-                    written == QuicheBindings.QUICHE_ERR_DONE || written == 0) {
+                    written == QuicheBindings.QUICHE_ERR_DONE ||
+                    written == QuicheBindings.QUICHE_ERR_STREAM_LIMIT ||
+                    written == 0) {
                 return UniStreamWriteResult.RETRY;
             }
             log.warn(sm.getString("quicheEndpoint.serverUniStreamWriteFailed",
@@ -3830,6 +4043,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                         state.getLastProcessedStreamId());
             }
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             if (log.isDebugEnabled()) {
                 log.debug("Error sending stream limit notification", t);
             }
@@ -3973,7 +4187,22 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         boolean carry = false;
         int carryLen = 0;
         boolean retryNeeded = false;
+        boolean stopSend = false;
+        int packetBudget = 64;
         while (true) {
+            if (--packetBudget < 0) {
+                // Yield back to the poll loop so incoming ACKs/MAX_DATA are
+                // processed; no single connection may monopolise the
+                // transport thread with a large send burst. A carried packet
+                // left quiche's queue already, so park it before yielding.
+                if (carry && pending != null) {
+                    enqueuePendingCarry(pending, carryLen, fallbackTo, fallbackToLen);
+                }
+                return true;
+            }
+            if (stopSend) {
+                return retryNeeded;
+            }
             int n0;
             if (carry) {
                 MemorySegment.copy(batchSlots, (long) GSO_MAX_BATCH * SEND_BUFFER_SIZE,
@@ -3990,12 +4219,17 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 }
                 if (n < 0) {
                     // Defensive: BUFFER_TOO_SHORT cannot occur while the bufLen
-                    // invariant above holds; any other negative is terminal for
-                    // this pass and retried next iteration (no storm: quiche
-                    // keeps the output queued and re-drives on recv/timer).
-                    if (log.isDebugEnabled()) {
+                    // invariant above holds. Any other negative is a send-side
+                    // failure: surface it instead of silently retrying until
+                    // the idle timeout. The binding records a local error for
+                    // real failures; noteConnectionError() logs and tears the
+                    // connection down in that case.
+                    if (conn != null) {
+                        noteConnectionError(conn, n, "send");
+                    } else if (log.isDebugEnabled()) {
                         log.debug("quiche_conn_send error " + n);
                     }
+                    retryNeeded = true;
                     break;
                 }
                 n0 = (int) n;
@@ -4011,6 +4245,9 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 to = fallbackTo;
                 useLen = fallbackToLen;
             } else {
+                log.warn(sm.getString("quicheEndpoint.sendNoDestination",
+                        conn == null ? "unknown" :
+                                Long.toHexString(conn.getConnAddress())));
                 continue;
             }
             int fromLen = sendInfo.get(ValueLayout.JAVA_INT, QuicheBindings.SEND_INFO_FROM_LEN);
@@ -4036,7 +4273,16 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 if (nk <= 0) {
                     // DONE or error: the batch stands; the next round's head
                     // pull reports it again (cheap - quiche's queue did not
-                    // move).
+                    // move). A real error must not be swallowed here either.
+                    if (nk < 0 && nk != QuicheBindings.QUICHE_ERR_DONE) {
+                        retryNeeded = true;
+                        stopSend = true;
+                        if (conn != null) {
+                            noteConnectionError(conn, nk, "send");
+                        } else if (log.isDebugEnabled()) {
+                            log.debug("quiche_conn_send error " + nk);
+                        }
+                    }
                     break;
                 }
                 if (!sameSendDest(sendInfo, sendInfoK)) {
@@ -4284,7 +4530,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      * analogue of the OpenSSL EC/ECD handling).
      */
     private void noteConnectionError(QuicheConnectionWrapper conn, long rc, String where) {
-        boolean isApp;
+        boolean hasError;
         long code;
         String reasonText;
         try (Arena localArena = Arena.ofConfined()) {
@@ -4292,9 +4538,11 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             MemorySegment codeSeg = localArena.allocate(ValueLayout.JAVA_LONG);
             MemorySegment reasonSeg = localArena.allocate(ValueLayout.ADDRESS);
             MemorySegment reasonLenSeg = localArena.allocate(ValueLayout.JAVA_LONG);
-            isApp = QuicheBindings.quiche_conn_local_error(conn.getConn(), isAppSeg,
+            // The binding return value means "a local error is recorded";
+            // the is_app distinction is the out-parameter.
+            hasError = QuicheBindings.quiche_conn_local_error(conn.getConn(), isAppSeg,
                     codeSeg, reasonSeg, reasonLenSeg);
-            if (!isApp) {
+            if (!hasError) {
                 // No local error (e.g. a transient recv parse rejection):
                 // log and let the normal close detection decide.
                 if (log.isDebugEnabled()) {
@@ -4363,6 +4611,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                         readReason(reasonSeg, reasonLenSeg)));
             }
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             if (log.isDebugEnabled()) {
                 log.debug("Error reading peer connection error", t);
             }
@@ -4618,6 +4867,13 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         }
         Runnable dispatch = () -> runStreamDispatch(wrapper, stream, conn, event, true);
         java.util.concurrent.Executor executor = conn != null ? getExecutor() : null;
+        if (executor != null && conn != null) {
+            // The active-handler reference above is now held by a queued
+            // task. If the executor is shut down with shutdownNow(), the
+            // task is discarded without running its finally block; the stop
+            // path balances this count (see discardQueuedDispatches()).
+            conn.incrQueuedDispatch();
+        }
         if (executor == null) {
             // No executor available (torn down by the shutdown, or a
             // connection-less stream). Inline processing is only safe on
@@ -4647,7 +4903,13 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             return;
         }
         try {
-            executor.execute(dispatch);
+            Runnable queued = () -> {
+                if (conn != null) {
+                    conn.decrQueuedDispatch();
+                }
+                dispatch.run();
+            };
+            executor.execute(queued);
         } catch (java.util.concurrent.RejectedExecutionException ree) {
             // A rejecting pool will never run the task; release the claim
             // and the active-handler count. Do NOT run inline (a full
@@ -4658,6 +4920,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             stream.clearProcessing();
             wakeClaimWaiters(stream, conn);
             if (conn != null) {
+                conn.decrQueuedDispatch();
                 conn.decrActiveHandlers();
                 if (!conn.isClosing() && !conn.isClosed()) {
                     failConnection(conn, getConnectionRejectErrorCode(),
@@ -4774,6 +5037,15 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
 
     /**
+     * A poll task that holds an active-handler reference from scheduling until
+     * it runs; the mailbox notifies it if a close/open discards it unrun.
+     */
+    private interface DiscardablePollTask extends Runnable,
+            QuicNativeMailbox.DiscardListener {
+    }
+
+
+    /**
      * @param abortIfDeregistered Whether the retry chain gives up once the
      *        stream has been deregistered (handler completion / teardown).
      *        Teardown's own terminal dispatches pass {@code false}: those
@@ -4802,7 +5074,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         // QuicheConnectionWrapper Cleaner (a bounded delay, not a
         // guaranteed stop-path free). Without this the count would stay
         // elevated forever on a wrapper the endpoint has already detached.
-        if (!submitConnPollTask(conn, new Runnable() {
+        if (!submitConnPollTask(conn, new DiscardablePollTask() {
             @Override
             public void run() {
                 // Register as a claim waiter before touching the claim, and
@@ -4856,6 +5128,18 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                             " after the claim budget - " + event +
                             " dispatch dropped");
                 }
+                finishStreamDispatch(conn);
+            }
+
+            @Override
+            public void onDiscard() {
+                // The mailbox was closed/opened while this attempt was still
+                // queued (a late handler submitted it after the stop drain).
+                // It never ran, so release the claim-waiter registration and
+                // the active-handler reference it owns; otherwise the count
+                // stays elevated and stopInternal() retains the connection
+                // forever.
+                stream.removeClaimWaiter(this);
                 finishStreamDispatch(conn);
             }
         })) {
@@ -4933,17 +5217,17 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
     // ------------------------------------- Socket Processor
 
     /*
-     * Currently unreached scaffolding: this processor is only ever created
-     * through AbstractEndpoint.processSocket() -> createSocketProcessor(),
-     * and no code path dispatches a QUIC wrapper through processSocket -
-     * both QUIC endpoints run their own dispatchToExecutor() ->
-     * executor.execute(lambda) path, so the claim/requeue/cache logic below
-     * has no production caller today. The override exists because
-     * AbstractEndpoint declares createSocketProcessor() abstract. Reason
-     * about dispatch from dispatchToExecutor()/runStreamDispatch(), not
-     * from this class. (The OpenSSL endpoint has the same unreached shape;
-     * the QuicOpenSSLEndpoint comments that cite QuicSocketProcessor.doRun()
-     * as a live path are stale in the same way.)
+     * Socket processor used for events that arrive through
+     * {@link AbstractEndpoint#processSocket}. The poll loop's own dispatches
+     * use {@code dispatchToExecutor()}, but async servlet completion,
+     * dispatch, error and timeout events from {@code AbstractProcessor}
+     * reach this class through
+     * {@code SocketWrapperBase.processSocket()} ->
+     * {@code AbstractEndpoint.processSocket()} ->
+     * {@code createSocketProcessor()}. It is therefore a live dispatch path
+     * and must keep the same claim, active-handler and requeue accounting as
+     * the poll-path dispatch. The OpenSSL endpoint's equivalent processor is
+     * live for the same reason.
      */
     private class QuicSocketProcessor extends SocketProcessorBase<QuicStream> {
 

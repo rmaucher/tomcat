@@ -910,6 +910,87 @@ public final class QuicheBindings {
         }
     }
 
+    /**
+     * {@code size_t quiche_conn_retired_scids(const quiche_conn *conn)}
+     */
+    static final MethodHandle quiche_conn_retired_scids$handle =
+            createHandle("quiche_conn_retired_scids",
+                    FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
+    /**
+     * {@code size_t quiche_conn_retired_scids(const quiche_conn *conn)}
+     */
+    static long quiche_conn_retired_scids(MemorySegment conn) {
+        try {
+            return (long) quiche_conn_retired_scids$handle.invokeExact(conn);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
+     * {@code quiche_connection_id_iter *quiche_conn_retired_scid_iter(
+     * quiche_conn *conn)}
+     */
+    static final MethodHandle quiche_conn_retired_scid_iter$handle =
+            createHandle("quiche_conn_retired_scid_iter",
+                    FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    /**
+     * {@code quiche_connection_id_iter *quiche_conn_retired_scid_iter(
+     * quiche_conn *conn)}
+     */
+    static MemorySegment quiche_conn_retired_scid_iter(MemorySegment conn) {
+        try {
+            return (MemorySegment) quiche_conn_retired_scid_iter$handle.invokeExact(conn);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
+     * {@code bool quiche_connection_id_iter_next(quiche_connection_id_iter
+     * *iter, const uint8_t **out, size_t *out_len)}
+     */
+    static final MethodHandle quiche_connection_id_iter_next$handle =
+            createHandle("quiche_connection_id_iter_next",
+                    FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    /**
+     * {@code bool quiche_connection_id_iter_next(quiche_connection_id_iter
+     * *iter, const uint8_t **out, size_t *out_len)}
+     */
+    static boolean quiche_connection_id_iter_next(MemorySegment iter,
+            MemorySegment out, MemorySegment outLen) {
+        try {
+            return (boolean) quiche_connection_id_iter_next$handle.invokeExact(iter,
+                    out, outLen);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
+     * {@code void quiche_connection_id_iter_free(
+     * quiche_connection_id_iter *iter)}
+     */
+    static final MethodHandle quiche_connection_id_iter_free$handle =
+            createHandle("quiche_connection_id_iter_free",
+                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+
+    /**
+     * {@code void quiche_connection_id_iter_free(
+     * quiche_connection_id_iter *iter)}
+     */
+    static void quiche_connection_id_iter_free(MemorySegment iter) {
+        try {
+            quiche_connection_id_iter_free$handle.invokeExact(iter);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
     // -------------------------------------------------- Stream I/O
 
     /**
@@ -1228,6 +1309,9 @@ public final class QuicheBindings {
     static final int AF_INET6 = 10;
     static final int SOCK_DGRAM = 2;
     static final int SOCK_NONBLOCK = 0x800;
+    // Linux SOCK_CLOEXEC == O_CLOEXEC. Every UDP socket is created with it so
+    // a child process cannot inherit the listener (and keep the port bound).
+    static final int SOCK_CLOEXEC = 0x80000;
 
     static final int MSG_DONTWAIT = 0x40;
 
@@ -1514,7 +1598,7 @@ public final class QuicheBindings {
     static final MethodHandle recvmmsg$handle = createLibcHandle("recvmmsg",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
                     ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
-                    ValueLayout.ADDRESS));
+                    ValueLayout.ADDRESS), false);
 
     /**
      * True when {@code recvmmsg} linked (it is missing from some libcs);
@@ -1824,10 +1908,10 @@ public final class QuicheBindings {
     static int fillSockaddr(MemorySegment sa, InetSocketAddress addr) {
         InetAddress a = addr.getAddress();
         int port = addr.getPort();
-        short portBE = (short) (((port & 0xFF) << 8) | ((port >> 8) & 0xFF));
         if (a instanceof Inet4Address) {
             sa.set(ValueLayout.JAVA_SHORT, 0, (short) AF_INET);
-            sa.set(ValueLayout.JAVA_SHORT, 2, portBE);
+            sa.set(ValueLayout.JAVA_BYTE, 2, (byte) ((port >> 8) & 0xFF));
+            sa.set(ValueLayout.JAVA_BYTE, 3, (byte) (port & 0xFF));
             byte[] bytes = a.getAddress();
             for (int i = 0; i < 4; i++) {
                 sa.set(ValueLayout.JAVA_BYTE, 4 + i, bytes[i]);
@@ -1835,7 +1919,8 @@ public final class QuicheBindings {
             return 16;
         }
         sa.set(ValueLayout.JAVA_SHORT, 0, (short) AF_INET6);
-        sa.set(ValueLayout.JAVA_SHORT, 2, portBE);
+        sa.set(ValueLayout.JAVA_BYTE, 2, (byte) ((port >> 8) & 0xFF));
+        sa.set(ValueLayout.JAVA_BYTE, 3, (byte) (port & 0xFF));
         sa.set(ValueLayout.JAVA_INT, 4, 0); // flowinfo
         byte[] bytes = a.getAddress();
         for (int i = 0; i < 16; i++) {
@@ -1863,8 +1948,8 @@ public final class QuicheBindings {
             return null;
         }
         short family = sa.get(ValueLayout.JAVA_SHORT, 0);
-        short portBE = sa.get(ValueLayout.JAVA_SHORT, 2);
-        int port = ((portBE & 0xFF) << 8) | ((portBE >> 8) & 0xFF);
+        int port = ((sa.get(ValueLayout.JAVA_BYTE, 2) & 0xFF) << 8) |
+                (sa.get(ValueLayout.JAVA_BYTE, 3) & 0xFF);
         if (family == AF_INET && len >= 16) {
             byte[] bytes = new byte[4];
             for (int i = 0; i < 4; i++) {
@@ -2037,9 +2122,21 @@ public final class QuicheBindings {
     }
 
     /**
-     * Creates a downcall handle for a libc symbol.
+     * Creates a downcall handle for a required libc symbol.
      */
     private static MethodHandle createLibcHandle(String symbol, FunctionDescriptor desc) {
+        return createLibcHandle(symbol, desc, true);
+    }
+
+
+    /**
+     * Creates a downcall handle for a libc symbol.
+     *
+     * @param required Whether a missing symbol makes the transport
+     *                 unavailable; optional symbols have a Java fallback
+     */
+    private static MethodHandle createLibcHandle(String symbol, FunctionDescriptor desc,
+            boolean required) {
         try {
             // The default lookup covers the platform libraries (libc).
             MemorySegment addr = Linker.nativeLinker().defaultLookup().find(symbol)
@@ -2049,7 +2146,9 @@ public final class QuicheBindings {
             return Linker.nativeLinker().downcallHandle(addr, desc);
         } catch (Throwable e) {
             // See createHandle(): the bind attempt is the availability probe.
-            MISSING_SYMBOLS.add(symbol);
+            if (required) {
+                MISSING_SYMBOLS.add(symbol);
+            }
             return null;
         }
     }
@@ -2104,9 +2203,9 @@ public final class QuicheBindings {
             int groSock = -1;
             int tx = -1;
             try {
-                plain = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-                groSock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-                tx = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+                plain = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                groSock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                tx = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                 if (plain >= 0 && groSock >= 0 && tx >= 0) {
                     MemorySegment saPlain = a.allocate(SOCKADDR_STORAGE_SIZE);
                     MemorySegment saGro = a.allocate(SOCKADDR_STORAGE_SIZE);

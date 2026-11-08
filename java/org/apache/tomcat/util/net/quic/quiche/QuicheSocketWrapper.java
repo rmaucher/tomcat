@@ -104,7 +104,7 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
      * {@code writeLock}: every mutation sits inside a write-path wrapper
      * method or inside the reset path that takes the same lock.
      */
-    private byte[] finTail;
+    private volatile byte[] finTail;
     private int finTailPos;
 
 
@@ -117,13 +117,13 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
     public QuicheSocketWrapper(QuicheStreamWrapper stream, QuicheEndpoint endpoint) {
         super(stream, endpoint);
         this.endpoint = endpoint;
-        // The write staging buffer is sized well above the 8 KiB
-        // application output buffer chunks: the real send buffer is the
-        // quiche transmit queue, so a larger staging buffer lets many
-        // framed chunks accumulate before one poll-thread hop is needed.
+        // The write staging buffer only feeds doWrite(), which forwards to the
+        // quiche transmit queue; matching the configured application write
+        // buffer avoids a per-request 64 KiB allocation for the common small
+        // response.
         this.socketBufferHandler = new SocketBufferHandler(
                 endpoint.getSocketProperties().getAppReadBufSize(),
-                Math.max(65536, endpoint.getSocketProperties().getAppWriteBufSize()),
+                Math.max(8192, endpoint.getSocketProperties().getAppWriteBufSize()),
                 false);
         QuicheConnectionWrapper conn = stream.getConnection();
         if (conn != null) {
@@ -259,7 +259,12 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
      * @return {@code true} if a flush would have something to send
      */
     boolean hasBufferedWrites() {
-        return !socketBufferHandler.isWriteBufferEmpty() || !nonBlockingWriteBuffer.isEmpty();
+        if (socketBufferHandler == null) {
+            // Closed stream: nothing can be written any more.
+            return false;
+        }
+        return finTail != null || !socketBufferHandler.isWriteBufferEmpty() ||
+                !nonBlockingWriteBuffer.isEmpty();
     }
 
 
@@ -287,6 +292,11 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
         readWaiter().set(self);
         try {
             pumpConnectionEvents();
+            // Arm the async read-interest latch as well: the contract says a
+            // false return still leaves read interest armed so a regular
+            // OPEN_READ is delivered when data arrives. awaitWritable() has
+            // always done the equivalent.
+            registerReadInterest();
             if (System.nanoTime() >= deadlineNanos) {
                 return false;
             }
@@ -743,6 +753,13 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
 
 
     private boolean flushNonBlockingLocked() throws IOException {
+        if (socketBufferHandler == null) {
+            // doClose() released the buffers; do not touch them and do not
+            // keep a FIN tail that can never be sent.
+            finTail = null;
+            finTailPos = 0;
+            return false;
+        }
         boolean dataLeft = !socketBufferHandler.isWriteBufferEmpty();
         if (dataLeft) {
             doWrite(false);
@@ -753,6 +770,21 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
             if (!dataLeft && !socketBufferHandler.isWriteBufferEmpty()) {
                 doWrite(false);
                 dataLeft = !socketBufferHandler.isWriteBufferEmpty();
+            }
+        }
+        if (!dataLeft && finTail != null) {
+            // A non-blocking flush must actually flush the held-back tail
+            // instead of reporting "nothing left" while the last <=128 bytes
+            // are still in Java. A blocking flush reaches the same state
+            // through doWrite(true); a streaming/asynchronous response that
+            // relies on flush would otherwise stall until the next write or
+            // the conclusion.
+            QuicheStreamWrapper stream = liveStream();
+            if (stream == null) {
+                finTail = null;
+                finTailPos = 0;
+            } else {
+                dataLeft = !releaseFinTail(stream, false, 0L);
             }
         }
         return dataLeft;
@@ -1136,11 +1168,21 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
 
     @Override
     public void registerReadInterest() {
-        // No-op on quiche. Readiness is owned by the transport: the poll
-        // loop's readable sweep (rearmReadWaiters) signals a parked waiter
-        // from quiche_conn_stream_readable directly, so there is no
-        // registration to make - unlike registerWriteInterest(), which
-        // latches a flag the writable sweep consults for buffered data.
+        QuicheStreamWrapper stream = getSocket();
+        if (stream != null && stream.setReadInterestIfAbsent()) {
+            // Latch async read interest so the readable sweep can deliver
+            // another OPEN_READ when the stream still has buffered data but
+            // no new network edge arrives (a large frame whose payload is
+            // drained in bounded chunks is the common case). Kick the loop
+            // once for the false->true transition so a stream that is already
+            // readable level-wise is serviced without waiting for new traffic.
+            QuicheConnectionWrapper conn = stream.getConnection();
+            conn.addReadInterestRearm(stream);
+            QuicheEndpoint ep = conn.getEndpoint();
+            if (ep != null) {
+                ep.kickPollLoop(conn);
+            }
+        }
     }
 
 
@@ -1152,6 +1194,14 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
             // connection's write re-arm index (re-arm sweep work set) before
             // the latch becomes observable to the writable sweep.
             stream.getConnection().addWriteRearm(stream);
+            if (stream.isDeregistered() || stream.isFreed()) {
+                // A close raced this registration (setDeregistered() clears
+                // the latch and releases once, but it may have done so before
+                // our add). Release our own unit after the add so the entry
+                // cannot survive on a stream that is no longer in the map.
+                stream.getConnection().removeWriteRearm(stream);
+                stream.clearWriteInterest();
+            }
         }
     }
 
@@ -1337,6 +1387,14 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
                     if (read) {
                         for (int i = 0; i < length; i++) {
                             int bytes = read(false, buffers[offset + i]);
+                            if (bytes < 0) {
+                                // EOF: treating it as would-block (0) would
+                                // re-run the operation or report no progress
+                                // forever instead of completing at end of
+                                // stream.
+                                completion.failed(new EOFException(), this);
+                                return;
+                            }
                             if (bytes > 0) {
                                 nBytes += bytes;
                             } else {

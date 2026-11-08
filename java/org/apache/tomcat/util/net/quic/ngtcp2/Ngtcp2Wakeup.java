@@ -44,16 +44,17 @@ import org.apache.tomcat.util.res.StringManager;
  * (the OpenSSL original cannot be shared: it lives in an FFM-gated transport
  * package and its libc downcalls route through the OpenSSL bindings, whose
  * initialization requires libssl). It keeps the same public surface, but its
- * libc downcalls are served by {@link Ngtcp2Bindings} so a machine running
- * only the ngtcp2 endpoint never needs libssl.
+ * libc downcalls are served by {@link Ngtcp2Bindings}. (The ngtcp2 transport
+ * itself still uses OpenSSL for TLS via {@code ngtcp2_crypto_ossl}; this class
+ * just avoids a dependency on the OpenSSL binding's libc handles.)
  * <p>
  * {@link #kick()} may be called from any thread. {@link #await(long)},
  * {@link #consumeWake()} and {@link #close()} are called only from the poll
  * thread (close also from the stop path after the poll loop has stopped).
  */
-final class QuicWakeup {
+final class Ngtcp2Wakeup {
 
-    private static final Log log = LogFactory.getLog(QuicWakeup.class);
+    private static final Log log = LogFactory.getLog(Ngtcp2Wakeup.class);
     private static final StringManager sm =
             StringManager.getManager(Ngtcp2Endpoint.class);
 
@@ -115,7 +116,7 @@ final class QuicWakeup {
      *
      * @throws IOException If the eventfd cannot be created
      */
-    QuicWakeup(int socketFd) throws IOException {
+    Ngtcp2Wakeup(int socketFd) throws IOException {
         this.arena = Arena.ofShared();
         int fd = Ngtcp2Bindings.eventfd(0,
                 Ngtcp2Bindings.EFD_NONBLOCK | Ngtcp2Bindings.EFD_CLOEXEC);

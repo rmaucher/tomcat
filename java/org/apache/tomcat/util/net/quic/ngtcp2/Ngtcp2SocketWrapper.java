@@ -105,7 +105,7 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
      * {@code writeLock}: every mutation sits inside a write-path wrapper
      * method or inside the reset path that takes the same lock.
      */
-    private byte[] finTail;
+    private volatile byte[] finTail;
     private int finTailPos;
 
 
@@ -261,7 +261,8 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
      * @return {@code true} if a flush would have something to send
      */
     boolean hasBufferedWrites() {
-        return !socketBufferHandler.isWriteBufferEmpty() || !nonBlockingWriteBuffer.isEmpty();
+        return finTail != null || !socketBufferHandler.isWriteBufferEmpty() ||
+                !nonBlockingWriteBuffer.isEmpty();
     }
 
 
@@ -289,6 +290,11 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
         readWaiter().set(self);
         try {
             pumpConnectionEvents();
+            // Arm the async read-interest latch as well: the contract says a
+            // false return still leaves read interest armed so a regular
+            // OPEN_READ is delivered when data arrives. awaitWritable() has
+            // always done the equivalent.
+            registerReadInterest();
             if (System.nanoTime() >= deadlineNanos) {
                 return false;
             }
@@ -757,6 +763,21 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
                 dataLeft = !socketBufferHandler.isWriteBufferEmpty();
             }
         }
+        if (!dataLeft && finTail != null) {
+            // A non-blocking flush must actually flush the held-back tail
+            // instead of reporting "nothing left" while the last <=128 bytes
+            // are still in Java. A blocking flush reaches the same state
+            // through doWrite(true); a streaming/asynchronous response that
+            // relies on flush would otherwise stall until the next write or
+            // the conclusion.
+            Ngtcp2StreamWrapper stream = liveStream();
+            if (stream == null) {
+                finTail = null;
+                finTailPos = 0;
+            } else {
+                dataLeft = !releaseFinTail(stream, false, 0L);
+            }
+        }
         return dataLeft;
     }
 
@@ -990,7 +1011,7 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
             long capacity = Ngtcp2Bindings.ngtcp2_conn_stream_capacity(connPtr,
                     stream.getStreamId());
             if (capacity < 0) {
-                // Any negative ngtcp2_conn_stream_capacity - ngtcp2 0.30.0
+                // Any negative ngtcp2_conn_stream_capacity - ngtcp2 1.16
                 // returns StreamStopped (peer STOP_SENDING) or
                 // InvalidStreamState (stream collected / never created), and
                 // a future ngtcp2 could add others - means the stream can
@@ -1018,40 +1039,34 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
                 return -1;
             }
             int toSend = (int) Math.min(capacity, payloadLen);
-            try (Arena localArena = Arena.ofConfined()) {
-                MemorySegment dataSeg = localArena.allocate(toSend);
-                dataSeg.asByteBuffer().put(payload, fin ? 0 : off, toSend);
-                MemorySegment errPtr = localArena.allocate(ValueLayout.JAVA_LONG);
-                errPtr.set(ValueLayout.JAVA_LONG, 0, 0L);
-                long written = Ngtcp2Bindings.ngtcp2_conn_stream_send(connPtr,
-                        stream.getStreamId(), dataSeg, toSend, fin, errPtr);
-                if (written > 0) {
-                    return (int) written;
-                }
-                if (written == 0) {
-                    // ngtcp2 accepted nothing (it can report usable capacity
-                    // yet still take zero). Treat as would-block: a zero
-                    // return makes the callers - doWrite, concludeStream and
-                    // releaseFinTail - advance their positions by nothing
-                    // and busy-spin without waiting.
-                    return -1;
-                }
-                if (written == Ngtcp2Bindings.NGTCP2_ERR_FLOW_CONTROL ||
-                        written == Ngtcp2Bindings.NGTCP2_ERR_DONE) {
-                    return -1;
-                }
-                if (written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_RESET ||
-                        written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_STOPPED ||
-                        written == Ngtcp2Bindings.NGTCP2_ERR_INVALID_STREAM_STATE ||
-                        written == Ngtcp2Bindings.NGTCP2_ERR_FINAL_SIZE) {
-                    return WRITE_TERMINAL;
-                }
-                if (Ngtcp2Bindings.ngtcp2_conn_is_closed(connPtr) ||
-                        conn.isClosed() || conn.isFreed()) {
-                    return WRITE_TERMINAL;
-                }
+            long written = Ngtcp2Bindings.ngtcp2_conn_stream_send(connPtr,
+                    stream.getStreamId(), payload, fin ? 0 : off, toSend, fin);
+            if (written > 0) {
+                return (int) written;
+            }
+            if (written == 0) {
+                // ngtcp2 accepted nothing (it can report usable capacity
+                // yet still take zero). Treat as would-block: a zero
+                // return makes the callers - doWrite, concludeStream and
+                // releaseFinTail - advance their positions by nothing
+                // and busy-spin without waiting.
                 return -1;
             }
+            if (written == Ngtcp2Bindings.NGTCP2_ERR_FLOW_CONTROL ||
+                    written == Ngtcp2Bindings.NGTCP2_ERR_DONE) {
+                return -1;
+            }
+            if (written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_RESET ||
+                    written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_STOPPED ||
+                    written == Ngtcp2Bindings.NGTCP2_ERR_INVALID_STREAM_STATE ||
+                    written == Ngtcp2Bindings.NGTCP2_ERR_FINAL_SIZE) {
+                return WRITE_TERMINAL;
+            }
+            if (Ngtcp2Bindings.ngtcp2_conn_is_closed(connPtr) ||
+                    conn.isClosed() || conn.isFreed()) {
+                return WRITE_TERMINAL;
+            }
+            return -1;
         });
     }
 
@@ -1113,20 +1128,12 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
             if (conn == null || conn.isFreed()) {
                 return;
             }
-            try (Arena localArena = Arena.ofConfined()) {
-                if (!sent) {
-                    // Zero-length send with fin=true. Pass a one-byte
-                    // allocation so the buffer pointer is never NULL.
-                    MemorySegment buf = localArena.allocate(1);
-                    MemorySegment errPtr = localArena.allocate(ValueLayout.JAVA_LONG);
-                    errPtr.set(ValueLayout.JAVA_LONG, 0, 0L);
-                    long rc = Ngtcp2Bindings.ngtcp2_conn_stream_send(conn.getConn(),
-                            stream.getStreamId(), buf, 0, true, errPtr);
-                    if (rc < 0 && log.isDebugEnabled()) {
-                        log.debug("concludeStream: stream_send(fin) rc=" + rc +
-                                " err=" + errPtr.get(ValueLayout.JAVA_LONG, 0) +
-                                " on stream " + stream.getStreamId());
-                    }
+            if (!sent) {
+                long rc = Ngtcp2Bindings.ngtcp2_conn_stream_send(conn.getConn(),
+                        stream.getStreamId(), null, 0, 0, true);
+                if (rc < 0 && log.isDebugEnabled()) {
+                    log.debug("concludeStream: stream_send(fin) rc=" + rc +
+                            " on stream " + stream.getStreamId());
                 }
             }
             endpoint.flushConnectionOnce(conn);
@@ -1157,6 +1164,14 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
             // connection's write re-arm index (re-arm sweep work set) before
             // the latch becomes observable to the writable sweep.
             stream.getConnection().addWriteRearm(stream);
+            if (stream.isDeregistered() || stream.isFreed()) {
+                // A close raced this registration (setDeregistered() clears
+                // the latch and releases once, but it may have done so before
+                // our add). Release our own unit after the add so the entry
+                // cannot survive on a stream that is no longer in the map.
+                stream.getConnection().removeWriteRearm(stream);
+                stream.clearWriteInterest();
+            }
         }
     }
 
@@ -1342,6 +1357,14 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
                     if (read) {
                         for (int i = 0; i < length; i++) {
                             int bytes = read(false, buffers[offset + i]);
+                            if (bytes < 0) {
+                                // EOF: treating it as would-block (0) would
+                                // re-run the operation or report no progress
+                                // forever instead of completing at end of
+                                // stream.
+                                completion.failed(new EOFException(), this);
+                                return;
+                            }
                             if (bytes > 0) {
                                 nBytes += bytes;
                             } else {
@@ -1399,11 +1422,10 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
 
     /**
      * SSLSupport implementation for QUIC streams on the ngtcp2 transport.
-     * ngtcp2 exposes none of the per-connection TLS details (cipher suite,
-     * session id, peer chain) through its C API, so those report
-     * "unavailable" ({@code null}), which is what
-     * {@code QuicOpenSSLSocketWrapper}'s support does for its unknowns.
-     * QUIC always runs over TLS 1.3 (RFC 9001 Section 4.2).
+     * The negotiated cipher suite and TLS session ID are read from the
+     * connection's OpenSSL {@code SSL} object (on the poll thread); the peer
+     * certificate chain is empty because the endpoint never requests a client
+     * certificate. QUIC always runs over TLS 1.3 (RFC 9001 Section 4.2).
      */
     private static class Ngtcp2SSLSupport implements SSLSupport {
         private final Ngtcp2SocketWrapper wrapper;
@@ -1418,22 +1440,33 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
                 return MemorySegment.NULL;
             }
             Ngtcp2ConnectionWrapper conn = stream.getConnection();
-            return conn == null ? MemorySegment.NULL : conn.getSsl();
+            if (conn == null || conn.isClosed() || conn.isFreed()) {
+                return MemorySegment.NULL;
+            }
+            return conn.getSsl();
         }
 
+        /*
+         * SSL access is confined to the endpoint's poll thread (the same
+         * contract as the rest of the native connection state), so both
+         * accessors hop there instead of touching OpenSSL on the worker
+         * thread servicing the request.
+         */
         @Override
         public String getCipherSuite() throws IOException {
-            MemorySegment ssl = ssl();
-            if (ssl.equals(MemorySegment.NULL)) {
-                return null;
-            }
-            MemorySegment cipher = openssl_h.SSL_get_current_cipher(ssl);
-            if (cipher.equals(MemorySegment.NULL)) {
-                return null;
-            }
-            MemorySegment name = openssl_h.SSL_CIPHER_get_name(cipher);
-            return name.equals(MemorySegment.NULL) ? null :
-                    name.reinterpret(128).getString(0);
+            return wrapper.onPollThread(() -> {
+                MemorySegment ssl = ssl();
+                if (ssl.equals(MemorySegment.NULL)) {
+                    return null;
+                }
+                MemorySegment cipher = openssl_h.SSL_get_current_cipher(ssl);
+                if (cipher.equals(MemorySegment.NULL)) {
+                    return null;
+                }
+                MemorySegment name = openssl_h.SSL_CIPHER_get_name(cipher);
+                return name.equals(MemorySegment.NULL) ? null :
+                        name.reinterpret(128).getString(0);
+            });
         }
 
         @Override
@@ -1444,29 +1477,31 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
 
         @Override
         public String getSessionId() throws IOException {
-            MemorySegment ssl = ssl();
-            if (ssl.equals(MemorySegment.NULL)) {
-                return null;
-            }
-            MemorySegment session = openssl_h.SSL_get_session(ssl);
-            if (session.equals(MemorySegment.NULL)) {
-                return null;
-            }
-            try (Arena arena = Arena.ofConfined()) {
-                MemorySegment len = arena.allocate(ValueLayout.JAVA_INT);
-                len.set(ValueLayout.JAVA_INT, 0, 0);
-                MemorySegment id = openssl_h.SSL_SESSION_get_id(session, len);
-                int n = len.get(ValueLayout.JAVA_INT, 0);
-                if (id.equals(MemorySegment.NULL) || n <= 0) {
-                    return "";
+            return wrapper.onPollThread(() -> {
+                MemorySegment ssl = ssl();
+                if (ssl.equals(MemorySegment.NULL)) {
+                    return null;
                 }
-                byte[] bytes = id.reinterpret(n).toArray(ValueLayout.JAVA_BYTE);
-                StringBuilder sb = new StringBuilder(n * 2);
-                for (byte b : bytes) {
-                    sb.append(String.format("%02X", Byte.valueOf(b)));
+                MemorySegment session = openssl_h.SSL_get_session(ssl);
+                if (session.equals(MemorySegment.NULL)) {
+                    return null;
                 }
-                return sb.toString();
-            }
+                try (Arena arena = Arena.ofConfined()) {
+                    MemorySegment len = arena.allocate(ValueLayout.JAVA_INT);
+                    len.set(ValueLayout.JAVA_INT, 0, 0);
+                    MemorySegment id = openssl_h.SSL_SESSION_get_id(session, len);
+                    int n = len.get(ValueLayout.JAVA_INT, 0);
+                    if (id.equals(MemorySegment.NULL) || n <= 0) {
+                        return "";
+                    }
+                    byte[] bytes = id.reinterpret(n).toArray(ValueLayout.JAVA_BYTE);
+                    StringBuilder sb = new StringBuilder(n * 2);
+                    for (byte b : bytes) {
+                        sb.append(String.format("%02X", Byte.valueOf(b)));
+                    }
+                    return sb.toString();
+                }
+            });
         }
 
         @Override

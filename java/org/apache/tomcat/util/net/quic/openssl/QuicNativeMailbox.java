@@ -25,7 +25,7 @@ import org.apache.tomcat.util.res.StringManager;
 
 /**
  * OpenSSL endpoint specialization of the shared poll-task mailbox
- * ({@code org.apache.tomcat.util.net.quic.QuicNativeMailbox}), adding the two
+ * ({@code org.apache.tomcat.util.net.quic.QuicNativeMailbox}), adding three
  * work queues that cross the endpoint's poll-thread confinement boundary
  * beside the base poll-task queue:
  * <ul>
@@ -41,7 +41,7 @@ import org.apache.tomcat.util.res.StringManager;
  * QUIC objects are single-threaded by default and the poll thread drives
  * the shared engine).</li>
  * </ul>
- * The two extra drains perform native work and must run on the poll thread
+ * The extra drains perform native work and must run on the poll thread
  * (or on the stop thread once the poll loop has stopped); the confinement
  * check inherited from the base is applied to each so a future mis-threading
  * is caught under {@code -ea}.

@@ -420,6 +420,31 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
+    public void testConnectHostHeaderDoesNotReplaceAuthority() throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 4.4 requires the :authority pseudo-header for
+        // CONNECT; a Host field is not a substitute.
+        ClientOutput output = rawRequest(":method", "CONNECT",
+                "host", "127.0.0.1:" + port);
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testConnectAuthorityWithoutPortRejected() throws Exception {
+        startHttp3Server();
+
+        // CONNECT uses the authority-form, which includes the port.
+        ClientOutput output = rawRequest(":method", "CONNECT",
+                ":authority", "127.0.0.1");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
     public void testConnectNotImplemented() throws Exception {
         startHttp3Server();
 
@@ -652,6 +677,34 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testTrailerFieldsReadyAfterContentLengthBodyWithoutTrailers()
+            throws Exception {
+        startHttp3Server(this::addTrailerEchoServlet);
+
+        // A content-length body with no trailer section must still observe
+        // the stream end: readAllBytes() has to consume the FIN before
+        // isTrailerFieldsReady() can report ready for the (empty) trailer
+        // map. Before the fix the pre-dispatch reader marked the body
+        // complete and doRead() returned -1 without reading the FIN, so the
+        // servlet's getTrailerFields() threw IllegalStateException.
+        String initial = buildFieldSection(":method", "POST", ":scheme",
+                "https", ":authority", "127.0.0.1:" + port, ":path",
+                "/trailerecho", "content-length", "5");
+        ClientOutput output = runClient(
+                rawCommandWith("--headers", initial,
+                        "--data", Base64.getEncoder().encodeToString(
+                                "body!".getBytes(StandardCharsets.UTF_8))),
+                CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertTrue("Expected ready=true in:\n" +
+                response.getBodyAsString(),
+                response.getBodyAsString().contains("ready=true"));
     }
 
 

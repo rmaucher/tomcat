@@ -180,7 +180,10 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
         try {
             return (QuicEndpoint<?>) Class.forName(endpointClassName)
                     .getConstructor().newInstance();
-        } catch (Exception e) {
+        } catch (Exception | LinkageError e) {
+            // A present but incompatible FFM class fails during linking or
+            // static initialisation with an Error, not an Exception; report
+            // it with the same actionable message and endpoint class name.
             throw new IllegalStateException(sm.getString(
                     "http3Protocol.noQuicEndpointImplementation",
                     endpointClassName), e);

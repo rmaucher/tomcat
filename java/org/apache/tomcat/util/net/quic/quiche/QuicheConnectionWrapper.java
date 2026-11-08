@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.net.quic.QuicConnection;
 import org.apache.tomcat.util.net.quic.QuicConnectionManager;
 import org.apache.tomcat.util.net.quic.QuicStream;
@@ -142,6 +143,15 @@ public class QuicheConnectionWrapper implements QuicConnection {
      * until this count reaches zero (see {@link #pendingFree}).
      */
     private final AtomicInteger activeHandlers = new AtomicInteger(0);
+
+    /**
+     * Active-handler references held by tasks that are queued in the executor
+     * but have not started yet. shutdownNow() discards such tasks without
+     * ever running their finally block; the stop path uses this count to
+     * balance those references instead of leaving the connection retained
+     * forever.
+     */
+    private final AtomicInteger queuedDispatches = new AtomicInteger(0);
 
     /**
      * Set when the poll thread wants to free this connection but must wait
@@ -315,6 +325,7 @@ public class QuicheConnectionWrapper implements QuicConnection {
             try {
                 result = endpoint.callOnPollThread(this, this::readSniHostNameCached);
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 // The poll thread is not (or no longer) reachable: the SNI
                 // host name is not critical, report "no SNI".
                 result = "";
@@ -374,18 +385,6 @@ public class QuicheConnectionWrapper implements QuicConnection {
 
 
     /**
-     * Caches the SNI host name. Called on the poll thread during connection
-     * setup so that worker threads never need to read the value from the
-     * native connection.
-     *
-     * @param sniHostName The SNI host name (empty string if none)
-     */
-    public void setSniHostName(String sniHostName) {
-        this.sniHostName = sniHostName;
-    }
-
-
-    /**
      * Fails this QUIC connection with the given application protocol error
      * (for HTTP/3, RFC 9114 Section 8): the connection is terminated with a
      * QUIC {@code CONNECTION_CLOSE} frame carrying the error code.
@@ -413,6 +412,7 @@ public class QuicheConnectionWrapper implements QuicConnection {
                 return null;
             });
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             // The hop did not run (or did not complete in time). Mark the
             // close JVM-side and wake the loop: its teardown sweep picks up
             // closed connections that are still registered and releases
@@ -686,6 +686,31 @@ public class QuicheConnectionWrapper implements QuicConnection {
 
 
     /**
+     * Per-stream async read-interest latches waiting for the readable sweep.
+     * A handler that registered read interest may still have buffered data
+     * in quiche after the readable edge was consumed; the sweep uses this
+     * index to deliver another OPEN_READ without waiting for new network
+     * traffic.
+     */
+    private final Set<QuicheStreamWrapper> readInterestRearm =
+            ConcurrentHashMap.newKeySet();
+
+    void addReadInterestRearm(QuicheStreamWrapper stream) {
+        readInterestRearm.add(stream);
+    }
+
+
+    void removeReadInterestRearm(QuicheStreamWrapper stream) {
+        readInterestRearm.remove(stream);
+    }
+
+
+    Set<QuicheStreamWrapper> readInterestRearmStreams() {
+        return readInterestRearm;
+    }
+
+
+    /**
      * Records one unit of poll-thread write interest on a stream (a parked
      * blocking writer or a write-interest latch transition). Callers must pair
      * every call with a {@link #releaseWriteRearm(QuicheStreamWrapper)} and
@@ -704,6 +729,17 @@ public class QuicheConnectionWrapper implements QuicConnection {
     void releaseWriteRearm(QuicheStreamWrapper stream) {
         writeRearm.compute(stream, (k, v) ->
                 v == null || v.intValue() <= 1 ? null : Integer.valueOf(v.intValue() - 1));
+    }
+
+
+    /**
+     * Drops every write-interest unit recorded for a stream. Used when the
+     * stream is deregistered/freed and no later release can be expected.
+     *
+     * @param stream The stream to remove from the write re-arm index
+     */
+    void removeWriteRearm(QuicheStreamWrapper stream) {
+        writeRearm.remove(stream);
     }
 
 
@@ -775,6 +811,36 @@ public class QuicheConnectionWrapper implements QuicConnection {
 
 
     /**
+     * Records that a dispatch task carrying an active-handler reference was
+     * queued in the executor.
+     */
+    void incrQueuedDispatch() {
+        queuedDispatches.incrementAndGet();
+    }
+
+
+    /**
+     * Records that a queued dispatch task started running (or was rejected).
+     */
+    void decrQueuedDispatch() {
+        queuedDispatches.decrementAndGet();
+    }
+
+
+    /**
+     * Balances the active-handler references of dispatch tasks that the
+     * executor discarded during shutdownNow(). Called by the stop path after
+     * the executor has terminated.
+     */
+    void discardQueuedDispatches() {
+        int discarded = queuedDispatches.getAndSet(0);
+        if (discarded > 0) {
+            activeHandlers.addAndGet(-discarded);
+        }
+    }
+
+
+    /**
      * Marks this connection's free as pending, waiting for
      * {@link #activeHandlers} to reach zero.
      */
@@ -837,10 +903,12 @@ public class QuicheConnectionWrapper implements QuicConnection {
      * <p>
      * As required by the {@link QuicConnection#writeToStream} contract, the
      * buffer's position is advanced by exactly the number of accepted bytes.
-     * The write itself is atomic: the stream's writable capacity is checked
-     * and the send is only attempted when the whole buffer fits, so in
-     * practice the accepted count is either nothing (position unchanged, the
-     * caller retries with the same bytes) or everything.
+     * A known capacity is checked first: when it is non-negative and smaller
+     * than the buffer nothing is accepted and the caller retries with the
+     * same bytes. A negative capacity (a stream not created yet, or already
+     * gone/stopped) still attempts the native send, because quiche creates
+     * local streams lazily on the first send and only the send can tell a
+     * never-created stream from a collected one.
      *
      * @param stream The stream to write to
      * @param data   The data to write, from the buffer's current position to
@@ -864,43 +932,52 @@ public class QuicheConnectionWrapper implements QuicConnection {
             MemorySegment dataSeg = localArena.allocate(bytes.length);
             dataSeg.asByteBuffer().put(bytes);
             long capacity = QuicheBindings.quiche_conn_stream_capacity(conn, s.getStreamId());
-            if (capacity < 0) {
-                // Any negative quiche_conn_stream_capacity - StreamStopped
-                // (peer STOP_SENDING), InvalidStreamState (stream collected)
-                // or any error a future quiche adds to the negative range -
-                // means the stream can never accept these bytes: terminal
-                // write state. The whole-negative-range rule is deliberately
-                // the same one QuicheSocketWrapper.writeBytes() applies; when
-                // a quiche update adds a capacity error, revisit both sites
-                // together. Report the bytes as consumed so the caller drops
-                // its pending state instead of re-attempting the write on
-                // every poll iteration for the remaining lifetime of the
-                // connection.
-                data.position(startPos + bytes.length);
-                return bytes.length;
-            }
-            if (capacity < bytes.length) {
+            if (capacity >= 0 && capacity < bytes.length) {
                 // Nothing accepted: leave the buffer for a retry with the
                 // same bytes (per the interface contract).
                 data.position(startPos);
                 return 0;
             }
+            // A negative capacity is not necessarily terminal: a local
+            // server-initiated stream does not exist in quiche's map until
+            // its first stream_send() creates it (capacity then reports
+            // INVALID_STREAM_STATE). Attempt the send and classify the
+            // result: STREAM_LIMIT/FLOW_CONTROL/DONE are retryable, while
+            // STOPPED/RESET/INVALID_STREAM_STATE/FINAL_SIZE are terminal.
             MemorySegment errPtr = localArena.allocate(ValueLayout.JAVA_LONG);
             errPtr.set(ValueLayout.JAVA_LONG, 0, 0L);
             long written = QuicheBindings.quiche_conn_stream_send(conn, s.getStreamId(),
                     dataSeg, bytes.length, false, errPtr);
+            if (written > 0) {
+                int accepted = (int) Math.min(written, bytes.length);
+                data.position(startPos + accepted);
+                return accepted;
+            }
+            if (written == 0 ||
+                    written == QuicheBindings.QUICHE_ERR_FLOW_CONTROL ||
+                    written == QuicheBindings.QUICHE_ERR_DONE ||
+                    written == QuicheBindings.QUICHE_ERR_STREAM_LIMIT) {
+                // Nothing accepted but the stream may still take the data
+                // later: leave the buffer intact for a retry.
+                data.position(startPos);
+                return 0;
+            }
             if (written == QuicheBindings.QUICHE_ERR_STREAM_STOPPED ||
                     written == QuicheBindings.QUICHE_ERR_STREAM_RESET ||
                     written == QuicheBindings.QUICHE_ERR_INVALID_STREAM_STATE ||
                     written == QuicheBindings.QUICHE_ERR_FINAL_SIZE) {
                 // Terminal send error: same drop-and-report semantics as the
-                // terminal capacity path above.
+                // terminal capacity path.
                 data.position(startPos + bytes.length);
                 return bytes.length;
             }
-            int accepted = written > 0 ? (int) Math.min(written, bytes.length) : 0;
-            data.position(startPos + accepted);
-            return accepted;
+            if (isClosed() || isFreed()) {
+                data.position(startPos + bytes.length);
+                return bytes.length;
+            }
+            // Unknown error: treat as would-block and retry later.
+            data.position(startPos);
+            return 0;
         }
     }
 
@@ -989,15 +1066,26 @@ public class QuicheConnectionWrapper implements QuicConnection {
      * thread.
      */
     public void closeAllStreams() {
+        int discardedWaiters = 0;
         for (QuicheStreamWrapper stream : streams.values()) {
+            while (stream.pollClaimWaiter() != null) {
+                discardedWaiters++;
+            }
             stream.setDeregistered();
             stream.setFreed();
+        }
+        // A parked claim-retry waiter owns one active-handler reference. The
+        // connection is going away, so those waiters will never run; release
+        // their references here instead of retaining the connection forever.
+        if (discardedWaiters > 0) {
+            activeHandlers.addAndGet(-discardedWaiters);
         }
         streams.clear();
         serverUniStreams.clear();
         pendingReadDispatches.clear();
         pendingUniStreamDrains.clear();
         readRearm.clear();
+        readInterestRearm.clear();
         writeRearm.clear();
         // Packets still queued for a dead connection: their destination
         // ceases to exist with it.

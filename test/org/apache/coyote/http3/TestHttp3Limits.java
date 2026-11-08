@@ -462,6 +462,87 @@ public class TestHttp3Limits extends Http3TestBase {
         Assert.assertEquals(12L, parseGoawayIdentifier(
                 manager.getStreamLimitFrame(state, 1000)));
         Assert.assertEquals(12L, state.getLastSentGoawayId());
+
+        // Once a GOAWAY identifier has been sent, new streams at or above it
+        // must be rejected: a client is entitled to retry them on another
+        // connection. Streams below the identifier may still be accepted
+        // (the client will not retry them).
+        Assert.assertFalse("stream at GOAWAY identifier accepted",
+                state.canAcceptStream(12));
+        Assert.assertFalse("stream above GOAWAY identifier accepted",
+                state.canAcceptStream(16));
+        Assert.assertTrue("stream below GOAWAY identifier rejected",
+                state.canAcceptStream(8));
+
+        // Stream data can arrive out of order. The recorded processed ID is a
+        // high-water mark, so a later lower ID must not move the GOAWAY
+        // identifier backwards above an already-processed stream.
+        Http3ConnectionManager.ConnectionState outOfOrder =
+                new Http3ConnectionManager.ConnectionState(null);
+        outOfOrder.setLastProcessedStreamId(8);
+        outOfOrder.setLastProcessedStreamId(4);
+        Assert.assertEquals(8L, outOfOrder.getLastProcessedStreamId());
+        Assert.assertEquals(12L, parseGoawayIdentifier(
+                manager.getStreamLimitFrame(outOfOrder,
+                        outOfOrder.getLastProcessedStreamId())));
+    }
+
+
+    @Test
+    public void testMaxFieldSectionSizeZeroIsNotAbsent() throws Exception {
+        Http3Settings absent =
+                new Http3Settings(ByteBuffer.allocate(0));
+        Assert.assertEquals(-1L, absent.getMaxFieldSectionSize());
+
+        ByteBuffer payload = ByteBuffer.allocate(16);
+        Qpack.encodeQuicInteger(payload,
+                Constants.H3_SETTINGS_MAX_FIELD_SECTION_SIZE);
+        Qpack.encodeQuicInteger(payload, 0);
+        payload.flip();
+        Http3Settings zero = new Http3Settings(payload);
+        Assert.assertEquals(0L, zero.getMaxFieldSectionSize());
+    }
+
+
+    @Test
+    public void testSharedDecoderRequiresSetCapacityBeforeInsert()
+            throws Exception {
+        Http3ConnectionManager manager =
+                new Http3ConnectionManager(newHttp3Protocol());
+        QpackDecoder decoder = manager.getSharedDecoder();
+
+        // RFC 9204 Section 3.2.2: the initial dynamic table capacity is
+        // zero, so an insert before Set Dynamic Table Capacity must be a
+        // QPACK_ENCODER_STREAM_ERROR (entry larger than the capacity).
+        ByteBuffer instruction = ByteBuffer.allocate(32);
+        Qpack.encodeIrp(instruction, 0x40, 5, 1); // literal name, length 1
+        instruction.put((byte) 'x');
+        Qpack.encodeIrp(instruction, 0, 7, 1); // value, length 1
+        instruction.put((byte) 'y');
+        instruction.flip();
+        try {
+            decoder.processInstruction(instruction);
+            Assert.fail("Insert before Set Dynamic Table Capacity accepted");
+        } catch (QpackException expected) {
+            // Expected
+        }
+    }
+
+
+    @Test
+    public void testServerQpackEncoderStreamSendsNoInstructions()
+            throws Exception {
+        Http3ConnectionManager manager =
+                new Http3ConnectionManager(newHttp3Protocol());
+
+        // The server encoder never inserts into a dynamic table. In
+        // particular it must not send a Set Dynamic Table Capacity
+        // instruction when the peer advertised a maximum capacity of zero
+        // (the default); the stream carries only its type byte.
+        ByteBuffer init = manager.getServerUniStreamInitData(
+                Http3ConnectionManager.SERVER_STREAM_INDEX_QPACK_ENCODER);
+        Assert.assertEquals(1, init.remaining());
+        Assert.assertEquals(Constants.H3_STREAM_TYPE_QPACK_ENCODER, init.get());
     }
 
 

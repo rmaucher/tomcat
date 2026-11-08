@@ -78,7 +78,10 @@ final class Http3Settings {
         // flags, which only ever constrain a client's requests, not this
         // server's - are deliberately not retained.
         Long maxFieldSection = settings.remove(Constants.H3_SETTINGS_MAX_FIELD_SECTION_SIZE);
-        maxFieldSectionSize = maxFieldSection != null ? maxFieldSection : 0;
+        // -1 distinguishes "setting absent" (RFC 9114 Section 7.2.4.1 default
+        // of unlimited) from an explicit value of 0 (a zero-byte limit).
+        maxFieldSectionSize = maxFieldSection != null ?
+                maxFieldSection.longValue() : -1;
 
         // Per RFC 9114 Section 7.2.4.1, setting identifiers that were
         // defined in HTTP/2 where there is no corresponding HTTP/3 setting
@@ -110,7 +113,9 @@ final class Http3Settings {
 
     /**
      * The peer's SETTINGS_MAX_FIELD_SECTION_SIZE value (RFC 9114
-     * Section 4.2.2). Zero means the peer did not declare a limit.
+     * Section 4.2.2). A negative value means the peer did not declare a
+     * limit (the RFC default is unlimited); zero is an explicit zero-byte
+     * limit and must not be treated as absent.
      */
     long getMaxFieldSectionSize() {
         return maxFieldSectionSize;

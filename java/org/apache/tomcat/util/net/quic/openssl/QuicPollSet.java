@@ -46,8 +46,8 @@ import org.apache.tomcat.util.res.StringManager;
  * The native array is kept on a dedicated {@link Arena} per generation:
  * when the set outgrows the current capacity a larger array is allocated on
  * a fresh arena and the previous arena is closed, so no superseded array is
- * retained. Each item's own struct is released by
- * {@link QuicPollItem#dispose()} when the item leaves the set.
+ * retained. An item owns no native struct of its own: its struct is rewritten
+ * into this array by {@link #rebuild()} whenever it is dirty.
  * <p>
  * Copies into the native array are incremental: an item's struct is copied
  * by {@link #rebuild()} only when the item is new or its descriptor/events
@@ -74,7 +74,6 @@ public class QuicPollSet {
     private static final int INITIAL_CAPACITY = 64;
     private static final int GROWTH_INCREMENT = 32;
 
-    private static final long ITEM_SIZE = QuicPoll.itemSize();
     private static final long STRIDE = QuicPoll.stride();
 
     /**
@@ -129,7 +128,7 @@ public class QuicPollSet {
         this.capacity = INITIAL_CAPACITY;
         this.count = 0;
         this.arrayArena = Arena.ofShared();
-        this.nativeArray = arrayArena.allocate(ITEM_SIZE * capacity);
+        this.nativeArray = arrayArena.allocate(STRIDE * capacity);
         this.slots = new QuicPollItem[capacity];
         this.resultCountArena = Arena.ofShared();
         this.resultCountSegment = resultCountArena.allocate(ValueLayout.JAVA_LONG);
@@ -146,13 +145,13 @@ public class QuicPollSet {
         QuicPollItem previous = items.putIfAbsent(key, item);
         if (previous != null) {
             // Already present - update in place. The passed-in item is not
-            // used; release its native struct.
+            // used; drop its dirty flag via dispose().
             // This path must not be taken for a live stream item: the
             // want-events mask is managed cooperatively by the endpoint
             // (dispatchStreamEvent strips R/W, the processor re-arms them), so
             // overwriting it with a freshly-constructed mask loses the current
-            // interest, and disposing the caller's item leaves it with a null
-            // arena so its later setWantEvents() calls silently no-op. No call
+            // interest, and disposing the caller's item can make its later
+            // setWantEvents() calls ineffective. No call
             // site is expected to re-add a tracked address, but the add is
             // still interpreted below (the previous item is updated in place),
             // so a regression on this path would not fail loudly - the warning
@@ -176,8 +175,9 @@ public class QuicPollSet {
 
 
     /**
-     * Removes a poll item by SSL pointer address. The item's native struct
-     * is released.
+     * Removes a poll item by SSL pointer address. The item owns no native
+     * memory; {@link QuicPollItem#dispose()} is still called as the lifecycle
+     * hook.
      *
      * @param sslAddr The SSL pointer address
      *
@@ -370,7 +370,7 @@ public class QuicPollSet {
         int newCapacity = capacity + GROWTH_INCREMENT;
         Arena oldArena = arrayArena;
         arrayArena = Arena.ofShared();
-        nativeArray = arrayArena.allocate(ITEM_SIZE * newCapacity);
+        nativeArray = arrayArena.allocate(STRIDE * newCapacity);
         capacity = newCapacity;
         QuicPollItem[] newSlots = new QuicPollItem[capacity];
         System.arraycopy(slots, 0, newSlots, 0, count);

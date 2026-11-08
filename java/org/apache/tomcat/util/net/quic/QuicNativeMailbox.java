@@ -76,6 +76,23 @@ public class QuicNativeMailbox {
     private final Object submitLock = new Object();
 
     /**
+     * A queued task that holds a resource (for example an active-handler
+     * reference that must be balanced) which is not released by the garbage
+     * collector. {@link #discardPollTasks()} invokes {@link #onDiscard()} for
+     * such a task instead of dropping it silently, so a task discarded by
+     * {@link #close()} or {@link #open()} cannot leave its reference elevated
+     * forever.
+     */
+    public interface DiscardListener {
+
+        /**
+         * Releases whatever the discarded task owns. Called once, on the
+         * thread performing the discard, and never for a task that ran.
+         */
+        void onDiscard();
+    }
+
+    /**
      * Applied at the start of every drain with the operation name; asserts
      * the poll-thread (or stopped-poll-thread) confinement invariant. Used
      * by the drains of subclasses too.
@@ -176,10 +193,22 @@ public class QuicNativeMailbox {
 
 
     /**
-     * Drops all queued poll tasks without running them.
+     * Drops all queued poll tasks without running them. A task implementing
+     * {@link DiscardListener} is notified so the references it holds are
+     * balanced even though its body never runs.
      */
     public void discardPollTasks() {
-        pollTasks.clear();
+        Runnable task;
+        while ((task = pollTasks.poll()) != null) {
+            if (task instanceof DiscardListener) {
+                try {
+                    ((DiscardListener) task).onDiscard();
+                } catch (Throwable t) {
+                    ExceptionUtils.handleThrowable(t);
+                    log.warn(sm.getString("mailbox.pollTaskError"), t);
+                }
+            }
+        }
     }
 
 

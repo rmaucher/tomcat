@@ -16,6 +16,7 @@
  */
 package org.apache.coyote.http3;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -73,13 +74,10 @@ public class TestHttp3Psk extends Http3TestBase {
         try {
             Process process = new ProcessBuilder(OPENSSL, "s_client", "-help")
                     .redirectErrorStream(true).start();
-            String output = readOutput(process);
-            if (!process.waitFor(10, TimeUnit.SECONDS)) {
-                process.destroyForcibly();
-                return false;
-            }
-            return process.exitValue() == 0
-                    && output.contains("-quic") && output.contains("-psk");
+            ProcessResult result = runProcess(process, 10);
+            return result.exitCode() == 0
+                    && result.output().contains("-quic")
+                    && result.output().contains("-psk");
         } catch (IOException | InterruptedException e) {
             return false;
         }
@@ -224,19 +222,49 @@ public class TestHttp3Psk extends Http3TestBase {
         Process process = processBuilder.start();
         process.getOutputStream().close();
 
-        String output = readOutput(process);
-        if (!process.waitFor(CLIENT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-            process.destroyForcibly();
-            Assert.fail("s_client timed out, output:\n" + output);
-        }
-        return new ClientResult(process.exitValue(), output);
+        ProcessResult result = runProcess(process, CLIENT_TIMEOUT_SECONDS);
+        return new ClientResult(result.exitCode(), result.output());
     }
 
 
-    private static String readOutput(Process process) throws IOException {
-        try (InputStream in = process.getInputStream()) {
-            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+    /*
+     * Waits for the process while draining its output in a daemon thread. The
+     * previous implementation read stdout to EOF before calling waitFor(), so
+     * an s_client that stayed alive (for example after a deliberately failed
+     * handshake) blocked the test JVM forever instead of hitting the timeout.
+     */
+    private static ProcessResult runProcess(Process process, long timeoutSeconds)
+            throws IOException, InterruptedException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        Thread reader = new Thread(() -> {
+            try (InputStream in = process.getInputStream()) {
+                in.transferTo(output);
+            } catch (IOException ioe) {
+                // The process was destroyed or its pipe closed; the timeout
+                // result below is what the test needs.
+            }
+        }, "http3-psk-output-reader");
+        reader.setDaemon(true);
+        reader.start();
+
+        boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+        if (!finished) {
+            process.destroyForcibly();
+            process.waitFor(5, TimeUnit.SECONDS);
         }
+        reader.join(5000);
+
+        String text = new String(output.toByteArray(), StandardCharsets.UTF_8);
+        if (!finished) {
+            text = text + "\n[s_client timed out after " + timeoutSeconds +
+                    " seconds]";
+            return new ProcessResult(-1, text);
+        }
+        return new ProcessResult(process.exitValue(), text);
+    }
+
+
+    private record ProcessResult(int exitCode, String output) {
     }
 
 

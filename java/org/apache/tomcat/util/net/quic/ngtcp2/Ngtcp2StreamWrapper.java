@@ -29,9 +29,11 @@ import org.apache.tomcat.util.net.quic.QuicStream;
  * stream is identified by its QUIC stream ID and its native state lives
  * inside the parent {@code ngtcp2_conn}. There is therefore no per-stream
  * native lifetime, no stream Cleaner, and no stream-free ordering
- * constraint - "freeing" a stream here is pure bookkeeping (clearing the
+ * constraint - "freeing" a stream here is wrapper bookkeeping (clearing the
  * wrapper's state and removing it from the connection maps), which is what
- * {@link #setFreed()} does despite the name. The parent connection does
+ * {@link #setFreed()} does despite the name. The binding-side
+ * {@code Ngtcp2Bindings.StreamState} is discarded separately by
+ * {@code ngtcp2_conn_discard_stream()}. The parent connection does
  * have a native handle and a Cleaner (see
  * {@code Ngtcp2ConnectionWrapper.State}); that lifetime is owned by the
  * connection, not by any stream wrapper.

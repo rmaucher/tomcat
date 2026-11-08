@@ -144,6 +144,15 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
     private final AtomicInteger activeHandlers = new AtomicInteger(0);
 
     /**
+     * Active-handler references held by tasks that are queued in the executor
+     * but have not started yet. shutdownNow() discards such tasks without
+     * ever running their finally block; the stop path uses this count to
+     * balance those references instead of leaving the connection retained
+     * forever.
+     */
+    private final AtomicInteger queuedDispatches = new AtomicInteger(0);
+
+    /**
      * Set when the poll thread wants to free this connection but must wait
      * for {@link #activeHandlers} to reach zero. The worker that decrements
      * the count to zero clears this flag and schedules the free on the poll
@@ -376,18 +385,6 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
             return new String(bytes, java.nio.charset.StandardCharsets.US_ASCII)
                     .toLowerCase(Locale.ENGLISH);
         }
-    }
-
-
-    /**
-     * Caches the SNI host name. Called on the poll thread during connection
-     * setup so that worker threads never need to read the value from the
-     * native connection.
-     *
-     * @param sniHostName The SNI host name (empty string if none)
-     */
-    public void setSniHostName(String sniHostName) {
-        this.sniHostName = sniHostName;
     }
 
 
@@ -733,6 +730,17 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
 
 
     /**
+     * Drops every write-interest unit recorded for a stream. Used when the
+     * stream is deregistered/freed and no later release can be expected.
+     *
+     * @param stream The stream to remove from the write re-arm index
+     */
+    void removeWriteRearm(Ngtcp2StreamWrapper stream) {
+        writeRearm.remove(stream);
+    }
+
+
+    /**
      * Whether the writable re-arm has any stream to consider.
      *
      * @return {@code true} if at least one stream has a parked blocking writer
@@ -796,6 +804,36 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
      */
     public boolean hasActiveHandlers() {
         return activeHandlers.get() > 0;
+    }
+
+
+    /**
+     * Records that a dispatch task carrying an active-handler reference was
+     * queued in the executor.
+     */
+    void incrQueuedDispatch() {
+        queuedDispatches.incrementAndGet();
+    }
+
+
+    /**
+     * Records that a queued dispatch task started running (or was rejected).
+     */
+    void decrQueuedDispatch() {
+        queuedDispatches.decrementAndGet();
+    }
+
+
+    /**
+     * Balances the active-handler references of dispatch tasks that the
+     * executor discarded during shutdownNow(). Called by the stop path after
+     * the executor has terminated.
+     */
+    void discardQueuedDispatches() {
+        int discarded = queuedDispatches.getAndSet(0);
+        if (discarded > 0) {
+            activeHandlers.addAndGet(-discarded);
+        }
     }
 
 
@@ -885,48 +923,42 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
             return 0;
         }
         Ngtcp2StreamWrapper s = (Ngtcp2StreamWrapper) stream;
-        try (Arena localArena = Arena.ofConfined()) {
-            MemorySegment dataSeg = localArena.allocate(bytes.length);
-            dataSeg.asByteBuffer().put(bytes);
-            long capacity = Ngtcp2Bindings.ngtcp2_conn_stream_capacity(conn, s.getStreamId());
-            if (capacity < 0) {
-                // Any negative ngtcp2_conn_stream_capacity - StreamStopped
-                // (peer STOP_SENDING), InvalidStreamState (stream collected)
-                // or any error a future ngtcp2 adds to the negative range -
-                // means the stream can never accept these bytes: terminal
-                // write state. The whole-negative-range rule is deliberately
-                // the same one Ngtcp2SocketWrapper.writeBytes() applies; when
-                // a ngtcp2 update adds a capacity error, revisit both sites
-                // together. Report the bytes as consumed so the caller drops
-                // its pending state instead of re-attempting the write on
-                // every poll iteration for the remaining lifetime of the
-                // connection.
-                data.position(startPos + bytes.length);
-                return bytes.length;
-            }
-            if (capacity < bytes.length) {
-                // Nothing accepted: leave the buffer for a retry with the
-                // same bytes (per the interface contract).
-                data.position(startPos);
-                return 0;
-            }
-            MemorySegment errPtr = localArena.allocate(ValueLayout.JAVA_LONG);
-            errPtr.set(ValueLayout.JAVA_LONG, 0, 0L);
-            long written = Ngtcp2Bindings.ngtcp2_conn_stream_send(conn, s.getStreamId(),
-                    dataSeg, bytes.length, false, errPtr);
-            if (written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_STOPPED ||
-                    written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_RESET ||
-                    written == Ngtcp2Bindings.NGTCP2_ERR_INVALID_STREAM_STATE ||
-                    written == Ngtcp2Bindings.NGTCP2_ERR_FINAL_SIZE) {
-                // Terminal send error: same drop-and-report semantics as the
-                // terminal capacity path above.
-                data.position(startPos + bytes.length);
-                return bytes.length;
-            }
-            int accepted = written > 0 ? (int) Math.min(written, bytes.length) : 0;
-            data.position(startPos + accepted);
-            return accepted;
+        long capacity = Ngtcp2Bindings.ngtcp2_conn_stream_capacity(conn, s.getStreamId());
+        if (capacity < 0) {
+            // Any negative ngtcp2_conn_stream_capacity - StreamStopped
+            // (peer STOP_SENDING), InvalidStreamState (stream collected)
+            // or any error a future ngtcp2 adds to the negative range -
+            // means the stream can never accept these bytes: terminal
+            // write state. The whole-negative-range rule is deliberately
+            // the same one Ngtcp2SocketWrapper.writeBytes() applies; when
+            // a ngtcp2 update adds a capacity error, revisit both sites
+            // together. Report the bytes as consumed so the caller drops
+            // its pending state instead of re-attempting the write on
+            // every poll iteration for the remaining lifetime of the
+            // connection.
+            data.position(startPos + bytes.length);
+            return bytes.length;
         }
+        if (capacity < bytes.length) {
+            // Nothing accepted: leave the buffer for a retry with the
+            // same bytes (per the interface contract).
+            data.position(startPos);
+            return 0;
+        }
+        long written = Ngtcp2Bindings.ngtcp2_conn_stream_send(conn, s.getStreamId(),
+                bytes, 0, bytes.length, false);
+        if (written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_STOPPED ||
+                written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_RESET ||
+                written == Ngtcp2Bindings.NGTCP2_ERR_INVALID_STREAM_STATE ||
+                written == Ngtcp2Bindings.NGTCP2_ERR_FINAL_SIZE) {
+            // Terminal send error: same drop-and-report semantics as the
+            // terminal capacity path above.
+            data.position(startPos + bytes.length);
+            return bytes.length;
+        }
+        int accepted = written > 0 ? (int) Math.min(written, bytes.length) : 0;
+        data.position(startPos + accepted);
+        return accepted;
     }
 
 

@@ -26,9 +26,10 @@ import org.apache.tomcat.util.res.StringManager;
 /**
  * QPACK decoder per RFC 9204.
  * <p>
- * The decoder receives decoder instructions on the decoder stream and
- * decodes header blocks from request/response streams. Unlike HPACK,
- * QPACK uses out-of-band dynamic table management.
+ * The decoder receives encoder instructions on the encoder stream, emits
+ * decoder instructions on the decoder stream, and decodes header blocks from
+ * request/response streams. Unlike HPACK, QPACK uses out-of-band dynamic
+ * table management.
  */
 public class QpackDecoder {
 
@@ -802,8 +803,8 @@ public class QpackDecoder {
         Qpack.HeaderField entry = resolveIndexedEntry(index, isStatic);
         String name = entry.name;
         String value = entry.value != null ? entry.value : "";
-        if (log.isDebugEnabled()) {
-            log.debug("QPACK Indexed: name=" + name + " value=" + value);
+        if (log.isTraceEnabled()) {
+            log.trace("QPACK Indexed: name=" + name + " value=" + value);
         }
         emit(name, value, emitter);
     }
@@ -811,8 +812,8 @@ public class QpackDecoder {
 
     private void emitNameRefEntry(int index, boolean isStatic, String value, HeaderEmitter emitter) throws QpackException, Http3Exception {
         String name = resolveIndexedEntry(index, isStatic).name;
-        if (log.isDebugEnabled()) {
-            log.debug("QPACK NameRef: name=" + name + " value=" + value);
+        if (log.isTraceEnabled()) {
+            log.trace("QPACK NameRef: name=" + name + " value=" + value);
         }
         emit(name, value, emitter);
     }
@@ -832,8 +833,8 @@ public class QpackDecoder {
         Qpack.HeaderField entry = resolvePostBaseEntry(postBaseIndex);
         String name = entry.name;
         String value = entry.value != null ? entry.value : "";
-        if (log.isDebugEnabled()) {
-            log.debug("QPACK PostBase Indexed: name=" + name + " value=" + value);
+        if (log.isTraceEnabled()) {
+            log.trace("QPACK PostBase Indexed: name=" + name + " value=" + value);
         }
         emit(name, value, emitter);
     }
@@ -841,8 +842,8 @@ public class QpackDecoder {
 
     private void emitPostBaseNameRefEntry(int postBaseIndex, String value, HeaderEmitter emitter) throws QpackException, Http3Exception {
         String name = resolvePostBaseEntry(postBaseIndex).name;
-        if (log.isDebugEnabled()) {
-            log.debug("QPACK PostBase NameRef: name=" + name + " value=" + value);
+        if (log.isTraceEnabled()) {
+            log.trace("QPACK PostBase NameRef: name=" + name + " value=" + value);
         }
         emit(name, value, emitter);
     }
@@ -871,8 +872,8 @@ public class QpackDecoder {
                     Integer.valueOf(headerSize), Integer.valueOf(maxHeaderSize)),
                     Http3Error.H3_MESSAGE_ERROR);
         }
-        if (log.isDebugEnabled()) {
-            log.debug("QPACK emit: name=" + name + " value=" + value + " count=" + headerCount + " size=" + headerSize);
+        if (log.isTraceEnabled()) {
+            log.trace("QPACK emit: name=" + name + " value=" + value + " count=" + headerCount + " size=" + headerSize);
         }
         emitter.emitHeader(name, value);
     }

@@ -23,8 +23,8 @@ package org.apache.coyote.http3;
  * attribute to run on the ngtcp2 implementation provided by the FFM
  * bindings. The endpoint class is instantiated reflectively by name (it
  * lives in the FFM gated compilation pass); if the build lacks that pass
- * the connector fails to create. A loadable libngtcp2 (1.16 series) and
- * libngtcp2_crypto_ossl, backed by the system OpenSSL 3.5+ TLS stack, are
+ * the connector fails to create. A loadable libngtcp2 (1.16.x or 1.26.x)
+ * and libngtcp2_crypto_ossl, backed by the system OpenSSL 3.5+ TLS stack, are
  * required at run time; an unusable installation fails the connector at bind
  * time.
  */

@@ -55,8 +55,12 @@ import org.apache.tomcat.util.openssl.openssl_h;
  * and is the only place that knows about ngtcp2's callback-driven model and
  * native struct layouts.
  * <p>
- * Target ABI: ngtcp2 1.16.x. The layout constants below were generated from
- * the installed 1.16 headers. The runtime version is gated accordingly.
+ * Target ABI: ngtcp2 1.16.x and 1.26.x. The layout constants below were
+ * generated from the installed 1.16 headers. The 1.26 structs only append
+ * fields after the slices this binding passes to the versioned API
+ * (CALLBACKS_V2 and SETTINGS_V3), so the 1.16 offsets and the V2/V3 struct
+ * lengths remain valid; transport_params (V1) did not change size. The runtime
+ * version is gated accordingly.
  */
 public final class Ngtcp2Bindings {
 
@@ -84,20 +88,24 @@ public final class Ngtcp2Bindings {
     static final int NGTCP2_SHUTDOWN_WRITE = 1;
     static final long NGTCP2_TRANSPORT_CONNECTION_REFUSED = 0x02L;
 
+    // QUIC wire versions.
+    private static final int QUIC_V1 = 1;
+    private static final int QUIC_V2 = 0x6b3343cf;
+
     // Packet type values used by the endpoint's demux.
     static final int NGTCP2_PACKET_TYPE_INITIAL = 1;
     static final int NGTCP2_PACKET_TYPE_SHORT = 5;
 
     // Native error codes (ngtcp2 1.16).
+    static final int NGTCP2_ERR_STREAM_ID_BLOCKED = -206;
     private static final int NGTCP2_ERR_STREAM_DATA_BLOCKED = -208;
-    private static final int NGTCP2_ERR_CRYPTO = -213;
+    static final int NGTCP2_ERR_CRYPTO = -213;
     private static final int NGTCP2_ERR_STREAM_SHUT_WR = -219;
     private static final int NGTCP2_ERR_STREAM_NOT_FOUND = -220;
-    private static final int NGTCP2_ERR_CLOSING = -223;
-    private static final int NGTCP2_ERR_DRAINING = -224;
-    private static final int NGTCP2_ERR_WRITE_MORE = -230;
-    private static final int NGTCP2_ERR_RETRY = -231;
-    private static final int NGTCP2_ERR_DROP_CONN = -232;
+    static final int NGTCP2_ERR_CLOSING = -223;
+    static final int NGTCP2_ERR_DRAINING = -224;
+    static final int NGTCP2_ERR_RETRY = -231;
+    static final int NGTCP2_ERR_DROP_CONN = -232;
     private static final int NGTCP2_ERR_IDLE_CLOSE = -238;
     private static final int NGTCP2_ERR_CALLBACK_FAILURE = -502;
 
@@ -111,7 +119,7 @@ public final class Ngtcp2Bindings {
 
     // -------------------------------------------------- struct layouts
 
-    // ngtcp2_cid: uint8_t datalen; uint8_t data[20]; (32 bytes)
+    // ngtcp2_cid: size_t datalen; uint8_t data[20]; (32 bytes on LP64)
     private static final long CID_DATALEN = 0;
     private static final long CID_DATA = 8;
     private static final long CID_SIZE = 32;
@@ -169,6 +177,10 @@ public final class Ngtcp2Bindings {
     private static final long CCERR_SIZE = 40;
     private static final long CCERR_TYPE = 0;
     private static final long CCERR_ERROR_CODE = 8;
+    private static final long CCERR_REASON = 24;
+    private static final long CCERR_REASONLEN = 32;
+    private static final int CCERR_TYPE_TRANSPORT = 0;
+    private static final int CCERR_TYPE_APPLICATION = 1;
 
     private static final long CONN_REF_SIZE = 16;
     private static final long CONN_REF_GET_CONN = 0;
@@ -185,7 +197,7 @@ public final class Ngtcp2Bindings {
 
     private static final Set<String> MISSING_SYMBOLS = new LinkedHashSet<>();
     private static final boolean SYMBOLS_AVAILABLE;
-    static final boolean NGTCP2_AVAILABLE;
+    static boolean NGTCP2_AVAILABLE;
     static final String NGTCP2_VERSION;
     private static final int NGTCP2_VERSION_NUM;
     private static SymbolLookup NGTCP2_LOOKUP;
@@ -198,9 +210,6 @@ public final class Ngtcp2Bindings {
     private static final Map<Long, ConnState> TOKEN_STATES = new ConcurrentHashMap<>();
 
     private static final MemorySegment CALLBACKS = CB_ARENA.allocate(CALLBACKS_SIZE);
-
-    private static volatile long serverMaxStreams = 100;
-    private static volatile long serverIdleTimeoutMs = 30000;
 
     /*
      * The library lookup must be established before any of the MethodHandle
@@ -290,10 +299,6 @@ public final class Ngtcp2Bindings {
             "ngtcp2_conn_open_uni_stream",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, openssl_h.C_POINTER,
                     openssl_h.C_POINTER, openssl_h.C_POINTER));
-    private static final MethodHandle ngtcp2ConnShutdownStream$handle = createHandle(
-            "ngtcp2_conn_shutdown_stream",
-            FunctionDescriptor.of(ValueLayout.JAVA_INT, openssl_h.C_POINTER,
-                    ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
     private static final MethodHandle ngtcp2ConnShutdownWrite$handle = createHandle(
             "ngtcp2_conn_shutdown_stream_write",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, openssl_h.C_POINTER,
@@ -334,14 +339,11 @@ public final class Ngtcp2Bindings {
             "ngtcp2_conn_extend_max_stream_offset",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, openssl_h.C_POINTER,
                     ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
-    private static final MethodHandle ngtcp2ConnStreamsUniLeft$handle = createHandle(
-            "ngtcp2_conn_get_streams_uni_left",
-            FunctionDescriptor.of(ValueLayout.JAVA_LONG, openssl_h.C_POINTER));
-    private static final MethodHandle ngtcp2ConnGetLocalParams$handle = createHandle(
-            "ngtcp2_conn_get_local_transport_params",
-            FunctionDescriptor.of(openssl_h.C_POINTER, openssl_h.C_POINTER));
     private static final MethodHandle ngtcp2Version$handle = createHandle(
             "ngtcp2_version", FunctionDescriptor.of(openssl_h.C_POINTER, ValueLayout.JAVA_INT));
+    private static final MethodHandle ngtcp2ErrInferTransport$handle = createHandle(
+            "ngtcp2_err_infer_quic_transport_error_code",
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
     private static final MethodHandle ngtcp2Strerror$handle = createHandle(
             "ngtcp2_strerror", FunctionDescriptor.of(openssl_h.C_POINTER, ValueLayout.JAVA_INT));
     private static final MethodHandle ngtcp2PktDecodeVersionCid$handle = createHandle(
@@ -355,6 +357,9 @@ public final class Ngtcp2Bindings {
                     ValueLayout.JAVA_LONG, openssl_h.C_POINTER, ValueLayout.JAVA_LONG,
                     openssl_h.C_POINTER, ValueLayout.JAVA_LONG));
 
+    private static final MethodHandle ngtcp2ConnGetCcerr$handle = createHandle(
+            "ngtcp2_conn_get_ccerr",
+            FunctionDescriptor.of(openssl_h.C_POINTER, openssl_h.C_POINTER));
     private static final MethodHandle ngtcp2CcerrDefault$handle = createHandle(
             "ngtcp2_ccerr_default",
             FunctionDescriptor.ofVoid(openssl_h.C_POINTER));
@@ -534,16 +539,35 @@ public final class Ngtcp2Bindings {
                 CB_VERSION_NEGOTIATION_ADDR);
 
         SYMBOLS_AVAILABLE = MISSING_SYMBOLS.isEmpty();
-        boolean abi = versionNum >= 0x011000 && versionNum < 0x012000;
-        NGTCP2_AVAILABLE = SYMBOLS_AVAILABLE && abi && CRYPTO_LOOKUP != null;
+        // The fixed layouts were validated against 1.16 and 1.26. Both pass
+        // the old versioned slices (CALLBACKS_V2, SETTINGS_V3,
+        // TRANSPORT_PARAMS_V1), so the 1.26 struct growth (callbacks 328->384,
+        // settings 200->216) happens after the bytes we allocate and the
+        // library reads/copies only the requested slice length. Do not widen
+        // this to arbitrary later minors without re-validating those layouts.
+        boolean abi = (versionNum >= 0x011000 && versionNum < 0x011100) ||
+                (versionNum >= 0x011a00 && versionNum < 0x011b00);
+        // The fixed LP64 layout, socket constants and libc downcalls below are
+        // Linux-specific (see the class constants). Without this gate a
+        // non-Linux installation with libngtcp2 present would report the
+        // transport available and then fail in eventfd/errno or with a wrong
+        // numeric socket option at bind time.
+        boolean linux = System.getProperty("os.name", "").startsWith("Linux");
+        NGTCP2_AVAILABLE = SYMBOLS_AVAILABLE && abi && CRYPTO_LOOKUP != null &&
+                linux;
+        if (!linux) {
+            log.warn(sm.getString("ngtcp2Bindings.unsupportedPlatform",
+                    System.getProperty("os.name", "unknown")));
+        }
+        if (!abi && versionNum != 0) {
+            log.warn(sm.getString("ngtcp2Bindings.abiMismatch",
+                    versionString != null ? versionString :
+                            "0x" + Integer.toHexString(versionNum),
+                    "1.16.x/1.26.x"));
+        }
         if (NGTCP2_AVAILABLE) {
             cryptoOsslInit();
         }
-    }
-
-    static void configureServer(long maxStreams, long idleTimeoutMs) {
-        serverMaxStreams = maxStreams > 0 ? maxStreams : 1;
-        serverIdleTimeoutMs = idleTimeoutMs > 0 ? idleTimeoutMs : 30000;
     }
 
     // -------------------------------------------------- connection state
@@ -586,7 +610,13 @@ public final class Ngtcp2Bindings {
         /** No packet could be produced in the last send pass (credit/CC). */
         boolean sendBlocked;
 
-        volatile Ngtcp2ConnectionWrapper wrapper;
+        /*
+         * Weak: the static CONN_STATES map must not keep the wrapper alive.
+         * The wrapper owns the Cleaner that is the last-resort free path for
+         * connections which escape the explicit teardown paths; a strong
+         * reference here would make the Cleaner unreachable forever.
+         */
+        volatile java.lang.ref.WeakReference<Ngtcp2ConnectionWrapper> wrapper;
         volatile boolean closed;
         volatile boolean draining;
         volatile boolean closeQueued;
@@ -594,7 +624,6 @@ public final class Ngtcp2Bindings {
         volatile long closeError;
         volatile String closeReason;
         volatile boolean lastErrorSet;
-        volatile boolean lastErrorApp;
         volatile long lastErrorCode;
         volatile String lastErrorReason;
         volatile boolean peerErrorSet;
@@ -606,6 +635,9 @@ public final class Ngtcp2Bindings {
         MemorySegment sniData = MemorySegment.NULL;
         MemorySegment errorReasonData = MemorySegment.NULL;
         MemorySegment peerReasonData = MemorySegment.NULL;
+
+        /** Thread the connection state is confined to (the poll thread). */
+        final Thread ownerThread;
 
         ConnState(MemorySegment conn, MemorySegment ssl, MemorySegment osslCtx,
                 MemorySegment connRef, MemorySegment token, Arena arena,
@@ -622,6 +654,7 @@ public final class Ngtcp2Bindings {
             this.remoteSockaddr = remote;
             this.remoteSockaddrLen = remoteLen;
             this.path = path;
+            this.ownerThread = Thread.currentThread();
             this.sendVecs = arena.allocate(64L * VEC_SIZE);
             this.datalenSeg = arena.allocate(ValueLayout.JAVA_LONG);
             this.ccerr = arena.allocate(CCERR_SIZE);
@@ -686,12 +719,37 @@ public final class Ngtcp2Bindings {
         final MemorySegment segment;
         final long start;
         final int len;
+        final Thread owner;
+        final boolean shared;
 
-        SendChunk(Arena arena, MemorySegment segment, long start, int len) {
+        SendChunk(Arena arena, MemorySegment segment, long start, int len,
+                Thread owner, boolean shared) {
             this.arena = arena;
             this.segment = segment;
             this.start = start;
             this.len = len;
+            this.owner = owner;
+            this.shared = shared;
+        }
+    }
+
+    /*
+     * Closes a send chunk's arena. A confined arena may only be closed by the
+     * thread that created it; if teardown runs on the stop/start/cleaner
+     * thread the close is deferred to the arena's Cleaner instead of throwing
+     * WrongThreadException. This keeps the hot path on confined arenas (a
+     * shared arena's close costs a VM-wide thread handshake, which dominated
+     * the poll thread) while cross-thread teardown remains safe.
+     */
+    private static void closeSendChunk(SendChunk c) {
+        if (!c.shared && Thread.currentThread() != c.owner) {
+            return;
+        }
+        try {
+            c.arena.close();
+        } catch (Throwable t) {
+            // Ignore: a chunk that cannot be closed here is still reclaimed
+            // by the arena Cleaner once it becomes unreachable.
         }
     }
 
@@ -703,9 +761,15 @@ public final class Ngtcp2Bindings {
     static void bindConnection(Ngtcp2ConnectionWrapper wrapper, MemorySegment conn) {
         ConnState state = CONN_STATES.get(Long.valueOf(conn.address()));
         if (state != null) {
-            state.wrapper = wrapper;
+            state.wrapper = new java.lang.ref.WeakReference<>(wrapper);
             TOKEN_STATES.put(Long.valueOf(state.token.address()), state);
         }
+    }
+
+    private static Ngtcp2ConnectionWrapper wrapper(ConnState st) {
+        java.lang.ref.WeakReference<Ngtcp2ConnectionWrapper> ref =
+                st == null ? null : st.wrapper;
+        return ref == null ? null : ref.get();
     }
 
     private static ConnState state(MemorySegment conn) {
@@ -757,6 +821,43 @@ public final class Ngtcp2Bindings {
         st.streams.remove(Long.valueOf(ss.id));
     }
 
+    /**
+     * Discards the binding-side receive state for a stream whose endpoint
+     * wrapper has gone away (handler close, rejection at the
+     * concurrent-stream limit, unidirectional terminal path). Without this
+     * the buffered {@link ReadChunk}s survive until the whole connection is
+     * freed, because no endpoint wrapper is left to call
+     * {@code ngtcp2_conn_stream_recv()}.
+     * <p>
+     * Only the receive side is dropped: a bidi stream may still have queued
+     * response bytes in {@code sends} that have to reach the peer, and the
+     * stream's send state is reclaimed by the ACK/stream_close callbacks as
+     * usual.
+     *
+     * @param conn The connection
+     * @param id   The stream identifier
+     */
+    static void ngtcp2_conn_discard_stream(MemorySegment conn, long id) {
+        ConnState st = state(conn);
+        if (st == null) {
+            return;
+        }
+        StreamState ss = st.streams.get(Long.valueOf(id));
+        if (ss == null) {
+            return;
+        }
+        dropBufferedReads(st, ss);
+        ss.finReceived = true;
+        ss.finDelivered = true;
+        ss.resetRemoteDelivered = true;
+        ss.readReported = false;
+        if (ss.inReadQueue) {
+            st.readableQueue.remove(ss);
+            ss.inReadQueue = false;
+        }
+        tryReclaim(st, ss);
+    }
+
     private static void writeCid(MemorySegment cid, long offset, MemorySegment data,
             long len) {
         cid.set(ValueLayout.JAVA_LONG, offset + CID_DATALEN, (long) len);
@@ -780,6 +881,22 @@ public final class Ngtcp2Bindings {
         }
     }
 
+    /**
+     * Maps an internal ngtcp2 error to the QUIC transport error code that
+     * should be reported to the peer.
+     *
+     * @param rc The internal ngtcp2 error code
+     *
+     * @return The QUIC transport error code
+     */
+    static long ngtcp2_infer_transport_error_code(int rc) {
+        try {
+            return (long) ngtcp2ErrInferTransport$handle.invokeExact(rc);
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
     private static String ngtcp2Strerror(int rc) {
         try {
             MemorySegment p = (MemorySegment) ngtcp2Strerror$handle.invokeExact(rc);
@@ -795,6 +912,7 @@ public final class Ngtcp2Bindings {
     static MemorySegment ngtcp2_accept(MemorySegment serverScid, int serverScidLen,
             MemorySegment originalDcid, int originalDcidLen,
             MemorySegment clientScid, int clientScidLen, int version,
+            long maxStreams, long idleTimeoutMs,
             MemorySegment localSockaddr, int localSockaddrLen,
             MemorySegment peerSockaddr, int peerSockaddrLen,
             MemorySegment sslCtx) {
@@ -836,10 +954,10 @@ public final class Ngtcp2Bindings {
             params.set(ValueLayout.JAVA_LONG, PARAMS_INITIAL_MAX_DATA,
                     32L * 1024 * 1024);
             params.set(ValueLayout.JAVA_LONG, PARAMS_INITIAL_MAX_STREAMS_BIDI,
-                    serverMaxStreams);
+                    maxStreams > 0 ? maxStreams : 1);
             params.set(ValueLayout.JAVA_LONG, PARAMS_INITIAL_MAX_STREAMS_UNI, 128);
             params.set(ValueLayout.JAVA_LONG, PARAMS_MAX_IDLE_TIMEOUT,
-                    serverIdleTimeoutMs * 1_000_000L);
+                    (idleTimeoutMs > 0 ? idleTimeoutMs : 30000) * 1_000_000L);
             params.set(ValueLayout.JAVA_LONG, PARAMS_ACTIVE_CONNECTION_ID_LIMIT, 4);
             params.set(ValueLayout.JAVA_BYTE, PARAMS_GREASE_QUIC_BIT, (byte) 1);
             writeCid(params, PARAMS_ORIGINAL_DCID, originalDcid, originalDcidLen);
@@ -936,8 +1054,15 @@ public final class Ngtcp2Bindings {
             int type;
             if ((first & 0xC0) == 0xC0) {
                 int longType = (first & 0x30) >> 4;
-                type = longType == 0 ? NGTCP2_PACKET_TYPE_INITIAL :
-                        longType == 3 ? 4 : 2;
+                if (version == QUIC_V2) {
+                    // RFC 9369: 0=Retry, 1=Initial, 2=0-RTT, 3=Handshake.
+                    type = longType == 1 ? NGTCP2_PACKET_TYPE_INITIAL :
+                            longType == 3 ? 4 : 2;
+                } else {
+                    // RFC 9000: 0=Initial, 1=0-RTT, 2=Handshake, 3=Retry.
+                    type = longType == 0 ? NGTCP2_PACKET_TYPE_INITIAL :
+                            longType == 3 ? 4 : 2;
+                }
             } else {
                 type = NGTCP2_PACKET_TYPE_SHORT;
             }
@@ -951,8 +1076,15 @@ public final class Ngtcp2Bindings {
         }
     }
 
+    /**
+     * The QUIC versions this endpoint advertises. ngtcp2 1.16 supports both
+     * v1 and v2 ({@code ngtcp2_is_supported_version()} returns true for
+     * {@code 0x6b3343cf}) and {@link #ngtcp2_header_info()} already maps the
+     * v2 long-header type table; restricting the endpoint to v1 is a
+     * deliberate deployment policy, not a library limitation.
+     */
     static boolean ngtcp2_version_is_supported(int version) {
-        return version == 1 || version == 0x6b3343cf;
+        return version == QUIC_V1;
     }
 
     static long ngtcp2_negotiate_version(MemorySegment dcid, long dcidLen,
@@ -961,8 +1093,8 @@ public final class Ngtcp2Bindings {
             MemorySegment versions = arena.allocate(ValueLayout.JAVA_INT);
             versions.set(ValueLayout.JAVA_INT, 0, 1);
             return (long) ngtcp2PktWriteVersionNegotiation$handle.invokeExact(
-                    dest, destLen, (byte) 0, dcid, dcidLen, scid, scidLen,
-                    versions, 1L);
+                    dest, destLen, (byte) (RANDOM.nextInt() & 0x3F), dcid, dcidLen,
+                    scid, scidLen, versions, 1L);
         } catch (Throwable t) {
             return -1;
         }
@@ -1034,6 +1166,19 @@ public final class Ngtcp2Bindings {
                         st.closed = true;
                         updatePktTxTime(st.conn);
                         fillSendInfo(st, sendInfo);
+                        return n;
+                    }
+                    if (n == 0 && (st.closed || connInClosing(conn) ||
+                            connInDraining(conn))) {
+                        // ngtcp2 reports 0 when it is already CLOSING/DRAINING
+                        // and cannot emit another close packet. Drop the queued
+                        // close so has_pending_send()/the retry sweep does not
+                        // spin on a frame that can never be written.
+                        st.closeQueued = false;
+                        return NGTCP2_ERR_DONE;
+                    }
+                    if (n < 0) {
+                        noteError(st, (int) n);
                         return n;
                     }
                     return NGTCP2_ERR_DONE;
@@ -1151,12 +1296,22 @@ public final class Ngtcp2Bindings {
                     fillSendInfo(st, sendInfo);
                     return n;
                 }
-                return NGTCP2_ERR_DONE;
+                if (n == 0) {
+                    return NGTCP2_ERR_DONE;
+                }
+                // A negative write_pkt result is a real send-side failure
+                // (crypto, protocol, internal state). Surface it instead of
+                // collapsing it into DONE, or the connection would silently
+                // stay live with output that can never be produced.
+                noteError(st, (int) n);
+                return n;
             } catch (Throwable t) {
-                return NGTCP2_ERR_DONE;
+                noteError(st, NGTCP2_ERR_CALLBACK_FAILURE);
+                return NGTCP2_ERR_CALLBACK_FAILURE;
             }
         } catch (Throwable t) {
-            return NGTCP2_ERR_DONE;
+            noteError(st, NGTCP2_ERR_CALLBACK_FAILURE);
+            return NGTCP2_ERR_CALLBACK_FAILURE;
         }
     }
 
@@ -1176,12 +1331,26 @@ public final class Ngtcp2Bindings {
         if (sendInfo == null || sendInfo.equals(MemorySegment.NULL)) {
             return;
         }
-        MemorySegment.copy(st.localSockaddr, 0, sendInfo, SEND_INFO_FROM,
-                st.localSockaddrLen);
-        MemorySegment.copy(st.remoteSockaddr, 0, sendInfo, SEND_INFO_TO,
-                st.remoteSockaddrLen);
-        sendInfo.set(ValueLayout.JAVA_INT, SEND_INFO_FROM_LEN, st.localSockaddrLen);
-        sendInfo.set(ValueLayout.JAVA_INT, SEND_INFO_TO_LEN, st.remoteSockaddrLen);
+        // ngtcp2's write functions copy the connection's *current* path into
+        // the path struct supplied to them (st.path), so use that rather than
+        // the addresses captured at accept time: after client migration or a
+        // path rebind the packets must go to the new peer address.
+        MemorySegment local = st.path.get(openssl_h.C_POINTER, PATH_LOCAL_ADDR);
+        int localLen = st.path.get(ValueLayout.JAVA_INT, PATH_LOCAL_LEN);
+        MemorySegment remote = st.path.get(openssl_h.C_POINTER, PATH_REMOTE_ADDR);
+        int remoteLen = st.path.get(ValueLayout.JAVA_INT, PATH_REMOTE_LEN);
+        if (local == null || local.equals(MemorySegment.NULL) || localLen <= 0) {
+            local = st.localSockaddr;
+            localLen = st.localSockaddrLen;
+        }
+        if (remote == null || remote.equals(MemorySegment.NULL) || remoteLen <= 0) {
+            remote = st.remoteSockaddr;
+            remoteLen = st.remoteSockaddrLen;
+        }
+        MemorySegment.copy(local, 0, sendInfo, SEND_INFO_FROM, localLen);
+        MemorySegment.copy(remote, 0, sendInfo, SEND_INFO_TO, remoteLen);
+        sendInfo.set(ValueLayout.JAVA_INT, SEND_INFO_FROM_LEN, localLen);
+        sendInfo.set(ValueLayout.JAVA_INT, SEND_INFO_TO_LEN, remoteLen);
     }
 
     static long ngtcp2_conn_stream_recv(MemorySegment conn, long id,
@@ -1196,7 +1365,14 @@ public final class Ngtcp2Bindings {
             return NGTCP2_ERR_DONE;
         }
         if (ss.resetRemote && !ss.resetRemoteDelivered) {
+            // Once the reset has been surfaced the receiver is gone for this
+            // direction; the buffered data can never be consumed and must not
+            // keep the StreamState alive.
+            dropBufferedReads(st, ss);
+            ss.finReceived = true;
+            ss.finDelivered = true;
             ss.resetRemoteDelivered = true;
+            ss.readReported = false;
             tryReclaim(st, ss);
             return NGTCP2_ERR_STREAM_RESET;
         }
@@ -1238,8 +1414,24 @@ public final class Ngtcp2Bindings {
         return n;
     }
 
+    /**
+     * Queues application bytes for a stream. The bytes are copied into a
+     * transport-owned chunk that lives until the peer acknowledges them; the
+     * caller's array is not retained, so callers on the poll thread do not
+     * need an intermediate native copy.
+     *
+     * @param conn   The connection
+     * @param id     The stream identifier
+     * @param data   The source bytes (may be {@code null} when {@code len} is 0)
+     * @param off    Offset of the first byte in {@code data}
+     * @param len    Number of bytes to queue
+     * @param fin    Whether this write concludes the stream
+     * @param errOut Optional scratch for the native stream error code
+     *
+     * @return The number of bytes accepted, or a negative ngtcp2 error
+     */
     static long ngtcp2_conn_stream_send(MemorySegment conn, long id,
-            MemorySegment data, int len, boolean fin, MemorySegment errOut) {
+            byte[] data, int off, int len, boolean fin, MemorySegment errOut) {
         ConnState st = state(conn);
         if (st == null) {
             return NGTCP2_ERR_STREAM_NOT_FOUND;
@@ -1254,6 +1446,15 @@ public final class Ngtcp2Bindings {
                     return rc;
                 }
                 long opened = out.get(ValueLayout.JAVA_LONG, 0);
+                if (opened != id) {
+                    // The endpoint's stream bookkeeping is keyed by the
+                    // assumed id (3 + 4*index). Do not send data on a
+                    // different native stream: record the opened stream so a
+                    // retry does not open yet another one, then fail clearly.
+                    st.streams.computeIfAbsent(Long.valueOf(opened),
+                            StreamState::new).nativeOpen = true;
+                    return NGTCP2_ERR_INVALID_STREAM_STATE;
+                }
                 ss = st.streams.computeIfAbsent(Long.valueOf(opened), StreamState::new);
                 ss.nativeOpen = true;
             } catch (Throwable t) {
@@ -1265,16 +1466,18 @@ public final class Ngtcp2Bindings {
         }
         if (len > 0) {
             try {
-                // Poll-thread confined: the chunk is created, handed to
-                // ngtcp2 and freed from that same thread (stream_send,
-                // acked_stream_data and stream_close all run on it). A shared
-                // arena here cost one VM-wide thread handshake per closed
-                // chunk, which showed up as a third of the poll thread's CPU
-                // budget in HandshakeAllThreads.
-                Arena arena = Arena.ofConfined();
+                // The normal send path runs on the poll thread, where a
+                // confined arena avoids the per-close VM-wide thread
+                // handshake that a shared arena incurs. Chunks created by the
+                // stop-path drain on another thread use a shared arena so
+                // they can be closed from any thread.
+                Thread current = Thread.currentThread();
+                boolean shared = current != st.ownerThread;
+                Arena arena = shared ? Arena.ofShared() : Arena.ofConfined();
                 MemorySegment seg = arena.allocate(len);
-                MemorySegment.copy(data, 0, seg, 0, len);
-                ss.sends.add(new SendChunk(arena, seg, ss.queuedOffset, len));
+                seg.asByteBuffer().put(data, off, len);
+                ss.sends.add(new SendChunk(arena, seg, ss.queuedOffset, len,
+                        current, shared));
                 ss.queuedOffset += len;
             } catch (Throwable t) {
                 return NGTCP2_ERR_INVALID_STREAM_STATE;
@@ -1285,16 +1488,26 @@ public final class Ngtcp2Bindings {
         }
         st.sendBlocked = false;
         queueSend(st, ss);
-        if (errOut != null) {
+        if (errOut != null && !errOut.equals(MemorySegment.NULL)) {
             errOut.set(ValueLayout.JAVA_LONG, 0, 0L);
         }
         return len;
     }
 
+    /**
+     * Convenience overload for the common write path, which does not need the
+     * native stream error code.
+     */
+    static long ngtcp2_conn_stream_send(MemorySegment conn, long id,
+            byte[] data, int off, int len, boolean fin) {
+        return ngtcp2_conn_stream_send(conn, id, data, off, len, fin,
+                MemorySegment.NULL);
+    }
+
     static boolean ngtcp2_conn_has_pending_send(MemorySegment conn) {
         ConnState st = state(conn);
-        return st != null && !st.closed && !st.sendBlocked &&
-                !st.sendQueue.isEmpty();
+        return st != null && !st.closed &&
+                (st.closeQueued || (!st.sendBlocked && !st.sendQueue.isEmpty()));
     }
 
     static long ngtcp2_conn_stream_capacity(MemorySegment conn, long id) {
@@ -1374,6 +1587,32 @@ public final class Ngtcp2Bindings {
         }
     }
 
+    /**
+     * Re-points the connection's send path at the sockaddr copies owned by its
+     * own connection arena.
+     * <p>
+     * {@code ngtcp2_conn_recv()} points {@code ConnState.path} at the
+     * endpoint's loop-arena scratch (saFrom/saTo or a receive-batch slot), and
+     * ngtcp2 copies the current path back into that struct during writes.
+     * {@code unbind()} closes the loop arena, so a connection retained across a
+     * stop/start (its handler outlived the stop) would otherwise keep dangling
+     * local/remote address pointers and hand them to the next send pass. The
+     * accept-time sockaddr copies live in the connection's own arena and stay
+     * valid for its lifetime.
+     *
+     * @param conn The ngtcp2 connection
+     */
+    static void ngtcp2_conn_reset_path(MemorySegment conn) {
+        ConnState st = state(conn);
+        if (st == null) {
+            return;
+        }
+        st.path.set(openssl_h.C_POINTER, PATH_LOCAL_ADDR, st.localSockaddr);
+        st.path.set(ValueLayout.JAVA_INT, PATH_LOCAL_LEN, st.localSockaddrLen);
+        st.path.set(openssl_h.C_POINTER, PATH_REMOTE_ADDR, st.remoteSockaddr);
+        st.path.set(ValueLayout.JAVA_INT, PATH_REMOTE_LEN, st.remoteSockaddrLen);
+    }
+
     static long ngtcp2_conn_timeout_as_millis(MemorySegment conn) {
         ConnState st = state(conn);
         if (st == null || st.closed) {
@@ -1410,7 +1649,55 @@ public final class Ngtcp2Bindings {
 
     static boolean ngtcp2_conn_is_closed(MemorySegment conn) {
         ConnState st = state(conn);
+        if (st != null && !st.peerErrorSet && !st.closeQueued &&
+                (st.closed || connInClosing(conn))) {
+            capturePeerError(st);
+        }
         return st == null || st.closed || connInClosing(conn);
+    }
+
+    /**
+     * Captures the peer's CONNECTION_CLOSE details on demand. Close detection
+     * calls this through {@code ngtcp2_conn_is_closed()}, but a receive error
+     * that puts ngtcp2 straight into DRAINING/CLOSING ({@code read_pkt}
+     * returns {@code NGTCP2_ERR_DRAINING}) never reaches that path; the
+     * endpoint calls this before reporting/tearing the connection down so the
+     * peer's diagnostic code and reason are available.
+     *
+     * @param conn The ngtcp2 connection
+     */
+    static void ngtcp2_conn_capture_peer_error(MemorySegment conn) {
+        ConnState st = state(conn);
+        if (st != null && !st.peerErrorSet) {
+            capturePeerError(st);
+        }
+    }
+
+    private static void capturePeerError(ConnState st) {
+        try {
+            MemorySegment ccerr = (MemorySegment) ngtcp2ConnGetCcerr$handle
+                    .invokeExact(st.conn);
+            if (ccerr.equals(MemorySegment.NULL)) {
+                return;
+            }
+            int type = ccerr.get(ValueLayout.JAVA_INT, CCERR_TYPE);
+            if (type != CCERR_TYPE_TRANSPORT &&
+                    type != CCERR_TYPE_APPLICATION) {
+                return;
+            }
+            st.peerErrorApp = type == CCERR_TYPE_APPLICATION;
+            st.peerErrorCode = ccerr.get(ValueLayout.JAVA_LONG, CCERR_ERROR_CODE);
+            MemorySegment reason = ccerr.get(openssl_h.C_POINTER, CCERR_REASON);
+            long len = ccerr.get(ValueLayout.JAVA_LONG, CCERR_REASONLEN);
+            st.peerErrorReason = reason.equals(MemorySegment.NULL) || len <= 0 ?
+                    null : reason.reinterpret(len).getString(0,
+                            StandardCharsets.UTF_8);
+            st.peerErrorSet = true;
+        } catch (Throwable t) {
+            if (log.isDebugEnabled()) {
+                log.debug("Failed to read ngtcp2 peer close error", t);
+            }
+        }
     }
 
     static boolean ngtcp2_conn_is_draining(MemorySegment conn) {
@@ -1439,14 +1726,6 @@ public final class Ngtcp2Bindings {
         } catch (Throwable t) {
             return NGTCP2_MAX_UDP_PAYLOAD_SIZE;
         }
-    }
-
-    static int ngtcp2_conn_new_scid(MemorySegment conn, MemorySegment scid,
-            long scidLen, MemorySegment token, boolean retireIfNeeded,
-            MemorySegment seqOut) {
-        // ngtcp2 issues connection IDs through its callback when configured;
-        // the compatibility path keeps the single CID issued at accept.
-        return 0;
     }
 
     static void ngtcp2_conn_application_proto(MemorySegment conn, MemorySegment out,
@@ -1504,7 +1783,7 @@ public final class Ngtcp2Bindings {
             isAppOut.set(ValueLayout.JAVA_BOOLEAN, 0, false);
             return false;
         }
-        isAppOut.set(ValueLayout.JAVA_BOOLEAN, 0, st.lastErrorApp);
+        isAppOut.set(ValueLayout.JAVA_BOOLEAN, 0, false);
         codeOut.set(ValueLayout.JAVA_LONG, 0, st.lastErrorCode);
         if (st.lastErrorReason != null) {
             st.errorReasonData = st.arena.allocateFrom(st.lastErrorReason,
@@ -1551,11 +1830,7 @@ public final class Ngtcp2Bindings {
         TOKEN_STATES.remove(Long.valueOf(st.token.address()));
         for (StreamState ss : st.streams.values()) {
             for (SendChunk c : ss.sends) {
-                try {
-                    c.arena.close();
-                } catch (Throwable t) {
-                    // Ignore
-                }
+                closeSendChunk(c);
             }
         }
         try {
@@ -1597,6 +1872,39 @@ public final class Ngtcp2Bindings {
         }
     }
 
+
+    /**
+     * Drops the binding-side receive copy of a stream and returns its bytes to
+     * the connection-level flow-control window.
+     * <p>
+     * Data queued in {@link StreamState#reads} has already been handed to the
+     * application callback. ngtcp2's own stream close only compensates for
+     * data still inside the native receive buffer
+     * ({@code rx.last_offset - rx_offset}), so without this the peer's
+     * {@code initial_max_data} credit for every Java-buffered byte would be
+     * consumed permanently. Only the connection window is extended: the stream
+     * is going away (discarded, rejected or reset), so stream-level credit
+     * would be meaningless, and ngtcp2_conn_extend_max_stream_offset() can
+     * fail for a stream already removed from the native map.
+     *
+     * @param st The connection state
+     * @param ss The stream state whose buffered receive data is dropped
+     */
+    private static void dropBufferedReads(ConnState st, StreamState ss) {
+        long unread = 0;
+        for (ReadChunk chunk : ss.reads) {
+            unread += chunk.data.length - chunk.off;
+        }
+        ss.reads.clear();
+        if (unread > 0) {
+            try {
+                ngtcp2ConnExtendMaxOffset$handle.invokeExact(st.conn, unread);
+            } catch (Throwable t) {
+                // Ignore: flow-control extension is best-effort here.
+            }
+        }
+    }
+
     private static void noteError(ConnState st, int rc) {
         st.lastErrorSet = true;
         st.lastErrorCode = rc;
@@ -1612,9 +1920,6 @@ public final class Ngtcp2Bindings {
             case NGTCP2_ERR_RETRY:
                 st.closed = true;
                 break;
-            case NGTCP2_ERR_CRYPTO:
-                st.lastErrorApp = false;
-                break;
             default:
                 break;
         }
@@ -1629,172 +1934,240 @@ public final class Ngtcp2Bindings {
         return Linker.nativeLinker().upcallStub(mh, descriptor, CB_ARENA);
     }
 
+    /*
+     * Every upcall below is invoked from native code. A Throwable escaping
+     * an FFM upcall terminates the JVM, so each body is wrapped and reports
+     * NGTCP2_ERR_CALLBACK_FAILURE instead. Diagnostics are debug-level to keep
+     * a remote-triggered failure from flooding the log.
+     */
+    private static int callbackFailure(String name, Throwable t) {
+        if (log.isDebugEnabled()) {
+            log.debug("ngtcp2 " + name + " callback failed", t);
+        }
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+
     private static int recvStreamData(MemorySegment conn, int flags, long id,
             long offset, MemorySegment data, long datalen, MemorySegment userData,
             MemorySegment streamUserData) {
-        ConnState st = stateFromUserData(userData);
-        if (st == null) {
-            return NGTCP2_ERR_CALLBACK_FAILURE;
+        try {
+            ConnState st = stateFromUserData(userData);
+            if (st == null) {
+                return NGTCP2_ERR_CALLBACK_FAILURE;
+            }
+            StreamState ss = st.stream(Long.valueOf(id));
+            ss.nativeOpen = true;
+            byte[] bytes = datalen == 0 ? new byte[0] :
+                    data.reinterpret(datalen).toArray(ValueLayout.JAVA_BYTE);
+            boolean fin = (flags & 1) != 0;
+            ss.reads.addLast(new ReadChunk(bytes, fin));
+            ss.readReported = false;
+            if (fin) {
+                ss.finReceived = true;
+            }
+            queueRead(st, ss);
+            return 0;
+        } catch (Throwable t) {
+            return callbackFailure("recvStreamData", t);
         }
-        StreamState ss = st.stream(Long.valueOf(id));
-        ss.nativeOpen = true;
-        byte[] bytes = datalen == 0 ? new byte[0] :
-                data.reinterpret(datalen).toArray(ValueLayout.JAVA_BYTE);
-        boolean fin = (flags & 1) != 0;
-        ss.reads.addLast(new ReadChunk(bytes, fin));
-        ss.readReported = false;
-        if (fin) {
-            ss.finReceived = true;
-        }
-        queueRead(st, ss);
-        return 0;
     }
 
     private static int ackedStreamData(MemorySegment conn, long id, long offset,
             long datalen, MemorySegment userData, MemorySegment streamUserData) {
-        ConnState st = stateFromUserData(userData);
-        if (st == null) {
+        try {
+            ConnState st = stateFromUserData(userData);
+            if (st == null) {
+                return 0;
+            }
+            StreamState ss = st.stream(Long.valueOf(id));
+            ss.ackedOffset = Math.max(ss.ackedOffset, offset + datalen);
+            while (ss.ackIndex < ss.sends.size()) {
+                SendChunk c = ss.sends.get(ss.ackIndex);
+                if (c.start + c.len > ss.ackedOffset) {
+                    break;
+                }
+                closeSendChunk(c);
+                ss.ackIndex++;
+            }
+            if (ss.ackIndex > 0 &&
+                    (ss.ackIndex >= 256 || ss.ackIndex >= ss.sends.size())) {
+                ss.sends.subList(0, ss.ackIndex).clear();
+                ss.sendVecIndex -= ss.ackIndex;
+                ss.ackIndex = 0;
+            }
+            tryReclaim(st, ss);
             return 0;
+        } catch (Throwable t) {
+            return callbackFailure("ackedStreamData", t);
         }
-        StreamState ss = st.stream(Long.valueOf(id));
-        ss.ackedOffset = Math.max(ss.ackedOffset, offset + datalen);
-        while (ss.ackIndex < ss.sends.size()) {
-            SendChunk c = ss.sends.get(ss.ackIndex);
-            if (c.start + c.len > ss.ackedOffset) {
-                break;
-            }
-            try {
-                c.arena.close();
-            } catch (Throwable t) {
-                // Ignore
-            }
-            ss.ackIndex++;
-        }
-        if (ss.ackIndex > 0 &&
-                (ss.ackIndex >= 256 || ss.ackIndex >= ss.sends.size())) {
-            ss.sends.subList(0, ss.ackIndex).clear();
-            ss.sendVecIndex -= ss.ackIndex;
-            ss.ackIndex = 0;
-        }
-        tryReclaim(st, ss);
-        return 0;
     }
 
     private static int streamOpen(MemorySegment conn, long id,
             MemorySegment userData) {
-        ConnState st = stateFromUserData(userData);
-        if (st != null) {
-            st.stream(Long.valueOf(id)).nativeOpen = true;
+        try {
+            ConnState st = stateFromUserData(userData);
+            if (st != null) {
+                st.stream(Long.valueOf(id)).nativeOpen = true;
+            }
+            return 0;
+        } catch (Throwable t) {
+            return callbackFailure("streamOpen", t);
         }
-        return 0;
     }
 
     private static int streamClose(MemorySegment conn, int flags, long id,
             long appErrorCode, MemorySegment userData, MemorySegment streamUserData) {
-        ConnState st = stateFromUserData(userData);
-        if (st != null) {
-            StreamState ss = st.stream(Long.valueOf(id));
-            ss.closed = true;
-            if ((id & 0x03) == 0) {
-                // Recycle the client-initiated bidirectional stream credit.
-                // Without this the peer stops after initial_max_streams_bidi
-                // sequential requests (the default is 100), which looks like
-                // a connection stall at exactly the configured stream cap.
-                extendMaxStreamsBidi(conn);
-            }
-            if ((flags & 1) != 0) {
-                ss.resetRemote = true;
-                ss.resetRemoteDelivered = false;
-            } else if (!ss.finReceived) {
-                ss.finReceived = true;
-            }
-            for (SendChunk c : ss.sends) {
-                try {
-                    c.arena.close();
-                } catch (Throwable t) {
-                    // Ignore
+        try {
+            ConnState st = stateFromUserData(userData);
+            if (st != null) {
+                StreamState ss = st.stream(Long.valueOf(id));
+                ss.closed = true;
+                if ((id & 0x03) == 0) {
+                    // Recycle the client-initiated bidirectional stream credit.
+                    // Without this the peer stops after initial_max_streams_bidi
+                    // sequential requests (the default is 100), which looks like
+                    // a connection stall at exactly the configured stream cap.
+                    extendMaxStreamsBidi(conn);
                 }
+                // NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET only says that
+                // an application error code was supplied - a locally generated
+                // RESET_STREAM or STOP_SENDING sets it as well. A remote reset
+                // is reported by the stream_reset callback, so never infer
+                // resetRemote from the flags (or resurrect a reset that was
+                // already delivered). The stream is fully closed here (both
+                // directions), so make sure the receive side reports a
+                // terminal edge: re-arm the FIN exactly once so a parked
+                // reader or stream wrapper observes EOF and can complete,
+                // instead of being left to wait for an event that will never
+                // come. A remote reset keeps its own terminal path.
+                if (!ss.resetRemote) {
+                    ss.finReceived = true;
+                    ss.finDelivered = false;
+                }
+                for (SendChunk c : ss.sends) {
+                    closeSendChunk(c);
+                }
+                ss.sends.clear();
+                ss.sendVecIndex = 0;
+                ss.ackIndex = 0;
+                ss.inSendQueue = false;
+                if (ss.readable()) {
+                    queueRead(st, ss);
+                }
+                tryReclaim(st, ss);
             }
-            ss.sends.clear();
-            ss.sendVecIndex = 0;
-            ss.ackIndex = 0;
-            ss.inSendQueue = false;
-            if (ss.readable()) {
-                queueRead(st, ss);
-            }
-            tryReclaim(st, ss);
+            return 0;
+        } catch (Throwable t) {
+            return callbackFailure("streamClose", t);
         }
-        return 0;
     }
 
     private static int streamReset(MemorySegment conn, long id, long finalSize,
             long appErrorCode, MemorySegment userData, MemorySegment streamUserData) {
-        ConnState st = stateFromUserData(userData);
-        if (st != null) {
-            StreamState ss = st.stream(Long.valueOf(id));
-            ss.resetRemote = true;
-            ss.resetRemoteDelivered = false;
-            ss.readReported = false;
-            queueRead(st, ss);
+        try {
+            ConnState st = stateFromUserData(userData);
+            if (st != null) {
+                StreamState ss = st.stream(Long.valueOf(id));
+                ss.resetRemote = true;
+                ss.resetRemoteDelivered = false;
+                ss.readReported = false;
+                queueRead(st, ss);
+            }
+            return 0;
+        } catch (Throwable t) {
+            return callbackFailure("streamReset", t);
         }
-        return 0;
     }
 
     private static int streamStopSending(MemorySegment conn, long id,
             long appErrorCode, MemorySegment userData, MemorySegment streamUserData) {
-        ConnState st = stateFromUserData(userData);
-        if (st != null) {
-            StreamState ss = st.stream(Long.valueOf(id));
-            ss.resetLocal = true;
-            ss.inSendQueue = false;
+        try {
+            // This callback reports a *local* read shutdown (ngtcp2 invokes it
+            // when it emits STOP_SENDING), not a peer reset of our send side.
+            // The write side is independent: a bidirectional stream whose
+            // handler shut the read direction down may still have response
+            // bytes/FIN queued in ss.sends, and marking resetLocal here would
+            // make capacity()/hasWritable() reject them and truncate the
+            // response. The receive copy is discarded separately by
+            // ngtcp2_conn_discard_stream() (with the connection-level flow
+            // control credit returned there), so this callback has nothing to
+            // do.
+            return 0;
+        } catch (Throwable t) {
+            return callbackFailure("streamStopSending", t);
         }
-        return 0;
     }
 
     private static void randBytes(MemorySegment dest, long destlen,
             MemorySegment randCtx) {
-        if (destlen <= 0 || dest.equals(MemorySegment.NULL)) {
-            return;
+        try {
+            if (destlen <= 0 || dest.equals(MemorySegment.NULL)) {
+                return;
+            }
+            // Fill the whole requested buffer (the contract has no upper
+            // bound); chunk the generation so a future larger request cannot
+            // allocate an unbounded temporary array.
+            long off = 0;
+            while (off < destlen) {
+                int n = (int) Math.min(destlen - off, 1088L);
+                byte[] bytes = new byte[n];
+                RANDOM.nextBytes(bytes);
+                dest.asSlice(off, n).asByteBuffer().put(bytes);
+                off += n;
+            }
+        } catch (Throwable t) {
+            // A void upcall cannot report failure; never let it escape.
+            callbackFailure("randBytes", t);
         }
-        byte[] bytes = new byte[(int) Math.min(destlen, 1088)];
-        RANDOM.nextBytes(bytes);
-        dest.reinterpret(destlen).asByteBuffer().put(bytes);
     }
 
     private static int getNewConnectionId(MemorySegment conn, MemorySegment cid,
             MemorySegment token, long cidlen, MemorySegment userData) {
-        if (cidlen <= 0 || cidlen > NGTCP2_MAX_CONN_ID_LEN) {
-            return NGTCP2_ERR_CALLBACK_FAILURE;
+        try {
+            if (cidlen <= 0 || cidlen > NGTCP2_MAX_CONN_ID_LEN) {
+                return NGTCP2_ERR_CALLBACK_FAILURE;
+            }
+            byte[] id = new byte[(int) cidlen];
+            byte[] reset = new byte[NGTCP2_STATELESS_RESET_TOKENLEN];
+            RANDOM.nextBytes(id);
+            RANDOM.nextBytes(reset);
+            cid.set(ValueLayout.JAVA_LONG, 0, cidlen);
+            cid.asSlice(CID_DATA, cidlen).asByteBuffer().put(id);
+            token.reinterpret(NGTCP2_STATELESS_RESET_TOKENLEN).asByteBuffer().put(reset);
+            Ngtcp2ConnectionWrapper wrapper = wrapper(stateFromUserData(userData));
+            if (wrapper != null && wrapper.getEndpoint() != null) {
+                wrapper.getEndpoint().registerCid(id, wrapper);
+            }
+            return 0;
+        } catch (Throwable t) {
+            return callbackFailure("getNewConnectionId", t);
         }
-        byte[] id = new byte[(int) cidlen];
-        byte[] reset = new byte[NGTCP2_STATELESS_RESET_TOKENLEN];
-        RANDOM.nextBytes(id);
-        RANDOM.nextBytes(reset);
-        cid.set(ValueLayout.JAVA_LONG, 0, cidlen);
-        cid.asSlice(CID_DATA, cidlen).asByteBuffer().put(id);
-        token.reinterpret(NGTCP2_STATELESS_RESET_TOKENLEN).asByteBuffer().put(reset);
-        ConnState st = stateFromUserData(userData);
-        if (st != null && st.wrapper != null && st.wrapper.getEndpoint() != null) {
-            st.wrapper.getEndpoint().registerCid(id, st.wrapper);
-        }
-        return 0;
     }
 
     private static int removeConnectionId(MemorySegment conn, MemorySegment cid,
             MemorySegment userData) {
-        ConnState st = stateFromUserData(userData);
-        if (st != null && st.wrapper != null && st.wrapper.getEndpoint() != null) {
-            long len = cid.get(ValueLayout.JAVA_LONG, CID_DATALEN);
-            if (len > 0 && len <= NGTCP2_MAX_CONN_ID_LEN) {
-                byte[] id = cid.asSlice(CID_DATA, len).toArray(ValueLayout.JAVA_BYTE);
-                st.wrapper.getEndpoint().removeCid(id);
+        try {
+            Ngtcp2ConnectionWrapper wrapper = wrapper(stateFromUserData(userData));
+            if (wrapper != null && wrapper.getEndpoint() != null) {
+                long len = cid.get(ValueLayout.JAVA_LONG, CID_DATALEN);
+                if (len > 0 && len <= NGTCP2_MAX_CONN_ID_LEN) {
+                    byte[] id = cid.asSlice(CID_DATA, len).toArray(ValueLayout.JAVA_BYTE);
+                    wrapper.getEndpoint().removeCid(id);
+                }
             }
+            return 0;
+        } catch (Throwable t) {
+            return callbackFailure("removeConnectionId", t);
         }
-        return 0;
     }
 
     private static MemorySegment getConn(MemorySegment connRef) {
-        return connRef.get(openssl_h.C_POINTER, CONN_REF_USER_DATA);
+        try {
+            return connRef.get(openssl_h.C_POINTER, CONN_REF_USER_DATA);
+        } catch (Throwable t) {
+            callbackFailure("getConn", t);
+            return MemorySegment.NULL;
+        }
     }
 
     // -------------------------------------------------- native wrappers
@@ -2015,9 +2388,12 @@ public final class Ngtcp2Bindings {
     // -------------------------------------------------- Struct layouts
 
     /**
-     * {@code ngtcp2_recv_info}: {@code { sockaddr* from; socklen_t from_len;
-     * sockaddr* to; socklen_t to_len; }}. Linux LP64: 32 bytes with 8-byte
-     * alignment padding after each socklen_t.
+     * Internal receive-path helper layout for this binding's
+     * {@code ngtcp2_conn_recv} wrapper:
+     * {@code { sockaddr* from; socklen_t from_len; sockaddr* to; socklen_t
+     * to_len; }}. It is not a public ngtcp2 1.16 type (1.16 uses
+     * {@code ngtcp2_path} with inline storage); Linux LP64: 32 bytes with
+     * 8-byte alignment padding after each socklen_t.
      */
     static final MemoryLayout RECV_INFO_LAYOUT = MemoryLayout.structLayout(
             ValueLayout.ADDRESS.withName("from"),
@@ -2035,10 +2411,12 @@ public final class Ngtcp2Bindings {
     static final long RECV_INFO_TO_LEN = RECV_INFO_LAYOUT.byteOffset(PathElement.groupElement("to_len"));
 
     /**
-     * {@code ngtcp2_send_info}: {@code { struct sockaddr_storage from(128);
-     * socklen_t from_len; struct sockaddr_storage to(128); socklen_t to_len;
-     * struct timespec at; }}. Linux LP64: 288 bytes (from at 0, from_len at
-     * 128, to at 136, to_len at 264, at at 272).
+     * Internal send-path helper layout for this binding's
+     * {@code ngtcp2_conn_send} wrapper: {@code { struct sockaddr_storage
+     * from(128); socklen_t from_len; struct sockaddr_storage to(128); socklen_t
+     * to_len; struct timespec at; }}. It is not a public ngtcp2 1.16 type.
+     * Linux LP64: 288 bytes (from at 0, from_len at 128, to at 136, to_len at
+     * 264, at at 272).
      */
     static final MemoryLayout SEND_INFO_LAYOUT = MemoryLayout.structLayout(
             MemoryLayout.sequenceLayout(128, ValueLayout.JAVA_BYTE).withName("from"),
@@ -2159,6 +2537,10 @@ public final class Ngtcp2Bindings {
     static final int AF_INET6 = 10;
     static final int SOCK_DGRAM = 2;
     static final int SOCK_NONBLOCK = 0x800;
+    // Linux SOCK_CLOEXEC == O_CLOEXEC. Every UDP socket is created with it so
+    // an exec() in the JVM cannot inherit the QUIC listener (the eventfd is
+    // already created with EFD_CLOEXEC).
+    static final int SOCK_CLOEXEC = 0x80000;
 
     static final int MSG_DONTWAIT = 0x40;
 
@@ -2442,7 +2824,7 @@ public final class Ngtcp2Bindings {
      * {@code int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int
      * vlen, int flags, struct timespec *timeout)}
      */
-    static final MethodHandle recvmmsg$handle = createLibcHandle("recvmmsg",
+    static final MethodHandle recvmmsg$handle = createOptionalLibcHandle("recvmmsg",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
                     ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
                     ValueLayout.ADDRESS));
@@ -2903,7 +3285,7 @@ public final class Ngtcp2Bindings {
      * Enforces the sockaddr contract of every ngtcp2 entry point that takes
      * one: ngtcp2's {@code std_addr_from_c} asserts the exact per-family
      * length (16 for {@code sockaddr_in}, 28 for {@code sockaddr_in6}) and
-     * reaches {@code unimplemented!()} for any other family (ngtcp2 0.30
+     * reaches {@code unimplemented!()} for any other family (ngtcp2 1.16
      * src/ffi.rs) - a violation never returns from the native call, it
      * panics and aborts the JVM from the poll thread. Every sockaddr/length
      * pair crossing into a ngtcp2 call is checked here first so a future
@@ -2967,6 +3349,27 @@ public final class Ngtcp2Bindings {
         }
     }
 
+
+    /**
+     * Like {@link #createLibcHandle(String, FunctionDescriptor)} but for
+     * optional symbols (e.g. {@code recvmmsg}, absent on some libcs): a
+     * missing symbol yields a {@code null} handle and the caller uses its
+     * documented fallback instead of disabling the whole transport.
+     */
+    private static MethodHandle createOptionalLibcHandle(String symbol,
+            FunctionDescriptor desc) {
+        try {
+            MemorySegment addr = Linker.nativeLinker().defaultLookup().find(symbol)
+                    .or(() -> NGTCP2_LOOKUP == null ? java.util.Optional.empty() :
+                            NGTCP2_LOOKUP.find(symbol))
+                    .orElseThrow(() -> new UnsatisfiedLinkError(
+                            "unresolved libc symbol: " + symbol));
+            return Linker.nativeLinker().downcallHandle(addr, desc);
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
     /**
      * Scratch allocation helper: allocates a confined scratch block for the
      * datagram helpers.
@@ -2977,6 +3380,42 @@ public final class Ngtcp2Bindings {
      */
     static MemorySegment allocateScratch(Arena arena) {
         return arena.allocate(SCRATCH_SIZE);
+    }
+
+
+    /**
+     * Receives a probe datagram, polling the socket for readability between
+     * attempts. A single non-blocking {@code recvmsg()} immediately after the
+     * send can race the loopback delivery and report {@code EAGAIN}, which
+     * would permanently disable an otherwise supported GSO/GRO path for the
+     * whole JVM. The bounded poll loop (10 x 50 ms) makes the probe verdict
+     * reliable without delaying class initialisation when the datagram
+     * arrives immediately.
+     *
+     * @return The received length, or {@code -1} if no datagram arrived
+     */
+    private static long recvProbeDatagram(Arena arena, int fd, MemorySegment rbuf,
+            int len, MemorySegment scratch, MemorySegment from, MemorySegment to,
+            MemorySegment toLen, int[] segOut) {
+        // struct pollfd { int fd; short events; short revents; } on Linux LP64.
+        MemorySegment pfd = arena.allocate(8);
+        for (int attempt = 0; attempt < 10; attempt++) {
+            long r = recvDatagram(fd, rbuf, len, scratch, from, to, toLen, segOut);
+            if (r >= 0) {
+                return r;
+            }
+            if (errno() != EAGAIN) {
+                return r;
+            }
+            pfd.set(ValueLayout.JAVA_INT, 0, fd);
+            pfd.set(ValueLayout.JAVA_SHORT, 4, (short) 1);
+            pfd.set(ValueLayout.JAVA_SHORT, 6, (short) 0);
+            int p = poll(pfd, 1, 50);
+            if (p < 0 && errno() != EINTR) {
+                return r;
+            }
+        }
+        return -1;
     }
 
     // -------------------------------------------------- UDP GSO/GRO probe
@@ -3008,9 +3447,12 @@ public final class Ngtcp2Bindings {
             int groSock = -1;
             int tx = -1;
             try {
-                plain = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-                groSock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-                tx = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+                plain = socket(AF_INET,
+                        SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                groSock = socket(AF_INET,
+                        SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                tx = socket(AF_INET,
+                        SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                 if (plain >= 0 && groSock >= 0 && tx >= 0) {
                     MemorySegment saPlain = a.allocate(SOCKADDR_STORAGE_SIZE);
                     MemorySegment saGro = a.allocate(SOCKADDR_STORAGE_SIZE);
@@ -3043,8 +3485,8 @@ public final class Ngtcp2Bindings {
                         MemorySegment to = a.allocate(SOCKADDR_STORAGE_SIZE);
                         MemorySegment toLen = a.allocate(ValueLayout.JAVA_INT);
                         int[] segOut = new int[1];
-                        long r = recvDatagram(plain, rbuf, 4096, scratch, from,
-                                to, toLen, segOut);
+                        long r = recvProbeDatagram(a, plain, rbuf, 4096, scratch,
+                                from, to, toLen, segOut);
                         gso = s == 3000 && r == 1500;
                         // GSO send + UDP_GRO-enabled receive: a coalesced
                         // read must carry the cmsg. Any other outcome (no
@@ -3056,8 +3498,8 @@ public final class Ngtcp2Bindings {
                             if (setsockopt(groSock, SOL_UDP, UDP_GRO, one, 4) == 0) {
                                 s = sendSegmentedDatagram(tx, data, lens, 2, 1500,
                                         1500, saGro, 16, null, bscratch);
-                                r = recvDatagram(groSock, rbuf, 4096, scratch, from,
-                                        to, toLen, segOut);
+                                r = recvProbeDatagram(a, groSock, rbuf, 4096,
+                                        scratch, from, to, toLen, segOut);
                                 gro = s == 3000 && r == 3000 && segOut[0] == 1500;
                             }
                         }
@@ -3082,5 +3524,20 @@ public final class Ngtcp2Bindings {
         }
         UDP_GSO_SEND = gso;
         UDP_GRO_RECEIVE = gro;
+    }
+
+
+    /*
+     * The required libc downcalls (socket/bind/sendmsg/recvmsg/close, errno,
+     * eventfd, poll, ...) are created after the early availability decision
+     * above. A missing one is added to MISSING_SYMBOLS by createLibcHandle();
+     * re-check here, after every handle has been resolved, so the transport
+     * reports unavailable instead of failing later with an AssertionError or
+     * NPE in the poll loop / bind path.
+     */
+    static {
+        if (NGTCP2_AVAILABLE && !MISSING_SYMBOLS.isEmpty()) {
+            NGTCP2_AVAILABLE = false;
+        }
     }
 }

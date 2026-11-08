@@ -571,7 +571,7 @@ short budget can still drop the tail. Both need
   unexplained by either CPU; worth a forensic pass.
 
 
-## 9. ngtcp2 backend (initial evaluation and request-path rework, November 6, 2026)
+## 9. ngtcp2 backend (initial evaluation and request-path rework, November 6, 2026; regression fix November 8)
 
 ### Method
 
@@ -642,6 +642,13 @@ problems, all in the ngtcp2 adapter rather than in libngtcp2:
    call re-walked every stream to return one readable result. The
    level-triggered re-arm already walks only streams with a parked writer
    or latched write interest, so the edge-triggered loop was removed.
+7. **No intermediate native copy on every stream write.** The socket
+   wrapper copied each payload into a per-call confined arena before
+   `ngtcp2_conn_stream_send` copied it again into the transport-owned chunk
+   that lives until acknowledgement. The send entry point now takes the
+   caller's byte array/slice directly and does the single copy into that
+   chunk, removing one arena acquire/allocate/copy/close per write (the
+   conclude path's empty FIN send no longer allocates at all).
 
 ### Idle fleet
 
@@ -683,6 +690,22 @@ at 78,691 rps / 12.6 us/req (8x25) and 72,853 / 13.6 (32x32), and OpenSSL
 ahead of the quiche baseline on this host and about 84-90 % of the current
 OpenSSL throughput (10-16 % behind), with 1x1 poller cost within ~20 % of
 quiche (38.7 vs 32.4 us/req; that row is client-bound either way).
+
+### Regression fix (November 8, 2026)
+
+The later correctness follow-ups (the D/F series) changed `streamClose`'s
+interpretation of `NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET`. The new
+reading is correct - a locally generated `RESET_STREAM` or `STOP_SENDING`
+sets the flag too - but it also stopped marking the receive side terminal
+at stream close. A fully closed stream then had no pending FIN edge (the
+FIN had already been delivered) and its binding state was reclaimed
+immediately, so the request path lost the terminal read event that lets
+the stream wrapper/handler complete. Re-arming the FIN on any close that
+was not a peer reset restores that edge without resurrecting the old "any
+application error is a remote reset" bug: 8x25 moved from ~69-72k rps /
+~13.8-14.5 us/req back to ~82-84k / ~11.9-12.2, the pre-follow-up
+baseline (83k / 12.0 on the same host); 32x32 measured 78k / 12.7 against
+the recorded 76k / 12.9 plateau.
 
 ### Conclusion
 

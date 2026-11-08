@@ -17,7 +17,6 @@
 package org.apache.coyote.http3;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 
 import org.apache.juli.logging.Log;
@@ -99,14 +98,15 @@ public class QpackEncoder {
             it = 0;
             currentHeaders = headers;
             prefixPending = true;
-            // Debug: log all headers being encoded
-            if (log.isDebugEnabled()) {
+            // Header values may contain credentials, cookies or tokens;
+            // keep the dump at TRACE like HTTP/2's per-header logging.
+            if (log.isTraceEnabled()) {
                 StringBuilder sb = new StringBuilder("QPACK encode headers (");
                 sb.append(headers.size()).append("): ");
                 for (int i = 0; i < headers.size(); i++) {
                     sb.append('[').append(i).append("]").append(headers.getName(i).toString()).append("=").append(headers.getValue(i).toString()).append(" ");
                 }
-                log.debug(sb.toString());
+                log.trace(sb.toString());
             }
         } else if (headers != currentHeaders) {
             throw new IllegalStateException();
@@ -164,11 +164,13 @@ public class QpackEncoder {
             if (!skip) {
                 String value = currentHeaders.getValue(it).toString();
 
-                // Header values are UTF-8 strings on the wire (RFC 9114
-                // Section 4.2, RFC 9204 Section 4.1.2); sizes must be computed
-                // in bytes, not chars.
-                byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
-                byte[] valueBytes = value.getBytes(StandardCharsets.UTF_8);
+                // HTTP field values are byte strings (RFC 9110 Section 5.5,
+                // obs-text). Tomcat stores them as ISO-8859-1 characters, as
+                // HTTP/1.1 and HPACK do; encode one wire byte per char rather
+                // than re-encoding as UTF-8 (which would change the bytes and
+                // fail to round-trip through Qpack.decodeString()).
+                byte[] nameBytes = toBytes(name);
+                byte[] valueBytes = toBytes(value);
 
                 StaticTableMatch match = lookupStaticTable(name, value);
                 // Worst case per header: 2 byte field prefix + iRP continuation
@@ -279,9 +281,25 @@ public class QpackEncoder {
     private void encodeString(ByteBuffer target, byte[] s) {
         // Per RFC 9204 Section 4.1.2: String Literal: H iRP(m=7) String Length
         // H = 0 (string is not Huffman-encoded). The length is the number of
-        // UTF-8 bytes, not the number of Java chars.
+        // wire bytes.
         Qpack.encodeIrp(target, 0, 7, s.length);
         target.put(s);
+    }
+
+
+    /*
+     * HTTP/3 field values are byte strings (RFC 9110 Section 5.5). Tomcat's
+     * header values use ISO-8859-1 characters (one byte per char), matching
+     * HTTP/1.1 and HPACK; UTF-8 re-encoding here would change non-ASCII
+     * values and make an HTTP/3 round trip produce a different string from
+     * the request decode path.
+     */
+    private static byte[] toBytes(String s) {
+        byte[] bytes = new byte[s.length()];
+        for (int i = 0; i < s.length(); i++) {
+            bytes[i] = (byte) s.charAt(i);
+        }
+        return bytes;
     }
 
 

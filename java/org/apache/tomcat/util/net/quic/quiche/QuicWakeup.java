@@ -287,6 +287,7 @@ final class QuicWakeup {
             try {
                 arena.close();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug(sm.getString("quicheEndpoint.wakeupCloseError"), t);
                 }

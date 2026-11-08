@@ -17,6 +17,8 @@
 package org.apache.coyote.http3;
 
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServlet;
@@ -333,6 +335,70 @@ public class TestHttp3Headers extends Http3TestBase {
 
 
     @Test
+    public void testNullResponseTrailerValueIgnored() throws Exception {
+        startHttp3Server(this::addNullTrailerServlet);
+
+        // The trailer map is application-supplied; a null value must be
+        // skipped rather than producing an NPE in the QPACK encoder.
+        Http3Response response = get("/nulltrailer");
+
+        validateStatus(response, 200);
+        Assert.assertEquals("ok", response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testNoContentLengthOn204Response() throws Exception {
+        startHttp3Server(this::addNoContentLengthServlet);
+
+        // RFC 9110 Section 8.6 forbids Content-Length in a 204 response even
+        // when the application supplies one.
+        Http3Response response = get("/nocontentlength");
+
+        validateStatus(response, 204);
+        Assert.assertNull("Content-Length sent on 204",
+                response.getHeader("content-length"));
+    }
+
+
+    @Test
+    public void testApplicationStatusPseudoHeaderDoesNotOverrideResponse()
+            throws Exception {
+        startHttp3Server(this::addStatusHeaderServlet);
+
+        // An application-supplied :status must not replace the status used
+        // for the response/body decisions. The wire status must be 200.
+        Http3Response response = get("/statusheader");
+
+        validateStatus(response, 200);
+        Assert.assertEquals("ok", response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testConnectionSpecificResponseHeadersRemoved()
+            throws Exception {
+        startHttp3Server(this::addConnectionHeaderServlet);
+
+        // RFC 9114 Section 4.2: an endpoint MUST NOT generate a field section
+        // containing connection-specific fields. The application can still
+        // attempt to set them, so the connector must remove them.
+        Http3Response response = get("/connheaders");
+
+        validateStatus(response, 200);
+        Assert.assertNull("Connection field sent",
+                response.getHeader("connection"));
+        Assert.assertNull("Transfer-Encoding field sent",
+                response.getHeader("transfer-encoding"));
+        Assert.assertNull("Keep-Alive field sent",
+                response.getHeader("keep-alive"));
+        Assert.assertNull("Upgrade field sent",
+                response.getHeader("upgrade"));
+        Assert.assertEquals("ok", response.getBodyAsString());
+    }
+
+
+    @Test
     public void testAltServiceAnnounced() throws Exception {
         startHttp3Server();
         ((AbstractHttp3Protocol) connector.getProtocolHandler())
@@ -358,6 +424,89 @@ public class TestHttp3Headers extends Http3TestBase {
 
         validateStatus(response, 200);
         Assert.assertEquals("h2=\":8443\"", response.getHeader("alt-svc"));
+    }
+
+
+    private void addNullTrailerServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "nulltrailer", new NullTrailerServlet());
+        ctxt.addServletMapping("/nulltrailer", "nulltrailer");
+    }
+
+
+    private static class NullTrailerServlet extends HttpServlet {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            resp.setContentType("text/plain");
+            resp.setTrailerFields(() -> {
+                Map<String,String> trailers = new HashMap<>();
+                trailers.put("x-null", null);
+                return trailers;
+            });
+            resp.getWriter().print("ok");
+        }
+    }
+
+
+    private void addNoContentLengthServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "nocontentlength", new NoContentLengthServlet());
+        ctxt.addServletMapping("/nocontentlength", "nocontentlength");
+    }
+
+
+    private static class NoContentLengthServlet extends HttpServlet {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
+            resp.setHeader("Content-Length", "10");
+        }
+    }
+
+
+    private void addStatusHeaderServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "statusheader", new StatusHeaderServlet());
+        ctxt.addServletMapping("/statusheader", "statusheader");
+    }
+
+
+    private static class StatusHeaderServlet extends HttpServlet {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            resp.setHeader(":status", "404");
+            resp.setStatus(HttpServletResponse.SC_OK);
+            resp.setContentType("text/plain");
+            resp.getWriter().print("ok");
+        }
+    }
+
+
+    private void addConnectionHeaderServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "connheaders", new ConnectionHeaderServlet());
+        ctxt.addServletMapping("/connheaders", "connheaders");
+    }
+
+
+    private static class ConnectionHeaderServlet extends HttpServlet {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            resp.setHeader("Connection", "close");
+            resp.setHeader("Transfer-Encoding", "chunked");
+            resp.setHeader("Keep-Alive", "timeout=5");
+            resp.setHeader("Upgrade", "h3");
+            resp.setContentType("text/plain");
+            resp.getWriter().print("ok");
+        }
     }
 
 

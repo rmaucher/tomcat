@@ -305,6 +305,15 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     private MemorySegment listener = MemorySegment.NULL;
 
     /**
+     * The listener's poll item. Retained so the poll set can be reduced to the
+     * listener alone when the endpoint stops: bind resources (and therefore the
+     * poll set) are reused by a restart of a BOUND_ON_INIT endpoint, and any
+     * connection/stream item left behind would keep polling an SSL that
+     * stopInternal() has already freed.
+     */
+    private QuicPollItem listenerPollItem;
+
+    /**
      * The socket file descriptor (created by native socket() call).
      */
     private int socketFd = -1;
@@ -872,6 +881,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 }
             }
             pollSet = null;
+            listenerPollItem = null;
         }
     }
 
@@ -1159,6 +1169,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         QuicPollItem listenerItem = new QuicPollItem(listener,
                   -1L, // want_events: all bits set, so the listener receives every event type
                   null);
+        listenerPollItem = listenerItem;
         pollSet.add(listenerItem);
     }
 
@@ -1516,6 +1527,20 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             drainCleanerStreamFrees();
             drainCleanerConnectionFrees();
         }
+        // Re-open the mailbox before the retention sweep so a handler that
+        // completes while the sweep runs is not orphaned: its deferred free
+        // must be accepted here. Previously the sweep ran against a closed
+        // mailbox; a handler finishing between the sweep's
+        // hasActiveHandlers() check and mailbox.open() had its free rejected
+        // and the connection stayed in stoppedBusyConnections forever.
+        // open() also drops poll tasks left over from the previous
+        // generation's stop before the new poll thread can drain them: such a
+        // task was submitted after the stop had already freed (or deferred)
+        // every connection it owned, so running it would operate on freed
+        // native state. Workers whose hops are rejected observe a
+        // RejectedExecutionException from callOnPollThread instead of a 30 s
+        // hop timeout.
+        mailbox.open();
         // Stop-time retentions whose handler has since completed: complete
         // their deferred free here (the mailbox task that carried it may have
         // been discarded by the mailbox close below) and drop them from the
@@ -1555,15 +1580,21 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 iterator.remove();
             }
         }
-        // Re-open the mailbox and drop any poll task left over from a previous
-        // generation's stop before the new poll thread can drain it: such a
-        // task was submitted after the stop had already freed (or deferred)
-        // every connection it owned, so running it would operate on freed
-        // native state (e.g. an SSL_write_ex/SSL_handle_events hop for a
-        // connection a late-completing worker no longer owns). Workers whose
-        // hops are rejected observe a RejectedExecutionException from
-        // callOnPollThread instead of a 30s hop timeout.
-        mailbox.open();
+        // Drop protocol-data bookkeeping left over from the previous
+        // generation. A handler that outlived the stop budget can mark a
+        // retained connection after stopInternal() cleared the queues; those
+        // marks can never be flushed (the previous stop dropped the manager
+        // state) and would otherwise keep protocolDataPendingCount positive
+        // for the endpoint's lifetime, making every poll iteration take the
+        // sweep branch. Clear the retained flags first so the subsequent
+        // tally reset cannot be decremented again by a later transition.
+        for (QuicConnectionWrapper conn : stoppedBusyConnections) {
+            setConnectionProtocolDataPending(conn, false);
+        }
+        protocolDataMarks.clear();
+        protocolDataConns.clear();
+        protocolDataRetry.clear();
+        protocolDataPendingCount.set(0);
         // One poll thread, deliberately: the per-connection native work (the
         // SSL_poll() ticks, event handling and stream lifecycle) is not
         // parallelised. Sharding connections across several native threads was
@@ -1657,12 +1688,33 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         drainWhile(System.currentTimeMillis() + ACTIVE_HANDLER_SHUTDOWN_WAIT_MS,
                 this::hasActiveRequestHandlers);
 
+        // shutdownExecutor() uses shutdownNow() for the internal executor:
+        // queued dispatch tasks are discarded without running their finally
+        // block, so balance the active-handler references they hold. Without
+        // this, hasActiveHandlers() stays true forever and the connection is
+        // retained permanently. An external executor is not shut down here,
+        // so its tasks may still run and must not be balanced.
+        if (getExecutor() == null) {
+            for (QuicConnectionWrapper conn : connections.values()) {
+                discardQueuedDispatches(conn);
+            }
+            for (QuicConnectionWrapper conn : stoppedBusyConnections) {
+                discardQueuedDispatches(conn);
+            }
+        }
+
         // Clean up HTTP/3 connection managers first
         for (QuicConnectionWrapper conn : connections.values()) {
             QuicConnectionManager connManager = conn.getQuicConnectionManager();
             conn.setQuicConnectionManager(null);
             if (connManager != null) {
-                connManager.connectionClose(conn);
+                try {
+                    connManager.connectionClose(conn);
+                } catch (Throwable t) {
+                    // A failing protocol callback must not abort the rest of
+                    // the shutdown cleanup.
+                    logTeardownError(conn, t);
+                }
             }
         }
 
@@ -1797,6 +1849,16 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         // an in-use connection SSL from the GC thread (see the connections
         // field javadoc).
         connections.clear();
+
+        // Drop every connection/stream item from the poll set, leaving only the
+        // listener. The poll set is part of the bind resources and is reused by
+        // a restart of an endpoint bound on init (stop() does not unbind a
+        // BOUND_ON_INIT endpoint), so leaving items whose SSLs were freed above
+        // would make the next poll loop call SSL_poll() on freed pointers.
+        if (pollSet != null && listenerPollItem != null) {
+            pollSet.clear();
+            pollSet.add(listenerPollItem);
+        }
 
         // Generation-confined protocol-data bookkeeping: the mark queue and
         // the poll-thread set reference wrappers of this generation (whose
@@ -2243,6 +2305,23 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             }
         }
         drainPollTasks();
+    }
+
+
+    /**
+     * Balances the dispatch tasks discarded by the internal executor's
+     * shutdownNow() and releases the processing claims they still hold. A
+     * discarded task never runs its finally block, so without clearing the
+     * claim the stream SSL cannot be freed and the connection is retained
+     * forever.
+     *
+     * @param conn The connection whose discarded dispatch tasks to process
+     */
+    private void discardQueuedDispatches(QuicConnectionWrapper conn) {
+        for (QuicStreamWrapper stream : conn.discardQueuedDispatches()) {
+            stream.clearProcessing();
+            wakeClaimWaiters(stream, conn);
+        }
     }
 
 
@@ -2996,6 +3075,11 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             if (protocolErrorCode > 0) {
                 sendConnectionCloseWithError(conn, protocolErrorCode);
             }
+        } catch (Throwable t) {
+            // Sending the close frame is best effort; teardown must still run.
+            logTeardownError(conn, t);
+        }
+        try {
             teardownConnection(conn, () -> {
                 // Transmit the queued CONNECTION_CLOSE before the connection
                 // SSL is freed.
@@ -3558,6 +3642,16 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      */
     private int[] bootstrapIncomingStreams(MemorySegment connSsl, QuicConnectionWrapper conn,
             QuicPollItem connItem) {
+        // Gate stream processing (including the inline pre-read of client UNI
+        // streams below) on the negotiated ALPN being one the application
+        // protocol serves. The ALPN select callback normally rejects an
+        // unsupported handshake, but the bootstrap path must not depend on
+        // that: it can run before the first gated poll event and would
+        // otherwise feed stream data to the protocol on a connection that is
+        // about to be rejected.
+        if (!ensureServedProtocol(conn)) {
+            return new int[] { 0, 0 };
+        }
         int uniAccepted = acceptStreams(connSsl, QuicPoll.SSL_ACCEPT_STREAM_UNI,
                 conn, "IC: accepted UNI", true);
 
@@ -3772,9 +3866,10 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
   */
     private void createServerUniStreams(QuicPollItem connItem, QuicConnectionWrapper conn) throws Exception {
         QuicConnectionManager connManager = conn.getQuicConnectionManager();
-        if (connManager == null) {
-            // The connection has no protocol manager (already closed): the
-            // streams would have nothing protocol-valid to write.
+        if (connManager == null || conn.isClosed() || conn.isFreed()) {
+            // The connection has no protocol manager or is already gone: the
+            // streams would have nothing protocol-valid to write, or must not
+            // be created on freed native state.
             return;
         }
 
@@ -3782,6 +3877,19 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         long[] streamInfo = new long[2];
         int index;
         while ((index = connManager.nextServerUniStream(conn)) >= 0) {
+            if (conn.getServerUniStream(index) != null) {
+                // Already created. A protocol manager that keeps handing out
+                // the same index - for example after a failure before
+                // serverUniStreamCreated() - would otherwise make this loop
+                // create an unbounded number of streams, overwrite the
+                // serverUniStreams entry and emit duplicate control/QPACK
+                // streams.
+                if (log.isDebugEnabled()) {
+                    log.debug("Server unidirectional stream index " + index +
+                            " already exists; stopping creation for this pass");
+                }
+                break;
+            }
             MemorySegment streamSsl = newUniStream(connItem.getSsl(), streamInfo);
             if (streamSsl.equals(MemorySegment.NULL)) {
                 // Not ready yet (peer has not yet advertised stream
@@ -3891,73 +3999,49 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     streamWrapper.signalWriteWaiter();
                 }
             }
-            // closeAllStreams() removes each stream's poll item from the poll
-            // set, marks the wrappers deregistered and frees the stream SSL
-            // objects (ordered before the connection SSL, per
-            // SSL_new_stream(3)).
-            conn.closeAllStreams();
-
-            // Wake up the processors of the streams that still hold one
-            // (for example waiting for more request body data via a
-            // non-blocking Read Listener). The connection is closed so no
-            // further data can arrive; the dispatch lets the processor
-            // deliver a terminal event (onAllDataRead) to the pending Read
-            // Listener instead of abandoning it. dispatchToExecutor() is a
-            // no-op for a stream that is already being processed (its
-            // worker will observe the closed stream through its read in
-            // flight) and the active handler count keeps the connection SSL
-            // alive until these dispatches have finished.
-            for (QuicOpenSSLSocketWrapper streamWrapper : streamWrapperList) {
-                QuicStreamWrapper wakeStream = (QuicStreamWrapper) streamWrapper.getSocket();
-                if (wakeStream == null) {
-                    continue;
+            // teardownConnection() removes the wrappers and stream items,
+            // frees the stream SSLs and then runs the callback; this is the
+            // single teardown implementation, so the ECD path cannot drift
+            // from the normal/failConnection teardown again.
+            teardownConnection(conn, () -> {
+                // Wake up the processors of the streams that still hold one
+                // (for example waiting for more request body data via a
+                // non-blocking Read Listener). The connection is closed so no
+                // further data can arrive; the dispatch lets the processor
+                // deliver a terminal event (onAllDataRead) to the pending Read
+                // Listener instead of abandoning it. dispatchToExecutor() is a
+                // no-op for a stream that is already being processed (its
+                // worker will observe the closed stream through its read in
+                // flight) and the active handler count keeps the connection SSL
+                // alive until these dispatches have finished.
+                for (QuicOpenSSLSocketWrapper streamWrapper : streamWrapperList) {
+                    QuicStreamWrapper wakeStream = (QuicStreamWrapper) streamWrapper.getSocket();
+                    if (wakeStream == null) {
+                        continue;
+                    }
+                    dispatchToExecutor(streamWrapper, wakeStream,
+                            SocketEvent.OPEN_READ);
+                    // The connection is gone, so a request that has not
+                    // completed (an asynchronous response still being
+                    // written, for example) can never complete normally.
+                    // Deliver an error event so the container raises the
+                    // asynchronous error notification (onError) rather than
+                    // leaving the application waiting; the stream's own error
+                    // event was discarded when its poll entry was removed
+                    // above. Requests that already completed are no longer
+                    // registered and are not reached here, and the async
+                    // state machine ignores an error event once the request
+                    // has been recycled. With no later event to re-trigger a
+                    // dropped dispatch, the ERROR dispatch must not be lost
+                    // while the wake-up dispatch above still holds the
+                    // stream's processing flag - claim it as a bounded poll
+                    // task instead of spinning here (a spin stalls the poll
+                    // thread, and with it every other connection, for as long
+                    // as a worker's handler runs).
+                    scheduleStreamDispatch(streamWrapper, wakeStream,
+                            SocketEvent.ERROR);
                 }
-                dispatchToExecutor(streamWrapper, wakeStream,
-                        SocketEvent.OPEN_READ);
-                // The connection is gone, so a request that has not
-                // completed (an asynchronous response still being
-                // written, for example) can never complete normally.
-                // Deliver an error event so the container raises the
-                // asynchronous error notification (onError) rather than
-                // leaving the application waiting; the stream's own error
-                // event was discarded when its poll entry was removed
-                // above. Requests that already completed are no longer
-                // registered and are not reached here, and the async
-                // state machine ignores an error event once the request
-                // has been recycled. With no later event to re-trigger a
-                // dropped dispatch, the ERROR dispatch must not be lost
-                // while the wake-up dispatch above still holds the
-                // stream's processing flag - claim it as a bounded poll
-                // task instead of spinning here (a spin stalls the poll
-                // thread, and with it every other connection, for as long
-                // as a worker's handler runs).
-                scheduleStreamDispatch(streamWrapper, wakeStream,
-                        SocketEvent.ERROR);
-            }
-
-            // Clean up HTTP/3 connection state
-            QuicConnectionManager connManager = conn.getQuicConnectionManager();
-            conn.setQuicConnectionManager(null);
-            if (connManager != null) {
-                connManager.connectionClose(conn);
-            }
-
-            setConnectionProtocolDataPending(conn, false);
-            // Drops the retention entry right before the deferred drain and
-            // CAS-guarded free below; removing earlier (streams still live)
-            // would let the GC-thread Cleaner race them (see the connections
-            // field javadoc).
-            connections.remove(item.getSsl().address());
-            pollSet.remove(item.getSsl().address());
-            // Free any stream SSL objects whose free was deferred by the
-            // wake-up/error dispatches above before dropping the connection
-            // reference: per SSL_new_stream(3) every stream SSL must be
-            // freed before the connection SSL.
-            drainPendingStreamFrees();
-            // Free the connection SSL exactly once (shared with the Cleaner),
-            // deferring the free if an executor worker is still running the
-            // HTTP handler for a stream on this connection.
-            freeConnectionOrDefer(conn);
+            });
             return;
         }
 
@@ -4021,6 +4105,15 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
 
     /**
+     * A poll task that holds an active-handler reference from scheduling until
+     * it runs; the mailbox notifies it if a close/open discards it unrun.
+     */
+    private interface DiscardablePollTask extends Runnable,
+            QuicNativeMailbox.DiscardListener {
+    }
+
+
+    /**
      * Schedules {@code event} for {@code stream} once the stream's processing
      * flag is free, without blocking the caller and without ever running the
      * handler concurrently with the current flag owner. Used for the terminal
@@ -4031,15 +4124,17 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * currently unreached scaffolding - see that class' comment).
      * <p>
      * Waiting for the flag on the poll thread would stall every other
-     * connection for as long as the owner's handler runs, so the claim is
-     * retried from the poll loop's task queue: the task re-queues itself
-     * while the budget lasts (retried on every drain, which the loop runs at
-     * a short timeout whenever tasks are pending). A dispatch that acquires
-     * the flag is delivered with flag ownership, exactly like the synchronous
-     * path. If the budget expires the event is dropped with a log line: the
+     * connection for as long as the owner's handler runs, so the attempt is
+     * parked as a claim waiter on the stream and re-run when the claim is
+     * released. A dispatch that acquires the flag is delivered with flag
+     * ownership, exactly like the synchronous path. If the budget expires when
+     * the task is finally re-run the event is dropped with a log line: the
      * flag owner re-arms the stream's poll interest on exit, so a pending
      * I/O wake-up cannot be lost, and an in-flight handler observes the
-     * closed stream through its own reads.
+     * closed stream through its own reads. The task must never re-submit
+     * itself from inside its own run: that re-enters the mailbox drain that
+     * is executing it, makes the drain loop spin until the budget expires and
+     * starves every other poll-loop job.
      */
     private void scheduleStreamDispatch(QuicOpenSSLSocketWrapper wrapper,
             QuicStreamWrapper stream, SocketEvent event) {
@@ -4060,10 +4155,16 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         // situation and left to the start-time sweep. Without this the count
         // would stay elevated forever on a wrapper the endpoint has already
         // detached.
-        if (!submitPollTask(new Runnable() {
+        if (!submitPollTask(new DiscardablePollTask() {
             @Override
             public void run() {
+                // Register before touching the claim. The dispatch that
+                // releases the flag drains this queue after clearing it, so
+                // either this attempt wins the freed claim or the release
+                // re-runs it.
+                stream.addClaimWaiter(this);
                 if (stream.compareAndSetProcessing(false, true)) {
+                    stream.removeClaimWaiter(this);
                     dispatchToExecutor(wrapper, stream, event, true);
                     // Release the scheduling reference; the executor dispatch
                     // carries its own until its processor finishes.
@@ -4071,11 +4172,11 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     return;
                 }
                 if (System.nanoTime() - deadline < 0) {
-                    if (!submitPollTask(this)) {
-                        finishStreamDispatch(stream, conn, false);
-                    }
+                    // Claim still held: stay registered and let the releasing
+                    // dispatch re-run this attempt.
                     return;
                 }
+                stream.removeClaimWaiter(this);
                 if (log.isDebugEnabled()) {
                     log.debug("Stream " + stream.getStreamId() + " still busy" +
                             " after the claim budget - " + event +
@@ -4084,8 +4185,41 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 }
                 finishStreamDispatch(stream, conn, false);
             }
+
+            @Override
+            public void onDiscard() {
+                // The mailbox was closed/opened while this attempt was still
+                // queued (a late handler submitted it after the stop drain).
+                // It never ran, so release the claim-waiter registration and
+                // the active-handler reference it owns; otherwise the count
+                // stays elevated and stopInternal() retains the connection
+                // forever.
+                stream.removeClaimWaiter(this);
+                finishStreamDispatch(stream, conn, false);
+            }
         })) {
             finishStreamDispatch(stream, conn, false);
+        }
+    }
+
+
+    /**
+     * Re-runs claim-retry attempts parked on a stream whose processing flag
+     * has just been released. Each waiter owns an active-handler reference,
+     * which it balances itself when it runs; a waiter that cannot be submitted
+     * (the mailbox is closed, i.e. the endpoint is stopping) has its reference
+     * balanced here.
+     *
+     * @param stream The stream whose waiters to wake
+     * @param conn   The stream's connection (may be {@code null})
+     */
+    private void wakeClaimWaiters(QuicStreamWrapper stream,
+            QuicConnectionWrapper conn) {
+        Runnable waiter;
+        while ((waiter = stream.pollClaimWaiter()) != null) {
+            if (conn == null || !submitPollTask(waiter)) {
+                finishStreamDispatch(stream, conn, false);
+            }
         }
     }
 
@@ -4623,45 +4757,73 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     private void teardownConnection(QuicConnectionWrapper conn, Runnable afterStreamsFreed) {
         assertNativeAccess("teardownConnection");
         conn.setClosed();
-        // Remove the stream wrappers before closeAllStreams() clears the
-        // stream map, otherwise they leak (see removeStreamWrappers()).
-        removeStreamWrappers(conn);
-        conn.closeAllStreams();
-        if (afterStreamsFreed != null) {
-            afterStreamsFreed.run();
-        }
         QuicConnectionManager connManager = conn.getQuicConnectionManager();
         conn.setQuicConnectionManager(null);
-        if (connManager != null) {
-            connManager.connectionClose(conn);
-        }
-        setConnectionProtocolDataPending(conn, false);
-        // Drops the retention entry right before the deferred drain and
-        // CAS-guarded free below; closeAllStreams() above left no live
-        // streams for a GC-thread Cleaner to race (see the connections
-        // field javadoc).
-        connections.remove(conn.getSslAddress());
-        QuicPollItem removedItem = pollSet.remove(conn.getSslAddress());
-        if (removedItem == null) {
-            // The connection item may never have been promoted into the poll
-            // set: bootstrapIncomingStreams() runs before the pollSet.add() in
-            // handleIncomingConnection(), and inline stream processing there
-            // can fail the connection (protocol error -> failConnection ->
-            // this teardown). The poll set only disposes items it removes, so
-            // release the item's native SSL_POLL_ITEM struct (and its shared
-            // arena) here; abortConnectionSetup() reaches this fallback
-            // through this method, deregisterStream() has its own. dispose()
-            // is idempotent.
-            QuicPollItem item = conn.getPollItem();
-            if (item != null) {
-                item.dispose();
+        try {
+            // Remove the stream wrappers before closeAllStreams() clears the
+            // stream map, otherwise they leak (see removeStreamWrappers()).
+            removeStreamWrappers(conn);
+            conn.closeAllStreams();
+            if (afterStreamsFreed != null) {
+                afterStreamsFreed.run();
             }
+        } catch (Throwable t) {
+            logTeardownError(conn, t);
         }
-        // Free stream SSL objects whose free closeAllStreams() / the workers
-        // deferred, before dropping the connection reference: per
-        // SSL_new_stream(3) every stream SSL must be freed first.
-        drainPendingStreamFrees();
-        freeConnectionOrDefer(conn);
+        try {
+            if (connManager != null) {
+                connManager.connectionClose(conn);
+            }
+        } catch (Throwable t) {
+            logTeardownError(conn, t);
+        }
+        // The connection must always leave the endpoint's maps/poll set and
+        // have its SSL freed even when a protocol callback above throws.
+        try {
+            setConnectionProtocolDataPending(conn, false);
+            // Drops the retention entry right before the deferred drain and
+            // CAS-guarded free below; closeAllStreams() above left no live
+            // streams for a GC-thread Cleaner to race (see the connections
+            // field javadoc).
+            connections.remove(conn.getSslAddress());
+            QuicPollItem removedItem = pollSet.remove(conn.getSslAddress());
+            if (removedItem == null) {
+                // The connection item may never have been promoted into the
+                // poll set: bootstrapIncomingStreams() runs before the
+                // pollSet.add() in handleIncomingConnection(), and inline
+                // stream processing there can fail the connection (protocol
+                // error -> failConnection -> this teardown). The poll set only
+                // disposes items it removes, so release the item's native
+                // SSL_POLL_ITEM struct (and its shared arena) here;
+                // abortConnectionSetup() reaches this fallback through this
+                // method, deregisterStream() has its own. dispose() is
+                // idempotent.
+                QuicPollItem item = conn.getPollItem();
+                if (item != null) {
+                    item.dispose();
+                }
+            }
+            // Free stream SSL objects whose free closeAllStreams() / the
+            // workers deferred, before dropping the connection reference: per
+            // SSL_new_stream(3) every stream SSL must be freed first.
+            drainPendingStreamFrees();
+            freeConnectionOrDefer(conn);
+        } catch (Throwable t) {
+            logTeardownError(conn, t);
+        }
+    }
+
+
+    /**
+     * Reports a failure in a teardown step without aborting the remaining
+     * cleanup.
+     *
+     * @param conn The connection being torn down
+     * @param t    The failure
+     */
+    private void logTeardownError(QuicConnectionWrapper conn, Throwable t) {
+        log.warn(sm.getString("quicEndpoint.teardownCleanupError",
+                Long.toHexString(conn.getSslAddress())), t);
     }
 
 
@@ -5424,15 +5586,46 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     + " event=" + event);
         }
         Runnable dispatch = () -> runStreamDispatch(wrapper, stream, conn, event, true);
-        java.util.concurrent.Executor executor = (running && conn != null) ?
-                getExecutor() : null;
+        java.util.concurrent.Executor executor = conn != null ? getExecutor() : null;
         if (executor == null) {
-            // No executor available (shutting down or no connection): process
-            // inline on the poll thread as before.
-            dispatch.run();
+            // No executor available (torn down by the shutdown, or a
+            // connection-less stream). Inline processing is only safe on the
+            // poll thread, where the handler's wrapper I/O runs its native
+            // operations directly; any other thread (a stop-path drain
+            // running a queued dispatch after shutdownExecutor() tore the
+            // executor down) would park the handler in a mailbox hop that
+            // nothing services until the hop timeout - the drainer being
+            // blocked inside the handler it would have to drain. Drop the
+            // dispatch the way a rejecting pool does.
+            if (isPollThread()) {
+                dispatch.run();
+                return;
+            }
+            log.warn(sm.getString("quicEndpoint.dispatchNoExecutor",
+                    Long.valueOf(stream.getStreamId())));
+            stream.clearProcessing();
+            wakeClaimWaiters(stream, conn);
+            if (conn != null) {
+                conn.decrActiveHandlers();
+                if (!conn.isClosing() && !conn.isClosed()) {
+                    failConnection(conn, getConnectionRejectErrorCode(),
+                            "No executor available for the dispatch of stream " +
+                                    Long.valueOf(stream.getStreamId()));
+                }
+            }
+            return;
         } else {
+            // The active-handler reference above is now held by a queued task.
+            // If the executor is shut down with shutdownNow(), the task is
+            // discarded without running its finally block; the stop path
+            // balances this count (see discardQueuedDispatches()).
+            conn.incrQueuedDispatch(stream);
+            Runnable queued = () -> {
+                conn.decrQueuedDispatch(stream);
+                dispatch.run();
+            };
             try {
-                executor.execute(dispatch);
+                executor.execute(queued);
             } catch (java.util.concurrent.RejectedExecutionException ree) {
                 // A rejecting pool will never run the task, so the claimed
                 // processing flag and the active-handler increment have to be
@@ -5446,7 +5639,9 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 // left to do there.
                 log.warn(sm.getString("quicEndpoint.dispatchRejected",
                         Long.valueOf(stream.getStreamId())), ree);
+                conn.decrQueuedDispatch(stream);
                 stream.clearProcessing();
+                wakeClaimWaiters(stream, conn);
                 conn.decrActiveHandlers();
                 if (!conn.isClosing() && !conn.isClosed()) {
                     failConnection(conn, getConnectionRejectErrorCode(),
@@ -5512,6 +5707,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             // count is decremented: once this flag is clear, the poll thread
             // may tear the stream down, so no native operation may follow.
             stream.clearProcessing();
+            wakeClaimWaiters(stream, conn);
             finishStreamDispatch(stream, conn, true);
         }
     }
@@ -5991,6 +6187,9 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      *         instead of the intended error code (logged as a warning here)
      */
     boolean resetStream(QuicStreamWrapper stream, long appErrorCode) {
+        if (!isStreamLive(stream)) {
+            return false;
+        }
         QuicConnectionWrapper conn = stream.getConnection();
         boolean resetDone = false;
         try (Arena localArena = Arena.ofConfined()) {
@@ -6125,12 +6324,23 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * boolean)} it does not notify the handler again.
      */
     void closeStreamByHandler(QuicStreamWrapper stream) {
+        QuicOpenSSLSocketWrapper wrapper =
+                streamWrappers.get(stream.getSslAddress());
         deregisterAndReleaseStream(stream);
+        if (wrapper != null) {
+            // Release any worker parked in a synchronous read or write on this
+            // stream so it observes the terminal state instead of waiting out
+            // the full stall timeout. Capture the wrapper before
+            // deregistration removes it from streamWrappers.
+            wrapper.signalReadWaiter();
+            wrapper.signalWriteWaiter();
+        }
         mailbox.queueStreamFree(stream);
     }
 
 
     private void closeStream(QuicStreamWrapper stream, boolean clean) {
+        QuicConnectionWrapper conn = stream.getConnection();
         QuicOpenSSLSocketWrapper wrapper =
                 streamWrappers.get(stream.getSslAddress());
         // The stream is done: release any worker parked in a synchronous
@@ -6176,6 +6386,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             }
         } finally {
             stream.clearProcessing();
+            wakeClaimWaiters(stream, conn);
         }
 
         // Defer the native free until the next poll iteration, after

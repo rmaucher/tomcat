@@ -41,6 +41,8 @@ import org.apache.tomcat.util.openssl.openssl_h;
  */
 final class Ngtcp2CertificateManager {
 
+    private static final org.apache.juli.logging.Log log =
+            org.apache.juli.logging.LogFactory.getLog(Ngtcp2CertificateManager.class);
     private static final StringManagerHolder SM = new StringManagerHolder();
 
     private final QuicCertificateManager delegate;
@@ -114,6 +116,11 @@ final class Ngtcp2CertificateManager {
         try {
             return QuicCertConfig.buildCertConfig(defaultHostConfig, hostConfigs);
         } catch (Throwable t) {
+            // Never swallow the cause: a failed reload otherwise silently
+            // keeps serving the old certificate with no diagnostic at all.
+            org.apache.tomcat.util.ExceptionUtils.handleThrowable(t);
+            log.error(SM.get("ngtcp2Endpoint.certificateReloadFailed",
+                    "certificate configuration build failed"), t);
             return null;
         }
     }

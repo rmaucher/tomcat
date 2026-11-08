@@ -35,6 +35,7 @@ import java.util.function.Supplier;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.net.SSLHostConfig;
 import org.apache.tomcat.util.net.SSLHostConfigCertificate;
 import org.apache.tomcat.util.net.quic.QuicProtocol;
@@ -240,6 +241,7 @@ class QuicheCertificateManager {
         try {
             QuicheBindings.quiche_config_free(c.ptr);
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             if (log.isDebugEnabled()) {
                 log.debug("Error freeing quiche config generation " + c.generation, t);
             }
@@ -585,6 +587,9 @@ class QuicheCertificateManager {
 
     private void addCertificates(java.security.cert.CertificateFactory cf,
             List<X509Certificate> chain, String path) throws IOException, CertificateException {
+        if (path == null || path.isEmpty()) {
+            return;
+        }
         File f = new File(path);
         if (!f.isFile()) {
             return;
@@ -622,6 +627,9 @@ class QuicheCertificateManager {
             case QuicheBindings.QUICHE_ERR_OUT_OF_IDENTIFIERS -> "OUT_OF_IDENTIFIERS";
             case QuicheBindings.QUICHE_ERR_KEY_UPDATE -> "KEY_UPDATE";
             case QuicheBindings.QUICHE_ERR_CRYPTO_BUFFER_EXCEEDED -> "CRYPTO_BUFFER_EXCEEDED";
+            case QuicheBindings.QUICHE_ERR_INVALID_ACK_RANGE -> "INVALID_ACK_RANGE";
+            case QuicheBindings.QUICHE_ERR_OPTIMISTIC_ACK_DETECTED -> "OPTIMISTIC_ACK_DETECTED";
+            case QuicheBindings.QUICHE_ERR_INVALID_DCID_INITIALIZATION -> "INVALID_DCID_INITIALIZATION";
             default -> "ERROR(" + rc + ")";
         };
     }

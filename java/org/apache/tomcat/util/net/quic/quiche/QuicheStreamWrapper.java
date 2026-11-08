@@ -146,6 +146,13 @@ public class QuicheStreamWrapper implements QuicStream {
     private final AtomicBoolean writeInterest = new AtomicBoolean(false);
 
     /**
+     * Read interest flag, latched by the async read path when a read could
+     * not consume all available data. The readable sweep uses it to deliver
+     * another OPEN_READ without waiting for a new network edge.
+     */
+    private final AtomicBoolean readInterest = new AtomicBoolean(false);
+
+    /**
      * Creates a new stream wrapper.
      *
      * @param streamId   The QUIC stream ID
@@ -438,6 +445,9 @@ public class QuicheStreamWrapper implements QuicStream {
         if (clearWriteInterest()) {
             connection.releaseWriteRearm(this);
         }
+        if (clearReadInterest()) {
+            connection.removeReadInterestRearm(this);
+        }
     }
 
 
@@ -482,6 +492,36 @@ public class QuicheStreamWrapper implements QuicStream {
      */
     public boolean hasWriteInterest() {
         return writeInterest.get();
+    }
+
+
+    /**
+     * Sets the read interest flag if it was not set.
+     *
+     * @return {@code true} if this call made the false→true transition
+     */
+    public boolean setReadInterestIfAbsent() {
+        return readInterest.compareAndSet(false, true);
+    }
+
+
+    /**
+     * Clears the read interest flag.
+     *
+     * @return {@code true} if this call made the true→false transition
+     */
+    public boolean clearReadInterest() {
+        return readInterest.compareAndSet(true, false);
+    }
+
+
+    /**
+     * Returns whether a read-interest latch is set.
+     *
+     * @return {@code true} if the async read path is waiting for readiness
+     */
+    public boolean hasReadInterest() {
+        return readInterest.get();
     }
 
 

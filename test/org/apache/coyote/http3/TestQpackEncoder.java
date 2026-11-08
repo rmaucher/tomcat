@@ -269,19 +269,19 @@ public class TestQpackEncoder {
 
 
     @Test
-    public void testUtf8ValueLengthIsInBytes() throws Exception {
-        // The value is transported as UTF-8 octets; the string length field
-        // counts octets, not characters (RFC 9204 Section 4.1.2).
-        String value = "caf\u00E9";    // 4 chars, 5 UTF-8 bytes
+    public void testNonAsciiValueIsBytePreserving() throws Exception {
+        // HTTP field values are byte strings (RFC 9110 Section 5.5). Tomcat
+        // stores them as ISO-8859-1 characters, and the HTTP/3 encoder must
+        // preserve those bytes just as HTTP/1.1 and HPACK do.
+        String value = "caf\u00E9";
         byte[] encoded = encodeFully(new QpackEncoder(),
                 headers("x-coffee", value));
         List<String[]> emitted = decode(encoded);
 
-        // Qpack.decodeString() yields ISO-8859-1 chars per octet; the
-        // octets themselves must be exactly the UTF-8 encoding.
-        String octets = emitted.get(0)[1];
-        Assert.assertArrayEquals(value.getBytes(StandardCharsets.UTF_8),
-                octets.getBytes(StandardCharsets.ISO_8859_1));
+        String decoded = emitted.get(0)[1];
+        Assert.assertEquals(value, decoded);
+        Assert.assertArrayEquals(value.getBytes(StandardCharsets.ISO_8859_1),
+                decoded.getBytes(StandardCharsets.ISO_8859_1));
     }
 
 

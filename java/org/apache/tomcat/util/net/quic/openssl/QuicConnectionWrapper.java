@@ -22,7 +22,9 @@ import java.lang.ref.Cleaner;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -138,6 +140,23 @@ public class QuicConnectionWrapper implements QuicConnection {
      * zero (see {@link #pendingFree}).
      */
     private final AtomicInteger activeHandlers = new AtomicInteger(0);
+
+    /**
+     * Active-handler references held by tasks that are queued in the executor
+     * but have not started yet. shutdownNow() discards such tasks without
+     * running their finally block; the stop path uses this count to balance
+     * those references instead of leaving the connection retained forever.
+     */
+    private final AtomicInteger queuedDispatches = new AtomicInteger(0);
+
+    /**
+     * Streams whose dispatch task is queued in the executor and has not
+     * started yet. Used by the stop path to release the processing claim of
+     * tasks discarded by shutdownNow(); a stuck claim would prevent the
+     * stream SSL from being freed.
+     */
+    private final ConcurrentLinkedQueue<QuicStreamWrapper> queuedDispatchStreams =
+            new ConcurrentLinkedQueue<>();
 
     /**
      * Set when the poll thread wants to free this connection's SSL but must
@@ -373,13 +392,14 @@ public class QuicConnectionWrapper implements QuicConnection {
         String result = sniHostName;
         if (result == null) {
             QuicOpenSSLEndpoint endpoint = this.endpoint;
-            if (endpoint == null) {
+            if (endpoint == null || isClosed() || isFreed()) {
                 // No poll thread to hop the native call to (endpoint not
-                // wired in yet). Calling SSL_get_servername here would race
-                // the poll loop with the connection SSL (which is not
-                // thread-safe and may be mid-free). The SNI host name is
-                // not critical: report "no SNI" (empty, as for a client
-                // that sent none) and do not touch native memory.
+                // wired in yet), or the native connection is already gone.
+                // Calling SSL_get_servername here would race the poll loop
+                // with the connection SSL (which is not thread-safe and may
+                // be mid-free). The SNI host name is not critical: report
+                // "no SNI" (empty, as for a client that sent none) and do
+                // not touch native memory.
                 return "";
             }
             try {
@@ -399,6 +419,14 @@ public class QuicConnectionWrapper implements QuicConnection {
      * Must only be called on the QUIC poll thread.
      */
     private String readSniHostNameCached() {
+        if (isClosed() || isFreed()) {
+            // The connection was torn down between queueing this hop and its
+            // execution (the free is poll-thread-confined too, so this check
+            // is race-free). The native connection may already be freed;
+            // report "no SNI" and do not touch it. Do not cache the result:
+            // it means "unknown", not "the client sent no SNI".
+            return "";
+        }
         String value = readSniHostName();
         sniHostName = value;
         return value;
@@ -605,6 +633,50 @@ public class QuicConnectionWrapper implements QuicConnection {
     }
 
     /**
+     * Records that a dispatch task carrying an active-handler reference was
+     * queued in the executor.
+     *
+     * @param stream The stream whose processing flag the task owns
+     */
+    void incrQueuedDispatch(QuicStreamWrapper stream) {
+        queuedDispatches.incrementAndGet();
+        queuedDispatchStreams.add(stream);
+    }
+
+    /**
+     * Records that a queued dispatch task started running (or was rejected).
+     *
+     * @param stream The stream whose processing flag the task owned
+     */
+    void decrQueuedDispatch(QuicStreamWrapper stream) {
+        queuedDispatches.decrementAndGet();
+        queuedDispatchStreams.remove(stream);
+    }
+
+    /**
+     * Balances the active-handler references of dispatch tasks that the
+     * executor discarded during shutdownNow() and returns the streams whose
+     * processing claims those tasks still hold. Called by the stop path after
+     * the executor has terminated; the caller clears the claims so the streams
+     * can be freed.
+     *
+     * @return The streams whose dispatch tasks were discarded unrun
+     */
+    List<QuicStreamWrapper> discardQueuedDispatches() {
+        int discarded = queuedDispatches.getAndSet(0);
+        if (discarded > 0) {
+            activeHandlers.addAndGet(-discarded);
+        }
+        List<QuicStreamWrapper> streams =
+                new ArrayList<>(discarded > 0 ? discarded : 0);
+        QuicStreamWrapper stream;
+        while ((stream = queuedDispatchStreams.poll()) != null) {
+            streams.add(stream);
+        }
+        return streams;
+    }
+
+    /**
      * Checks whether any executor worker is currently running the HTTP handler
      * for a stream on this connection.
      *
@@ -712,10 +784,20 @@ public class QuicConnectionWrapper implements QuicConnection {
             }
             // Nothing was accepted. Tell a would-block (retry the same bytes
             // once the peer's credit/ACKs arrive) from a terminal stream
-            // state that can never accept them.
+            // state or a hard write error that can never accept them. The
+            // write state alone is not enough: an internal failure can leave
+            // the state OK while SSL_write_ex2() failed, and returning 0 would
+            // make the protocol layer retry the same bytes forever.
+            int sslError = QuicBindings.SSL_get_error(s.getSsl(), 0);
             int writeState = QuicBindings.SSL_get_stream_write_state(s.getSsl());
-            boolean terminal = QuicPoll.isTerminalWriteState(writeState);
+            boolean wouldBlock = sslError == QuicBindings.SSL_ERROR_WANT_READ ||
+                    sslError == QuicBindings.SSL_ERROR_WANT_WRITE;
+            boolean terminal = !wouldBlock ||
+                    QuicPoll.isTerminalWriteState(writeState);
             if (terminal) {
+                // Consume the bytes so the caller drops its pending state
+                // instead of retrying forever; the connection-level error
+                // path surfaces the failure.
                 data.position(startPos + len);
                 return len;
             }

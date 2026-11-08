@@ -84,6 +84,50 @@ public class QuicStreamWrapper implements QuicStream {
      */
     private final AtomicBoolean processing = new AtomicBoolean(false);
 
+    /**
+     * Claim-retry tasks parked while another thread owns the processing flag.
+     * {@code scheduleStreamDispatch()} registers its task here before
+     * attempting the claim; the dispatch that releases the claim (or a close
+     * path that clears it) drains and re-submits them. Re-submitting into the
+     * mailbox drain from the retry task itself would make that drain loop
+     * never terminate and starve the poll thread.
+     */
+    private final ConcurrentLinkedQueue<Runnable> claimWaiters =
+            new ConcurrentLinkedQueue<>();
+
+
+    /**
+     * Registers a claim-retry task to be re-run when the processing flag is
+     * released. Callers add the waiter before attempting the claim so a
+     * release racing the attempt cannot miss it.
+     *
+     * @param waiter The retry task
+     */
+    void addClaimWaiter(Runnable waiter) {
+        claimWaiters.add(waiter);
+    }
+
+
+    /**
+     * Removes a claim-retry task that no longer needs a wake.
+     *
+     * @param waiter The task to remove
+     */
+    void removeClaimWaiter(Runnable waiter) {
+        claimWaiters.remove(waiter);
+    }
+
+
+    /**
+     * Takes one pending claim-retry task, or {@code null} when none is
+     * waiting.
+     *
+     * @return The next parked task, or {@code null}
+     */
+    Runnable pollClaimWaiter() {
+        return claimWaiters.poll();
+    }
+
 
     /**
      * Atomically sets the processing flag if currently not processing.

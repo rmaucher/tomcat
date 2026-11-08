@@ -542,7 +542,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         if (stream == null) {
             return;
         }
-        concludeStream(stream.getSsl());
+        concludeStream(stream);
         stream.setConcluded();
     }
 
@@ -589,6 +589,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void writeBlocking(byte[] buf, int off, int len) throws IOException {
+        checkNotClosed();
         writeLock.lock();
         try {
             super.writeBlocking(buf, off, len);
@@ -600,6 +601,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void writeBlocking(ByteBuffer from) throws IOException {
+        checkNotClosed();
         writeLock.lock();
         try {
             super.writeBlocking(from);
@@ -611,6 +613,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void writeNonBlocking(byte[] buf, int off, int len) throws IOException {
+        checkNotClosed();
         writeLock.lock();
         try {
             super.writeNonBlocking(buf, off, len);
@@ -622,6 +625,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void writeNonBlocking(ByteBuffer from) throws IOException {
+        checkNotClosed();
         writeLock.lock();
         try {
             super.writeNonBlocking(from);
@@ -633,6 +637,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void flushBlocking() throws IOException {
+        checkNotClosed();
         writeLock.lock();
         try {
             super.flushBlocking();
@@ -716,8 +721,6 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             throw new IOException(sm.getString("socketWrapper.quicStreamClosed"));
         }
 
-        MemorySegment ssl = stream.getSsl();
-
         if (log.isDebugEnabled()) {
             log.debug("doWrite: streamId=" + stream.getStreamId() + " len=" + buffer.remaining()
                     + " conclude=" + conclude + " block=" + block);
@@ -739,7 +742,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             if (remaining == 0) {
                 // Entire buffer written; conclude the stream if requested.
                 if (conclude) {
-                    concludeStream(ssl);
+                    concludeStream(stream);
                     stream.setConcluded();
                 }
                 return;
@@ -758,7 +761,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             // write never concludes the stream prematurely.
             int written;
             try {
-                written = writeChunk(ssl, buffer);
+                written = writeChunk(stream, buffer);
             } catch (IOException ioe) {
                 buffer.position(startPos);
                 throw new IOException(sm.getString("socketWrapper.quicWriteError"), ioe);
@@ -804,7 +807,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             // already past the anchor) stays in the buffer.
             buffer.position(startPos);
             // Check write state for a terminal error.
-            if (QuicPoll.isTerminalWriteState(getStreamWriteState(ssl))) {
+            if (QuicPoll.isTerminalWriteState(getStreamWriteState(stream))) {
                 throw new IOException(sm.getString("socketWrapper.quicStreamClosed"));
             }
             if (!block) {
@@ -836,25 +839,86 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      * @return the number of bytes written, or -1 if the write would block
      * @throws IOException if the native write fails
      */
-    private int writeChunk(MemorySegment ssl, ByteBuffer buffer) throws IOException {
+    private int writeChunk(QuicStreamWrapper stream, ByteBuffer buffer) throws IOException {
         // Hand the live buffer to the kernel instead of snapshotting it into
         // an array: the kernel leaves its position untouched (the caller
         // anchors progress itself) and this worker stays blocked in the hop
         // while the native call reads it, so neither position nor content can
-        // change underneath the call.
+        // change underneath the call. Re-fetch and re-check the SSL on the
+        // poll thread: the stream may have been torn down between the
+        // caller's liveStream() check and this hop.
         return onPollThread(() -> {
+            MemorySegment ssl = requireLiveSsl(stream);
             try (Arena localArena = Arena.ofConfined()) {
-                return QuicOpenSSLEndpoint.writeStreamData(ssl, buffer, localArena);
+                int written = QuicOpenSSLEndpoint.writeStreamData(ssl, buffer, localArena);
+                if (written < 0) {
+                    throwIfHardWriteError(ssl);
+                }
+                return written;
             }
         });
     }
 
 
     /**
+     * Re-fetches a stream's SSL on the poll thread, rejecting a stream that
+     * was freed or deregistered while a native hop was queued.
+     *
+     * @param stream The stream to check
+     *
+     * @return The live SSL pointer
+     *
+     * @throws IOException If the stream is no longer safe to touch
+     */
+    private MemorySegment requireLiveSsl(QuicStreamWrapper stream) throws IOException {
+        if (stream == null || stream.isFreed()) {
+            throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
+        }
+        MemorySegment ssl = stream.getSsl();
+        if (ssl == null || ssl.equals(MemorySegment.NULL)) {
+            throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
+        }
+        return ssl;
+    }
+
+
+    /**
+     * Distinguishes a hard native write error from the two would-block
+     * results. {@code writeStreamData()} returns -1 for any failed
+     * {@code SSL_write_ex2()}; only {@code SSL_ERROR_WANT_READ/WRITE} mean the
+     * caller should retry. A hard error that is not reflected in the stream
+     * write state must be reported instead of being retried until the blocking
+     * timeout (or re-armed forever in non-blocking mode). Must run on the poll
+     * thread immediately after the failed write, before any other native call
+     * consumes the error queue.
+     *
+     * @param ssl The stream SSL that just failed to accept data
+     *
+     * @throws IOException If the failure is a hard write error
+     */
+    private void throwIfHardWriteError(MemorySegment ssl) throws IOException {
+        int sslError = QuicBindings.SSL_get_error(ssl, 0);
+        if (sslError == QuicBindings.SSL_ERROR_WANT_READ ||
+                sslError == QuicBindings.SSL_ERROR_WANT_WRITE) {
+            return;
+        }
+        if (QuicPoll.isTerminalWriteState(
+                QuicBindings.SSL_get_stream_write_state(ssl))) {
+            // The caller detects the terminal state and reports the closed
+            // stream; a reset/closed stream is not a hard write failure.
+            return;
+        }
+        throw new IOException(sm.getString("socketWrapper.quicWriteNativeError",
+                Integer.valueOf(sslError), QuicDiagnostics.dumpErrorQueue()));
+    }
+
+
+    /**
      * Queries the stream write state on the poll thread.
      */
-    private int getStreamWriteState(MemorySegment ssl) throws IOException {
-        return onPollThread(() -> QuicBindings.SSL_get_stream_write_state(ssl));
+    private int getStreamWriteState(QuicStreamWrapper stream) throws IOException {
+        return onPollThread(() -> QuicBindings.SSL_get_stream_write_state(
+                requireLiveSsl(stream)));
     }
 
 
@@ -872,8 +936,11 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      * connection fleet, so they were removed; this is what keeps the
      * per-response worker-hop cost constant in the fleet size.
      */
-    private void concludeStream(MemorySegment ssl) throws IOException {
-        onPollThreadVoid(() -> QuicBindings.SSL_stream_conclude(ssl, 0L));
+    private void concludeStream(QuicStreamWrapper stream) throws IOException {
+        onPollThread(() -> {
+            QuicBindings.SSL_stream_conclude(requireLiveSsl(stream), 0L);
+            return null;
+        });
     }
 
 
@@ -1096,14 +1163,44 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             }
         } catch (Throwable t) {
             ExceptionUtils.handleThrowable(t);
-            // A close failure leaves native state behind; surface it
-            // unconditionally rather than hiding it behind a debug guard.
-            log.error(sm.getString("socketWrapper.quicCloseError"), t);
+            if (isInterrupted(t)) {
+                // The calling request handler was interrupted - by the
+                // executor shutdown at endpoint stop - while this close
+                // hopped to the poll thread. Expected shutdown noise, not a
+                // transport failure.
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("socketWrapper.quicCloseInterrupted"), t);
+                }
+            } else {
+                // A close failure leaves native state behind; surface it
+                // unconditionally rather than hiding it behind a debug guard.
+                log.error(sm.getString("socketWrapper.quicCloseError"), t);
+            }
         } finally {
             // Release point of the documented post-close contract (above);
             // the read paths guard on it, the write paths never touch it.
             socketBufferHandler = null;
         }
+    }
+
+
+    /**
+     * Whether the failure surface wraps a thread interruption (the hop's
+     * {@link InterruptedException} translated into an {@link IOException},
+     * with the interrupt flag already restored).
+     *
+     * @param t The failure to inspect
+     *
+     * @return {@code true} if an {@link InterruptedException} appears in the
+     *         cause chain
+     */
+    private static boolean isInterrupted(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof InterruptedException) {
+                return true;
+            }
+        }
+        return false;
     }
 
 
@@ -1173,6 +1270,15 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     if (read) {
                         for (int i = 0; i < length; i++) {
                             int bytes = read(false, buffers[offset + i]);
+                            if (bytes < 0) {
+                                // EOF: treating it as would-block (0) would
+                                // re-run the operation or report no progress
+                                // forever instead of completing at end of
+                                // stream.
+                                completion.failed(new EOFException(
+                                        sm.getString("socketWrapper.quicStreamClosed")), this);
+                                return;
+                            }
                             if (bytes > 0) {
                                 nBytes += bytes;
                             } else {
@@ -1280,7 +1386,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     // or session, so the connection-level handle must be
                     // used here.
                     QuicConnectionWrapper c = connection();
-                    if (c == null) {
+                    if (c == null || c.isClosed() || c.isFreed()) {
                         return null;
                     }
                     MemorySegment ssl = c.getSsl();
@@ -1319,7 +1425,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                         // connection's SSL, not the per-stream SSL
                         // (see getCipherSuite()).
                         QuicConnectionWrapper c = connection();
-                        if (c == null) {
+                        if (c == null || c.isClosed() || c.isFreed()) {
                             return null;
                         }
                         MemorySegment ssl = c.getSsl();
@@ -1448,7 +1554,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     // The session is held by the connection's SSL, not the
                     // per-stream SSL (see getCipherSuite()).
                     QuicConnectionWrapper c = connection();
-                    if (c == null) {
+                    if (c == null || c.isClosed() || c.isFreed()) {
                         return null;
                     }
                     MemorySegment ssl = c.getSsl();
@@ -1495,7 +1601,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     // the negotiated version are connection-level (see
                     // getCipherSuite()).
                     QuicConnectionWrapper c = connection();
-                    if (c != null) {
+                    if (c != null && !c.isClosed() && !c.isFreed()) {
                         MemorySegment ssl = c.getSsl();
                         if (!ssl.equals(MemorySegment.NULL)) {
                             return openssl_h.SSL_get_version(ssl).getString(0);

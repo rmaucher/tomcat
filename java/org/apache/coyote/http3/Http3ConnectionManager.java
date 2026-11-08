@@ -112,7 +112,10 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // handles a zero-capacity table.
         long capacity = protocol.getQpackMaxTableCapacity();
         int tableCapacity = Constants.clampToNonNegativeInt(capacity);
-        sharedDecoder = new QpackDecoder(tableCapacity, tableCapacity);
+        // RFC 9204 Section 3.2.2: the dynamic table starts at capacity zero.
+        // The encoder must send Set Dynamic Table Capacity before any insert;
+        // the hard limit is the value this server advertises.
+        sharedDecoder = new QpackDecoder(0, tableCapacity);
         protocol.configureDecoder(sharedDecoder);
     }
 
@@ -263,7 +266,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             // server's QPACK encoder (RFC 9204 Section 4.2). A malformed
             // instruction is a connection error of type
             // H3_QPACK_DECODER_STREAM_ERROR (RFC 9204 Section 6).
-            processQpackDecoderStream(state, streamId, data);
+            processQpackDecoderStream(streamId, data);
         }
 
         // No native work here: this method only parses and updates the
@@ -301,18 +304,13 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * The two QPACK streams are deferred until the client's SETTINGS have
      * been received: RFC 9204 Section 4.2 does not require this - an
      * endpoint MAY create the streams at any time and MUST allow the peer
-     * to do the same - but holding them back keeps the encoder stream from
-     * being created before the peer's dynamic table capacity is known
-     * (RFC 9204 Section 3.2.3), and the deferral costs nothing on the
-     * output side: the server's encoder never uses the dynamic table, so
-     * the first - and only - instruction on its encoder stream is a
-     * constant-zero Set Dynamic Table Capacity (see
-     * {@link #getServerUniStreamInitData(int)}). That constant is the
-     * capacity of the server's own encoder table; it is not the
-     * SETTINGS_QPACK_MAX_TABLE_CAPACITY the server announces in its
-     * SETTINGS, which is the configured (by default non-zero) limit the
-     * peer's encoder must respect when inserting into this server's
-     * decoder.
+     * to do the same - but it keeps the QPACK streams from being created
+     * before the peer's SETTINGS are known. The server's encoder never uses
+     * the dynamic table, so its encoder stream carries only the stream type
+     * byte and no encoder instructions (in particular no Set Dynamic Table
+     * Capacity instruction; RFC 9204 Section 3.2.3 forbids encoder
+     * instructions when the peer advertised a maximum table capacity of 0,
+     * and the unmodified initial capacity is already zero).
      */
     @Override
     public int nextServerUniStream(QuicConnection connection) {
@@ -353,14 +351,12 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * <li>index 0: control stream type plus the SETTINGS frame (RFC 9114
      * Sections 6.2.1 and 7.2.4 require SETTINGS to be the first frame on
      * the control stream)</li>
-     * <li>index 1: QPACK encoder stream type byte plus the Set Dynamic
-     * Table Capacity instruction with capacity {@code 0}, announcing the
-     * initial (zero) capacity of the server's dynamic table for decoding
-     * responses (RFC 9204 Section 3.2.2: the dynamic table starts at zero
-     * capacity; Section 4.3.1 defines the instruction but imposes no
-     * ordering on encoder instructions - the server encoder never
-     * inserts, so it announces {@code 0} and no further instructions
-     * follow)</li>
+     * <li>index 1: QPACK encoder stream type byte only. The server's
+     * encoder never inserts into a dynamic table, so it sends no encoder
+     * instructions. Omitting the Set Dynamic Table Capacity instruction is
+     * required when the peer advertised a maximum capacity of 0 (RFC 9204
+     * Section 3.2.3) and is harmless otherwise because the initial
+     * capacity is already zero (Section 3.2.2).</li>
      * <li>index 2: QPACK decoder stream type byte (RFC 9204 Section 4.2)</li>
      * </ul>
      */
@@ -370,9 +366,11 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             case SERVER_STREAM_INDEX_CONTROL:
                 return createServerControlStreamData();
             case SERVER_STREAM_INDEX_QPACK_ENCODER:
-                // 0x20 = Set Dynamic Table Capacity: 001 + iRP(m=5) capacity=0
+                // Stream type only: the server encoder never inserts and
+                // must not send encoder instructions when the peer's
+                // maximum table capacity is zero.
                 return ByteBuffer.wrap(new byte[]{
-                        (byte) Constants.H3_STREAM_TYPE_QPACK_ENCODER, 0x20 });
+                        (byte) Constants.H3_STREAM_TYPE_QPACK_ENCODER });
             case SERVER_STREAM_INDEX_QPACK_DECODER:
                 return ByteBuffer.wrap(new byte[]{
                         (byte) Constants.H3_STREAM_TYPE_QPACK_DECODER });
@@ -970,8 +968,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * instructions from decoder to encoder. The stream type varint has
      * already been read by {@link #processClientUniStreamData}.
      */
-    private void processQpackDecoderStream(ConnectionState state, long streamId,
-            ByteBuffer data) throws Http3Exception {
+    private void processQpackDecoderStream(long streamId, ByteBuffer data)
+            throws Http3Exception {
         // Process QPACK decoder instructions: Section Acknowledgment,
         // Stream Cancellation, Insert Count Increment (RFC 9204 Section 4.4)
         processQpackInstructions(streamId, data,
@@ -1420,7 +1418,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // Volatile because it is written on the QUIC poll thread (when the
         // client's SETTINGS are processed) and read by executor worker
         // threads (the response field section limit in Http3Processor).
-        private volatile long peerMaxFieldSectionSize = 0;
+        // -1 means the peer did not declare a limit; 0 is an explicit limit.
+        private volatile long peerMaxFieldSectionSize = -1;
         private int activeStreamCount = 0;
         // Volatile because it is updated on the QUIC poll thread (transport
         // stream limit reconciliation) after the state has been published
@@ -1831,8 +1830,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
          * Returns the peer's advertised SETTINGS_MAX_FIELD_SECTION_SIZE
          * (RFC 9114 Section 4.2.2).
          *
-         * @return The peer's maximum field section size, or {@code 0} if the
-         *         peer did not declare a limit
+         * @return The peer's maximum field section size, or a negative value
+         *         if the peer did not declare a limit
          */
         public long getPeerMaxFieldSectionSize() {
             return peerMaxFieldSectionSize;
@@ -1879,18 +1878,25 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
         /**
          * Checks if a new bidirectional stream can be accepted.
+         * <p>
+         * The concurrency limit (the peer's SETTINGS_MAX_STREAMS /
+         * MAX_STREAMS credit) caps the number of concurrently open streams.
+         * In addition, once a GOAWAY has been sent, a stream with an
+         * identifier at or above the GOAWAY identifier must be rejected:
+         * RFC 9114 Section 5.2 makes the sender responsible for rejecting
+         * requests with an identifier at or above the one it advertised, and
+         * a client may retry them on another connection after receiving the
+         * GOAWAY.
          *
-         * @param streamId The stream ID of the new stream. Not used: the
-         *                 HTTP/3 concurrency limit (the peer's
-         *                 SETTINGS_MAX_STREAMS / MAX_STREAMS credit) caps
-         *                 the number of concurrently open streams, not any
-         *                 particular stream ID; the parameter is required
-         *                 by the {@link QuicConnectionManager.ConnectionState}
-         *                 interface shape
+         * @param streamId The stream ID of the new stream
          * @return true if the stream can be accepted, false if limit reached
+         *         or the stream is at/after a GOAWAY identifier already sent
          */
         @Override
         public boolean canAcceptStream(long streamId) {
+            if (lastSentGoawayId >= 0 && streamId >= lastSentGoawayId) {
+                return false;
+            }
             return activeStreamCount < maxConcurrentStreams;
         }
 
@@ -1898,13 +1904,21 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         /**
          * {@inheritDoc}
          * <p>
-         * Updates the last processed stream ID.
+         * Records the highest request-stream ID accepted so far. Stream IDs
+         * are assigned in creation order but their data can arrive out of
+         * order, so keeping the maximum (rather than the most recently
+         * accepted value) ensures the GOAWAY identifier never moves backwards
+         * above a stream that may already have been processed. A lower ID
+         * that was not processed before a GOAWAY may consequently be reported
+         * as "might have been processed" and not be retried; that is
+         * preferable to allowing a processed non-idempotent request to be
+         * retried and executed twice.
          *
          * @param streamId The identifier of the last processed stream
          */
         @Override
         public void setLastProcessedStreamId(long streamId) {
-            this.lastProcessedStreamId = streamId;
+            this.lastProcessedStreamId = Math.max(lastProcessedStreamId, streamId);
         }
 
 
@@ -1972,15 +1986,6 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             this.maxConcurrentStreams = max;
         }
 
-
-        /**
-         * Returns the maximum concurrent streams.
-         *
-         * @return The maximum number of concurrent streams
-         */
-        public long getMaxConcurrentStreams() {
-            return maxConcurrentStreams;
-        }
 
     }
 }
