@@ -18,6 +18,7 @@ package org.apache.coyote.http3;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 
@@ -209,12 +210,113 @@ public class TestAsyncReadListener extends Http3TestBase {
     }
 
 
+    @Test
+    public void testLargeContentLengthBodyAllDataReadWithoutFin()
+            throws Exception {
+        startHttp3Server(ctxt -> {
+            Wrapper w = Tomcat.addServlet(ctxt, "async", asyncServlet);
+            w.setAsyncSupported(true);
+            ctxt.addServletMapping("/async", "async");
+        });
+
+        // A body larger than Http3Processor.MAX_PRE_BUFFERED_BODY_BYTES is
+        // delivered through the streaming read path. The declared body is
+        // complete once all Content-Length bytes have arrived, even if the
+        // client keeps the request stream open for a possible trailer
+        // section; onAllDataRead must be delivered without waiting for FIN.
+        byte[] body = new byte[70 * 1024];
+        Arrays.fill(body, (byte) 'a');
+        String headers = buildFieldSection(
+                ":method", "POST",
+                ":scheme", "https",
+                ":authority", "127.0.0.1:" + port,
+                ":path", "/async",
+                "content-length", Integer.toString(body.length));
+        Thread clientThread = new Thread(
+                () -> runClient(rawCommandWith(
+                        "--headers", headers,
+                        "--data", Base64.getEncoder().encodeToString(body),
+                        "--no-fin",
+                        "--timeout", "2",
+                        "--wait", "6"), CLIENT_TIMEOUT_SECONDS));
+        clientThread.setDaemon(true);
+        clientThread.start();
+
+        synchronized (asyncServlet) {
+            long deadline = System.currentTimeMillis() + 3000;
+            while (asyncServlet.error == null && !asyncServlet.allDataRead
+                    && System.currentTimeMillis() < deadline) {
+                asyncServlet.wait(
+                        Math.max(10, deadline - System.currentTimeMillis()));
+            }
+        }
+
+        Assert.assertNull("Unexpected ReadListener error: "
+                + asyncServlet.error, asyncServlet.error);
+        Assert.assertEquals("Body bytes were not all delivered",
+                body.length, asyncServlet.bytesReceived);
+        Assert.assertTrue("onAllDataRead was not called before the stream " +
+                "was closed by the client", asyncServlet.allDataRead);
+
+        clientThread.join(20000);
+    }
+
+
+    @Test
+    public void testGetBodyWithoutContentLengthIsRead() throws Exception {
+        startHttp3Server(ctxt -> {
+            Wrapper w = Tomcat.addServlet(ctxt, "async", asyncServlet);
+            w.setAsyncSupported(true);
+            ctxt.addServletMapping("/async", "async");
+        });
+
+        // RFC 9110 Section 6.5 and RFC 9114 Section 4.1 allow content with any
+        // method. Without Content-Length the body is delimited by the end of
+        // the request stream. A conforming client closes the stream for
+        // sending after the request, so the async reader must receive both
+        // the body bytes and onAllDataRead().
+        String headers = buildFieldSection(
+                ":method", "GET",
+                ":scheme", "https",
+                ":authority", "127.0.0.1:" + port,
+                ":path", "/async");
+        runClient(rawCommandWith(
+                "--headers", headers,
+                "--data", Base64.getEncoder().encodeToString(
+                        "GETBODY".getBytes(StandardCharsets.UTF_8))),
+                CLIENT_TIMEOUT_SECONDS);
+
+        synchronized (asyncServlet) {
+            long deadline = System.currentTimeMillis() + 15000;
+            while (asyncServlet.error == null && !asyncServlet.allDataRead
+                    && System.currentTimeMillis() < deadline) {
+                asyncServlet.wait(
+                        Math.max(10, deadline - System.currentTimeMillis()));
+            }
+        }
+
+        Assert.assertNull("Unexpected ReadListener error: "
+                + asyncServlet.error, asyncServlet.error);
+        Assert.assertEquals("Request body bytes were not delivered",
+                7, asyncServlet.bytesReceived);
+        Assert.assertTrue("onAllDataRead was not called",
+                asyncServlet.allDataRead);
+    }
+
+
     public static class AsyncServlet extends HttpServlet {
         private static final long serialVersionUID = 1L;
 
         volatile int bytesReceived;
         volatile boolean allDataRead;
         volatile Throwable error;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            doPost(req, resp);
+        }
+
 
         @Override
         protected void doPost(HttpServletRequest req, HttpServletResponse resp)

@@ -50,8 +50,20 @@ import java.lang.foreign.ValueLayout;
  *     uint64_t revents;          // offset 24, 8 bytes
  * } SSL_POLL_ITEM;               // total 32 bytes
  * </pre>
+ * <p>
+ * The layout and the {@code struct timeval} used by the poll loop assume the
+ * 64-bit Linux LP64 ABI ({@code time_t}/{@code suseconds_t} and pointers are
+ * 8 bytes). A 32-bit build is rejected at class initialisation rather than
+ * silently passing a mismatched struct to {@code SSL_poll()}.
  */
 public final class QuicPoll {
+
+    static {
+        if (ValueLayout.ADDRESS.byteSize() != Long.BYTES) {
+            throw new IllegalStateException(
+                    "OpenSSL QUIC requires a 64-bit (LP64) JVM/ABI");
+        }
+    }
 
     private QuicPoll() {
         // Utility class - constants, layout and the SSL_poll() driver only.
@@ -219,22 +231,22 @@ public final class QuicPoll {
      */
     public static int poll(MemorySegment nativeArray, int count, long timeoutMs,
             long flags, MemorySegment resultCount) {
-        // Build timeval on a confined arena; the native call copies the value before we return
-        Arena localArena = Arena.ofConfined();
-        MemorySegment timeoutPtr;
-        if (timeoutMs < 0) {
-            // Infinite timeout
-            timeoutPtr = MemorySegment.NULL;
-        } else {
-            MemorySegment tv = localArena.allocate(TIMEVAL_LAYOUT);
-            long secs = timeoutMs / 1000;
-            long usecs = (timeoutMs % 1000) * 1000;
-            tv.set(ValueLayout.JAVA_LONG, TV_SEC_OFFSET, secs);
-            tv.set(ValueLayout.JAVA_LONG, TV_USEC_OFFSET, usecs);
-            timeoutPtr = tv;
-        }
-
-        try {
+        // Build timeval on a confined arena; the native call copies the value
+        // before we return. try-with-resources also closes the arena if the
+        // allocation for the timeval fails.
+        try (Arena localArena = Arena.ofConfined()) {
+            MemorySegment timeoutPtr;
+            if (timeoutMs < 0) {
+                // Infinite timeout
+                timeoutPtr = MemorySegment.NULL;
+            } else {
+                MemorySegment tv = localArena.allocate(TIMEVAL_LAYOUT);
+                long secs = timeoutMs / 1000;
+                long usecs = (timeoutMs % 1000) * 1000;
+                tv.set(ValueLayout.JAVA_LONG, TV_SEC_OFFSET, secs);
+                tv.set(ValueLayout.JAVA_LONG, TV_USEC_OFFSET, usecs);
+                timeoutPtr = tv;
+            }
             return QuicBindings.SSL_poll(
                     nativeArray,
                     (long) count,
@@ -242,8 +254,6 @@ public final class QuicPoll {
                     timeoutPtr,
                     flags,
                     resultCount);
-        } finally {
-            localArena.close();
         }
     }
 

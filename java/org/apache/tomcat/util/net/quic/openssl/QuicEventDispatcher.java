@@ -44,8 +44,7 @@ final class QuicEventDispatcher {
     // the endpoint, whose poll loop evicts F first) deliberately falls into
     // the error bucket: on a non-listener item it yields ERROR_OTHER, which
     // counts as progress, rather than being routed to an IN/OUT handler of
-    // an item SSL_poll() could not poll. Frozen by
-    // TestQuicEventDispatcher#testPollFailureFlagClassifiesAsOtherError.
+    // an item SSL_poll() could not poll.
     private static final long SSL_POLL_ERROR = QuicPoll.SSL_POLL_EVENT_F |
             QuicPoll.SSL_POLL_EVENT_EL |
             QuicPoll.SSL_POLL_EVENT_EC |

@@ -52,6 +52,12 @@ import org.apache.tomcat.util.res.StringManager;
  * {@link #kick()} may be called from any thread. {@link #await(long)},
  * {@link #consumeWake()} and {@link #close()} are called only from the poll
  * thread (close also from the stop path after the poll loop has stopped).
+ * <p>
+ * This class is a deliberate twin of
+ * {@code org.apache.tomcat.util.net.quic.quiche.QuicWakeup}: the libc downcalls
+ * differ (this copy routes them through {@link QuicBindings}), while the
+ * eventfd/pollfd logic and public surface must stay in step. The quiche copy
+ * carries the same note.
  */
 final class QuicWakeup {
 
@@ -166,7 +172,9 @@ final class QuicWakeup {
      * for the timeout to expire. Retries transparently on {@code EINTR}
      * (thread interrupt / signal) with the remaining time.
      *
-     * @param timeoutMs Maximum time to wait; {@code 0} returns immediately
+     * @param timeoutMs Maximum time to wait; {@code 0} returns immediately and
+     *                  a negative value waits without a deadline (served by the
+     *                  {@code -1} timeout of {@code poll(2)})
      *
      * @return A bitmask of {@link #EVENT_WAKE} and {@link #EVENT_SOCK};
      *         {@code 0} means the wait timed out, a negative value means the

@@ -212,6 +212,13 @@ public class QuicheConnectionWrapper implements QuicConnection {
 
     @Override
     public void setProtocolDataPending(boolean pending) {
+        if (pending && (isClosed() || isFreed())) {
+            // A late worker/manager mark on a connection that has already
+            // been torn down cannot be flushed and would otherwise strand
+            // the endpoint-wide pending counter. A false transition is still
+            // allowed so an existing mark can be balanced.
+            return;
+        }
         QuicheEndpoint ep = endpoint;
         if (ep != null) {
             ep.setConnectionProtocolDataPending(this, pending);

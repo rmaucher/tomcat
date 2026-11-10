@@ -28,14 +28,19 @@ import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Deque;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
+import org.apache.coyote.AbstractProcessor;
+import org.apache.coyote.Response;
 import org.apache.coyote.UpgradeToken;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
@@ -57,6 +62,9 @@ import org.apache.tomcat.util.net.quic.QuicStream;
  * request bodies, query strings and concurrent requests.
  */
 public class TestHttp3Functional extends Http3TestBase {
+
+    private static final org.apache.coyote.Adapter TEST_ADAPTER =
+            new TestAdapter();
 
     @Test
     public void testGet() throws Exception {
@@ -166,6 +174,39 @@ public class TestHttp3Functional extends Http3TestBase {
             validateStatus(response, 200);
             Assert.assertEquals("Hello over HTTP/3",
                     response.getBodyAsString());
+        }
+    }
+
+
+    @Test
+    public void testLateResetAfterCompletedResponseIsIgnored() throws Exception {
+        Assume.assumeTrue("Late-read-edge suppression is ngtcp2-specific",
+                endpointIsNgtcp2());
+        startHttp3Server();
+
+        // Two completed requests on one connection, then a late RESET_STREAM
+        // on the first (already finalised) stream. The reset must not
+        // re-enter request dispatch: doing so would enter service() without a
+        // request head, reset the stream with H3_REQUEST_INCOMPLETE and
+        // abandon its QPACK section. The second response proves the
+        // connection stays usable.
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers", buildFieldSection(simpleGetHeaders("/simple")),
+                "--streams", "2",
+                "--reset-request", "2",
+                "--wait", "1",
+                "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
+
+        Assert.assertEquals("Both completed requests must have responses",
+                2, output.getResponses().size());
+        Assert.assertNull("A late reset must not reset the request stream",
+                output.getStreamError());
+        Assert.assertNull("A late reset must not fail the connection",
+                output.getConnectionError());
+        if (endpointIsNgtcp2()) {
+            Assert.assertFalse("A late reset on a completed request must not "
+                    + "abandon its QPACK section",
+                    output.getDecoderCancellations().contains(Integer.valueOf(0)));
         }
     }
 
@@ -315,6 +356,203 @@ public class TestHttp3Functional extends Http3TestBase {
         Assert.assertTrue("The suppressed error response must still claim "
                 + "the response as started",
                 startedField.getBoolean(processor));
+    }
+
+
+    @Test
+    public void testAbandonedTrailerReadMarksStreamCancellation() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, null);
+        processor.setStreamId(0);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper();
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        Field hasData = Http3Processor.class.getDeclaredField(
+                "inputBufferHasData");
+        hasData.setAccessible(true);
+        hasData.setBoolean(processor, true);
+        Field bufferField = Http3Processor.class.getDeclaredField(
+                "inputBuffer");
+        bufferField.setAccessible(true);
+        ByteBuffer inputBuffer = (ByteBuffer) bufferField.get(processor);
+        inputBuffer.clear();
+        inputBuffer.limit(1);
+        inputBuffer.put(0, (byte) 0x01);
+        inputBuffer.position(0);
+
+        Object inBuf = processor.getRequest().getInputBuffer();
+        Method handle = Http3Processor.class.getDeclaredMethod(
+                "handleTrailerReadEnd", SocketWrapperBase.class,
+                inBuf.getClass());
+        handle.setAccessible(true);
+        Assert.assertEquals(Boolean.TRUE, handle.invoke(processor, wrapper,
+                inBuf));
+
+        Field cancellationSent = Http3Processor.class.getDeclaredField(
+                "streamCancellationSent");
+        cancellationSent.setAccessible(true);
+        Assert.assertTrue("An abandoned trailer read must queue the QPACK " +
+                "Stream Cancellation", cancellationSent.getBoolean(processor));
+    }
+
+
+    @Test
+    public void testRecycleClearsBadRequestNote() throws Exception {
+        // Request.recycle() does not clear the notes array. HTTP/2 clears
+        // NOTE_BAD_REQUEST explicitly because its processors/request objects
+        // may be reused; HTTP/3 processors are pooled across streams and
+        // connections, so the same stale note would make later valid
+        // requests receive a spurious 400.
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setAdapter(TEST_ADAPTER);
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.getRequest().setNote(
+                org.apache.coyote.Request.NOTE_BAD_REQUEST, Boolean.TRUE);
+
+        processor.recycle();
+
+        Assert.assertNull("NOTE_BAD_REQUEST must not survive recycle()",
+                processor.getRequest().getNote(
+                        org.apache.coyote.Request.NOTE_BAD_REQUEST));
+    }
+
+
+    @Test
+    public void testErrorProcessorIsNotReusable() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setAdapter(TEST_ADAPTER);
+
+        Http3Processor normal = new Http3Processor(protocol, TEST_ADAPTER);
+        normal.recycle();
+        Assert.assertTrue("A clean processor may be pooled",
+                normal.isReusable());
+
+        Http3Processor reset = new Http3Processor(protocol, TEST_ADAPTER);
+        Field resetField =
+                Http3Processor.class.getDeclaredField("streamReset");
+        resetField.setAccessible(true);
+        ((AtomicBoolean) resetField.get(reset)).set(true);
+        reset.recycle();
+        Assert.assertFalse("A processor whose stream was reset must not be "
+                + "returned to the shared pool", reset.isReusable());
+    }
+
+
+    @Test
+    public void testConnectionFailureProcessorNotReusable() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setAdapter(TEST_ADAPTER);
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper();
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        // bodyFrameError is handled by recycle() after the initial reusable
+        // decision; failConnection() must mark the processor non-reusable.
+        Field bodyFrameError =
+                Http3Processor.class.getDeclaredField("bodyFrameError");
+        bodyFrameError.setAccessible(true);
+        bodyFrameError.set(processor, Http3Error.H3_FRAME_UNEXPECTED);
+
+        processor.recycle();
+
+        Assert.assertFalse("A processor that failed the connection must not "
+                + "be returned to the shared pool", processor.isReusable());
+    }
+
+
+    @Test
+    public void testTrailerFieldsNotSupportedAfterConclusion() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, null);
+        processor.setStreamId(0);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper();
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        Assert.assertTrue("Trailer fields should be supported before the " +
+                "response is concluded", processor.isTrailerFieldsSupported());
+
+        Method conclude = Http3Processor.class.getDeclaredMethod(
+                "concludeStream", SocketWrapperBase.class);
+        conclude.setAccessible(true);
+        conclude.invoke(processor, wrapper);
+
+        Assert.assertFalse("Trailer fields must not be supported after the " +
+                "response has been concluded",
+                processor.isTrailerFieldsSupported());
+    }
+
+
+    @Test
+    public void testTrailersSuppressedWithoutFinalHeaders() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, null);
+        processor.setStreamId(0);
+        setTrailerSupplier(processor);
+
+        // sendResponseHeadersInternal() sets responseStarted only after the
+        // final HEADERS frame has been written, so a header-send failure
+        // leaves it false. finishResponse() catches that failure and then
+        // calls sendResponseTrailers(); the trailer HEADERS frame must not
+        // be attempted without a final response head (RFC 9114 Section 4.1).
+        // The stub wrapper throws on any write attempt.
+        invokeSendResponseTrailers(processor, new StubReadSocketWrapper());
+    }
+
+
+    @Test
+    public void testTrailersSuppressedAfterStreamReset() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, null);
+        processor.setStreamId(0);
+        setTrailerSupplier(processor);
+
+        // The reset path in sendResponseHeadersInternal() claims the
+        // response as started without writing anything. Trailers must still
+        // not be sent on a reset stream.
+        Field resetField =
+                Http3Processor.class.getDeclaredField("streamReset");
+        resetField.setAccessible(true);
+        ((AtomicBoolean) resetField.get(processor)).set(true);
+        Field startedField =
+                Http3Processor.class.getDeclaredField("responseStarted");
+        startedField.setAccessible(true);
+        startedField.setBoolean(processor, true);
+
+        invokeSendResponseTrailers(processor, new StubReadSocketWrapper());
+    }
+
+
+    private static void setTrailerSupplier(Http3Processor processor)
+            throws Exception {
+        Field responseField =
+                AbstractProcessor.class.getDeclaredField("response");
+        responseField.setAccessible(true);
+        Response response = (Response) responseField.get(processor);
+        Map<String,String> trailers = new HashMap<>();
+        trailers.put("x-test-trailer", "value");
+        response.setTrailerFields(() -> trailers);
+    }
+
+
+    private static void invokeSendResponseTrailers(Http3Processor processor,
+            SocketWrapperBase<?> socketWrapper) throws Exception {
+        Method sendResponseTrailers = Http3Processor.class.getDeclaredMethod(
+                "sendResponseTrailers", SocketWrapperBase.class);
+        sendResponseTrailers.setAccessible(true);
+        try {
+            sendResponseTrailers.invoke(processor, socketWrapper);
+        } catch (InvocationTargetException ite) {
+            throw (Exception) ite.getCause();
+        }
     }
 
 
@@ -864,6 +1102,45 @@ public class TestHttp3Functional extends Http3TestBase {
      *
      * @param <S> The socket type
      */
+    private static class TestAdapter implements org.apache.coyote.Adapter {
+
+        @Override
+        public void service(org.apache.coyote.Request req,
+                org.apache.coyote.Response res) {
+            // NO-OP
+        }
+
+        @Override
+        public boolean prepare(org.apache.coyote.Request req,
+                org.apache.coyote.Response res) {
+            return true;
+        }
+
+        @Override
+        public boolean asyncDispatch(org.apache.coyote.Request req,
+                org.apache.coyote.Response res, SocketEvent status) {
+            return true;
+        }
+
+        @Override
+        public void log(org.apache.coyote.Request req,
+                org.apache.coyote.Response res, long time) {
+            // NO-OP
+        }
+
+        @Override
+        public void checkRecycled(org.apache.coyote.Request req,
+                org.apache.coyote.Response res) {
+            // NO-OP
+        }
+
+        @Override
+        public String getDomain() {
+            return "test";
+        }
+    }
+
+
     private static class StubEndpoint<S>
             extends AbstractEndpoint<S, Object> {
 

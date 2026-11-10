@@ -259,6 +259,54 @@ public class TestHttp3Headers extends Http3TestBase {
 
 
     @Test
+    public void testEmptyAuthorityPortAccepted() throws Exception {
+        startHttp3Server(this::addServerNameServlet);
+
+        // RFC 3986 Section 3.2.3 permits an empty port and treats it as
+        // equivalent to no port. The request must be accepted and the
+        // scheme default port populated by the adapter.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":path", "/serverName",
+                ":authority", "127.0.0.1:");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertEquals("127.0.0.1:443", response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testEmptyHostPortAccepted() throws Exception {
+        startHttp3Server(this::addServerNameServlet);
+
+        // Same rule when the authority is supplied by the Host field.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":path", "/serverName",
+                "host", "127.0.0.1:");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertEquals("127.0.0.1:443", response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testEmptyAuthorityAndHostPortsAccepted() throws Exception {
+        startHttp3Server(this::addServerNameServlet);
+
+        // Both fields carry the empty-port form; the host names are equal
+        // and neither carries an explicit port.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":path", "/serverName",
+                ":authority", "127.0.0.1:", "host", "127.0.0.1:");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertEquals("127.0.0.1:443", response.getBodyAsString());
+    }
+
+
+    @Test
     public void testUserinfoInAuthorityRejected() throws Exception {
         startHttp3Server(this::addServerNameServlet);
 
@@ -344,6 +392,49 @@ public class TestHttp3Headers extends Http3TestBase {
 
         validateStatus(response, 200);
         Assert.assertEquals("ok", response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testServletProtocolIsHttp30() throws Exception {
+        startHttp3Server(this::addProtocolServlet);
+
+        Http3Response response = get("/protocol");
+
+        validateStatus(response, 200);
+        Assert.assertEquals("HTTP/3.0", response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testResponseCommittedAfterDirectWrite() throws Exception {
+        startHttp3Server(this::addCommittedServlet);
+
+        // A write larger than the container's output buffer is passed
+        // straight to the processor before Response.commit() runs. The
+        // processor must mark the response committed when it writes the
+        // final HEADERS frame, otherwise the servlet observes
+        // isCommitted() == false after its headers are on the wire.
+        Http3Response response = get("/committed");
+
+        validateStatus(response, 200);
+        String body = response.getBodyAsString();
+        Assert.assertTrue("Expected committed=true in body: " + body,
+                body.contains("committed=true"));
+    }
+
+
+    @Test
+    public void testContentLengthZeroOn205Response() throws Exception {
+        startHttp3Server(this::addResetContentServlet);
+
+        // RFC 9110 Section 15.3.5 requires a Content-Length: 0 field in a
+        // 205 response.
+        Http3Response response = get("/resetcontent");
+
+        validateStatus(response, 205);
+        Assert.assertEquals("205 response must carry Content-Length: 0",
+                "0", response.getHeader("content-length"));
     }
 
 
@@ -447,6 +538,54 @@ public class TestHttp3Headers extends Http3TestBase {
             });
             resp.getWriter().print("ok");
         }
+    }
+
+
+    private void addProtocolServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "protocol", new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void doGet(HttpServletRequest req,
+                    HttpServletResponse resp) throws IOException {
+                resp.setContentType("text/plain");
+                resp.getWriter().write(req.getProtocol());
+            }
+        });
+        ctxt.addServletMapping("/protocol", "protocol");
+    }
+
+
+    private void addCommittedServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "committed", new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void doGet(HttpServletRequest req,
+                    HttpServletResponse resp) throws IOException {
+                resp.setContentType("text/plain");
+                jakarta.servlet.ServletOutputStream out =
+                        resp.getOutputStream();
+                out.write(new byte[9000]);
+                out.write(("committed=" + resp.isCommitted())
+                        .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            }
+        });
+        ctxt.addServletMapping("/committed", "committed");
+    }
+
+
+    private void addResetContentServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "resetcontent", new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void doGet(HttpServletRequest req,
+                    HttpServletResponse resp) {
+                resp.setStatus(205);
+            }
+        });
+        ctxt.addServletMapping("/resetcontent", "resetcontent");
     }
 
 

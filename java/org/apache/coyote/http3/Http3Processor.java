@@ -18,6 +18,7 @@ package org.apache.coyote.http3;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.io.StringReader;
 import java.net.SocketTimeoutException;
@@ -35,6 +36,7 @@ import jakarta.servlet.ServletConnection;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.apache.coyote.AbstractProcessor;
+import org.apache.coyote.ActionCode;
 import org.apache.coyote.Adapter;
 import org.apache.coyote.ContinueResponseTiming;
 import org.apache.coyote.ErrorState;
@@ -84,8 +86,10 @@ class Http3Processor extends AbstractProcessor
     private QpackDecoder qpackDecoder;
 
     /**
-     * QPACK encoder for this stream.
-     * May be shared with other streams on the same connection.
+     * QPACK encoder for this stream. This is always a per-stream instance:
+     * unlike the shared decoder, its in-progress encoding state (header
+     * iterator, pending prefix) must not be visible to the worker threads
+     * processing other streams of the same connection.
      */
     private QpackEncoder qpackEncoder;
 
@@ -100,7 +104,9 @@ class Http3Processor extends AbstractProcessor
      * only to the frame types whose payload this receiver buffers on a
      * request stream (DATA, HEADERS - see {@link #parseFrameHeader});
      * ignored frames (unknown or reserved-family padding) are discarded
-     * without buffering at any declared size (RFC 9114 Sections 9, 7.2.8).
+     * without buffering, but remain subject to the per-request
+     * {@link #MAX_NON_BODY_FRAME_BYTES} and {@link #MAX_NON_BODY_FRAMES}
+     * budgets (RFC 9114 Sections 9, 7.2.8).
      * A buffered frame above this limit is protocol-valid (HTTP/3 has no
      * negotiated frame size limit); the affected request stream is
      * rejected with {@code RESET_STREAM} ({@link Http3Error#H3_FRAME_ERROR})
@@ -140,11 +146,12 @@ class Http3Processor extends AbstractProcessor
      * deliver more data (or close the stream) before the stream is treated
      * as closed. A peer that stalls the body while keeping the QUIC
      * connection alive (for example with PING frames) must not be able to
-     * pin a worker thread indefinitely. This matches the 30-second
-     * blocking-write deadline of the {@code doWrite} implementation of the
-     * QUIC socket wrapper;
-     * the individual would-block pump retries within a single read carry
-     * their own, shorter deadline (see {@link #PUMP_RETRY_TIMEOUT_MS}).
+     * pin a worker thread indefinitely. The QUIC socket wrapper uses the
+     * connector's configured read timeout when one is set and otherwise
+     * falls back to its 30-second stall timeout; this is the same default
+     * bound used when the wrapper reports no read timeout. The individual
+     * would-block pump retries within a single read carry their own,
+     * shorter deadline (see {@link #PUMP_RETRY_TIMEOUT_MS}).
      */
     private static final int MAX_BODY_READ_STALL_MS = 30_000;
 
@@ -226,9 +233,32 @@ class Http3Processor extends AbstractProcessor
     private boolean trailersSent = false;
 
     /**
+     * Whether the response stream has been concluded (the FIN has been sent
+     * or a conclusion attempt was made). Once set, no further response fields
+     * can be sent, so the trailer-fields supplier is no longer supported.
+     */
+    private boolean responseConcluded = false;
+
+    /**
      * Whether the stream has been reset (to prevent double reset).
      */
     private final AtomicBoolean streamReset = new AtomicBoolean(false);
+
+    /**
+     * Whether this processor may be returned to the shared processor pool.
+     * Cleared by recycle() if the request ended with an error or reset, as a
+     * non-container thread may still be using the request, response or
+     * output buffer in those cases. The HTTP/2 implementation avoids reuse
+     * of such objects for the same reason.
+     */
+    private volatile boolean reusable = true;
+
+    /**
+     * Set when the processor has failed the whole HTTP/3 connection. Such a
+     * processor is not returned to the shared pool because a non-container
+     * thread may still hold its response/output state.
+     */
+    private volatile boolean connectionFailed = false;
 
     /**
      * Current frame being assembled (for multi-chunk frames).
@@ -357,7 +387,14 @@ class Http3Processor extends AbstractProcessor
             "content-range", "content-disposition", "content-language",
             "set-cookie", "www-authenticate", "proxy-authenticate",
             "location", "retry-after", "vary", "etag", "last-modified",
-            "cache-control", "expires", "warning");
+            "cache-control", "expires", "warning",
+            // Security/response-policy fields that must not be dropped just
+            // because a peer advertised a tiny field-section limit.
+            "strict-transport-security", "content-security-policy",
+            "x-frame-options", "x-content-type-options",
+            "access-control-allow-origin", "access-control-allow-credentials",
+            "access-control-allow-methods", "access-control-allow-headers",
+            "access-control-expose-headers");
 
     /*
      * Bit used to record a pseudo-header as seen, or 0 for a pseudo-header
@@ -373,17 +410,6 @@ class Http3Processor extends AbstractProcessor
             default:            return 0;
         }
     }
-
-    /**
-     * Whether the stream currently has a field section that referenced the
-     * dynamic table (Required Insert Count &gt; 0, RFC 9204 Section 4.5.1)
-     * and has not been acknowledged yet. Set before each field section
-     * decode (and when a trailer section is staged mid-read), cleared when
-     * the section's Section Acknowledgment is queued. While set, abandoning
-     * the stream emits a Stream Cancellation instruction
-     * (RFC 9204 Section 2.2.2.2).
-     */
-    private boolean fieldSectionUsedDynamicTable = false;
 
     /**
      * Whether the per-stream Stream Cancellation instruction
@@ -524,18 +550,32 @@ class Http3Processor extends AbstractProcessor
                                     "were received");
                         }
                         if (isStreamFin(socketWrapper)) {
+                            if (payloadEof || hasPartialFrameData()) {
+                                // RFC 9114 Section 7.1: a cleanly terminated
+                                // stream whose last frame (or frame header) is
+                                // truncated is a connection error, not the
+                                // stream-scoped H3_REQUEST_INCOMPLETE used for
+                                // an empty stream at a frame boundary.
+                                throw new Http3Exception(
+                                        sm.getString("http3Processor.frameError",
+                                                Long.valueOf(streamId)),
+                                        Http3Error.H3_FRAME_ERROR);
+                            }
+                            if (socketWrapper.getSocket() instanceof QuicStream
+                                    quicStream && quicStream.isLateDuplicate()) {
+                                // Late FIN edge for a request that already
+                                // completed: the terminal read has been
+                                // drained above, so close without resetting
+                                // the stream or abandoning its QPACK section.
+                                return SocketState.CLOSED;
+                            }
                             handleStreamError(socketWrapper,
                                     Http3Error.H3_REQUEST_INCOMPLETE);
                         } else {
                             // A reset cut off the initial HEADERS frame
-                            // before it could be decoded. Its Required Insert
-                            // Count may already be in the staged bytes, so
-                            // record it and cancel the abandoned section even
-                            // if the payload was only partially received.
-                            if (pendingFramePayload != null) {
-                                notePartialSectionDynamicTableUse(
-                                        pendingFramePayload);
-                            }
+                            // before it could be decoded. The section was
+                            // abandoned, so noteStreamAbandoned() emits the
+                            // Stream Cancellation unconditionally.
                             noteStreamAbandoned();
                         }
                         return SocketState.CLOSED;
@@ -554,7 +594,21 @@ class Http3Processor extends AbstractProcessor
             // content-length header, independent of the method name.
             if (isRequestBodyIndicated()) {
                 readRequestBody(socketWrapper);
+            } else if (inputBufferHasData && inputBuffer.hasRemaining()) {
+                // A request without Content-Length may still carry content
+                // (RFC 9110 Section 6.5, RFC 9114 Section 4.1). If body frames
+                // were read together with the request head, transfer them to
+                // the processor body buffers so an async reader has data to
+                // consume; this does not add a socket read on the hot
+                // header-only path.
+                readRequestBody(socketWrapper);
             }
+            // Trailer decoding and clean-FIN recording are deliberately
+            // lazy: isTrailerFieldsReady() performs them on demand (and
+            // decodeTrailerSectionAfterResponse() does so for applications
+            // that never ask). Eagerly reading here cost one socket read per
+            // request on the hot GET path, which is a measurable poller
+            // overhead on the QUIC transport.
 
             // Validate headers
             validateHeadersInternal();
@@ -592,17 +646,24 @@ class Http3Processor extends AbstractProcessor
                 if (log.isDebugEnabled()) {
                     log.debug(sm.getString("http3Processor.error", Long.valueOf(streamId)), e);
                 }
-                // Send 500 error response before closing
+                // Send 500 error response before closing. Clear any
+                // application-provided headers while the response is still
+                // uncommitted so the minimal error response cannot carry
+                // stale framing or content-coding fields.
+                if (!response.isCommitted()) {
+                    response.reset();
+                }
                 try {
                     sendErrorResponse(socketWrapper, 500);
                 } catch (IOException ex) {
                     // Ignore - stream may already be closed
                 }
-                // sendErrorResponse uses a non-blocking write and does not
+                // sendErrorResponse uses a blocking write but does not
                 // conclude the stream. Without the FIN, closeStreamByHandler
                 // would reset the stream and the client might never see the
                 // 500; the 400 path above concludes explicitly.
                 concludeStream(socketWrapper);
+                protocol.getAdapter().log(request, response, 0);
                 return SocketState.CLOSED;
             }
 
@@ -620,6 +681,17 @@ class Http3Processor extends AbstractProcessor
             if (isAsync()) {
                 // Stream stays open for async completion.
                 // The async servlet will eventually call response.flush() or complete().
+                // If body bytes were already pre-buffered before the listener
+                // was registered, trigger the initial non-blocking read
+                // dispatch; otherwise the listener could wait for a socket
+                // event that the already-consumed data will never generate.
+                Http3InputBuffer h3Input =
+                        (Http3InputBuffer) request.getInputBuffer();
+                if (request.getReadListener() != null &&
+                        h3Input.available() > 0) {
+                    request.action(ActionCode.DISPATCH_READ, null);
+                    request.action(ActionCode.DISPATCH_EXECUTE, null);
+                }
                 return SocketState.LONG;
             }
 
@@ -638,6 +710,9 @@ class Http3Processor extends AbstractProcessor
             // rather than the trailing bytes being dropped silently when
             // the concluded stream is torn down.
             checkFramesAfterTrailer(socketWrapper);
+
+            // Conclude the response stream after the request-stream scans.
+            concludeStream(socketWrapper);
 
             return SocketState.CLOSED;
 
@@ -723,7 +798,6 @@ class Http3Processor extends AbstractProcessor
      */
     private void handleStreamError(SocketWrapperBase<?> socketWrapper,
             Http3Error error) {
-        fieldSectionUsedDynamicTable = false;
         if (!streamCancellationSent) {
             streamCancellationSent = true;
             noteStreamCancellation();
@@ -737,32 +811,6 @@ class Http3Processor extends AbstractProcessor
 
 
     /*
-     * Notes the abandonment of receiving this stream's field sections: any
-     * dynamic table references from a field section that was never
-     * acknowledged stop being outstanding, which the peer's encoder needs
-     * to know for its eviction control (RFC 9204 Sections 2.2.2.2, 4.4.2).
-     * Acknowledged sections need no cancellation: their Section
-     * Acknowledgment already released their references. Emission is
-     * single-shot per field section (the flag is cleared) and — via
-     * streamCancellationSent — per stream, so a stream abandoned through
-     * several error paths still sends one instruction. Reset paths do not
-     * rely on this method's precondition: handleStreamError() emits
-     * unconditionally (RFC 9204 Section 2.2.2.2); this variant serves the
-     * abandonment paths that never reset the stream (e.g. the after-response
-     * scan, where the stream is simply dropped).
-     */
-    private void noteAbandonedDynamicTableUse() {
-        if (fieldSectionUsedDynamicTable) {
-            fieldSectionUsedDynamicTable = false;
-            if (!streamCancellationSent) {
-                streamCancellationSent = true;
-                noteStreamCancellation();
-            }
-        }
-    }
-
-
-    /*
      * Notes that reading this stream is being abandoned even if no dynamic
      * table use has been observed. RFC 9204 Section 2.2.2.2 requires a Stream
      * Cancellation whenever an endpoint abandons a stream before all of its
@@ -771,27 +819,9 @@ class Http3Processor extends AbstractProcessor
      * single-shot per stream.
      */
     private void noteStreamAbandoned() {
-        fieldSectionUsedDynamicTable = false;
         if (!streamCancellationSent) {
             streamCancellationSent = true;
             noteStreamCancellation();
-        }
-    }
-
-
-    /*
-     * Notes dynamic-table use observed in a field section that was only
-     * partially received (so processHeadersFrame()/processTrailerSection()
-     * never recorded it). The Required Insert Count is an 8-bit prefix
-     * integer occupying the whole first byte of the section, so a non-zero
-     * first byte means Required Insert Count > 0 (RFC 9204 Section 4.5.1).
-     * A partial section in write mode carries the bytes read so far in
-     * [0, position()); a zero-length prefix means nothing was observed yet
-     * and nothing is recorded.
-     */
-    private void notePartialSectionDynamicTableUse(ByteBuffer partialRead) {
-        if (partialRead.position() > 0 && partialRead.get(0) != 0) {
-            fieldSectionUsedDynamicTable = true;
         }
     }
 
@@ -858,6 +888,8 @@ class Http3Processor extends AbstractProcessor
      * @param error The connection error
      */
     private void failConnection(SocketWrapperBase<?> socketWrapper, Http3Error error) {
+        connectionFailed = true;
+        reusable = false;
         QuicConnection conn = quicConnection(socketWrapper);
         if (conn != null) {
             if (log.isDebugEnabled()) {
@@ -941,36 +973,12 @@ class Http3Processor extends AbstractProcessor
      * present with any method), so the declaration - not the method name -
      * drives the pre-dispatch body handling (pre-buffering, content-length
      * overrun checks). Bodies without a content-length are delimited by the
-     * end of the stream and are not pre-read.
+     * end of the stream; they are not pre-read on the basis of this method,
+     * although body frames already buffered with the request head are
+     * transferred to the streaming buffers by service().
      */
     private boolean isRequestBodyIndicated() {
         return requestContentLength >= 0;
-    }
-
-
-    /**
-     * Checks whether the method is one of the methods that commonly carries
-     * a request body. Used only for bodies whose length is not declared:
-     * for these methods the end of the stream is treated as a possible body
-     * boundary rather than as the end of a body-less request. Any method may
-     * in principle carry a body (RFC 9110 Section 6.5, RFC 9114 Section 4.1)
-     * but bodies on methods outside this set must declare their length to be
-     * read; otherwise they are not awaited.
-     */
-    private boolean isMethodWithBody(String method) {
-        if (method == null) {
-            return false;
-        }
-        switch (method) {
-            case "POST":
-            case "PUT":
-            case "PATCH":
-            case "DELETE":
-            case "CONNECT":
-                return true;
-            default:
-                return false;
-        }
     }
 
 
@@ -1162,8 +1170,15 @@ class Http3Processor extends AbstractProcessor
         org.apache.tomcat.util.http.MimeHeaders errorHeaders = response.getMimeHeaders();
         setResponseStatus(errorHeaders, statusCode);
 
-        sendHeadersFrame(socketWrapper, errorHeaders, 256, false);
+        // Blocking write: this is the last write before concludeStream()
+        // sends the FIN. A non-blocking write that the transport accepts only
+        // as a prefix would leave the rest of the HEADERS frame staged, and
+        // the FIN could then be delivered ahead of those bytes (truncating or
+        // losing the error response). This is the same hazard documented for
+        // response trailers in sendResponseTrailers().
+        sendHeadersFrame(socketWrapper, errorHeaders, 256, true);
         responseStarted = true;
+        response.setCommitted(true);
     }
 
 
@@ -1269,11 +1284,20 @@ class Http3Processor extends AbstractProcessor
         }
         long deadline = System.nanoTime() +
                 TimeUnit.MILLISECONDS.toNanos(PUMP_RETRY_TIMEOUT_MS);
-        while (n == 0 && !Thread.currentThread().isInterrupted()) {
+        while (n == 0) {
+            // An interrupted thread must fail the read rather than return
+            // "would block": the caller's outer retry loop would otherwise
+            // spin until its deadline because awaitReadableData() keeps
+            // returning immediately for an interrupted thread.
+            if (Thread.currentThread().isInterrupted()) {
+                throw interruptedRead();
+            }
             // Pump, arm interest and park until the poll thread signals a
-            // read event / terminal state, the deadline passes or the thread
-            // is interrupted (false in the latter two cases).
+            // read event / terminal state or the deadline passes.
             if (!quicWrapper.awaitReadableData(deadline)) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw interruptedRead();
+                }
                 break;
             }
             try {
@@ -1289,6 +1313,18 @@ class Http3Processor extends AbstractProcessor
         return n;
     }
 
+
+    /*
+     * A body read interrupted while waiting for QUIC data. Reported as an
+     * IOException so the read ends instead of busy-spinning to the stall
+     * deadline (the interrupt flag makes awaitReadableData() return
+     * immediately).
+     */
+    private InterruptedIOException interruptedRead() {
+        return new InterruptedIOException(sm.getString(
+                "http3Processor.inputBuffer.interrupted",
+                Long.valueOf(streamId)));
+    }
 
 
     /**
@@ -1346,12 +1382,20 @@ class Http3Processor extends AbstractProcessor
         } else {
             inputBuffer.clear();
         }
-        int n = pump ? readWithPump(socketWrapper, inputBuffer) :
-                readNonBlocking(socketWrapper, inputBuffer);
+        int n;
+        try {
+            n = pump ? readWithPump(socketWrapper, inputBuffer) :
+                    readNonBlocking(socketWrapper, inputBuffer);
+        } finally {
+            // Restore read mode even if the read throws: callers (for
+            // example isTrailerFieldsReady()) may catch the IOException and
+            // continue using the processor, and a retained write-mode buffer
+            // would expose stale tail bytes to a later frame-header parse.
+            inputBuffer.flip();
+        }
         if (n > 0) {
             inputBufferHasData = true;
         }
-        inputBuffer.flip();
         return n;
     }
 
@@ -1368,6 +1412,17 @@ class Http3Processor extends AbstractProcessor
                     && stream.getReadState() == QuicStream.ReadState.FINISHED;
         }
         return false;
+    }
+
+
+    /*
+     * Whether the protocol input buffer currently retains bytes that only
+     * form part of a frame header. A clean FIN with such bytes retained means
+     * the last frame header was truncated (RFC 9114 Section 7.1, connection
+     * error H3_FRAME_ERROR), as opposed to a clean end at a frame boundary.
+     */
+    private boolean hasPartialFrameData() {
+        return inputBufferHasData && inputBuffer.hasRemaining();
     }
 
 
@@ -1389,14 +1444,234 @@ class Http3Processor extends AbstractProcessor
 
 
     /**
-     * Reads frames for the request body, pre-dispatch. Called only when the
-     * request declares a body via Content-Length (see
-     * {@link #isRequestBodyIndicated()}): HTTP/3 bodies are not restricted to
-     * particular methods (RFC 9114 Section 4.1; RFC 9110 Section 6.5), so the
-     * declaration - not the method name - drives the pre-read. Reads DATA
-     * frames until the declared body is buffered, a terminal frame (TRAILERS)
-     * is encountered, a read would-block, the stream ends, or the pre-buffer
-     * bound is reached.
+     * Opportunistically consumes frames when the application asks whether
+     * the trailer fields are ready. Used to decode a trailer section that is
+     * already fully buffered and to record a clean FIN at a frame boundary
+     * in the request input buffer, so that {@link #isTrailerFieldsReady()}
+     * can report an empty trailer map for a complete request without trailers
+     * instead of treating the clean end as an abandoned read.
+     * <p>
+     * The method never consumes a non-empty DATA frame: it rewinds to the
+     * frame start and returns false so the body remains available to the
+     * streaming read path. Frames that are only partially buffered are left
+     * in the input buffer for the streaming/after-response paths.
+     *
+     * @param socketWrapper The socket wrapper
+     * @return {@code true} if a trailer section was decoded or the stream was
+     *         found to have ended cleanly at a frame boundary
+     * @throws IOException If an I/O error occurs
+     * @throws Http3Exception If a protocol error occurs
+     * @throws QpackException If a QPACK error occurs
+     */
+    private boolean readTrailerSectionIfAvailable(SocketWrapperBase<?> socketWrapper)
+            throws IOException, Http3Exception, QpackException {
+        Http3InputBuffer inBuf = (Http3InputBuffer) request.getInputBuffer();
+        if (inBuf.isTrailersReceived() || inBuf.isStreamClosed()) {
+            return true;
+        }
+        // A partially read trailer section can be completed here: the
+        // application is asking for trailer fields and the body may already
+        // have been fully read (bodyComplete), in which case the streaming
+        // read path will never run again to finish it. Use a non-blocking
+        // read so an incomplete section does not block the caller.
+        if (inBuf.trailerPayload != null) {
+            if (socketWrapper == null) {
+                return false;
+            }
+            return inBuf.completeTrailerSection(socketWrapper, false) == 1;
+        }
+        // A partially read DATA frame or ignored-frame skip belongs to the
+        // streaming/after-response paths; do not touch it.
+        if (inBuf.partialDataRemaining > 0 || inBuf.pendingSkipRemaining > 0) {
+            return false;
+        }
+        if (socketWrapper == null) {
+            return false;
+        }
+
+        while (true) {
+            if (!inputBufferHasData || !inputBuffer.hasRemaining()) {
+                int n = refillInputBuffer(socketWrapper, inputBuffer, false);
+                if (n < 0) {
+                    return handleTrailerReadEnd(socketWrapper, inBuf);
+                }
+                if (n == 0) {
+                    return false;
+                }
+            }
+            if (inputBuffer.remaining() < 2) {
+                int n = refillInputBuffer(socketWrapper, inputBuffer, false);
+                if (n < 0) {
+                    return handleTrailerReadEnd(socketWrapper, inBuf);
+                }
+                if (n == 0) {
+                    return false;
+                }
+                continue;
+            }
+
+            int frameStart = inputBuffer.position();
+            if (!parseFrameHeader(inputBuffer, frameHeader)) {
+                int n = refillInputBuffer(socketWrapper, inputBuffer, false);
+                if (n < 0) {
+                    return handleTrailerReadEnd(socketWrapper, inBuf);
+                }
+                if (n == 0) {
+                    return false;
+                }
+                continue;
+            }
+            long frameType = frameHeader[0];
+            long frameLen = frameHeader[1];
+
+            switch (classifyBodyFrame(frameType)) {
+                case TRAILERS -> {
+                    checkBufferedFrameLength(frameType, frameLen);
+                    long wireLimit = trailerFieldSectionWireLimit();
+                    if (frameLen > wireLimit) {
+                        throw new Http3StreamException(
+                                sm.getString("http3Processor.header.sectionTooLarge",
+                                        Long.valueOf(streamId), Long.valueOf(frameLen),
+                                        Long.valueOf(wireLimit)),
+                                Http3Error.H3_MESSAGE_ERROR, streamId);
+                    }
+                    if (inputBuffer.remaining() < frameLen) {
+                        if (isStreamFin(socketWrapper)) {
+                            throw truncatedFrameError();
+                        }
+                        inputBuffer.position(frameStart);
+                        return false;
+                    }
+                    ByteBuffer payload = ByteBuffer.allocate((int) frameLen);
+                    payload.put(inputBuffer);
+                    payload.flip();
+                    // A trailer section ends the message: the Content-Length
+                    // invariant is checkable before decoding it.
+                    if (requestContentLength > 0 &&
+                            totalDataReceived < requestContentLength) {
+                        throw new Http3StreamException(
+                                sm.getString("http3Processor.bodyShorterThanContentLength",
+                                        Long.valueOf(streamId),
+                                        Long.valueOf(totalDataReceived),
+                                        Long.valueOf(requestContentLength)),
+                                Http3Error.H3_MESSAGE_ERROR, streamId);
+                    }
+                    processTrailerSection(payload);
+                    // The trailer section may itself have installed a
+                    // Content-Length (the allow-list can permit it); the
+                    // message is complete here, so check the shortfall after
+                    // the decode as finishTrailerSection() does.
+                    if (requestContentLength > 0 &&
+                            totalDataReceived < requestContentLength) {
+                        throw new Http3StreamException(
+                                sm.getString("http3Processor.bodyShorterThanContentLength",
+                                        Long.valueOf(streamId),
+                                        Long.valueOf(totalDataReceived),
+                                        Long.valueOf(requestContentLength)),
+                                Http3Error.H3_MESSAGE_ERROR, streamId);
+                    }
+                    inBuf.setTrailersReceived(true);
+                    inBuf.setBodyComplete(true);
+                    return true;
+                }
+                case DATA -> {
+                    checkBufferedFrameLength(frameType, frameLen);
+                    if (frameLen == 0) {
+                        checkNonBodyFrame(frameType, 0);
+                        continue;
+                    }
+                    if (dataOverrunsContentLength(totalDataReceived, frameLen)) {
+                        throw new Http3StreamException(
+                                sm.getString("http3Processor.dataFrameExceedsContentLength",
+                                        Long.valueOf(streamId),
+                                        Long.valueOf(totalDataReceived + frameLen),
+                                        Long.valueOf(requestContentLength)),
+                                Http3Error.H3_MESSAGE_ERROR, streamId);
+                    }
+                    if (inputBuffer.remaining() < frameLen) {
+                        if (isStreamFin(socketWrapper)) {
+                            throw truncatedFrameError();
+                        }
+                        // Leave the frame (including its header) for the
+                        // streaming body read path once more data arrives.
+                        inputBuffer.position(frameStart);
+                        return false;
+                    }
+                    // Leave the complete DATA frame (including its header)
+                    // for the streaming body read path.
+                    inputBuffer.position(frameStart);
+                    return false;
+                }
+                case CONTROL_ONLY -> {
+                    inputBuffer.position(frameStart);
+                    throw frameUnexpected(frameType);
+                }
+                case IGNORED -> {
+                    checkNonBodyFrame(frameType, frameLen);
+                    if (inputBuffer.remaining() < frameLen) {
+                        if (isStreamFin(socketWrapper)) {
+                            throw truncatedFrameError();
+                        }
+                        inputBuffer.position(frameStart);
+                        return false;
+                    }
+                    if (frameLen > 0) {
+                        inputBuffer.position(inputBuffer.position() + (int) frameLen);
+                    }
+                }
+            }
+        }
+    }
+
+
+    /*
+     * Handles an end-of-stream encountered by
+     * readTrailerSectionIfAvailable(). A clean frame-boundary FIN marks the
+     * request input as closed; retained partial frame bytes are a truncated
+     * last frame (connection error H3_FRAME_ERROR); a declared body shorter
+     * than Content-Length is a malformed message (stream error
+     * H3_MESSAGE_ERROR).
+     */
+    private boolean handleTrailerReadEnd(SocketWrapperBase<?> socketWrapper,
+            Http3InputBuffer inBuf) throws Http3Exception {
+        if (inputBufferHasData && inputBuffer.hasRemaining()) {
+            if (isStreamFin(socketWrapper)) {
+                throw truncatedFrameError();
+            }
+            // An abrupt reset may cut a frame anywhere; it is not a
+            // truncated-frame error. The stream is simply abandoned, which
+            // owes the peer a Stream Cancellation (RFC 9204 Section 2.2.2.2):
+            // the partial frame may be the start of a trailer section that
+            // references dynamic table entries.
+            inBuf.setStreamClosed(true);
+            noteStreamAbandoned();
+            return true;
+        }
+        if (requestContentLength > 0 && totalDataReceived < requestContentLength &&
+                isStreamFin(socketWrapper)) {
+            throw new Http3StreamException(
+                    sm.getString("http3Processor.bodyShorterThanContentLength",
+                            Long.valueOf(streamId),
+                                        Long.valueOf(totalDataReceived),
+                            Long.valueOf(requestContentLength)),
+                    Http3Error.H3_MESSAGE_ERROR, streamId);
+        }
+        inBuf.setStreamClosed(true);
+        return true;
+    }
+
+
+    /**
+     * Reads frames for the request body, pre-dispatch. Called for a request
+     * that declares a body via Content-Length (see
+     * {@link #isRequestBodyIndicated()}), and also when body frames were
+     * already buffered together with the request head for a request that
+     * did not declare a Content-Length: HTTP/3 bodies are not restricted to
+     * particular methods (RFC 9114 Section 4.1; RFC 9110 Section 6.5), so
+     * the declaration - not the method name - drives the pre-read. Reads
+     * DATA frames until the declared body is buffered, a terminal frame
+     * (TRAILERS) is encountered, a read would-block, the stream ends, or
+     * the pre-buffer bound is reached.
      * <p>
      * Reads are non-blocking and bounded to
      * {@link #MAX_PRE_BUFFERED_BODY_BYTES}: the body is not drained to
@@ -1413,9 +1688,18 @@ class Http3Processor extends AbstractProcessor
         // ByteBuffer per DATA frame would let a peer send thousands of
         // one-byte frames and multiply the retained heap (one buffer object
         // plus array per frame) while staying below the 64 KiB payload bound.
-        int bodyBufferCapacity = requestContentLength > 0
-                ? (int) Math.min(MAX_PRE_BUFFERED_BODY_BYTES, requestContentLength)
-                : 0;
+        int bodyBufferCapacity;
+        if (requestContentLength > 0) {
+            bodyBufferCapacity = (int) Math.min(MAX_PRE_BUFFERED_BODY_BYTES,
+                    requestContentLength);
+        } else if (requestContentLength < 0) {
+            // Undeclared body (delimited by stream end/trailers): pre-buffer
+            // up to the same bound.
+            bodyBufferCapacity = MAX_PRE_BUFFERED_BODY_BYTES;
+        } else {
+            // Declared zero-length body.
+            bodyBufferCapacity = 0;
+        }
         ByteBuffer bodyBuffer = bodyBufferCapacity > 0
                 ? ByteBuffer.allocate(bodyBufferCapacity)
                 : null;
@@ -1451,6 +1735,7 @@ class Http3Processor extends AbstractProcessor
             }
             switch (classifyBodyFrame(frameType)) {
                 case DATA -> {
+                    checkBufferedFrameLength(frameType, frameLen);
                     if (frameLen == 0) {
                         // No body progress, but still consumed a frame.
                         checkNonBodyFrame(frameType, 0);
@@ -1491,20 +1776,21 @@ class Http3Processor extends AbstractProcessor
                         // without mis-parsing it as a new frame header. The input
                         // buffer is left in read mode (possibly empty), so no
                         // stale bytes can be re-exposed to the frame parser.
-                        // Safe cast: parseFrameHeader rejects DATA frames
-                        // above MAX_FRAME_LENGTH at the header.
+                        // Safe cast: the DATA frame length was checked
+                        // against MAX_FRAME_LENGTH above.
                         inBuf.setPartialDataRemaining((int) (frameLen - payloadRead));
                         if (payloadEof) {
-                            // A clean FIN cut the copy short rather than a
-                            // would-block: the reads have now exhausted the
-                            // stream, so totalPayloadBytes is the complete
-                            // received total and the shortfall check after
-                            // the loop is conclusive. Without this, a body
-                            // truncated mid-frame would only be surfaced if
-                            // the application happened to read the body —
-                            // otherwise the malformed request (RFC 9114
-                            // Section 4.1.2) would be answered with a normal
-                            // response.
+                            // A clean FIN cut the copy short: RFC 9114
+                            // Section 7.1 makes a truncated last frame a
+                            // connection error of type H3_FRAME_ERROR. An
+                            // abrupt reset is not a truncated-frame error;
+                            // the reset aborts the request instead.
+                            if (isStreamFin(socketWrapper)) {
+                                throw new Http3Exception(
+                                        sm.getString("http3Processor.frameError",
+                                                Long.valueOf(streamId)),
+                                        Http3Error.H3_FRAME_ERROR);
+                            }
                             eof = true;
                         }
                         if (log.isDebugEnabled()) {
@@ -1516,6 +1802,7 @@ class Http3Processor extends AbstractProcessor
                     }
                 }
                 case TRAILERS -> {
+                    checkBufferedFrameLength(frameType, frameLen);
                     // A HEADERS frame after the initial request HEADERS frame
                     // is the trailer section (see BodyFrameKind.TRAILERS).
                     // The declared-length preflight uses the wire-side bound
@@ -1529,21 +1816,24 @@ class Http3Processor extends AbstractProcessor
                                         Long.valueOf(wireLimit)),
                                 Http3Error.H3_MESSAGE_ERROR, streamId);
                     }
-                    // Safe casts: parseFrameHeader rejects HEADERS frames
-                    // above MAX_FRAME_LENGTH at the header.
+                    // Safe cast: the HEADERS frame length was checked
+                    // against MAX_FRAME_LENGTH above.
                     ByteBuffer trailerPayload =
                             ByteBuffer.allocate((int) frameLen);
                     int payloadRead = copyFramePayload(inputBuffer, socketWrapper,
                             trailerPayload, (int) frameLen, false);
                     if (payloadRead < frameLen && payloadEof) {
                         // FIN arrived before the trailer section was complete:
-                        // truncated field section, malformed request. The
-                        // section never reached the decoder, but its Required
-                        // Insert Count is already on the staged bytes: a
-                        // dynamic-table use abandoned here still owes the
-                        // peer a Stream Cancellation (RFC 9204 Section
-                        // 2.2.2.2; the error handler below emits it).
-                        notePartialSectionDynamicTableUse(trailerPayload);
+                        // a cleanly terminated stream with a truncated last
+                        // frame is the connection error of RFC 9114 Section
+                        // 7.1. An abrupt reset is not a truncated-frame error;
+                        // it aborts the request as before.
+                        if (isStreamFin(socketWrapper)) {
+                            throw new Http3Exception(
+                                    sm.getString("http3Processor.frameError",
+                                            Long.valueOf(streamId)),
+                                    Http3Error.H3_FRAME_ERROR);
+                        }
                         throw new Http3StreamException(
                                 sm.getString("http3Processor.header.error", Long.valueOf(streamId)),
                                 Http3Error.H3_MESSAGE_ERROR, streamId);
@@ -1552,7 +1842,6 @@ class Http3Processor extends AbstractProcessor
                         // Would-block mid-section: stash the partial payload so
                         // the streaming read completes and decodes it before
                         // parsing any further frame header.
-                        notePartialSectionDynamicTableUse(trailerPayload);
                         inBuf.setTrailerPartial(trailerPayload);
                         break readLoop;
                     }
@@ -1568,6 +1857,7 @@ class Http3Processor extends AbstractProcessor
                         throw new Http3StreamException(
                                 sm.getString(
                                         "http3Processor.bodyShorterThanContentLength",
+                                        Long.valueOf(streamId),
                                         Long.valueOf(totalPayloadBytes),
                                         Long.valueOf(requestContentLength)),
                                 Http3Error.H3_MESSAGE_ERROR, streamId);
@@ -1591,10 +1881,18 @@ class Http3Processor extends AbstractProcessor
                     long skipped = frameLen > 0 ?
                             skipFramePayload(socketWrapper, frameLen, false) : frameLen;
                     if (skipped < 0) {
+                        if (isStreamFin(socketWrapper)) {
+                            throw truncatedFrameError();
+                        }
                         eof = true;
                         break readLoop;
                     }
                     if (skipped < frameLen) {
+                        if (isStreamFin(socketWrapper)) {
+                            // A clean FIN before the ignored frame's payload
+                            // was fully skipped leaves a truncated last frame.
+                            throw truncatedFrameError();
+                        }
                         // Would-block mid-payload: remember the remainder so the
                         // streaming read path skips it before parsing the next
                         // frame header (the bytes must not be mis-parsed as one).
@@ -1621,7 +1919,17 @@ class Http3Processor extends AbstractProcessor
         // for the stream to close (matching the treatment of a fully
         // received non-zero content length).
         if (requestContentLength >= 0 && totalPayloadBytes >= requestContentLength) {
-            ((Http3InputBuffer) request.getInputBuffer()).setBodyComplete(true);
+            inBuf.setBodyComplete(true);
+        }
+
+        // A clean FIN at a frame boundary means the whole request stream has
+        // been consumed: there can be no later trailer section. Record that
+        // in the input buffer so isTrailerFieldsReady() can report the empty
+        // trailer map and the after-response scan does not mistake the clean
+        // end for an abandoned read. A FIN observed mid-frame (payloadEof)
+        // is a truncated frame and is handled as an error below/the caller.
+        if (eof && !payloadEof && isStreamFin(socketWrapper)) {
+            inBuf.setStreamClosed(true);
         }
 
         // Per RFC 9114 Section 4.1.2, a request whose body is shorter than
@@ -1632,7 +1940,8 @@ class Http3Processor extends AbstractProcessor
                 && isStreamFin(socketWrapper)) {
             throw new Http3StreamException(
                     sm.getString("http3Processor.bodyShorterThanContentLength",
-                            Long.valueOf(totalPayloadBytes), Long.valueOf(requestContentLength)),
+                            Long.valueOf(streamId),
+                                        Long.valueOf(totalPayloadBytes), Long.valueOf(requestContentLength)),
                     Http3Error.H3_MESSAGE_ERROR, streamId);
         }
     }
@@ -1836,6 +2145,40 @@ class Http3Processor extends AbstractProcessor
         // request stream has ended without one (the trailer fields are then
         // empty). Same end-of-request semantics as HTTP/2, which reports
         // ready once the stream can no longer read.
+        if (h3Input.isTrailersReceived() || h3Input.isStreamClosed()) {
+            return true;
+        }
+        // On the synchronous path the servlet thread is the only reader, so
+        // opportunistically consume a trailer section or a clean frame-boundary
+        // FIN that arrived after the pre-dispatch read. The async path leaves
+        // this to the read listener's readMoreData() so the servlet thread
+        // never races that reader.
+        if (isAsync()) {
+            return false;
+        }
+        SocketWrapperBase<?> socketWrapper = getSocketWrapper();
+        try {
+            return readTrailerSectionIfAvailable(socketWrapper);
+        } catch (Http3StreamException e) {
+            handleStreamError(socketWrapper, e.getError());
+        } catch (Http3Exception e) {
+            if (e.getError().isStreamError()) {
+                handleStreamError(socketWrapper, e.getError());
+            } else {
+                failConnection(socketWrapper, e.getError());
+            }
+        } catch (QpackValueTooLargeException e) {
+            handleStreamError(socketWrapper,
+                    Http3Error.H3_QPACK_DECOMPRESSION_FAILED);
+        } catch (QpackException e) {
+            failConnection(socketWrapper,
+                    Http3Error.H3_QPACK_DECOMPRESSION_FAILED);
+        } catch (IOException e) {
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("http3Processor.error",
+                        Long.valueOf(streamId)), e);
+            }
+        }
         return h3Input.isTrailersReceived() || h3Input.isStreamClosed();
     }
 
@@ -1843,8 +2186,10 @@ class Http3Processor extends AbstractProcessor
     @Override
     protected boolean isTrailerFieldsSupported() {
         // Response trailers are sent as a second HEADERS frame before the
-        // stream is concluded (RFC 9114 Section 4.1).
-        return true;
+        // stream is concluded (RFC 9114 Section 4.1). Once the trailers have
+        // been sent, the stream has been reset, or the response has been
+        // concluded, a newly registered supplier can never be sent.
+        return !trailersSent && !responseConcluded && !streamReset.get();
     }
 
 
@@ -1885,11 +2230,12 @@ class Http3Processor extends AbstractProcessor
                 return true;
             }
         }
-        // Nothing more can arrive once neither a declared body (content
-        // length not yet fully received) nor an undeclared body on a method
-        // that commonly sends one is outstanding.
-        return !isRequestBodyIndicated() &&
-                !isMethodWithBody(request.getMethod());
+        // With no declared Content-Length the body is delimited by the end of
+        // the request stream (FIN) or a trailer section; it cannot be
+        // considered complete just because the method commonly does not carry
+        // a body. Keep read interest registered so an async reader can consume
+        // content sent with any method.
+        return false;
     }
 
 
@@ -1922,13 +2268,14 @@ class Http3Processor extends AbstractProcessor
         // the remaining DATA frames would only be written after the FIN and
         // would be lost.
         // Trailers (if any) must also be sent before the stream is
-        // concluded: this method runs before sendResponse() on the
-        // synchronous path and is the only conclusion point on the
-        // asynchronous path (AsyncContext.complete()), so the trailers are
-        // sent here and sendResponse()'s own calls are no-ops.
+        // concluded. The actual FIN is deferred to the synchronous service()
+        // completion point or to dispatchEndRequest() on the asynchronous
+        // path, after the after-response request-stream scan has run, so a
+        // malformed request observed at FIN can still be reset at stream
+        // scope before the response stream is concluded.
         SocketWrapperBase<?> socketWrapper = getSocketWrapper();
         try {
-            if (!responseStarted) {
+            if (socketWrapper != null && !responseStarted) {
                 sendResponseHeadersInternal(socketWrapper);
             }
             // Finish compression (if enabled) before anything else is
@@ -1950,7 +2297,8 @@ class Http3Processor extends AbstractProcessor
             // Ignore. The stream is about to be concluded and the wrapper
             // will be closed.
         }
-        concludeStream(getSocketWrapper());
+        // The FIN is sent by the completion path after the request-stream
+        // after-response scan; see the method comment.
     }
 
 
@@ -2032,8 +2380,16 @@ class Http3Processor extends AbstractProcessor
             }
         }
 
-        // Write the early hints as a HEADERS frame with no body
-        sendHeadersFrame(socketWrapper, earlyHeaders, 1024, false);
+        // Write the early hints as a HEADERS frame with no body. Use a
+        // blocking write: the final response HEADERS/DATA and trailers are
+        // written with blocking writes, and SocketWrapperBase.writeBlocking()
+        // does not drain the non-blocking staging buffer before appending to
+        // the socket write buffer (flushBlocking() writes the socket buffer
+        // first and drains the staging buffer afterwards). A partially
+        // accepted non-blocking 103 write would therefore let the final
+        // response overtake the remainder of the interim HEADERS frame on
+        // the wire. Blocking writes the complete interim frame first.
+        sendHeadersFrame(socketWrapper, earlyHeaders, 1024, true);
     }
 
 
@@ -2058,6 +2414,41 @@ class Http3Processor extends AbstractProcessor
         // arrive on a stream whose read side is closed.
         if (isStreamReset(getSocketWrapper())) {
             return true;
+        }
+        // A partially delivered DATA frame leaves body bytes either in the
+        // protocol input buffer or in the QUIC stream. The buffered part is
+        // immediately readable and must make the request ready; without this
+        // check the async reader would wait for a new socket event even though
+        // readMoreData() can make progress from bytes already retained.
+        Http3InputBuffer h3Input = (Http3InputBuffer) request.getInputBuffer();
+        if (h3Input.getPartialDataRemaining() > 0) {
+            return true;
+        }
+        // Bytes retained in the protocol input buffer can be consumed by the
+        // next read even though no new socket event is pending; report the
+        // request as ready so an async reader is not left waiting for an event
+        // that an already-buffered frame will never generate.
+        if (inputBufferHasData && inputBuffer.hasRemaining() &&
+                !h3Input.isStreamClosed() && !h3Input.isTrailersReceived()) {
+            return true;
+        }
+        // The wrapper may already hold read data (for example a body frame
+        // read together with the request head) that has not yet been copied
+        // into the processor input buffer. Such data can be consumed by the
+        // next read even though no socket event is pending.
+        SocketWrapperBase<?> socketWrapper = getSocketWrapper();
+        if (socketWrapper != null) {
+            try {
+                if (socketWrapper.isReadyForRead()) {
+                    return true;
+                }
+            } catch (IOException ioe) {
+                // Report not-ready here; the next real read reports the error.
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("http3Processor.error",
+                            Long.valueOf(streamId)), ioe);
+                }
+            }
         }
         return super.isReadyForRead();
     }
@@ -2157,6 +2548,12 @@ class Http3Processor extends AbstractProcessor
         if (frameType == Constants.H3_DATA || isControlOnlyFrame(frameType)) {
             throw frameUnexpected(frameType);
         }
+        if (frameType == Constants.H3_HEADERS) {
+            // The frame type/sequence is valid here, so a local buffering
+            // limit must not downgrade the classification: reject the frame
+            // at stream scope only after the position check above.
+            checkBufferedFrameLength(frameType, frameLength);
+        }
         if (frameType == Constants.H3_HEADERS &&
                 frameLength > fieldSectionWireLimit()) {
             throw new Http3StreamException(
@@ -2215,13 +2612,10 @@ class Http3Processor extends AbstractProcessor
      * Parses the frame header (QUIC varint type + QUIC varint length) at the
      * buffer's current position into out[0]/out[1]. Returns false for an
      * incomplete header, restoring the position so the header is re-parsed
-     * once more bytes arrive. A length above the local buffering limit
-     * raises a stream-scoped error only for the frame types whose payload
-     * this receiver buffers (DATA, HEADERS); every other type is either
-     * rejected at the header without touching the payload or ignored with
-     * the payload discarded as it streams in, none of which needs the
-     * declared size to fit the limit (this only ever parses client request
-     * streams).
+     * once more bytes arrive. Frame-type/position validation and the local
+     * buffering limit for DATA/HEADERS are applied by the callers after (or
+     * before) this parse, so a protocol-invalid frame keeps its required
+     * error classification regardless of its declared length.
      */
     private boolean parseFrameHeader(ByteBuffer buffer, long[] out)
             throws Http3StreamException {
@@ -2236,31 +2630,50 @@ class Http3Processor extends AbstractProcessor
             buffer.position(sp);
             return false;
         }
-        if ((frameType == Constants.H3_DATA || frameType == Constants.H3_HEADERS) &&
-                frameLength > MAX_FRAME_LENGTH) {
-            // HTTP/3 has no negotiated frame size limit (unlike HTTP/2's
-            // SETTINGS_MAX_FRAME_SIZE), so a frame larger than this
-            // implementation's limit is protocol-valid; this receiver
-            // merely declines to buffer it. Only DATA and HEADERS have
-            // their payload buffered on a request stream: every other
-            // frame type is rejected at the header (connection-scoped,
-            // nothing consumed) or ignored with the payload discarded
-            // unsaved (RFC 9114 Section 9 unknown-frame rule, Section
-            // 7.2.8 reserved-family padding - the same unlimited discard
-            // the control stream applies in Http3ConnectionManager), so a
-            // large declared length there costs nothing and must not
-            // reset the padded request. The frame is confined to a request
-            // stream, so only that stream is rejected via RESET_STREAM
-            // (RFC 9114 Section 8 uses the same error codes for stream
-            // errors) rather than failing the connection.
+        out[0] = frameType;
+        out[1] = frameLength;
+        return true;
+    }
+
+
+    /*
+     * Whether a frame type whose payload this receiver buffers on a request
+     * stream (DATA, HEADERS) declares a length above the local buffering
+     * limit. HTTP/3 has no negotiated frame size limit (unlike HTTP/2's
+     * SETTINGS_MAX_FRAME_SIZE), so such a frame is protocol-valid; this
+     * receiver merely declines to buffer it.
+     * <p>
+     * The check is deliberately separate from parseFrameHeader(): frame
+     * sequence/position validation must run before it, so an invalid DATA or
+     * HEADERS frame (for example DATA before HEADERS) keeps the connection
+     * error classification required by RFC 9114 Section 4.1 instead of being
+     * downgraded to a stream error by the local limit.
+     */
+    private boolean exceedsBufferedFrameLimit(long frameType, long frameLength) {
+        return (frameType == Constants.H3_DATA ||
+                frameType == Constants.H3_HEADERS) &&
+                frameLength > MAX_FRAME_LENGTH;
+    }
+
+
+    /*
+     * Rejects a valid DATA/HEADERS frame whose declared payload is above the
+     * local buffering limit at stream scope (RESET_STREAM H3_FRAME_ERROR).
+     * H3_FRAME_ERROR is used deliberately rather than the connection-scoped
+     * H3_EXCESSIVE_LOAD suggested for local resource limits in RFC 9114
+     * Section 10.5: this failure is scoped to the offending request stream,
+     * and a stream reset with H3_FRAME_ERROR lets the client distinguish this
+     * local buffering limit from a protocol-level frame-format error without
+     * tearing down the other streams on the connection.
+     */
+    private void checkBufferedFrameLength(long frameType, long frameLength)
+            throws Http3StreamException {
+        if (exceedsBufferedFrameLimit(frameType, frameLength)) {
             throw new Http3StreamException(
                     sm.getString("http3Processor.frameError",
                             Long.valueOf(streamId)),
                     Http3Error.H3_FRAME_ERROR, streamId);
         }
-        out[0] = frameType;
-        out[1] = frameLength;
-        return true;
     }
 
 
@@ -2586,10 +2999,6 @@ class Http3Processor extends AbstractProcessor
         // first byte, so it is non-zero iff the first byte is non-zero.
         boolean ricNonZero = pendingFramePayload.remaining() > 0
                 && pendingFramePayload.get(0) != 0;
-        // Record before decoding: if the field section is rejected or
-        // the stream is abandoned mid-decode, a Stream Cancellation
-        // instruction must still be emitted (RFC 9204 Section 2.2.2.2).
-        fieldSectionUsedDynamicTable = ricNonZero;
         // QpackExceptions from the decode are deliberately not caught and
         // logged here: service() catches, logs and scopes every QPACK error
         // reaching it (at the same debug level), so an inner catch would
@@ -2611,7 +3020,6 @@ class Http3Processor extends AbstractProcessor
             // abandonment of the stream no longer owes the peer a
             // Stream Cancellation for this section.
             noteSectionAcknowledgment();
-            fieldSectionUsedDynamicTable = false;
         }
         if (log.isTraceEnabled()) {
             log.trace("Stream [" + streamId + "] QPACK decode successful. Headers: " + request.getMethod() + " " + request.requestURI());
@@ -2672,7 +3080,6 @@ class Http3Processor extends AbstractProcessor
         // Required Insert Count > 0 signals dynamic table use (RFC 9204
         // Section 4.5.1), same detection as processHeadersFrame().
         boolean ricNonZero = payload.remaining() > 0 && payload.get(0) != 0;
-        fieldSectionUsedDynamicTable = ricNonZero;
         trailerMode = true;
         try {
             // The trailer limits travel with the decode call: the decoder is
@@ -2694,7 +3101,6 @@ class Http3Processor extends AbstractProcessor
                 // abandonment no longer owes a Stream Cancellation
                 // (see processHeadersFrame()).
                 noteSectionAcknowledgment();
-                fieldSectionUsedDynamicTable = false;
             }
             if (cookieHeader != null) {
                 // A trailer field named cookie survives the allow-list gate
@@ -2852,6 +3258,17 @@ class Http3Processor extends AbstractProcessor
      */
     private void sendResponseTrailers(SocketWrapperBase<?> socketWrapper) throws IOException {
         if (trailersSent) {
+            return;
+        }
+        // RFC 9114 Section 4.1: a trailer section follows the final response
+        // HEADERS frame. Do not attempt a trailer HEADERS frame when the
+        // final headers were never written (sendResponseHeadersInternal()
+        // only sets responseStarted after the HEADERS frame is written, so a
+        // failed header send leaves this false) or when the stream was reset
+        // (the reset path claims responseStarted without writing anything).
+        // Writing trailers on a reset stream or without a final response
+        // head would produce an invalid response sequence.
+        if (!responseStarted || streamReset.get() || socketWrapper == null) {
             return;
         }
 
@@ -3018,10 +3435,20 @@ class Http3Processor extends AbstractProcessor
                 throw messageError("http3Processor.header.connectAuthorityMissing",
                         Long.valueOf(streamId));
             }
-            if (request.getServerPort() == -1) {
-                // CONNECT uses the authority-form (host ":" port).
+            if (!hasProtocol && request.getServerPort() == -1) {
+                // A plain tunnel CONNECT uses the authority-form (host ":"
+                // port). RFC 8441 Section 4 interprets the :authority of an
+                // extended CONNECT (one carrying :protocol) using the normal
+                // request-authority rules instead, where the port is optional.
                 throw messageError("http3Processor.header.connectAuthorityNoPort",
                         Long.valueOf(streamId));
+            }
+            if (hasProtocol) {
+                // RFC 9220/8441 extended CONNECT carries a normal :path that
+                // identifies the targeted resource (RFC 9114 Section 4.3.1,
+                // RFC 3986 path-absolute); apply the same request-target and
+                // query validation as a non-CONNECT request.
+                validateRequestTarget();
             }
         } else {
             // Non-CONNECT: :scheme and :path are required
@@ -3048,37 +3475,7 @@ class Http3Processor extends AbstractProcessor
             // :scheme pseudo-header for non-CONNECT requests; any scheme is
             // accepted.
 
-            // RFC 9114 Section 4.3.1: The :path pseudo-header MUST NOT be empty
-            String path = request.requestURI().toString();
-            if (path.isEmpty()) {
-                throw messageError("http3Processor.header.emptyPath",
-                        Long.valueOf(streamId));
-            }
-
-            // RFC 9110 Section 7.1: the request target and query string are
-            // restricted character sets. Apply the same relaxed whitelists
-            // HTTP/2's validateRequest() applies before dispatch, so a
-            // target outside the set fails cleanly here as a malformed
-            // message instead of hitting undefined behaviour inside the
-            // adapter (normalization failure, dispatcher split, odd
-            // %-sequences).
-            HttpParser httpParser = protocol.getHttpParser();
-            ByteChunk bc = request.requestURI().getByteChunk();
-            for (int i = bc.getStart(); i < bc.getEnd(); i++) {
-                if (httpParser.isNotRequestTargetRelaxed(bc.getBuffer()[i])) {
-                    throw messageError("http3Processor.header.invalidRequestTarget",
-                            Long.valueOf(streamId));
-                }
-            }
-            String qs = request.queryString().toString();
-            if (qs != null) {
-                for (int i = 0; i < qs.length(); i++) {
-                    if (!httpParser.isQueryRelaxed(qs.charAt(i))) {
-                        throw messageError("http3Processor.header.invalidQueryString",
-                                Long.valueOf(streamId));
-                    }
-                }
-            }
+            validateRequestTarget();
         }
 
         // Match host name with SNI if required. An empty SNI host name means
@@ -3094,6 +3491,46 @@ class Http3Processor extends AbstractProcessor
 
 
     /*
+     * Validates the request-target and query string of a request that carries
+     * a :path pseudo-header. Shared by non-CONNECT requests and RFC 9220
+     * extended CONNECT requests, whose :path identifies the targeted resource
+     * like a normal request.
+     */
+    private void validateRequestTarget() throws Http3Exception {
+        // RFC 9114 Section 4.3.1: The :path pseudo-header MUST NOT be empty
+        String path = request.requestURI().toString();
+        if (path.isEmpty()) {
+            throw messageError("http3Processor.header.emptyPath",
+                    Long.valueOf(streamId));
+        }
+
+        // RFC 9110 Section 7.1: the request target and query string are
+        // restricted character sets. Apply the same relaxed whitelists
+        // HTTP/2's validateRequest() applies before dispatch, so a target
+        // outside the set fails cleanly here as a malformed message instead
+        // of hitting undefined behaviour inside the adapter (normalization
+        // failure, dispatcher split, odd %-sequences).
+        HttpParser httpParser = protocol.getHttpParser();
+        ByteChunk bc = request.requestURI().getByteChunk();
+        for (int i = bc.getStart(); i < bc.getEnd(); i++) {
+            if (httpParser.isNotRequestTargetRelaxed(bc.getBuffer()[i])) {
+                throw messageError("http3Processor.header.invalidRequestTarget",
+                        Long.valueOf(streamId));
+            }
+        }
+        String qs = request.queryString().toString();
+        if (qs != null) {
+            for (int i = 0; i < qs.length(); i++) {
+                if (!httpParser.isQueryRelaxed(qs.charAt(i))) {
+                    throw messageError("http3Processor.header.invalidQueryString",
+                            Long.valueOf(streamId));
+                }
+            }
+        }
+    }
+
+
+    /*
      * Malformed request (RFC 9114 Section 4.1.2): resolve the message from the
      * string bundle, log it at debug level and return the stream error carrying
      * the same message, so callers can use {@code throw messageError(key, args)}.
@@ -3104,6 +3541,22 @@ class Http3Processor extends AbstractProcessor
             log.debug(message);
         }
         return new Http3StreamException(message, Http3Error.H3_MESSAGE_ERROR, streamId);
+    }
+
+
+    /*
+     * A cleanly terminated stream whose last frame (or frame header) is
+     * truncated is a connection error of type H3_FRAME_ERROR (RFC 9114
+     * Section 7.1). Shared by the frame readers so the classification and
+     * message live in one place.
+     */
+    private Http3Exception truncatedFrameError() {
+        String message = sm.getString("http3Processor.frameError",
+                Long.valueOf(streamId));
+        if (log.isDebugEnabled()) {
+            log.debug(message);
+        }
+        return new Http3Exception(message, Http3Error.H3_FRAME_ERROR);
     }
 
 
@@ -3130,7 +3583,7 @@ class Http3Processor extends AbstractProcessor
      */
     private boolean prepareRequest() {
         request.markStartTime();
-        request.protocol().setString("HTTP/3");
+        request.protocol().setString("HTTP/3.0");
         return true;
     }
 
@@ -3156,8 +3609,9 @@ class Http3Processor extends AbstractProcessor
         // Send trailers if available (RFC 9114 Section 4.1)
         sendResponseTrailers(socketWrapper);
 
-        // Conclude the stream after response is complete
-        concludeStream(socketWrapper);
+        // The FIN is sent by service() after the request-stream
+        // after-response scan, so a malformed request observed at FIN can
+        // still be reset at stream scope before the response is concluded.
     }
 
 
@@ -3262,6 +3716,10 @@ class Http3Processor extends AbstractProcessor
                 h.removeHeader("content-length");
             }
             if (statusCode == 205) {
+                // RFC 9110 Section 15.3.5 requires a Content-Length: 0
+                // field in a 205 response, and the application-supplied value
+                // (if any) must not survive with a non-zero length.
+                h.setValue("content-length").setLong(0);
                 response.setContentLength(0);
             } else {
                 response.setContentLength(-1);
@@ -3314,6 +3772,7 @@ class Http3Processor extends AbstractProcessor
                 response.getMimeHeaders(), 1024, true);
 
         responseStarted = true;
+        response.setCommitted(true);
         if (log.isDebugEnabled()) {
             log.debug("Stream [" + streamId + "] HEADERS frame sent, total=" + frame.limit() + " bytes");
         }
@@ -3349,6 +3808,9 @@ class Http3Processor extends AbstractProcessor
      * sending the complete response.
      */
     private void concludeStream(SocketWrapperBase<?> socketWrapper) {
+        // The response is complete from the application's point of view even
+        // if the native FIN write fails or the stream was already concluded.
+        responseConcluded = true;
         QuicSocketWrapper quicWrapper = quicWrapper(socketWrapper);
         if (quicWrapper != null) {
             if (quicWrapper.isStreamConcluded()) {
@@ -3388,6 +3850,9 @@ class Http3Processor extends AbstractProcessor
      */
     private void checkFramesAfterTrailer(SocketWrapperBase<?> socketWrapper)
             throws IOException {
+        if (socketWrapper == null) {
+            return;
+        }
         Http3InputBuffer inBuf = (Http3InputBuffer) request.getInputBuffer();
         if (!inBuf.isTrailersReceived()) {
             return;
@@ -3405,7 +3870,13 @@ class Http3Processor extends AbstractProcessor
                 if (parseFrameHeaderWithRefill(socketWrapper) !=
                         HEADER_PARSED) {
                     // Would-block or the stream ended: nothing more
-                    // observable to classify.
+                    // observable to classify. A clean FIN with a partially
+                    // received frame header is a truncated last frame and
+                    // therefore a connection error (RFC 9114 Section 7.1).
+                    if (isStreamFin(socketWrapper) && hasPartialFrameData()) {
+                        failConnection(socketWrapper,
+                                Http3Error.H3_FRAME_ERROR);
+                    }
                     return;
                 }
                 long frameType = frameHeader[0];
@@ -3425,18 +3896,26 @@ class Http3Processor extends AbstractProcessor
                         long skipped = frameLen > 0 ? skipFramePayload(
                                 socketWrapper, frameLen, false) : frameLen;
                         if (skipped < frameLen) {
-                            // Would-block or the stream ended: nothing more
-                            // observable to classify.
+                            if (isStreamFin(socketWrapper)) {
+                                // Clean FIN in the middle of the ignored
+                                // frame's payload: truncated final frame
+                                // (RFC 9114 Section 7.1).
+                                failConnection(socketWrapper,
+                                        Http3Error.H3_FRAME_ERROR);
+                            }
+                            // Otherwise would-block or an abrupt reset:
+                            // nothing more observable to classify.
                             return;
                         }
                     }
                 }
             }
         } catch (Http3StreamException e) {
-            // A frame header declaring a size above this receiver's frame
-            // limit is a stream-scoped condition (see parseFrameHeader);
-            // the stream is already concluded, so there is nothing left to
-            // reset and the connection outcome is unchanged.
+            // Defensive: the header parser no longer rejects an oversized
+            // frame itself; the frame sequence is classified before any
+            // local limit applies. The stream is already concluded, so
+            // there is nothing left to reset and the connection outcome is
+            // unchanged.
             return;
         }
     }
@@ -3459,11 +3938,9 @@ class Http3Processor extends AbstractProcessor
      * service() and the asynchronous one in dispatchEndRequest()). The scan
      * is non-blocking (like checkFramesAfterTrailer): frames fully
      * available in the buffer / already delivered by the poll thread are
-     * processed, and anything short of that is abandoned - a partially
-     * observable section still owes the peer a Stream Cancellation when
-     * its Required Insert Count is visible in the bytes received (exactly
-     * as notePartialSectionDynamicTableUse() records it for the streaming
-     * paths). Frames other than a second HEADERS frame stop the scan
+     * processed, and anything short of that is abandoned - an abandoned
+     * section still owes the peer a Stream Cancellation (RFC 9204 Section
+     * 2.2.2.2). Frames other than a second HEADERS frame stop the scan
      * without new enforcement: the frame-level violations they would
      * represent are already handled - or deliberately not read - by the
      * live read paths, and re-classifying them after the response has been
@@ -3473,6 +3950,14 @@ class Http3Processor extends AbstractProcessor
     private void decodeTrailerSectionAfterResponse(
             SocketWrapperBase<?> socketWrapper) throws IOException {
         if (socketWrapper == null) {
+            return;
+        }
+        if (streamReset.get()) {
+            // The stream was already reset (for example at stream scope for a
+            // Content-Length overrun). Reading its remaining bytes here could
+            // misclassify the already abandoned stream data as a truncated
+            // frame and escalate to a connection error; the reset already
+            // reported the stream failure and released its QPACK state.
             return;
         }
         Http3InputBuffer inBuf =
@@ -3505,70 +3990,176 @@ class Http3Processor extends AbstractProcessor
             return;
         }
         try {
-            // Parse (once at least two bytes are buffered), refilling
-            // on failure - the shared parseFrameHeaderWithRefill() shape:
-            // a read boundary inside a varint leaves two or more bytes
-            // that are only a partial header, and giving up on the byte
-            // count alone would miss a header completed by the refill.
-            if (parseFrameHeaderWithRefill(socketWrapper) != HEADER_PARSED) {
-                // Would-block or the stream ended: nothing more is
-                // observable to decode. If the stream is still open, the
-                // remaining bytes (possibly a trailer section) are being
-                // abandoned; cancel any references they might hold.
-                if (!inBuf.isStreamClosed()) {
-                    noteStreamAbandoned();
+            while (true) {
+                // Parse (once at least two bytes are buffered), refilling
+                // on failure - the shared parseFrameHeaderWithRefill() shape:
+                // a read boundary inside a varint leaves two or more bytes
+                // that are only a partial header, and giving up on the byte
+                // count alone would miss a header completed by the refill.
+                if (parseFrameHeaderWithRefill(socketWrapper) != HEADER_PARSED) {
+                    // Would-block or the stream ended: nothing more is
+                    // observable to decode. A clean frame-boundary FIN means
+                    // the request is complete with no trailer section; record
+                    // that, so this is not mistaken for an abandoned read and
+                    // no unnecessary Stream Cancellation is queued. If bytes
+                    // were retained, or the stream is still open, the
+                    // remaining data (possibly a trailer section) is being
+                    // abandoned.
+                    if (!inBuf.isStreamClosed()) {
+                        if (isStreamFin(socketWrapper) && hasPartialFrameData()) {
+                            // Clean FIN with a partially received frame
+                            // header: truncated final frame (RFC 9114
+                            // Section 7.1).
+                            failConnection(socketWrapper,
+                                    Http3Error.H3_FRAME_ERROR);
+                        } else if (isStreamFin(socketWrapper)) {
+                            if (requestContentLength > 0 &&
+                                    totalDataReceived < requestContentLength) {
+                                // The clean frame-boundary FIN makes the
+                                // Content-Length shortfall fully observable:
+                                // the request is malformed (RFC 9114 Section
+                                // 4.1.2).
+                                throw new Http3StreamException(
+                                        sm.getString(
+                                                "http3Processor.bodyShorterThanContentLength",
+                                                Long.valueOf(streamId),
+                                        Long.valueOf(totalDataReceived),
+                                                Long.valueOf(requestContentLength)),
+                                        Http3Error.H3_MESSAGE_ERROR, streamId);
+                            }
+                            inBuf.setStreamClosed(true);
+                        } else {
+                            noteStreamAbandoned();
+                        }
+                    }
+                    return;
                 }
-                return;
-            }
-            long frameType = frameHeader[0];
-            long frameLen = frameHeader[1];
-            switch (classifyBodyFrame(frameType)) {
-                case TRAILERS -> {
-                    long wireLimit = trailerFieldSectionWireLimit();
-                    if (frameLen > wireLimit) {
-                        // Malformed (declared beyond the field section
-                        // limit); the response has been answered - stop.
-                        // The section is abandoned without ever being
-                        // consumed, so the peer's encoder is owed the
-                        // Stream Cancellation unconditionally (RFC 9204
-                        // Section 2.2.2.2): its Required Insert Count was
-                        // never observable here but the entries it
-                        // references are outstanding until released.
-                        if (!streamCancellationSent) {
-                            streamCancellationSent = true;
-                            noteStreamCancellation();
+                long frameType = frameHeader[0];
+                long frameLen = frameHeader[1];
+                switch (classifyBodyFrame(frameType)) {
+                    case TRAILERS -> {
+                        checkBufferedFrameLength(frameType, frameLen);
+                        long wireLimit = trailerFieldSectionWireLimit();
+                        if (frameLen > wireLimit) {
+                            // Malformed (declared beyond the field section
+                            // limit); the response has been answered - stop.
+                            // The section is abandoned without ever being
+                            // consumed, so the peer's encoder is owed the
+                            // Stream Cancellation unconditionally (RFC 9204
+                            // Section 2.2.2.2): its Required Insert Count was
+                            // never observable here but the entries it
+                            // references are outstanding until released.
+                            if (!streamCancellationSent) {
+                                streamCancellationSent = true;
+                                noteStreamCancellation();
+                            }
+                            return;
+                        }
+                        // Safe cast: the HEADERS frame length was checked
+                        // against MAX_FRAME_LENGTH above.
+                        ByteBuffer trailerPayload =
+                                ByteBuffer.allocate((int) frameLen);
+                        int payloadRead = copyFramePayload(inputBuffer,
+                                socketWrapper, trailerPayload, (int) frameLen,
+                                false);
+                        if (payloadRead < frameLen) {
+                            // Would-block or FIN mid-section: the section will
+                            // never be decoded. Record any dynamic-table use
+                            // observable from the first received byte. A clean
+                            // FIN with a truncated trailer frame is the
+                            // connection error of RFC 9114 Section 7.1;
+                            // otherwise this is an abandoned read and owes a
+                            // Stream Cancellation (RFC 9204 Section 2.2.2.2).
+                            if (isStreamFin(socketWrapper)) {
+                                failConnection(socketWrapper,
+                                        Http3Error.H3_FRAME_ERROR);
+                            } else {
+                                noteStreamAbandoned();
+                            }
+                            return;
+                        }
+                        trailerPayload.flip();
+                        processTrailerSection(trailerPayload);
+                        // A trailer section ends the message, so the
+                        // Content-Length invariant is fully observable here.
+                        // The two live body-read paths apply the same check
+                        // (the pre-dispatch trailer reader and
+                        // finishTrailerSection()); applying it here as well
+                        // keeps a request that the application never drained
+                        // from escaping detection just because this
+                        // after-response scan is the only path that saw the
+                        // trailers (RFC 9114 Section 4.1.2).
+                        if (requestContentLength > 0 &&
+                                totalDataReceived < requestContentLength) {
+                            handleStreamError(socketWrapper,
+                                    Http3Error.H3_MESSAGE_ERROR);
+                            return;
+                        }
+                        inBuf.setTrailersReceived(true);
+                        inBuf.setBodyComplete(true);
+                        // A trailer ends the message. Any frames after it are
+                        // handled (and rejected if invalid) by
+                        // checkFramesAfterTrailer().
+                        return;
+                    }
+                    case CONTROL_ONLY -> {
+                        // A control-stream-confined, PUSH_PROMISE or reserved
+                        // HTTP/2 frame type on a request stream is a
+                        // connection error of type H3_FRAME_UNEXPECTED (RFC
+                        // 9114 Sections 4.1, 7.2.3 through 7.2.8, 11.2.1).
+                        // The live body-read paths enforce this, but a
+                        // body-less request never runs them; this
+                        // after-response scan is then the only frame consumer
+                        // and must apply the same rule.
+                        failConnection(socketWrapper,
+                                frameUnexpected(frameType).getError());
+                        return;
+                    }
+                    case DATA -> {
+                        if (frameLen == 0) {
+                            // RFC 9114 Section 4.1 permits zero-length DATA
+                            // frames before the trailer section. They make no
+                            // body progress; ignore them and continue to the
+                            // trailer (bounded by the non-body-frame budget).
+                            if (noteNonBodyFrame(frameLen)) {
+                                failConnection(socketWrapper,
+                                        Http3Error.H3_EXCESSIVE_LOAD);
+                                return;
+                            }
+                            continue;
+                        }
+                        // A non-empty DATA frame is request content. Reading
+                        // it here is not needed for the response and would
+                        // require consuming the body; abandon the remainder.
+                        if (!inBuf.isStreamClosed()) {
+                            noteStreamAbandoned();
                         }
                         return;
                     }
-                    // Safe casts: parseFrameHeader rejects HEADERS frames
-                    // above MAX_FRAME_LENGTH at the header.
-                    ByteBuffer trailerPayload =
-                            ByteBuffer.allocate((int) frameLen);
-                    int payloadRead = copyFramePayload(inputBuffer,
-                            socketWrapper, trailerPayload, (int) frameLen, false);
-                    if (payloadRead < frameLen) {
-                        // Would-block or FIN mid-section: the section will
-                        // never be decoded. Record any dynamic-table use
-                        // observable from the first received byte and
-                        // report the abandonment (RFC 9204 Section
-                        // 2.2.2.2).
-                        notePartialSectionDynamicTableUse(trailerPayload);
-                        noteStreamAbandoned();
-                        return;
-                    }
-                    trailerPayload.flip();
-                    processTrailerSection(trailerPayload);
-                    inBuf.setTrailersReceived(true);
-                    inBuf.setBodyComplete(true);
-                }
-                default -> {
-                    // DATA before a trailer on a stream with no (further)
-                    // body, or a control-stream-confined/ignored frame:
-                    // nothing to decode here. The bytes after this frame
-                    // cannot be inspected without consuming a body we do
-                    // not need, so cancel the abandoned remainder.
-                    if (!inBuf.isStreamClosed()) {
-                        noteStreamAbandoned();
+                    case IGNORED -> {
+                        // RFC 9114 Section 9 requires unknown/reserved frames
+                        // to be ignored. Skip a complete payload and continue
+                        // scanning for the trailer; a truncated payload at a
+                        // clean FIN is the connection error of Section 7.1.
+                        if (noteNonBodyFrame(frameLen)) {
+                            failConnection(socketWrapper,
+                                    Http3Error.H3_EXCESSIVE_LOAD);
+                            return;
+                        }
+                        if (frameLen == 0) {
+                            continue;
+                        }
+                        long skipped = skipFramePayload(socketWrapper, frameLen,
+                                false);
+                        if (skipped < frameLen) {
+                            if (isStreamFin(socketWrapper)) {
+                                failConnection(socketWrapper,
+                                        Http3Error.H3_FRAME_ERROR);
+                            } else if (!inBuf.isStreamClosed()) {
+                                noteStreamAbandoned();
+                            }
+                            return;
+                        }
                     }
                 }
             }
@@ -3661,7 +4252,9 @@ class Http3Processor extends AbstractProcessor
 
         // RFC 9114 Section 4.2: Validate header field wire format.
         // Header field names MUST be tokens (RFC 9110 Section 5.6.2).
-        // Header field values MUST be valid UTF-8 (already handled by QPACK decoding).
+        // HTTP/3 field values are byte strings validated by the per-position
+        // HttpParser.isFieldVChar()/isFieldContent() loop above; QPACK
+        // decoding deliberately performs no UTF-8 validation.
         if (!name.startsWith(":")) {
             if (!HttpParser.isToken(name)) {
                 throw new Http3StreamException(
@@ -3772,14 +4365,22 @@ class Http3Processor extends AbstractProcessor
                                         Long.valueOf(streamId), value),
                                 Http3Error.H3_MESSAGE_ERROR, streamId);
                     }
-                    request.scheme().setString(value);
+                    // RFC 3986 Section 3.1: scheme names are
+                    // case-insensitive. Store the canonical lower-case form
+                    // so downstream consumers (for example
+                    // CoyoteAdapter.postParseRequest(), which compares the
+                    // request scheme with "https" case-sensitively to set
+                    // request.isSecure()) see the same scheme that this
+                    // consistency check accepted.
+                    String canonicalScheme = value.toLowerCase(Locale.ENGLISH);
+                    request.scheme().setString(canonicalScheme);
                     // Connector policy ported from HTTP/2 (Stream.java
                     // :scheme case): unless allowSchemeMismatch is set, the
                     // scheme must be consistent with the TLS state of the
                     // connector. QUIC always uses TLS, so "https" is
                     // expected.
                     if (!protocol.getAllowSchemeMismatch() &&
-                            "https".equals(value) != protocol.isSSLEnabled()) {
+                            "https".equals(canonicalScheme) != protocol.isSSLEnabled()) {
                         throw new Http3StreamException(
                                 sm.getString("http3Processor.header.inconsistentScheme",
                                         Long.valueOf(streamId), value,
@@ -3835,13 +4436,14 @@ class Http3Processor extends AbstractProcessor
             }
         } else {
             pseudoHeadersDone = true;
-            // Track content-length for request body validation. Like every
-            // other special case here the case is gated only by the trailer
-            // allow-list above (as in HTTP/2's Stream.emitHeader, which
-            // gates no switch case on the header state): a field the
-            // operator explicitly allowed as a trailer is processed like
-            // any field of its name, with the consequences.
-            if ("content-length".equals(name)) {
+            // Track content-length for request body validation. The
+            // content-length and host cases are deliberately not applied to
+            // trailer sections: RFC 9110 Sections 6.5/6.5.1 forbid using a
+            // trailer field for message framing or routing, and using a
+            // trailer Host for the request authority would let a trailer
+            // satisfy the initial header-section validation. Allowed trailer
+            // fields of these names remain ordinary trailer fields below.
+            if (!trailerMode && "content-length".equals(name)) {
                 if (requestContentLength >= 0) {
                     // Per RFC 9114 Section 4.2, a request with multiple
                     // Content-Length header fields is malformed.
@@ -3850,6 +4452,21 @@ class Http3Processor extends AbstractProcessor
                             Http3Error.H3_MESSAGE_ERROR, streamId);
                 }
                 try {
+                    // RFC 9110 Section 8.6 defines Content-Length as
+                    // 1*DIGIT. Long.parseLong() alone would also accept a
+                    // leading '+' and "-0" (which is numerically zero), so
+                    // reject anything outside the digit grammar before
+                    // parsing. This also keeps HTTP/3 consistent with the
+                    // digit-only parser used by HTTP/1.1.
+                    if (value == null || value.isEmpty()) {
+                        throw new NumberFormatException();
+                    }
+                    for (int i = 0; i < value.length(); i++) {
+                        char c = value.charAt(i);
+                        if (c < '0' || c > '9') {
+                            throw new NumberFormatException();
+                        }
+                    }
                     long parsedContentLength = Long.parseLong(value);
                     if (parsedContentLength < 0) {
                         throw new NumberFormatException(value);
@@ -3863,7 +4480,7 @@ class Http3Processor extends AbstractProcessor
                             Http3Error.H3_MESSAGE_ERROR, streamId);
                 }
                 request.getMimeHeaders().addValue(name).setString(value);
-            } else if ("host".equals(name)) {
+            } else if (!trailerMode && "host".equals(name)) {
                 // RFC 9114 Section 4.3.1: the authority may be carried by
                 // the Host field when :authority is absent; when both are
                 // present they must agree. Same first-set / consistency
@@ -3966,7 +4583,14 @@ class Http3Processor extends AbstractProcessor
             i = Host.parse(value);
             if (i > -1) {
                 request.serverName().setString(value.substring(0, i));
-                request.setServerPort(Integer.parseInt(value.substring(i + 1)));
+                // Host.parse() permits an empty port (RFC 3986 Section
+                // 3.2.3): it is equivalent to no port. Do not try to parse
+                // the empty string as an integer; leave the server port for
+                // CoyoteAdapter to populate from the scheme default.
+                String port = value.substring(i + 1);
+                if (!port.isEmpty()) {
+                    request.setServerPort(Integer.parseInt(port));
+                }
             } else {
                 request.serverName().setString(value);
             }
@@ -3988,10 +4612,13 @@ class Http3Processor extends AbstractProcessor
         int i;
         try {
             i = Host.parse(value);
-            if (i == -1 &&
-                    (!value.equals(request.serverName().getString()) || request.getServerPort() != -1) ||
-                    i > -1 && ((!value.substring(0, i).equals(request.serverName().getString()) ||
-                            Integer.parseInt(value.substring(i + 1)) != request.getServerPort()))) {
+            String host = i == -1 ? value : value.substring(0, i);
+            String portText = i == -1 ? "" : value.substring(i + 1);
+            boolean portSpecified = !portText.isEmpty();
+            if (!host.equals(request.serverName().getString()) ||
+                    (!portSpecified && request.getServerPort() != -1) ||
+                    (portSpecified &&
+                            Integer.parseInt(portText) != request.getServerPort())) {
                 // Host value inconsistent with :authority
                 throw new Http3StreamException(
                         sm.getString("http3Processor.host.inconsistent", Long.valueOf(streamId), value,
@@ -4015,7 +4642,20 @@ class Http3Processor extends AbstractProcessor
 
 
     @Override
+    public boolean isReusable() {
+        return reusable;
+    }
+
+
+    @Override
     public void recycle() {
+        // Decide whether this processor may safely be returned to the shared
+        // pool before super.recycle() resets the error state. An error or
+        // stream/connection reset means an application thread may still be
+        // blocked in a write using this processor; reusing it could send the
+        // stale response to a later request on another stream/connection.
+        reusable = !getErrorState().isError() && !streamReset.get() &&
+                !connectionFailed;
         // Stop being the RFC 9218 priority consumer for this stream before
         // the per-stream state is discarded, so PRIORITY_UPDATE frames for
         // an already closed stream are buffered (with the ConnectionState
@@ -4034,6 +4674,9 @@ class Http3Processor extends AbstractProcessor
         // dispatch). Mirrors the connectionState cleanup above.
         qpackDecoder = new QpackDecoder();
         protocol.configureDecoder(qpackDecoder);
+        // Drop any in-progress or aborted encoding state, including its
+        // reference to the previous response's MimeHeaders.
+        qpackEncoder.resetEncodingState();
         // Drop the RFC 9218 priority signal of the previous request: it is
         // set per request from the Priority header field / PRIORITY_UPDATE
         // frames, and must not leak into the next request handled by this
@@ -4066,20 +4709,33 @@ class Http3Processor extends AbstractProcessor
         // buffers do not, so it must be done here. Without this, response
         // headers (content-length, etag, date, ...) and request state from the
         // previous request leak into the next one.
+        // Notes are not reset when request is recycled but this is a per
+        // request note. Clear it before recycling so a malformed request
+        // (bad :authority or Host) cannot make the next request handled by
+        // this pooled processor fail with a stale 400 response.
+        request.setNote(org.apache.coyote.Request.NOTE_BAD_REQUEST, null);
         request.recycle();
         response.recycle();
 
         headersReceived = false;
         requestStreamEof = false;
+        // payloadEof/payloadBlocked describe the last copyFramePayload()
+        // call, but service() also reads payloadEof before any copy in the
+        // new request (when a frame header is only partially buffered and the
+        // read would block). Leaving the previous request's value set would
+        // make a live stream look ended; clear both with the other
+        // per-request parser state.
+        payloadEof = false;
+        payloadBlocked = false;
         responseStarted = false;
         ackSent = false;
         trailersSent = false;
+        responseConcluded = false;
         pseudoHeadersDone = false;
         seenPseudoHeaders = 0;
         hostHeaderSeen = false;
         trailerMode = false;
         cookieHeader = null;
-        fieldSectionUsedDynamicTable = false;
         streamCancellationSent = false;
         // Drop any per-response compression state so the next request
         // handled by this (pooled) processor starts uncompressed. Runs
@@ -4112,6 +4768,7 @@ class Http3Processor extends AbstractProcessor
         // Do not keep a pooled processor's last stream/connection reachable.
         // HTTP/1.1 and HTTP/2 clear the wrapper in recycle() as well; the
         // compression reset above is the last user of the old wrapper.
+        streamId = -1;
         setSocketWrapper(null);
     }
 
@@ -4401,6 +5058,22 @@ class Http3Processor extends AbstractProcessor
         }
 
 
+        /*
+         * Marks the body complete once the streaming read path has delivered
+         * all bytes declared by Content-Length. The pre-dispatch reader already
+         * applies the same rule; without this update a body larger than the
+         * pre-dispatch buffer never reaches the completed state, so the
+         * application-facing read would wait for FIN/trailers (or the stall
+         * timeout) after the declared body was fully delivered.
+         */
+        private void updateBodyComplete() {
+            if (processor.requestContentLength >= 0 &&
+                    processor.totalDataReceived >= processor.requestContentLength) {
+                bodyComplete = true;
+            }
+        }
+
+
         boolean isBodyComplete() {
             return bodyComplete;
         }
@@ -4408,6 +5081,19 @@ class Http3Processor extends AbstractProcessor
 
         boolean isStreamClosed() {
             return streamClosed;
+        }
+
+
+        /**
+         * Records that the request stream has reached a clean end of stream.
+         * Used when a frame-boundary FIN is observed by a protocol read path
+         * that is not the application-facing {@link #doRead()} path.
+         *
+         * @param closed {@code true} once the stream can no longer produce
+         *               input
+         */
+        void setStreamClosed(boolean closed) {
+            this.streamClosed = closed;
         }
 
 
@@ -4473,25 +5159,27 @@ class Http3Processor extends AbstractProcessor
             // not be able to pin this worker thread indefinitely: after the
             // configured read timeout (the connector connection timeout wired
             // into the wrapper, MAX_BODY_READ_STALL_MS as fallback) with no
-            // data and no stream close the stream is treated as closed (EOF).
-            // Even after the declared Content-Length has been received the
-            // request stream may still carry a trailer section and/or the
-            // FIN. Continue reading in that case so trailers become available
-            // to the application and the stream end is observed; otherwise
-            // isTrailerFieldsReady() could never become true for a
-            // content-length request.
-            if (totalRead == 0 && !streamClosed && !trailersReceived) {
+            // data and no stream close, the stream is reset with
+            // H3_REQUEST_INCOMPLETE or H3_REQUEST_CANCELLED and the read
+            // fails with SocketTimeoutException.
+            // Once the declared Content-Length has been received the body is
+            // complete. This method returns -1 without waiting for a possible
+            // trailer section or FIN; trailer fields are read by
+            // isTrailerFieldsReady() and the after-response scan instead.
+            if (totalRead == 0 && !streamClosed && !trailersReceived &&
+                    !bodyComplete) {
                 SocketWrapperBase<?> socketWrapper = processor.getSocketWrapper();
                 if (socketWrapper != null) {
                     long stallMs = socketWrapper.getReadTimeout() > 0
                             ? socketWrapper.getReadTimeout() : MAX_BODY_READ_STALL_MS;
                     long deadline = System.nanoTime()
                             + TimeUnit.MILLISECONDS.toNanos(stallMs);
-                    while (totalRead == 0 && !streamClosed && !trailersReceived
-                            && System.nanoTime() < deadline) {
+                    while (totalRead == 0 && !streamClosed && !trailersReceived &&
+                            !bodyComplete && System.nanoTime() < deadline) {
                         totalRead = readMoreData(socketWrapper, out);
                     }
-                    if (totalRead == 0 && !streamClosed && !trailersReceived) {
+                    if (totalRead == 0 && !streamClosed && !trailersReceived &&
+                            !bodyComplete) {
                         // A stall is not end of stream: the QUIC stream is
                         // still open and the declared body may be incomplete.
                         // Returning -1 here made a truncated content-length
@@ -4523,19 +5211,25 @@ class Http3Processor extends AbstractProcessor
             }
             // The stream ended cleanly (FIN, not a reset or a stall
             // timeout) with the body short of the declared Content-Length:
-            // a malformed message (RFC 9114 Section 4.1.2). The stream is
-            // reset with H3_MESSAGE_ERROR and reported as end of data; the
-            // pending response is suppressed via the streamReset checks in
-            // the response paths (the application must not be able to
-            // answer a truncated body with a normal response).
+            // a malformed message (RFC 9114 Section 4.1.2). Reset the stream
+            // and surface the malformed request to the application as an
+            // I/O error rather than returning -1: a clean EOF would let a
+            // servlet treat the partial body as complete. HTTP/1.1 and
+            // HTTP/2 likewise report the truncation as an error.
             if (totalRead == 0 && streamClosed && !trailersReceived &&
                     !bodyComplete && processor.requestContentLength > 0 &&
                     processor.totalDataReceived <
                             processor.requestContentLength &&
+                    processor.bodyFrameError == null &&
                     isStreamFin(processor.getSocketWrapper())) {
                 streamClosed = true;
                 processor.handleStreamError(processor.getSocketWrapper(),
                         Http3Error.H3_MESSAGE_ERROR);
+                throw new IOException(sm.getString(
+                        "http3Processor.inputBuffer.contentLengthShortfall",
+                        Long.valueOf(processor.streamId),
+                        Long.valueOf(processor.totalDataReceived),
+                        Long.valueOf(processor.requestContentLength)));
             }
             return (streamClosed || trailersReceived || bodyComplete) ? -1 : 0;
         }
@@ -4627,22 +5321,32 @@ class Http3Processor extends AbstractProcessor
          */
         private int completeTrailerSection(SocketWrapperBase<?> socketWrapper)
                 throws IOException {
+            return completeTrailerSection(socketWrapper, true);
+        }
+
+
+        private int completeTrailerSection(SocketWrapperBase<?> socketWrapper,
+                boolean pump) throws IOException {
             int needed = trailerPayload.remaining();
             int copied = needed == 0 ? 0 : processor.copyFramePayload(
-                    processor.inputBuffer, socketWrapper, trailerPayload, needed, true);
-            // The Required Insert Count may already be among the staged
-            // bytes: an abandoned (truncated or reset) section that used
-            // the dynamic table still owes the peer a Stream Cancellation
-            // (RFC 9204 Section 2.2.2.2).
-            processor.notePartialSectionDynamicTableUse(trailerPayload);
+                    processor.inputBuffer, socketWrapper, trailerPayload, needed, pump);
+            // An abandoned (truncated or reset) section owes the peer a
+            // Stream Cancellation (RFC 9204 Section 2.2.2.2); the error
+            // paths below queue it unconditionally.
             if (copied < needed) {
                 if (processor.payloadEof) {
-                    // FIN before the section was complete: truncated field
-                    // section, malformed request.
+                    // FIN before the section was complete: a cleanly
+                    // terminated stream with a truncated last frame is the
+                    // connection error of RFC 9114 Section 7.1. An abrupt
+                    // reset remains a stream-scoped abandonment.
                     streamClosed = true;
                     trailerPayload = null;
-                    processor.handleStreamError(socketWrapper,
-                            Http3Error.H3_MESSAGE_ERROR);
+                    if (processor.isStreamFin(socketWrapper)) {
+                        processor.bodyFrameError = Http3Error.H3_FRAME_ERROR;
+                    } else {
+                        processor.handleStreamError(socketWrapper,
+                                Http3Error.H3_MESSAGE_ERROR);
+                    }
                     return -1;
                 }
                 // Would-block; the rest is completed on the next call.
@@ -4670,7 +5374,8 @@ class Http3Processor extends AbstractProcessor
 
         /**
          * Reads more DATA frames from the stream, preserving frame boundaries.
-         * Tracks partial DATA frames so remaining bytes are skipped on the next call.
+         * Tracks partial DATA frames so their remaining bytes are delivered to
+         * the caller on the next call.
          */
         private int readMoreData(SocketWrapperBase<?> socketWrapper, ByteBuffer dst) throws IOException {
             int read = 0;
@@ -4682,8 +5387,12 @@ class Http3Processor extends AbstractProcessor
             if (pendingSkipRemaining > 0) {
                 long skipped = processor.skipFramePayload(socketWrapper,
                         pendingSkipRemaining, true);
-                if (skipped < 0) {
+                if (skipped < 0 || (skipped < pendingSkipRemaining &&
+                        processor.isStreamFin(socketWrapper))) {
                     streamClosed = true;
+                    if (processor.isStreamFin(socketWrapper)) {
+                        processor.bodyFrameError = Http3Error.H3_FRAME_ERROR;
+                    }
                     return read > 0 ? read : -1;
                 }
                 pendingSkipRemaining -= skipped;
@@ -4703,14 +5412,28 @@ class Http3Processor extends AbstractProcessor
                         dst, toCopy, true);
                 read += bytesCopied;
                 processor.totalDataReceived += bytesCopied;
+                updateBodyComplete();
                 partialDataRemaining -= bytesCopied;
                 if (processor.payloadEof) {
                     streamClosed = true;
+                    if (processor.isStreamFin(socketWrapper)) {
+                        // Clean FIN in the middle of a DATA frame: truncated
+                        // last frame (RFC 9114 Section 7.1).
+                        processor.bodyFrameError = Http3Error.H3_FRAME_ERROR;
+                    }
                     return read;
                 }
                 if (processor.payloadBlocked || partialDataRemaining > 0) {
                     // Would-block or destination full; the rest is delivered
                     // on the next call.
+                    return read;
+                }
+                if (bodyComplete) {
+                    // The declared body is complete. Do not parse a possible
+                    // following trailer/FIN here; trailer fields are handled by
+                    // isTrailerFieldsReady() and the after-response scan, and
+                    // parsing now could block waiting for bytes the caller does
+                    // not need for the body read.
                     return read;
                 }
                 // Frame complete; fall through to normal frame parsing.
@@ -4739,12 +5462,11 @@ class Http3Processor extends AbstractProcessor
                     headerComplete = processor.parseFrameHeader(inputBuf,
                             processor.frameHeader);
                 } catch (Http3StreamException e) {
-                    // A frame longer than the local frame length limit:
-                    // protocol-valid (HTTP/3 has no negotiated frame size
-                    // limit), merely too large for this receiver to buffer.
-                    // Reject the request at stream scope (RESET_STREAM)
-                    // instead of failing the connection; no payload of the
-                    // declared size is allocated or read.
+                    // Defensive: the header parser no longer rejects an
+                    // oversized DATA/HEADERS frame itself; the per-frame
+                    // checks below run only after the frame sequence has
+                    // been classified. Any stream error raised here is
+                    // still handled at stream scope.
                     streamClosed = true;
                     processor.handleStreamError(socketWrapper, e.getError());
                     return read > 0 ? read : -1;
@@ -4755,6 +5477,14 @@ class Http3Processor extends AbstractProcessor
                     // discard a partially consumed type byte and the bytes are
                     // re-parsed as a header on the next iteration.
                     if (!refillForHeader(inputBuf, socketWrapper)) {
+                        if (streamClosed &&
+                                processor.isStreamFin(socketWrapper) &&
+                                processor.hasPartialFrameData()) {
+                            // Clean FIN with a partially received frame header:
+                            // the last frame header is truncated (RFC 9114
+                            // Section 7.1, connection error H3_FRAME_ERROR).
+                            processor.bodyFrameError = Http3Error.H3_FRAME_ERROR;
+                        }
                         break;
                     }
                     continue;
@@ -4764,6 +5494,18 @@ class Http3Processor extends AbstractProcessor
 
                 switch (classifyBodyFrame(frameType)) {
                     case DATA -> {
+                        if (processor.exceedsBufferedFrameLimit(frameType,
+                                frameLen)) {
+                            // Sequence classification (the switch) ran first;
+                            // a valid DATA frame is only too large for this
+                            // receiver, so reset this stream (RESET_STREAM
+                            // H3_FRAME_ERROR) instead of failing the
+                            // connection.
+                            streamClosed = true;
+                            processor.handleStreamError(socketWrapper,
+                                    Http3Error.H3_FRAME_ERROR);
+                            return read > 0 ? read : -1;
+                        }
                         if (frameLen == 0) {
                             if (noteNonBodyFrame(frameType, 0)) {
                                 return read > 0 ? read : -1;
@@ -4802,18 +5544,32 @@ class Http3Processor extends AbstractProcessor
                         if (bytesCopied < frameLen) {
                             // dst filled up (or the read would-blocked) before the frame
                             // was fully delivered; defer the rest to the next call.
-                            // Safe cast: parseFrameHeader rejects DATA frames above
-                            // MAX_FRAME_LENGTH at the header.
+                            // Safe cast: the DATA frame length was checked
+                            // against MAX_FRAME_LENGTH above.
                             partialDataRemaining = (int) (frameLen - bytesCopied);
                         }
                         read += bytesCopied;
                         processor.totalDataReceived += bytesCopied;
+                        updateBodyComplete();
                         if (processor.payloadEof) {
                             streamClosed = true;
+                            if (processor.isStreamFin(socketWrapper)) {
+                                // Clean FIN in the middle of a DATA frame:
+                                // truncated last frame (RFC 9114 Section 7.1).
+                                processor.bodyFrameError =
+                                        Http3Error.H3_FRAME_ERROR;
+                            }
                         }
                         return read;
                     }
                     case TRAILERS -> {
+                        if (processor.exceedsBufferedFrameLimit(frameType,
+                                frameLen)) {
+                            streamClosed = true;
+                            processor.handleStreamError(socketWrapper,
+                                    Http3Error.H3_FRAME_ERROR);
+                            return read > 0 ? read : -1;
+                        }
                         // See BodyFrameKind.TRAILERS. Declared-length
                         // preflight against the wire-side bound of the
                         // field section limit (see fieldSectionWireLimit);
@@ -4824,8 +5580,8 @@ class Http3Processor extends AbstractProcessor
                                     Http3Error.H3_MESSAGE_ERROR);
                             return read > 0 ? read : -1;
                         }
-                        // Safe cast: parseFrameHeader rejects HEADERS frames
-                        // above MAX_FRAME_LENGTH at the header.
+                        // Safe cast: the HEADERS frame length was checked
+                        // against MAX_FRAME_LENGTH above.
                         trailerPayload = ByteBuffer.allocate((int) frameLen);
                         int result = completeTrailerSection(socketWrapper);
                         if (result < 0) {
@@ -4861,8 +5617,13 @@ class Http3Processor extends AbstractProcessor
                         }
                         long skipped = frameLen > 0 ? processor.skipFramePayload(
                                 socketWrapper, frameLen, true) : frameLen;
-                        if (skipped < 0) {
+                        if (skipped < 0 || (skipped < frameLen &&
+                                processor.isStreamFin(socketWrapper))) {
                             streamClosed = true;
+                            if (processor.isStreamFin(socketWrapper)) {
+                                processor.bodyFrameError =
+                                        Http3Error.H3_FRAME_ERROR;
+                            }
                             return read > 0 ? read : -1;
                         }
                         if (skipped < frameLen) {
@@ -4960,8 +5721,8 @@ class Http3Processor extends AbstractProcessor
          * lingering (reachable from the pooled processor) until the cleaner
          * runs. On a reset stream the trailer bytes the close produces are
          * swallowed by the emitData() streamReset guard (recycle() runs this
-         * before clearing the flag); a stream that already completed
-         * (end() finished it) throws "Stream closed" here, which is
+         * before clearing the flag). If end() already closed the stream, the
+         * second close is a no-op; any IOException from a dead QUIC stream is
          * expected - the deflater is released either way.
          */
         void resetCompression() {
@@ -5016,6 +5777,17 @@ class Http3Processor extends AbstractProcessor
             // this response, so the compression branch below must come after.
             if (!processor.responseStarted) {
                 processor.sendResponseHeadersInternal(processor.getSocketWrapper());
+            }
+            // The header send above may have decided that this response has
+            // no body (HEAD or a no-content status) and set voidOutput. It
+            // may also have observed a stream reset. Re-check both before
+            // handing the current chunk to emitData(), otherwise the first
+            // direct-write chunk after the headers would be sent as DATA on
+            // a response that must not carry content.
+            if (voidOutput || processor.streamReset.get() ||
+                    processor.responseConcluded) {
+                chunk.position(chunk.limit());
+                return pending;
             }
             if (pending == 0) {
                 return 0;
@@ -5136,16 +5908,13 @@ class Http3Processor extends AbstractProcessor
 
         public void flush() throws IOException {
             if (compressionStream != null) {
-                try {
-                    if (log.isTraceEnabled()) {
-                        log.trace("Flushing the compression stream!");
-                    }
-                    compressionStream.flush();
-                } catch (IOException ioe) {
-                    if (log.isDebugEnabled()) {
-                        log.debug("Stream [" + processor.streamId + "] failed to flush the compression stream", ioe);
-                    }
+                if (log.isTraceEnabled()) {
+                    log.trace("Flushing the compression stream!");
                 }
+                // A failure here means compressed bytes could not be emitted;
+                // propagate it rather than silently continuing with a short
+                // compressed body.
+                compressionStream.flush();
             }
             SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
             if (wrapper != null) {

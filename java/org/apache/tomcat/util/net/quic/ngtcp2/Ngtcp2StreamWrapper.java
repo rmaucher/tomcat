@@ -125,6 +125,13 @@ public class Ngtcp2StreamWrapper implements QuicStream {
     private volatile boolean concluded;
 
     /**
+     * Whether this wrapper was created for a late readable edge on a stream
+     * whose request already completed and whose endpoint wrapper was
+     * discarded.
+     */
+    private volatile boolean lateDuplicate;
+
+    /**
      * Whether the endpoint has removed this stream from its bookkeeping.
      * Set on the poll thread by the endpoint's stream close paths.
      */
@@ -386,6 +393,28 @@ public class Ngtcp2StreamWrapper implements QuicStream {
      */
     public void setConcluded() {
         this.concluded = true;
+    }
+
+
+    /**
+     * Marks this stream wrapper as a late duplicate for an already completed
+     * request. The processor must close it without treating the missing
+     * request head as a new empty request.
+     */
+    public void setLateDuplicate() {
+        this.lateDuplicate = true;
+    }
+
+
+    /**
+     * Whether this stream wrapper is a late duplicate for an already
+     * completed request.
+     *
+     * @return {@code true} if this is a late duplicate edge
+     */
+    @Override
+    public boolean isLateDuplicate() {
+        return lateDuplicate;
     }
 
 

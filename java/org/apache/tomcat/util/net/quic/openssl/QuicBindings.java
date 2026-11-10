@@ -56,9 +56,8 @@ import org.apache.tomcat.util.openssl.openssl_h;
  *     {@code SSL_get_peer_addr()} (with the {@code BIO_ADDR_family()} /
  *     {@code BIO_ADDR_rawaddress()} / {@code BIO_ADDR_rawport()} accessors)</li>
  * <li>{@code SSL_get_servername()}, {@code SSL_get0_alpn_selected()},
- *     {@code SSL_use_certificate()}, {@code SSL_use_PrivateKey()},
- *     {@code X509_free()}, {@code EVP_PKEY_free()}</li>
- * <li>{@code SSL_CTX_ctrl()}, {@code SSL_ctrl()}, {@code SSL_CTX_callback_ctrl()}
+ *     {@code SSL_use_certificate()}, {@code SSL_use_PrivateKey()}</li>
+ * <li>{@code SSL_ctrl()}, {@code SSL_CTX_callback_ctrl()}
  *     (used for the SNI callback and chain certificate management, which are
  *     macros in OpenSSL 4.0)</li>
  * <li>C libc helpers for the datagram socket: {@code socket()}, {@code bind()},
@@ -555,6 +554,12 @@ public class QuicBindings {
     public static final int SSL_ERROR_WANT_WRITE = 3;
 
     /**
+     * {@code SSL_ERROR_ZERO_RETURN}: the peer cleanly finished the stream and
+     * no more bytes are available (the QUIC equivalent of EOF).
+     */
+    public static final int SSL_ERROR_ZERO_RETURN = 6;
+
+    /**
      * {@code int SSL_shutdown_ex(SSL *ssl, uint64_t flags, const SSL_SHUTDOWN_EX_ARGS *args, size_t args_len)}
      * Extended shutdown with flags for rapid drain, no stream flush, etc.
      */
@@ -728,6 +733,49 @@ public class QuicBindings {
     }
 
     /**
+     * {@code BIO_ADDR *BIO_ADDR_new(void)}
+     * Allocates an opaque BIO_ADDR on the OpenSSL heap. Use the allocator
+     * rather than a caller-sized byte buffer so the transport does not depend
+     * on the private union layout/size of BIO_ADDR.
+     */
+    public static final MethodHandle BIO_ADDR_new$handle =
+            createHandle("BIO_ADDR_new",
+                    FunctionDescriptor.of(openssl_h.C_POINTER));
+
+    /**
+     * {@code BIO_ADDR *BIO_ADDR_new(void)}
+     *
+     * @return The new BIO_ADDR, or {@code NULL} on failure
+     */
+    public static MemorySegment BIO_ADDR_new() {
+        try {
+            return (MemorySegment) BIO_ADDR_new$handle.invokeExact();
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
+     * {@code void BIO_ADDR_free(BIO_ADDR *ap)}
+     */
+    public static final MethodHandle BIO_ADDR_free$handle =
+            createHandle("BIO_ADDR_free",
+                    FunctionDescriptor.ofVoid(openssl_h.C_POINTER));
+
+    /**
+     * {@code void BIO_ADDR_free(BIO_ADDR *ap)}
+     *
+     * @param ap The BIO_ADDR to free
+     */
+    public static void BIO_ADDR_free(MemorySegment ap) {
+        try {
+            BIO_ADDR_free$handle.invokeExact(ap);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
      * {@code int BIO_ADDR_family(const BIO_ADDR *ap)}
      * Returns the address family of a BIO_ADDR using its documented accessor
      * (BIO_ADDR is an opaque union of sockaddr structs; the raw layout must
@@ -787,7 +835,7 @@ public class QuicBindings {
      */
     public static final MethodHandle BIO_ADDR_rawport$handle =
             createHandle("BIO_ADDR_rawport",
-                    FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER));
+                    FunctionDescriptor.of(openssl_h.C_SHORT, openssl_h.C_POINTER));
 
     /**
      * {@code unsigned short BIO_ADDR_rawport(const BIO_ADDR *ap)}
@@ -800,7 +848,7 @@ public class QuicBindings {
      */
     public static int BIO_ADDR_rawport(MemorySegment ap) {
         try {
-            return (int) BIO_ADDR_rawport$handle.invokeExact(ap);
+            return ((short) BIO_ADDR_rawport$handle.invokeExact(ap)) & 0xFFFF;
         } catch (Throwable t) {
             throw new AssertionError("should not reach here", t);
         }
@@ -1302,6 +1350,16 @@ public class QuicBindings {
     public static final int SSL_MODE_ENABLE_PARTIAL_WRITE = 0x00000001;
 
     /**
+     * {@code SSL_MODE} bit applied via {@code SSL_CTX_ctrl(SSL_CTRL_MODE)}.
+     * The QUIC endpoint sets {@code SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER}
+     * together with partial writes: a would-blocking call arms a retry state
+     * in OpenSSL, and this package re-stages the unwritten remainder into a
+     * fresh native buffer for the retry, so the retried address differs from
+     * the original one.
+     */
+    public static final int SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = 0x00000002;
+
+    /**
      * {@code const char *SSL_get_servername(const SSL *s, int type)}
      * Returns the server name of the given type (e.g. the SNI host name) sent
      * by the peer, or NULL if no such server name was sent.
@@ -1333,15 +1391,9 @@ public class QuicBindings {
      * with its length. The memory is owned by the SSL object; it is valid
      * until the SSL object is freed. {@code *data} is set to NULL when no
      * protocol was negotiated.
-     */
-    public static final MethodHandle SSL_get0_alpn_selected$handle =
-            createHandle("SSL_get0_alpn_selected",
-                    FunctionDescriptor.ofVoid(openssl_h.C_POINTER,
-                            ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-
-    /**
-     * {@code void SSL_get0_alpn_selected(const SSL *ssl, const unsigned char
-     * **data, unsigned int *len)}
+     * <p>
+     * Delegates to the generated {@link openssl_h} binding instead of
+     * declaring a second, independent handle for the same C signature.
      *
      * @param ssl  The SSL object
      * @param data Out parameter receiving the selected protocol bytes
@@ -1349,11 +1401,7 @@ public class QuicBindings {
      */
     public static void SSL_get0_alpn_selected(MemorySegment ssl, MemorySegment data,
             MemorySegment len) {
-        try {
-            SSL_get0_alpn_selected$handle.invokeExact(ssl, data, len);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
+        openssl_h.SSL_get0_alpn_selected(ssl, data, len);
     }
 
     /**
@@ -1403,88 +1451,6 @@ public class QuicBindings {
     public static int SSL_use_PrivateKey(MemorySegment ssl, MemorySegment key) {
         try {
             return (int) SSL_use_PrivateKey$handle.invokeExact(ssl, key);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code void X509_free(X509 *a)}
-     * Releases one reference to an X509 object allocated on the OpenSSL heap
-     * (for example by the PEM/d2i loaders). {@code SSL_use_certificate()} and
-     * {@code SSL_add1_chain_cert()} increment the object's own reference count,
-     * so releasing the configuration's reference after applying a certificate
-     * does not free an object that live connections still hold - the object
-     * survives until those connections release it. See the endpoint's
-     * {@code freeCertConfig()} / {@code swapCertConfig()} reload analysis.
-     */
-    public static final MethodHandle X509_free$handle =
-            createHandle("X509_free",
-                    FunctionDescriptor.ofVoid(openssl_h.C_POINTER));
-
-    /**
-     * {@code void X509_free(X509 *a)}
-     *
-     * @param a The certificate to free
-     */
-    public static void X509_free(MemorySegment a) {
-        try {
-            X509_free$handle.invokeExact(a);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code void EVP_PKEY_free(EVP_PKEY *pkey)}
-     * Releases one reference to an EVP_PKEY object allocated on the OpenSSL heap
-     * (for example by {@code d2i_AutoPrivateKey}). {@code SSL_use_PrivateKey()}
-     * increments the object's own reference count, so releasing the
-     * configuration's reference after applying a key does not free a key that
-     * live connections still hold - the key survives until those connections
-     * release it. See the endpoint's {@code freeCertConfig()} /
-     * {@code swapCertConfig()} reload analysis.
-     */
-    public static final MethodHandle EVP_PKEY_free$handle =
-            createHandle("EVP_PKEY_free",
-                    FunctionDescriptor.ofVoid(openssl_h.C_POINTER));
-
-    /**
-     * {@code void EVP_PKEY_free(EVP_PKEY *pkey)}
-     *
-     * @param pkey The private key to free
-     */
-    public static void EVP_PKEY_free(MemorySegment pkey) {
-        try {
-            EVP_PKEY_free$handle.invokeExact(pkey);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code long SSL_CTX_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)}
-     * Implements, amongst others, the OpenSSL 4.0 macros
-     * {@code SSL_CTX_add1_chain_cert(ctx, x)} (cmd =
-     * {@link #SSL_CTRL_CHAIN_CERT}, larg = 1).
-     */
-    public static final MethodHandle SSL_CTX_ctrl$handle =
-            createHandle("SSL_CTX_ctrl",
-                    FunctionDescriptor.of(openssl_h.C_LONG, openssl_h.C_POINTER,
-                            openssl_h.C_INT, openssl_h.C_LONG, openssl_h.C_POINTER));
-
-    /**
-     * {@code long SSL_CTX_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)}
-     *
-     * @param ctx  The SSL context
-     * @param cmd  The control command
-     * @param larg The long argument of the control command
-     * @param parg The pointer argument of the control command
-     * @return The result of the control command
-     */
-    public static long SSL_CTX_ctrl(MemorySegment ctx, int cmd, long larg, MemorySegment parg) {
-        try {
-            return (long) SSL_CTX_ctrl$handle.invokeExact(ctx, cmd, larg, parg);
         } catch (Throwable t) {
             throw new AssertionError("should not reach here", t);
         }

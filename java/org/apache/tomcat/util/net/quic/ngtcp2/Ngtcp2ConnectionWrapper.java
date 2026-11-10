@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.net.quic.QuicConnection;
 import org.apache.tomcat.util.net.quic.QuicConnectionManager;
 import org.apache.tomcat.util.net.quic.QuicStream;
@@ -330,6 +331,7 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
             try {
                 result = endpoint.callOnPollThread(this, this::readSniHostNameCached);
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 // The poll thread is not (or no longer) reachable: the SNI
                 // host name is not critical, report "no SNI".
                 result = "";
@@ -416,6 +418,7 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
                 return null;
             });
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             // The hop did not run (or did not complete in time). Mark the
             // close JVM-side and wake the loop: its teardown sweep picks up
             // closed connections that are still registered and releases
@@ -1046,15 +1049,26 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
      * thread.
      */
     public void closeAllStreams() {
+        int discardedWaiters = 0;
         for (Ngtcp2StreamWrapper stream : streams.values()) {
+            while (stream.pollClaimWaiter() != null) {
+                discardedWaiters++;
+            }
             stream.setDeregistered();
             stream.setFreed();
+        }
+        // A parked claim-retry waiter owns one active-handler reference. The
+        // connection is going away, so those waiters will never run; release
+        // their references here instead of retaining the connection forever.
+        if (discardedWaiters > 0) {
+            activeHandlers.addAndGet(-discardedWaiters);
         }
         streams.clear();
         serverUniStreams.clear();
         pendingReadDispatches.clear();
         pendingUniStreamDrains.clear();
         readRearm.clear();
+        readInterestRearm.clear();
         writeRearm.clear();
         // Packets still queued for a dead connection: their destination
         // ceases to exist with it.

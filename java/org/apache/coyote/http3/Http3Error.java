@@ -90,8 +90,9 @@ enum Http3Error {
      * rather than by exception type, so they also fail only the affected
      * stream, and the emit sites carry a note.
      * <p>
-     * This classification therefore drives only the base-{@link
-     * Http3Exception} dispatch in {@code service()}. It does not mean no
+     * This classification therefore drives the base-{@link
+     * Http3Exception} dispatch in both {@code service()} and
+     * {@code isTrailerFieldsReady()}. It does not mean no
      * other code is ever stream-scoped: the processor resets individual
      * streams with other codes directly at their sites via
      * {@code Http3StreamException}/{@code handleStreamError()} - e.g.

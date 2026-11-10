@@ -230,6 +230,46 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
+    public void testUppercaseHttpsSchemeAccepted() throws Exception {
+        startHttp3Server();
+
+        // RFC 3986 scheme names are case-insensitive. "HTTPS" is the same
+        // scheme as "https" and is therefore consistent with the QUIC TLS
+        // usage; it must not be rejected by the scheme/TLS check.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "HTTPS", ":authority", "127.0.0.1:" + port,
+                ":path", "/simple");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertNull(output.getStreamError());
+    }
+
+
+    @Test
+    public void testUppercaseHttpsSchemeIsSecure() throws Exception {
+        startHttp3Server(this::addSecureServlet);
+
+        // RFC 3986 scheme names are case-insensitive. The canonical lower
+        // case form must reach the container so that CoyoteAdapter's
+        // case-sensitive "https" comparison sets request.isSecure() and
+        // the session cookie is marked Secure.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "HTTPS", ":authority", "127.0.0.1:" + port,
+                ":path", "/secure");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertNull(output.getStreamError());
+        Assert.assertEquals("true", response.getBodyAsString().trim());
+        String setCookie = response.getHeader("set-cookie");
+        Assert.assertNotNull("Expected a session cookie", setCookie);
+        Assert.assertTrue("Expected Secure in: " + setCookie,
+                setCookie.contains("Secure"));
+    }
+
+
+    @Test
     public void testInvalidSchemeRejected() throws Exception {
         startHttp3Server();
 
@@ -526,6 +566,62 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
+    public void testExtendedConnectWithoutPortAccepted() throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setEnableConnectProtocol(true);
+
+        // RFC 8441 Section 4 interprets the :authority of an extended CONNECT
+        // using the normal request-authority rules, not the host:port
+        // authority-form required for a plain tunnel CONNECT (RFC 9114
+        // Section 4.4). A port is therefore optional; the RFC 8441 example
+        // uses an authority without one. The request must reach the
+        // container (501 because no tunnel protocol is implemented).
+        ClientOutput output = rawRequest(":method", "CONNECT",
+                ":scheme", "https", ":authority", "127.0.0.1",
+                ":protocol", "websocket", ":path", "/simple");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 501);
+        Assert.assertNull(output.getStreamError());
+    }
+
+
+    @Test
+    public void testExtendedConnectInvalidPathRejected() throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setEnableConnectProtocol(true);
+
+        // RFC 9220 Section 3 / RFC 8441 Section 4: the extended CONNECT :path
+        // identifies the targeted resource and must obey the same request
+        // target character rules as a non-CONNECT :path. A backslash is not
+        // permitted in a request target and makes the message malformed.
+        ClientOutput output = rawRequest(":method", "CONNECT",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":protocol", "websocket", ":path", "/simple\\evil");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testExtendedConnectInvalidQueryRejected() throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setEnableConnectProtocol(true);
+
+        // The extended CONNECT :path query string is validated with the same
+        // relaxed query whitelist as a non-CONNECT request.
+        ClientOutput output = rawRequest(":method", "CONNECT",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":protocol", "websocket", ":path", "/simple?bad=sp ace");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
     public void testExtendedConnectMissingSchemeRejected() throws Exception {
         startHttp3Server();
         ((AbstractHttp3Protocol) connector.getProtocolHandler())
@@ -641,6 +737,21 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
+    public void testSignedContentLengthRejected() throws Exception {
+        startHttp3Server();
+
+        // RFC 9110 Section 8.6 defines Content-Length as 1*DIGIT. A sign
+        // (including "-0", which Long.parseLong treats as zero) is not part
+        // of the grammar and makes the request malformed (RFC 9114
+        // Section 4.1.2).
+        for (String value : new String[] { "+0", "-0", "+5", "-5" }) {
+            ClientOutput output = rawGet("/simple", "content-length", value);
+            assertStreamError(output, H3_MESSAGE_ERROR);
+        }
+    }
+
+
+    @Test
     public void testRequestWithBody() throws Exception {
         startHttp3Server();
 
@@ -680,6 +791,58 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
     }
 
 
+    private static volatile Throwable shortBodyReadException;
+
+
+    @Test
+    public void testStreamedBodyShortfallSurfacedAsIOException()
+            throws Exception {
+        shortBodyReadException = null;
+        startHttp3Server(this::addShortBodyServlet);
+
+        // The request body crosses the pre-dispatch buffer and the FIN
+        // arrives only after dispatch, so the shortfall is observed by the
+        // streaming read. The application must not see a clean EOF for the
+        // truncated body.
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers",
+                buildFieldSection(":method", "POST", ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/shortbody", "content-length", "10"),
+                "--data", Base64.getEncoder().encodeToString(
+                        "12345".getBytes(StandardCharsets.US_ASCII)),
+                "--fin-after", "0.5", "--timeout", "3"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+        Assert.assertNotNull("The truncated body must raise an I/O error "
+                + "to the application", shortBodyReadException);
+        Assert.assertTrue("Expected an IOException, got "
+                        + shortBodyReadException.getClass().getName(),
+                shortBodyReadException instanceof IOException);
+    }
+
+
+    private void addShortBodyServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "shortbody", new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void doPost(HttpServletRequest req,
+                    HttpServletResponse resp) throws IOException {
+                try {
+                    req.getInputStream().readAllBytes();
+                } catch (IOException ioe) {
+                    shortBodyReadException = ioe;
+                }
+                resp.setContentType("text/plain");
+                resp.getWriter().write("done");
+            }
+        });
+        ctxt.addServletMapping("/shortbody", "shortbody");
+    }
+
+
     @Test
     public void testTrailerFieldsReadyAfterContentLengthBodyWithoutTrailers()
             throws Exception {
@@ -705,6 +868,110 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         Assert.assertTrue("Expected ready=true in:\n" +
                 response.getBodyAsString(),
                 response.getBodyAsString().contains("ready=true"));
+    }
+
+
+    @Test
+    public void testTrailerFieldsReadyWithoutBodyReadAndWithoutTrailers()
+            throws Exception {
+        startHttp3Server(this::addTrailerReadyServlet);
+
+        // A complete body-less request with no trailer section must report
+        // the empty trailer map as ready even when the application never
+        // reads the input stream. The client FIN is consumed by the protocol
+        // layer, not by the application.
+        ClientOutput output = runClient(rawCommandWith("--headers",
+                buildFieldSection(simpleGetHeaders("/trailerready")),
+                "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertTrue("Expected ready=true without ISE in:\n" +
+                response.getBodyAsString(),
+                response.getBodyAsString().contains("ready=true"));
+        Assert.assertFalse("getTrailerFields() threw in:\n" +
+                response.getBodyAsString(),
+                response.getBodyAsString().contains("ISE"));
+    }
+
+
+    @Test
+    public void testContentLengthShortfallAfterResponse() throws Exception {
+        startHttp3Server();
+
+        // The response is produced before the client FINs the request stream.
+        // The declared Content-Length (100) is larger than the DATA payload
+        // (10 bytes). The clean frame-boundary FIN makes the shortfall
+        // observable during the after-response scan, which must apply the
+        // malformed-message rule (RFC 9114 Section 4.1.2): H3_MESSAGE_ERROR.
+        String initial = buildFieldSection(":method", "GET", ":scheme",
+                "https", ":authority", "127.0.0.1:" + port, ":path",
+                "/sleep?ms=1000", "content-length", "100");
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers", initial,
+                "--data", Base64.getEncoder().encodeToString(
+                        "0123456789".getBytes(StandardCharsets.US_ASCII)),
+                "--fin-after", "0.5",
+                "--timeout", "5",
+                "--wait", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        validateStatus(output.getResponse(), 200);
+        Assert.assertEquals("Expected stream error H3_MESSAGE_ERROR after the "
+                        + "Content-Length shortfall, got "
+                        + output.getStreamError(),
+                Integer.valueOf(H3_MESSAGE_ERROR), output.getStreamError());
+    }
+
+
+    @Test
+    public void testSplitTrailerAfterContentLengthBodyIsDecoded()
+            throws Exception {
+        startHttp3Server(this::addTrailerReadyServlet);
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowedTrailerHeaders("x-checksum");
+        // The body fits entirely in the pre-dispatch buffer, so the
+        // streaming read path is never entered after bodyComplete is set.
+        // A trailer section whose payload is split across reads is staged;
+        // the trailer-fields readiness path must be able to finish it.
+        java.util.List<String> command = new java.util.ArrayList<>();
+        command.add(PYTHON);
+        command.add(new java.io.File(
+                "test/org/apache/coyote/http3/split_trailer_client.py")
+                        .getAbsolutePath());
+        command.add(Integer.toString(port));
+        ClientOutput output = runClient(command, CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        String body = response.getBodyAsString();
+        Assert.assertTrue("Expected ready=true in: " + body,
+                body.contains("ready=true"));
+        Assert.assertTrue("Expected x-checksum trailer in: " + body,
+                body.contains("x-checksum=abc123"));
+    }
+
+
+    @Test
+    public void testTrailerFieldsWithoutBodyRead() throws Exception {
+        startHttp3Server(this::addTrailerReadyServlet);
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowedTrailerHeaders("x-test");
+
+        // Trailer fields carried by a body-less request must be decoded
+        // without requiring the application to read the input stream.
+        ClientOutput output = runClient(rawCommandWith("--headers",
+                buildFieldSection(simpleGetHeaders("/trailerready")),
+                "--trailers", buildFieldSection("x-test", "value"),
+                "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertTrue("Expected ready=true without ISE in:\n" +
+                response.getBodyAsString(),
+                response.getBodyAsString().contains("ready=true"));
+        Assert.assertTrue("Expected trailer x-test=value in:\n" +
+                response.getBodyAsString(),
+                response.getBodyAsString().contains("x-test=value"));
     }
 
 
@@ -858,6 +1125,38 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
+    public void testTruncatedIgnoredFrameAfterTrailerConnectionError()
+            throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 7.1: a frame truncated by the end of the stream is
+        // a connection error of type H3_FRAME_ERROR. Unknown frames are
+        // permitted after the trailing HEADERS section (Section 4.1), so the
+        // after-trailer scan must still detect the truncated payload rather
+        // than discard it at stream teardown.
+        String initial = buildFieldSection(":method", "GET", ":scheme",
+                "https", ":authority", "127.0.0.1:" + port, ":path",
+                "/simple");
+        String trailers = buildFieldSection("x-checksum", "abc123");
+        // Unknown frame type 0x0a, declared payload length 10, but only two
+        // payload bytes followed by the stream FIN.
+        byte[] truncated = new byte[] { 0x0a, 0x0a, 'a', 'b' };
+        ClientOutput output = runClient(
+                rawCommandWith("--headers", initial,
+                        "--frame-after-data", buildFrameB64(0x01,
+                                Base64.getDecoder().decode(trailers)),
+                        "--frame-after-data",
+                        Base64.getEncoder().encodeToString(truncated),
+                        "--timeout", "5"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        Assert.assertEquals("Expected connection error H3_FRAME_ERROR, got "
+                        + output.getConnectionError(),
+                Integer.valueOf(H3_FRAME_ERROR), output.getConnectionError());
+    }
+
+
+    @Test
     public void testRequestTrailers() throws Exception {
         startHttp3Server();
 
@@ -966,21 +1265,16 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
-    public void testAllowedContentLengthTrailerHitsDuplicateCheck()
+    public void testAllowedContentLengthTrailerDoesNotUseFraming()
             throws Exception {
         startHttp3Server(this::addTrailerEchoServlet);
         ((AbstractHttp3Protocol) connector.getProtocolHandler())
                 .setAllowedTrailerHeaders("content-length");
 
-        // A content-length permitted via allowedTrailerHeaders is processed
-        // by the content-length case of emitHeader like any other
-        // content-length field: emitHeader gates no special case on the
-        // trailer state (HTTP/2's Stream.emitHeader gates none either), so
-        // the trailer's re-declaration of the head's content-length is the
-        // duplicate Content-Length malformed message of RFC 9114 Section
-        // 4.2. Allowing the field as a trailer is an operator choice via
-        // allowedTrailerHeaders, and its consequences are part of that
-        // choice.
+        // RFC 9110 Sections 6.5/6.5.1: Content-Length is a framing field and
+        // must not be used as a trailer. An operator may allow-list the name,
+        // but it must remain an ordinary trailer field; it must not reinstall
+        // or duplicate the request framing.
         String initial = buildFieldSection(":method", "POST", ":scheme",
                 "https", ":authority", "127.0.0.1:" + port, ":path",
                 "/trailerecho", "content-length", "5");
@@ -992,30 +1286,60 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                         "--trailers", trailers),
                 CLIENT_TIMEOUT_SECONDS);
 
-        assertStreamError(output, H3_MESSAGE_ERROR);
+        validateStatus(output.getResponse(), 200);
+        Assert.assertNull(output.getStreamError());
+        Assert.assertTrue("Expected the allowed content-length trailer in:\n"
+                        + output.getResponse().getBodyAsString(),
+                output.getResponse().getBodyAsString()
+                        .contains("content-length=99"));
     }
 
 
     @Test
-    public void testAllowedContentLengthTrailerInstallsFraming()
+    public void testAllowedContentLengthTrailerDoesNotInstallFraming()
             throws Exception {
         startHttp3Server(this::addTrailerEchoServlet);
         ((AbstractHttp3Protocol) connector.getProtocolHandler())
                 .setAllowedTrailerHeaders("content-length");
 
-        // Same for a request whose head carried no content-length: the
-        // trailer is processed like any content-length field (no
-        // trailer-mode gate in emitHeader), so it installs a framing
-        // declaration after the body was already complete; the shortfall
-        // against the declared length is then the malformed message of
-        // RFC 9114 Section 4.1.2 (stream reset). A misconfigured
-        // allowedTrailerHeaders takes effect, as in HTTP/2.
+        // A request whose head carries no Content-Length must not gain a
+        // framing declaration from a permitted trailer field.
         String initial = buildFieldSection(":method", "POST", ":scheme",
                 "https", ":authority", "127.0.0.1:" + port, ":path",
                 "/trailerecho");
         String trailers = buildFieldSection("content-length", "5");
         ClientOutput output = runClient(
                 rawCommandWith("--headers", initial,
+                        "--trailers", trailers),
+                CLIENT_TIMEOUT_SECONDS);
+
+        validateStatus(output.getResponse(), 200);
+        Assert.assertNull(output.getStreamError());
+        Assert.assertTrue("Expected the allowed content-length trailer in:\n"
+                        + output.getResponse().getBodyAsString(),
+                output.getResponse().getBodyAsString()
+                        .contains("content-length=5"));
+    }
+
+
+    @Test
+    public void testAllowedHostTrailerDoesNotSupplyAuthority()
+            throws Exception {
+        startHttp3Server(this::addTrailerEchoServlet);
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowedTrailerHeaders("host");
+
+        // RFC 9110 Sections 6.5/6.5.1: Host is a routing field and must not
+        // be used as a trailer. A Host trailer must not satisfy a missing
+        // initial :authority/Host, which is required for the https scheme
+        // (RFC 9114 Section 4.3.1).
+        String initial = buildFieldSection(":method", "POST", ":scheme",
+                "https", ":path", "/trailerecho", "content-length", "5");
+        String trailers = buildFieldSection("host", "evil.example:443");
+        ClientOutput output = runClient(
+                rawCommandWith("--headers", initial,
+                        "--data", Base64.getEncoder().encodeToString(
+                                "body!".getBytes(StandardCharsets.UTF_8)),
                         "--trailers", trailers),
                 CLIENT_TIMEOUT_SECONDS);
 
@@ -1201,6 +1525,64 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         Assert.assertEquals("body", response.getBodyAsString());
         Assert.assertEquals("valid",
                 response.getTrailer("x-valid-trailer"));
+    }
+
+
+    private void addSecureServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "secure", new SecureServlet());
+        ctxt.addServletMapping("/secure", "secure");
+    }
+
+
+    private static class SecureServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            // Create a session so the response carries the session cookie;
+            // the container decides its Secure attribute from isSecure().
+            req.getSession(true);
+            resp.setContentType("text/plain");
+            resp.getWriter().write(Boolean.toString(req.isSecure()));
+        }
+    }
+
+
+    private void addTrailerReadyServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "trailerready", new TrailerReadyServlet());
+        ctxt.addServletMapping("/trailerready", "trailerready");
+    }
+
+
+    private static class TrailerReadyServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            // Give a separately delivered trailer/FIN packet time to arrive
+            // so the readiness check exercises the protocol-side trailer
+            // reader rather than merely "no data yet".
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            StringBuilder body = new StringBuilder();
+            body.append("ready=").append(req.isTrailerFieldsReady());
+            try {
+                req.getTrailerFields().forEach(
+                        (name, value) -> body.append(';').append(name)
+                                .append('=').append(value));
+            } catch (IllegalStateException e) {
+                body.append(";ISE");
+            }
+            resp.setContentType("text/plain");
+            resp.getWriter().write(body.toString());
+        }
     }
 
 

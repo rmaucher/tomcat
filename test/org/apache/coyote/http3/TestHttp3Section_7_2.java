@@ -29,6 +29,92 @@ import org.junit.Test;
 public class TestHttp3Section_7_2 extends Http3TestBase {
 
     @Test
+    public void testTruncatedHeadersFrameConnectionError() throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 7.1: a cleanly terminated stream whose last
+        // frame is truncated is a connection error of type H3_FRAME_ERROR.
+        // A HEADERS frame declaring 10 payload bytes but carrying only 2,
+        // followed by FIN, must fail the connection rather than reset only
+        // the request stream.
+        byte[] truncatedHeaders =
+                new byte[] { 0x01, 0x0A, 0x00, 0x00 };
+        ClientOutput output = runClient(rawCommandWith(
+                "--frame", Base64.getEncoder().encodeToString(truncatedHeaders),
+                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_FRAME_ERROR);
+    }
+
+
+    @Test
+    public void testTruncatedDataFrameConnectionError() throws Exception {
+        startHttp3Server();
+
+        // The request declares 10 body bytes. A DATA frame declaring 10
+        // payload bytes but delivering only 5 before FIN is a truncated
+        // last frame: connection error H3_FRAME_ERROR (RFC 9114 Section
+        // 7.1), not H3_MESSAGE_ERROR on the stream.
+        byte[] truncatedData = new byte[] {
+                0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers", buildFieldSection(":method", "POST",
+                        ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path", "/echo",
+                        "content-length", "10"),
+                "--frame-after-data",
+                Base64.getEncoder().encodeToString(truncatedData),
+                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_FRAME_ERROR);
+    }
+
+
+    @Test
+    public void testTruncatedTrailerFrameConnectionError() throws Exception {
+        startHttp3Server();
+
+        // The initial body and its Content-Length are complete, then a
+        // trailer HEADERS frame is truncated by the FIN. RFC 9114
+        // Section 7.1 requires a connection error of type H3_FRAME_ERROR.
+        byte[] truncatedTrailer =
+                new byte[] { 0x01, 0x0A, 0x00, 0x00 };
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers", buildFieldSection(":method", "POST",
+                        ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path", "/echo",
+                        "content-length", "5"),
+                "--data", Base64.getEncoder().encodeToString(
+                        "body!".getBytes()),
+                "--frame-after-data",
+                Base64.getEncoder().encodeToString(truncatedTrailer),
+                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_FRAME_ERROR);
+    }
+
+
+    @Test
+    public void testOversizedDataBeforeHeadersIsFrameUnexpected()
+            throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Sections 4.1 and 7.2.8: DATA before the initial HEADERS
+        // frame is a connection error of type H3_FRAME_UNEXPECTED. The
+        // position check must run before the local buffering limit, so an
+        // oversized declared length must not downgrade the classification
+        // to the stream-scoped H3_FRAME_ERROR used for an oversized DATA
+        // frame in a valid position.
+        long declaredLength = 16L * 1024 * 1024 + 1;
+        ClientOutput output = runClient(rawCommandWith(
+                "--frame", oversizedDataFrameB64(declaredLength),
+                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_FRAME_UNEXPECTED);
+    }
+
+
+    @Test
     public void testPushPromiseOnRequestStream() throws Exception {
         startHttp3Server();
 
@@ -235,6 +321,31 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
 
 
     @Test
+    public void testControlFrameAfterHeadersWithoutBody() throws Exception {
+        startHttp3Server();
+
+        // A body-less GET never runs the live body-read paths, so the
+        // after-response scan is the only consumer of a frame that follows
+        // the request HEADERS. A control-stream-only frame there is still
+        // an invalid frame sequence and MUST be a connection error of type
+        // H3_FRAME_UNEXPECTED (RFC 9114 Sections 4.1, 7.2.3 through 7.2.7).
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers",
+                buildFieldSection(simpleGetHeaders("/sleep?ms=1000")),
+                "--frame-after-data", buildFrameB64(0x04, new byte[] { 0 }),
+                "--no-fin", "--timeout", "3"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        // The response may already have been sent when the after-response
+        // scan detects the invalid trailing frame, so allow a response here
+        // and assert the connection error directly.
+        Assert.assertEquals("Expected a connection error. Client output: "
+                        + output.getLines(), Integer.valueOf(H3_FRAME_UNEXPECTED),
+                output.getConnectionError());
+    }
+
+
+    @Test
     public void testDataBeforeHeaders() throws Exception {
         startHttp3Server();
 
@@ -288,5 +399,24 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_REQUEST_INCOMPLETE);
+    }
+
+
+    /*
+     * A DATA frame declaring a length above the implementation's 16 MiB
+     * buffering limit, with only one payload byte delivered. Protocol-valid
+     * in a valid position (HTTP/3 has no negotiated frame size limit); used
+     * here to show that the frame-sequence error wins over the local limit.
+     */
+    private static String oversizedDataFrameB64(long declaredLength) {
+        byte[] type = encodeVarint(0x00);
+        byte[] length = encodeVarint(declaredLength);
+        byte[] payload = new byte[] { (byte) 'x' };
+        byte[] frame = new byte[type.length + length.length + payload.length];
+        System.arraycopy(type, 0, frame, 0, type.length);
+        System.arraycopy(length, 0, frame, type.length, length.length);
+        System.arraycopy(payload, 0, frame, type.length + length.length,
+                payload.length);
+        return Base64.getEncoder().encodeToString(frame);
     }
 }

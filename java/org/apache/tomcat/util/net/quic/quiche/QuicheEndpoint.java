@@ -26,11 +26,9 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.security.SecureRandom;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Locale;
 import java.util.PriorityQueue;
 import java.util.Set;
@@ -97,11 +95,14 @@ import org.apache.tomcat.util.threads.LimitLatch;
  * {@code quiche_conn_new_scid}, saturating quiche's default
  * {@code active_connection_id_limit=2}) and registers it in the demux map,
  * which lets a spec-compliant deliberate client migration (RFC 9000
- * Section 9.5) switch to a fresh destination CID. There is no CID rotation
- * or retirement yet; the OpenSSL backend issues more CIDs automatically,
- * which is library-internal behaviour there (OpenSSL's QUIC implementation
- * manages and retires source CIDs itself - see the OpenSSL QUIC docs -
- * no endpoint code supplies them on that side).
+ * Section 9.5) switch to a fresh destination CID. Peer-initiated retirement
+ * (RETIRE_CONNECTION_ID) is handled by removing the retired CID from the
+ * demux map (see {@code processRetiredScids}); the endpoint does not itself
+ * initiate CID rotation/retirement beyond issuing that one additional SCID.
+ * The OpenSSL backend issues more CIDs automatically, which is
+ * library-internal behaviour there (OpenSSL's QUIC implementation manages
+ * and retires source CIDs itself - see the OpenSSL QUIC docs - no endpoint
+ * code supplies them on that side).
  */
 public class QuicheEndpoint extends QuicEndpoint<Long> {
 
@@ -155,7 +156,10 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
     /** Stateless-reset token byte length read by quiche_conn_new_scid. */
     private static final int RESET_TOKEN_LEN = 16;
 
-    /** Maximum datagrams read per poll-loop iteration (fairness bound). */
+    /**
+     * Maximum datagrams delivered per poll-loop iteration, including the
+     * segments expanded from a GRO read (fairness bound).
+     */
     private static final int RECV_BUDGET = 64;
 
     /**
@@ -201,6 +205,15 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      * (120) prefixed with {@code 0x100} (RFC 9001 Section 4.8/8.1).
      */
     private static final long NO_APPLICATION_PROTOCOL_ERROR = 0x100 + 120;
+
+    /**
+     * Upper bound for notifications appended to the primary server
+     * unidirectional stream while it is flow-control blocked. A legitimate
+     * SETTINGS + GOAWAY sequence is far smaller; the cap prevents repeated
+     * rejection notifications from growing the Java write buffer without
+     * bound.
+     */
+    private static final int MAX_CONTROL_STREAM_NOTIFICATION_BUFFER = 8192;
 
     private static final long GRACEFUL_SHUTDOWN_DRAIN_MS = 500;
     private static final long ACTIVE_HANDLER_SHUTDOWN_WAIT_MS = 1000;
@@ -353,21 +366,22 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
     /**
      * Connections a request handler still owned when {@link #stopInternal()}
-     * released the rest of the endpoint. Their native connections are not
-     * freed (a free under a running handler is a use-after-free); holding the
-     * wrappers keeps their Cleaners from running too.
+     * released the rest of the endpoint, plus connections whose teardown
+     * deferred their free until the active handler count reached zero. Their
+     * native connections are not freed (a free under a running handler is a
+     * use-after-free); holding the wrappers keeps their Cleaners from running
+     * too.
      * <p>
-     * The list is not drained during the stop itself - that is deliberate,
-     * not an oversight: reachability via this list is what holds the
-     * Cleaner back while a handler may still touch the connection.
-     * {@link #startInternal()} releases the entries whose handlers have
-     * completed (freeing their native connections), so the list cannot
-     * accumulate across stop/start cycles; entries whose handlers outlived
-     * even that are reclaimed when the endpoint itself becomes unreachable
-     * (an undeployed connector) and the Cleaner runs.
+     * The set is concurrent because teardown adds to it on the poll thread,
+     * the worker that brings the handler count to zero removes the entry on
+     * the poll thread, and stop/start use it from their own threads after the
+     * poll thread has stopped. Entries whose handlers are still running stay
+     * retained; {@link #startInternal()} releases entries whose handlers have
+     * completed (freeing their native connections), so the set cannot
+     * accumulate across stop/start cycles.
      */
-    private final List<QuicheConnectionWrapper> stoppedBusyConnections =
-            new ArrayList<>();
+    private final Set<QuicheConnectionWrapper> stoppedBusyConnections =
+            ConcurrentHashMap.newKeySet();
 
     /**
      * Poll loop thread. Published across threads (the reload/unbind guards
@@ -405,13 +419,14 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      * datagram delivered to the connection ({@link #sweepTouchedConns}), a
      * timer deadline expiring (the timer heap), a worker mailbox hop (named
      * via {@link #hopInterest}, or unattributed - which forces a full pass),
-     * a queued protocol-data flush (full pass), a handshake still pending
-     * ({@code pendingConns} is processed every pass that runs) or a deferred
-     * dispatch replay ({@link #sweepRetryConns}). Iterations with none of
-     * these skip the connection sweep entirely, so the poll loop's
-     * per-iteration work is O(work), not O(live connections).
+     * a queued protocol-data flush (full pass), a pending handshake that was
+     * just fed ({@link #sweepPendingConns}) or a deferred dispatch replay
+     * ({@link #sweepRetryConns}). Iterations with none of these skip the
+     * connection sweep entirely, so the poll loop's per-iteration work is
+     * O(work), not O(live connections).
      */
     private final Set<QuicheConnectionWrapper> sweepTouchedConns = new HashSet<>();
+    private final Set<QuicheConnectionWrapper> sweepPendingConns = new HashSet<>();
     private final Set<QuicheConnectionWrapper> sweepRetryConns = new HashSet<>();
     private final Set<QuicheConnectionWrapper> sweepDueConns = new HashSet<>();
     private final Set<QuicheConnectionWrapper> sweepScratch = new HashSet<>();
@@ -434,12 +449,12 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      * Timer deadline index: a min-heap of (absolute deadline, stamp,
      * connection) entries, one pushed every time a connection's
      * {@code quiche_conn_timeout_as_millis()} is re-read (see
-     * {@link #refreshTimerDeadline}). Entries whose stamp no longer matches
-     * the connection's current one are stale and dropped on pop without a
-     * native call; the heap is rebuilt from the per-connection deadlines
-     * when stale entries pile up. Replaces the per-iteration O(fleet)
-     * earliest-timer scan and pinpoints which connections a timer wake must
-     * service.
+     * {@link #refreshTimerDeadline}). Established and pending handshake
+     * connections both have entries, so pending handshakes no longer need a
+     * linear native scan every poll iteration. Entries whose stamp no longer
+     * matches the connection's current one are stale and dropped on pop
+     * without a native call; the heap is rebuilt from the per-connection
+     * deadlines when stale entries pile up.
      */
     private final PriorityQueue<TimerEntry> timerHeap = new PriorityQueue<>(
             Comparator.comparingLong(e -> e.deadlineMs));
@@ -451,6 +466,17 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      * {@link #WAIT_CAP_MS} even while the loop stays event-driven.
      */
     private long lastClosedScanMs;
+
+    /**
+     * Rate limit for protocol-data flush failure warnings (poll thread only).
+     */
+    private long lastProtocolDataFlushWarnMs;
+
+    /**
+     * Rate limit for attacker-influenced ALPN-not-served warnings (poll
+     * thread only).
+     */
+    private long lastAlpnNotServedLogMs;
 
     /**
      * Connection ID randomness (per-connection SCIDs).
@@ -608,7 +634,33 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             throw new IllegalStateException(sm.getString("quicheEndpoint.sniUnsupported"));
         }
 
-        certManager.initialize(getSSLHostConfig(null));
+        SSLHostConfig sslHostConfig = getSSLHostConfig(null);
+        if (pollThread != null && pollThread.isAlive()) {
+            // This public method may be used to switch an already bound,
+            // running endpoint to TLS. Build the native config off the poll
+            // thread, then install it through the same staged poll-task swap
+            // as certificate reloads: initialize() would free the old config
+            // while the poll thread could still be inside quiche_accept()
+            // with that pointer.
+            QuicheCertificateManager.Config prepared =
+                    certManager.prepareConfig(sslHostConfig, "initialiseSsl");
+            QuicheCertificateManager.Config superseded =
+                    stagedCertConfig.getAndSet(prepared);
+            if (superseded != null) {
+                certManager.discardPrepared(superseded);
+            }
+            if (!submitPollTask(this::runStagedCertInstall)) {
+                QuicheCertificateManager.Config leftover =
+                        stagedCertConfig.getAndSet(null);
+                if (leftover != null) {
+                    certManager.discardPrepared(leftover);
+                }
+                throw new IllegalStateException(
+                        sm.getString("quicheEndpoint.pollTaskRejected"));
+            }
+        } else {
+            certManager.initialize(sslHostConfig);
+        }
 
         // Populate the JMX / Manager TLS information (protocols,
         // certificates) for every configured host via the base loop, which
@@ -1063,6 +1115,18 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             throw new IllegalStateException(sm.getString(
                     "quicheEndpoint.pollThreadStillRunning", getName()));
         }
+        // A late handler from the previous generation may have queued a mark
+        // for a retained connection after the stop path cleared the queue;
+        // those connections are not part of this generation's sweep set, so
+        // drop the marks instead of letting them drive work against wrappers
+        // that are no longer registered.
+        hopInterest.clear();
+        // Re-open the mailbox before the retention sweep: open() may discard
+        // queued dispatch tasks and release the active-handler references
+        // they held. The sweep below must observe those releases so a
+        // connection whose handler has actually completed is freed instead
+        // of being retained until a later cycle.
+        mailbox.open();
         // Release the connections a previous generation's stop retained
         // because a handler still owned them: the retention exists only
         // while such a handler might still touch the native connection.
@@ -1089,6 +1153,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 // stop loop cleared it, and its queued data can never be
                 // flushed (stop already dropped the manager state).
                 setConnectionProtocolDataPending(conn, false);
+                conn.closeAllStreams();
                 conn.setClosed();
                 try {
                     conn.freeConnOnce();
@@ -1100,15 +1165,21 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 iterator.remove();
             }
         }
-        // A late handler from the previous generation may have queued a mark
-        // for a retained connection after the stop path cleared the queue;
-        // those connections are not part of this generation's sweep set, so
-        // drop the marks instead of letting them drive work against wrappers
-        // that are no longer registered.
-        hopInterest.clear();
-        // Re-open the mailbox and drop any task left over from a previous
-        // generation's stop before the new poll thread can drain it.
-        mailbox.open();
+        // Drop stale protocol-data marks left by the previous generation
+        // (including late marks on retained connections whose manager state
+        // is already gone) and reset the endpoint-wide tally. Without this a
+        // single late mark keeps computeWait() at the service cadence for the
+        // endpoint's lifetime even though no connection can flush it.
+        for (QuicheConnectionWrapper conn : connections.values()) {
+            setConnectionProtocolDataPending(conn, false);
+        }
+        for (QuicheConnectionWrapper conn : pendingConns.values()) {
+            setConnectionProtocolDataPending(conn, false);
+        }
+        for (QuicheConnectionWrapper conn : stoppedBusyConnections) {
+            setConnectionProtocolDataPending(conn, false);
+        }
+        protocolDataPendingCount.set(0);
         if (getExecutor() == null) {
             createExecutor();
         }
@@ -1207,12 +1278,19 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             }
         }
 
-        // Clean up HTTP/3 connection managers.
+        // Clean up HTTP/3 connection managers. A failing protocol callback
+        // must not abort the rest of the shutdown cleanup.
         for (QuicheConnectionWrapper conn : connections.values()) {
             QuicConnectionManager connManager = conn.getQuicConnectionManager();
             conn.setQuicConnectionManager(null);
             if (connManager != null) {
-                connManager.connectionClose(conn);
+                try {
+                    connManager.connectionClose(conn);
+                } catch (Throwable t) {
+                    ExceptionUtils.handleThrowable(t);
+                    log.warn(sm.getString("quicheEndpoint.managerCloseError",
+                            Long.toHexString(conn.getConnAddress())), t);
+                }
             }
         }
 
@@ -1231,11 +1309,16 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             // protocol-data branch.
             setConnectionProtocolDataPending(conn, false);
             if (conn.hasActiveHandlers()) {
-                stoppedBusyConnections.add(conn);
-                if (log.isDebugEnabled()) {
-                    log.debug("Retaining connection 0x" +
-                            Long.toHexString(conn.getConnAddress()) +
-                            " still owned by a request handler at stop");
+                // Claim the free and retain the wrapper on
+                // stoppedBusyConnections; the worker that drops the handler
+                // count to zero will complete the free if still possible.
+                freeConnectionOrDefer(conn);
+                if (!conn.isFreed()) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Retaining connection 0x" +
+                                Long.toHexString(conn.getConnAddress()) +
+                                " still owned by a request handler at stop");
+                    }
                 }
                 continue;
             }
@@ -1260,11 +1343,13 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 // still open, the same retain-don't-free rule as the
                 // established loop above applies instead of freeing the
                 // native connection under a running handler.
-                stoppedBusyConnections.add(conn);
-                if (log.isDebugEnabled()) {
-                    log.debug("Retaining pending connection 0x" +
-                            Long.toHexString(conn.getConnAddress()) +
-                            " still owned by a request handler at stop");
+                freeConnectionOrDefer(conn);
+                if (!conn.isFreed()) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Retaining pending connection 0x" +
+                                Long.toHexString(conn.getConnAddress()) +
+                                " still owned by a request handler at stop");
+                    }
                 }
                 continue;
             }
@@ -1278,6 +1363,35 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 }
             }
         }
+        // A handler that completed while this stop was releasing the
+        // connections may have left its deferred-free task in the mailbox
+        // (which is closed below, so a plain free task would be discarded).
+        // Complete those frees here; connections still owned by a running
+        // handler stay retained for the start-time sweep. This mirrors the
+        // OpenSSL endpoint's post-handler retention pass.
+        Iterator<QuicheConnectionWrapper> retainedIterator =
+                stoppedBusyConnections.iterator();
+        while (retainedIterator.hasNext()) {
+            QuicheConnectionWrapper conn = retainedIterator.next();
+            if (conn.hasActiveHandlers()) {
+                continue;
+            }
+            if (conn.isFreed()) {
+                retainedIterator.remove();
+                continue;
+            }
+            setConnectionProtocolDataPending(conn, false);
+            conn.closeAllStreams();
+            conn.setClosed();
+            try {
+                conn.freeConnOnce();
+            } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
+                log.warn(sm.getString("quicheEndpoint.connectionFreeError",
+                        Long.toHexString(conn.getConnAddress())), t);
+            }
+            retainedIterator.remove();
+        }
         connections.clear();
         pendingConns.clear();
         cidMap.clear();
@@ -1286,6 +1400,7 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         // guard at the top of this section refuses to proceed otherwise),
         // so clearing here races with nothing.
         sweepTouchedConns.clear();
+        sweepPendingConns.clear();
         sweepRetryConns.clear();
         sweepDueConns.clear();
         sweepScratch.clear();
@@ -1419,6 +1534,15 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
     private boolean hasActiveRequestHandlers() {
         for (QuicheConnectionWrapper conn : connections.values()) {
+            if (conn.hasActiveHandlers()) {
+                return true;
+            }
+        }
+        // Connections removed from the connections map by a deferred
+        // teardown are retained in stoppedBusyConnections until their active
+        // handlers complete. They must still be included in the stop-time
+        // handler wait or the executor shutdown interrupts those handlers.
+        for (QuicheConnectionWrapper conn : stoppedBusyConnections) {
             if (conn.hasActiveHandlers()) {
                 return true;
             }
@@ -1778,6 +1902,11 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      *                {@code false} once the flush drained them
      */
     void setConnectionProtocolDataPending(QuicheConnectionWrapper conn, boolean pending) {
+        if (pending && (conn.isClosed() || conn.isFreed())) {
+            // Defense in depth for callers that bypass the wrapper method:
+            // a mark for a torn-down connection can never be flushed.
+            return;
+        }
         if (conn.protocolDataPendingTransition(pending)) {
             if (pending) {
                 protocolDataPendingCount.incrementAndGet();
@@ -1976,6 +2105,11 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                     + Long.toHexString(conn.getConnAddress())
                     + ") until active handlers complete");
         }
+        // Retention: a connection removed from the endpoint maps by a
+        // deferred teardown must stay visible to stopInternal()'s handler
+        // wait and to the start-time sweep. The worker that brings the
+        // handler count to zero removes the entry after freeing.
+        stoppedBusyConnections.add(conn);
     }
 
 
@@ -2058,7 +2192,6 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
                 long nowMs = System.currentTimeMillis();
                 collectDueTimers(nowMs);
-                boolean anyPending = !pendingConns.isEmpty();
                 // Unattributed hops, queued protocol data (any connection
                 // may hold the flush) and wait failures can touch any
                 // connection: full pass. A mailbox drain that ran work not
@@ -2067,16 +2200,37 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 boolean hopPass = unknownHops || events < 0;
                 boolean closedScanDue = nowMs - lastClosedScanMs >=
                         CLOSED_SCAN_INTERVAL_MS;
-                if (hopPass || closedScanDue || anyPending ||
+                if (hopPass || closedScanDue ||
+                        !sweepPendingConns.isEmpty() ||
                         !sweepDueConns.isEmpty() ||
                         !sweepTouchedConns.isEmpty() ||
                         !sweepRetryConns.isEmpty()) {
-                    if (anyPending) {
-                        processPendingConnections();
+                    // Pending (handshaking) connections are not in
+                    // `connections`; process the ones fed this iteration and
+                    // the ones whose timer-heap deadline is due separately,
+                    // so a full established pass and a targeted pass see the
+                    // same handshake work. Each is removed from
+                    // sweepDueConns here: once processed/accepted it is
+                    // handled by the normal connection pass below.
+                    for (QuicheConnectionWrapper conn : sweepPendingConns) {
+                        processPendingConnection(conn);
+                    }
+                    sweepPendingConns.clear();
+                    Iterator<QuicheConnectionWrapper> dueIterator =
+                            sweepDueConns.iterator();
+                    while (dueIterator.hasNext()) {
+                        QuicheConnectionWrapper conn = dueIterator.next();
+                        if (pendingConns.containsKey(conn.getConnAddress())) {
+                            dueIterator.remove();
+                            processPendingConnection(conn);
+                        }
                     }
                     if (hopPass) {
                         // Full pass (it also reclaims any JVM-side closed
-                        // connection on the way).
+                        // connection on the way). Drop stale retry entries
+                        // first; the full sweep below re-registers only the
+                        // connections that still need a deferred replay.
+                        sweepRetryConns.clear();
                         for (QuicheConnectionWrapper conn : connections.values()) {
                             sweepConn(conn);
                         }
@@ -2123,6 +2277,10 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
      */
     private void sweepConn(QuicheConnectionWrapper conn) {
         if (conn.isFreed()) {
+            return;
+        }
+        if (pendingConns.containsKey(conn.getConnAddress())) {
+            processPendingConnection(conn);
             return;
         }
         if (conn.isClosed()) {
@@ -2211,7 +2369,8 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 System.currentTimeMillis() + t);
         timerHeap.add(new TimerEntry(conn.getTimerDeadlineMs(),
                 conn.getTimerSeq(), conn));
-        if (timerHeap.size() > (connections.size() << 2) + HEAP_STALE_FLOOR) {
+        if (timerHeap.size() > ((connections.size() + pendingConns.size()) << 2) +
+                HEAP_STALE_FLOOR) {
             rebuildTimerHeap();
         }
     }
@@ -2259,13 +2418,20 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
 
     /**
-     * Drops every heap entry and re-pushes one per live connection from the
-     * deadlines stored on the wrappers - no native calls. Triggered when the
-     * stale-entry backlog grows past four times the live fleet.
+     * Drops every heap entry and re-pushes one per live established or
+     * pending connection from the deadlines stored on the wrappers - no
+     * native calls. Triggered when the stale-entry backlog grows past four
+     * times the live fleet.
      */
     private void rebuildTimerHeap() {
         timerHeap.clear();
         for (QuicheConnectionWrapper conn : connections.values()) {
+            if (!conn.isFreed() && !conn.isClosed()) {
+                timerHeap.add(new TimerEntry(conn.getTimerDeadlineMs(),
+                        conn.getTimerSeq(), conn));
+            }
+        }
+        for (QuicheConnectionWrapper conn : pendingConns.values()) {
             if (!conn.isFreed() && !conn.isClosed()) {
                 timerHeap.add(new TimerEntry(conn.getTimerDeadlineMs(),
                         conn.getTimerSeq(), conn));
@@ -2277,8 +2443,8 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
     /**
      * Computes the wait bound: queued work shortens it to the pending-task
      * cadence; otherwise the idle cadence, capped by the earliest quiche
-     * timer deadline (the timer-heap head for established connections, a
-     * small linear scan of the bounded pending set), the deferred-replay /
+     * timer deadline (the timer-heap head, which now includes both
+     * established and pending handshake connections), the deferred-replay /
      * protocol-data service cadence and the stop-responsiveness cap.
      */
     private long computeWait(boolean recvBudgetExhausted) {
@@ -2288,8 +2454,8 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         long wait = PENDING_TASK_POLL_TIMEOUT_MS;
         if (!mailbox.hasPollTasks()) {
             // No queued work: the socket fd wakes the loop for every datagram
-            // and the timer heap / pending scan caps the wait to the earliest
-            // quiche deadline, so an idle fleet does not need the busy 10 ms
+            // and the timer heap caps the wait to the earliest quiche
+            // deadline, so an idle fleet does not need the busy 10 ms
             // service cadence.
             wait = IDLE_POLL_TIMEOUT_MS;
         }
@@ -2297,10 +2463,6 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         if (head != null) {
             wait = Math.min(wait, head.deadlineMs - System.currentTimeMillis());
         }
-        // Pending (handshaking) connections are absent from the heap; their
-        // set is bounded by the handshake limit, so the scan is cheap and
-        // only runs while handshakes are actually in flight.
-        wait = earliestTimer(pendingConns.values(), wait);
         // Deferred dispatch replays and pending protocol-data flushes keep
         // the service cadence regardless of the fleet timer state.
         if (!sweepRetryConns.isEmpty() || protocolDataPendingCount.get() > 0) {
@@ -2313,38 +2475,6 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             wait = 0;
         }
         return wait;
-    }
-
-
-    /**
-     * Folds the earliest quiche timer deadline of one connection map into
-     * the running minimum. Used for the pending (handshaking) set of
-     * {@link #computeWait(boolean)} - established connections are covered by
-     * the timer heap instead.
-     *
-     * @param conns   The connection values to scan
-     * @param current The minimum so far
-     *
-     * @return The smaller of {@code current} and the earliest timer in
-     *         {@code conns}
-     */
-    private static long earliestTimer(Iterable<QuicheConnectionWrapper> conns,
-            long current) {
-        for (QuicheConnectionWrapper conn : conns) {
-            long t = QuicheBindings.quiche_conn_timeout_as_millis(conn.getConn());
-            if (t < 0) {
-                // u64::MAX through the signed read: quiche reports this when
-                // the connection has no timer armed (ffi.rs maps a None
-                // timeout to u64::MAX). Folding it in would drive the wait to
-                // zero and spin the poll loop; a timer-less connection has
-                // no deadline to honour, so skip it.
-                continue;
-            }
-            if (t < current) {
-                current = t;
-            }
-        }
-        return current;
     }
 
 
@@ -2378,9 +2508,15 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 // EAGAIN/EWOULDBLOCK (and any hard error) end the pass.
                 return any;
             }
-            delivered++;
             any = true;
             int seg = groReceive ? groSeg[0] : 0;
+            // Charge GRO-expanded segments, not just syscalls, against the
+            // per-iteration fairness budget. Linux caps one GSO batch at
+            // UDP_MAX_SEGMENTS (128), but without this a single read can
+            // bypass the RECV_BUDGET datagram bound entirely.
+            int segments = (seg > 0 && n > seg) ?
+                    (int) ((n + seg - 1) / seg) : 1;
+            delivered += segments;
             try {
                 if (seg > 0 && n > seg) {
                     // Coalesced GRO read: equal-size segments, the last one
@@ -2454,7 +2590,6 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 // one message or reports EAGAIN. Zero would spin the loop.
                 return any;
             }
-            delivered += got;
             any = true;
             MemorySegment savedFrom = saFrom;
             MemorySegment savedTo = saTo;
@@ -2484,6 +2619,9 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                     long n = hdr.get(ValueLayout.JAVA_INT,
                             QuicheBindings.MMSGHDR_MSGLEN) & 0xFFFFFFFFL;
                     int seg = groReceive ? groSeg[0] : 0;
+                    int segments = (seg > 0 && n > seg) ?
+                            (int) ((n + seg - 1) / seg) : 1;
+                    delivered += segments;
                     MemorySegment slotBuf = recvBatchBuf[i];
                     try {
                         if (seg > 0 && n > seg) {
@@ -2553,6 +2691,14 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             negotiateVersionIfNeeded(len);
             return;
         }
+        if (typeByte == QuicheBindings.QUICHE_PACKET_TYPE_INITIAL &&
+                len < MIN_CLIENT_DATAGRAM_SIZE) {
+            // RFC 9000 Section 5.2.2: a server MUST discard an Initial packet
+            // carried in a UDP datagram smaller than 1200 bytes. quiche 0.30
+            // does not enforce this on receive, so do it before a small
+            // Initial can allocate connection state or trigger crypto work.
+            return;
+        }
         long dcidLen = hdrDcidLen.get(ValueLayout.JAVA_LONG, 0);
         CidKey dcidKey = new CidKey(hdrDcid, (int) dcidLen);
 
@@ -2613,6 +2759,10 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         if (pendingConns.containsKey(addr)) {
             if (QuicheBindings.quiche_conn_is_established(conn.getConn())) {
                 acceptConnection(conn);
+            } else {
+                // The feed can have queued handshake output or armed a
+                // timer; process this pending connection on this iteration.
+                sweepPendingConns.add(conn);
             }
         } else if (!conn.isClosed() && !conn.isFreed()) {
             // Established: the feed can have opened readable/writable edges
@@ -2689,11 +2839,15 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
 
     private int pendingLimit() {
-        // Use long arithmetic: maxConnections * 2 overflows for very large
-        // limits and would silently fall back to the floor.
-        long limit = Math.max((long) PENDING_LIMIT_FLOOR,
-                (long) maxConnections * 2L);
-        return (int) Math.min(Integer.MAX_VALUE, limit);
+        // Bound the handshake queue independently of a large maxConnections:
+        // every pending connection carries native TLS/QUIC state and would
+        // otherwise make handshake processing and timer work scale with the
+        // full connection limit. A negative maxConnections ("unlimited")
+        // still gets the fixed handshake cap.
+        long limit = maxConnections >= 0 ?
+                Math.min((long) PENDING_LIMIT_FLOOR, (long) maxConnections) :
+                PENDING_LIMIT_FLOOR;
+        return (int) Math.max(1L, Math.min(Integer.MAX_VALUE, limit));
     }
 
 
@@ -2746,6 +2900,9 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         cidMap.put(scidKey, conn);
         cidMap.putIfAbsent(odcidKey, conn);
         pendingConns.put(conn.getConnAddress(), conn);
+        // Run the initial handshake/send pass immediately after the datagram
+        // that created this connection has been fed.
+        sweepPendingConns.add(conn);
         if (log.isDebugEnabled()) {
             log.debug("Created pending connection 0x" +
                     Long.toHexString(conn.getConnAddress()) + " from " +
@@ -2965,30 +3122,48 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
 
     /*
-     * Pending (un-established) connections: timers, send flush, teardown of
-     * those that closed or timed out before establishing.
+     * Processes one pending (un-established) connection: its timer, send
+     * flush, promotion when the handshake completed and teardown when it
+     * closed or timed out before establishing. Runs only on the poll thread.
      */
-    private void processPendingConnections() {
-        for (QuicheConnectionWrapper conn : pendingConns.values()) {
-            if (conn.isClosed() || conn.isFreed()) {
-                discardPending(conn);
-                continue;
+    private void processPendingConnection(QuicheConnectionWrapper conn) {
+        assertNativeAccess("processPendingConnection");
+        if (conn.isClosed() || conn.isFreed()) {
+            discardPending(conn);
+            return;
+        }
+        long addr = conn.getConnAddress();
+        if (!pendingConns.containsKey(addr)) {
+            // Accepted by a racing delivery in the same iteration.
+            return;
+        }
+        try {
+            // See processConnection(): unconditional covers draining.
+            QuicheBindings.quiche_conn_on_timeout(conn.getConn());
+            flushSend(conn);
+            if (conn.isFreed()) {
+                return;
             }
-            try {
-                // See processConnection(): unconditional covers draining.
-                QuicheBindings.quiche_conn_on_timeout(conn.getConn());
-                flushSend(conn);
-                if (conn.isFreed()) {
-                    continue;
+            if (QuicheBindings.quiche_conn_is_closed(conn.getConn())) {
+                discardPending(conn);
+                return;
+            }
+            if (QuicheBindings.quiche_conn_is_established(conn.getConn())) {
+                acceptConnection(conn);
+                if (!conn.isFreed() && !conn.isClosed()) {
+                    // acceptConnection() registered the connection and
+                    // queued its first server streams; drive its first pass
+                    // now so the handshake response/SETTINGS leave the socket
+                    // on this iteration.
+                    sweepConn(conn);
                 }
-                if (QuicheBindings.quiche_conn_is_closed(conn.getConn())) {
-                    discardPending(conn);
-                }
-            } catch (Throwable t) {
-                ExceptionUtils.handleThrowable(t);
-                if (log.isDebugEnabled()) {
-                    log.debug("Error processing pending connection", t);
-                }
+                return;
+            }
+            refreshTimerDeadline(conn);
+        } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
+            if (log.isDebugEnabled()) {
+                log.debug("Error processing pending connection", t);
             }
         }
     }
@@ -3029,12 +3204,11 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             conn.getSniHostName();
 
             if (!isServedProtocol(alpn)) {
-                log.warn(sm.getString("quicheEndpoint.alpnNotServed",
-                        Long.toHexString(conn.getConnAddress()), String.valueOf(alpn)));
+                logAlpnNotServed(conn, alpn);
                 connections.put(conn.getConnAddress(), conn);
-                failConnection(conn, NO_APPLICATION_PROTOCOL_ERROR,
+                failConnectionTransport(conn, NO_APPLICATION_PROTOCOL_ERROR,
                         "Negotiated application protocol is not served");
-                // failConnection only queues the CONNECTION_CLOSE; transmitting
+                // failConnectionTransport only queues the CONNECTION_CLOSE; transmitting
                 // it needs a sweep of this connection. The caller evaluated
                 // pendingConns.containsKey() as true before this method removed
                 // the entry, so its "established" else-branch (which would have
@@ -3198,12 +3372,27 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         if (isServedProtocol(conn.getNegotiatedProtocol())) {
             return true;
         }
-        log.warn(sm.getString("quicheEndpoint.alpnNotServed",
-                Long.toHexString(conn.getConnAddress()),
-                String.valueOf(conn.getNegotiatedProtocol())));
-        failConnection(conn, NO_APPLICATION_PROTOCOL_ERROR,
+        logAlpnNotServed(conn, conn.getNegotiatedProtocol());
+        failConnectionTransport(conn, NO_APPLICATION_PROTOCOL_ERROR,
                 "Negotiated application protocol is not served");
         return false;
+    }
+
+
+    /**
+     * Rate-limits the attacker-influenced ALPN-not-served warning. The
+     * connection is rejected either way; only the log rate is bounded.
+     */
+    private void logAlpnNotServed(QuicheConnectionWrapper conn, String alpn) {
+        long now = System.currentTimeMillis();
+        if (now - lastAlpnNotServedLogMs >= MAX_CONNECTIONS_LOG_INTERVAL_MS) {
+            lastAlpnNotServedLogMs = now;
+            log.warn(sm.getString("quicheEndpoint.alpnNotServed",
+                    Long.toHexString(conn.getConnAddress()), String.valueOf(alpn)));
+        } else if (log.isDebugEnabled()) {
+            log.debug(sm.getString("quicheEndpoint.alpnNotServed",
+                    Long.toHexString(conn.getConnAddress()), String.valueOf(alpn)));
+        }
     }
 
 
@@ -3330,6 +3519,10 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             }
             QuicheSocketWrapper wrapper = stream.getSocketWrapper();
             if (wrapper == null) {
+                // The stream can never get a wrapper again (it was rejected
+                // or its wrapper was detached); drop the pending entry so it
+                // is not retried on every sweep.
+                iterator.remove();
                 stream.clearProcessing();
                 wakeClaimWaiters(stream, conn);
                 continue;
@@ -3625,6 +3818,12 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                     connManager.processClientUniStreamData(conn, streamId, buffer);
                 } catch (Throwable t) {
                     ExceptionUtils.handleThrowable(t);
+                    // The buffer is in read mode on entry to the protocol
+                    // callback. Restore put mode before failing the connection
+                    // so a later sweep that still sees this stream cannot
+                    // misinterpret the flipped state.
+                    buffer.compact();
+                    buffer.limit(buffer.capacity());
                     long code = connManager.getProtocolErrorCode(t);
                     if (code == 0) {
                         code = getDefaultStreamErrorCode();
@@ -3709,18 +3908,21 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
         boolean known = conn.getStreams().containsKey(Long.valueOf(streamId));
         if (!known && !state.canAcceptStream(streamId)) {
-            // Concurrent stream limit: GOAWAY + reject this stream (RFC 9114
+            // Concurrent stream limit: reject this stream (RFC 9114
             // H3_REQUEST_REJECTED - retryable, before processing began). The
-            // READ shutdown below makes the rejection terminal - the stream
-            // can never re-enter this sweep - so each fresh rejection gets
-            // its own GOAWAY. The single-slot cache keeps a repeat of the
-            // most recent rejection quiet defensively: client bidi stream IDs
-            // never repeat on a connection, so an ID equal to the last
-            // rejected one can only be a repeat of that rejection, while a
-            // higher ID is a fresh rejection.
+            // READ shutdown below makes the rejection terminal, so a client
+            // that keeps opening fresh stream IDs can force one reset per
+            // stream. Send the GOAWAY only until one has actually been sent:
+            // repeating it for every fresh rejection merely appends identical
+            // frames to the control-stream write buffer and can grow unbounded
+            // when that stream is flow-control blocked or the peer advertises
+            // no server uni-stream limit. The single-slot cache keeps a repeat
+            // of the most recent rejection quiet defensively.
             if (streamId != conn.getLastRejectedStreamId()) {
                 conn.setLastRejectedStreamId(streamId);
-                sendStreamLimitNotification(connManager, state);
+                if (state.getLastSentGoawayId() < 0) {
+                    sendStreamLimitNotification(connManager, state);
+                }
                 QuicheBindings.quiche_conn_stream_shutdown(conn.getConn(),
                         streamId, QuicheBindings.QUICHE_SHUTDOWN_WRITE,
                         getStreamRejectErrorCode());
@@ -4029,6 +4231,21 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
 
             ByteBuffer existing = primaryStream.getWriteBuffer();
             if (existing != null && existing.hasRemaining()) {
+                if (existing.remaining() + data.length >
+                        MAX_CONTROL_STREAM_NOTIFICATION_BUFFER) {
+                    // The control stream is not draining (typically because
+                    // the peer did not grant server uni-stream flow control).
+                    // Drop this notification rather than growing the buffer
+                    // without bound; the connection is already being rejected
+                    // and the stream reset still reaches the peer.
+                    if (log.isDebugEnabled()) {
+                        log.debug("Dropping stream limit notification on 0x" +
+                                Long.toHexString(conn.getConnAddress()) +
+                                ": control-stream buffer would exceed " +
+                                MAX_CONTROL_STREAM_NOTIFICATION_BUFFER + " bytes");
+                    }
+                    return;
+                }
                 ByteBuffer combined = ByteBuffer.allocate(existing.remaining() + data.length);
                 combined.put(existing);
                 combined.put(data);
@@ -4066,8 +4283,15 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             connManager.flushPendingProtocolData(conn);
         } catch (Throwable t) {
             ExceptionUtils.handleThrowable(t);
-            log.warn(sm.getString("quicheEndpoint.protocolDataFlushError",
-                    Long.toHexString(conn.getConnAddress())), t);
+            long now = System.currentTimeMillis();
+            if (now - lastProtocolDataFlushWarnMs >= MAX_CONNECTIONS_LOG_INTERVAL_MS) {
+                lastProtocolDataFlushWarnMs = now;
+                log.warn(sm.getString("quicheEndpoint.protocolDataFlushError",
+                        Long.toHexString(conn.getConnAddress())), t);
+            } else if (log.isDebugEnabled()) {
+                log.debug(sm.getString("quicheEndpoint.protocolDataFlushError",
+                        Long.toHexString(conn.getConnAddress())), t);
+            }
         }
     }
 
@@ -4684,9 +4908,22 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         }
         conn.closeAllStreams();
         conn.setClosed();
+        // Re-clear after setting closed: a worker may have re-marked
+        // protocol data in the window between the early clear above and
+        // setClosed(). From here on the wrapper ignores new marks for this
+        // connection.
+        setConnectionProtocolDataPending(conn, false);
         if (connManager != null) {
             conn.setQuicConnectionManager(null);
-            connManager.connectionClose(conn);
+            try {
+                connManager.connectionClose(conn);
+            } catch (Throwable t) {
+                // A failing protocol callback must not skip the native free
+                // below; the connection is already removed from all maps.
+                ExceptionUtils.handleThrowable(t);
+                log.warn(sm.getString("quicheEndpoint.managerCloseError",
+                        Long.toHexString(addr)), t);
+            }
         }
         freeConnectionOrDefer(conn);
     }
@@ -4779,6 +5016,34 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                     " with code " + errorCode + ": " + reason);
         }
         queueConnectionClose(conn, errorCode, reason);
+    }
+
+
+    /**
+     * Fails a connection with a transport-level error (for example a TLS
+     * alert-derived code such as {@link #NO_APPLICATION_PROTOCOL_ERROR}).
+     * Unlike {@link #failConnection(QuicheConnectionWrapper, long, String)},
+     * this always queues a transport CONNECTION_CLOSE, even after the
+     * handshake is established. The packet loop transmits it and close
+     * detection tears the connection down once it has left.
+     *
+     * @param conn      The connection
+     * @param errorCode The QUIC transport error code
+     * @param reason    A diagnostic reason phrase
+     */
+    private void failConnectionTransport(QuicheConnectionWrapper conn, long errorCode,
+            String reason) {
+        assertNativeAccess("failConnectionTransport");
+        if (conn.isClosed() || conn.isFreed() || conn.isClosing()) {
+            return;
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("Failing connection 0x" + Long.toHexString(conn.getConnAddress()) +
+                    " with transport code " + errorCode + ": " + reason);
+        }
+        conn.setClosing();
+        QuicheBindings.quiche_conn_close(conn.getConn(), false, errorCode,
+                MemorySegment.NULL, 0);
     }
 
 
@@ -4893,7 +5158,10 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             stream.clearProcessing();
             wakeClaimWaiters(stream, conn);
             if (conn != null) {
-                conn.decrActiveHandlers();
+                // Use the shared dispatch-completion accounting: if teardown
+                // deferred this connection's free while the dispatch was in
+                // flight, this last decrement must complete that free.
+                finishStreamDispatch(conn);
                 if (!conn.isClosing() && !conn.isClosed()) {
                     failConnection(conn, getConnectionRejectErrorCode(),
                             "No executor available for the dispatch of stream " +
@@ -4921,7 +5189,8 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             wakeClaimWaiters(stream, conn);
             if (conn != null) {
                 conn.decrQueuedDispatch();
-                conn.decrActiveHandlers();
+                // Same deferred-free completion as the no-executor branch.
+                finishStreamDispatch(conn);
                 if (!conn.isClosing() && !conn.isClosed()) {
                     failConnection(conn, getConnectionRejectErrorCode(),
                             "Executor rejected the dispatch for stream " +
@@ -5015,8 +5284,12 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         int remaining = conn.decrActiveHandlers();
         if (remaining == 0 && conn.clearPendingFree()) {
             // Last worker on a connection whose free was deferred: free it,
-            // on the poll thread.
-            submitConnPollTask(conn, () -> conn.freeConnOnce());
+            // on the poll thread, and drop the stop-time retention entry so
+            // a completed connection is not retained until the next start.
+            submitConnPollTask(conn, () -> {
+                conn.freeConnOnce();
+                stoppedBusyConnections.remove(conn);
+            });
         }
     }
 

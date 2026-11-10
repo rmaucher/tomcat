@@ -178,15 +178,23 @@ public class QuicCertConfig {
             Map<String, OpenSSLPreSharedKeySelector> pskByHost = new HashMap<>();
             for (SSLHostConfig hostConfig : hostConfigs) {
                 String hostName = hostConfig.getHostName().toLowerCase(Locale.ENGLISH);
-                if (hostConfig.getCertificateVerification() !=
-                        SSLHostConfig.CertificateVerification.NONE) {
+                SSLHostConfig.CertificateVerification verification =
+                        hostConfig.getCertificateVerification();
+                if (verification != SSLHostConfig.CertificateVerification.NONE) {
                     // This transport installs no client-certificate verify
                     // hook (no SSL_set_verify/trust-store wiring): make the
                     // ignored setting visible rather than silently dropping
-                    // it, matching the quiche transport's warning.
+                    // it, matching the quiche transport's warning. A required
+                    // verification is a security setting that cannot be
+                    // honoured, so fail the build instead of serving the host
+                    // without client authentication.
                     log.warn(sm.getString("quicEndpoint.clientAuthUnsupported",
-                            hostConfig.getHostName(),
-                            hostConfig.getCertificateVerification().name()));
+                            hostConfig.getHostName(), verification.name()));
+                    if (verification == SSLHostConfig.CertificateVerification.REQUIRED) {
+                        throw new IllegalStateException(sm.getString(
+                                "quicEndpoint.clientAuthRequiredUnsupported",
+                                hostConfig.getHostName(), verification.name()));
+                    }
                 }
                 List<CertificateEntry> entries = new ArrayList<>();
                 for (SSLHostConfigCertificate certificate : hostConfig.getCertificates()) {

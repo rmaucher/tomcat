@@ -202,7 +202,7 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
 
 
     @Test
-    public void testStreamCancellationOnTruncatedTrailer() throws Exception {
+    public void testTruncatedTrailerFailsConnection() throws Exception {
         startHttp3Server();
 
         // Encoder stream: capacity 512, one insert (absolute index 0).
@@ -211,11 +211,10 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
         insertLiteral(encoder, "x-dyn", "v1");          // abs 0
 
         // The trailer section with the dynamic reference is truncated by
-        // the FIN before it completes. The section never reaches the
-        // decoder, but its Required Insert Count was delivered: abandoning
-        // the stream still requires a Stream Cancellation so the peer's
-        // encoder may again evict the referenced entry (RFC 9204
-        // Sections 2.2.2.2, 4.4.2).
+        // the FIN before it completes. RFC 9114 Section 7.1 requires a
+        // cleanly terminated stream whose last frame is truncated to fail
+        // the connection with H3_FRAME_ERROR; a connection close releases
+        // the QPACK references, so no stream-scoped signal remains.
         byte[] section = dynamicTrailerSection();
         ClientOutput output = runClient(rawCommandWith(
                 "--encoder", b64(encoder),
@@ -229,10 +228,7 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
                 "--frame-after-data", truncatedTrailerFrame(section),
                 "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
 
-        assertStreamError(output, H3_MESSAGE_ERROR);
-        Assert.assertTrue("Expected a Stream Cancellation for the truncated "
-                        + "trailer section, got " + output.getDecoderCancellations(),
-                output.getDecoderCancellations().contains(Integer.valueOf(0)));
+        assertConnectionError(output, H3_FRAME_ERROR);
     }
 
 
@@ -346,6 +342,43 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
                 output.getConnectionError());
         Assert.assertTrue("Expected a Section Acknowledgment for the "
                         + "trailer section of the body-less request, got "
+                        + output.getDecoderAcks(),
+                output.getDecoderAcks().contains(Integer.valueOf(0)));
+    }
+
+
+    @Test
+    public void testTrailerAfterEmptyDataOnBodylessRequestIsAcknowledged()
+            throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 4.1 permits zero-length DATA frames before the
+        // trailing HEADERS section. The after-response scan must ignore such
+        // a frame and continue to the trailer, rather than treating the first
+        // frame it sees as the end of the message. A dynamic trailer makes
+        // the omission observable: the Section Acknowledgment must arrive.
+        ByteBuffer encoder = ByteBuffer.allocate(4096);
+        Qpack.encodeIrp(encoder, 0x20, 5, 512);
+        insertLiteral(encoder, "x-dyn", "v1");          // abs 0
+
+        ClientOutput output = runClient(rawCommandWith(
+                "--encoder", b64(encoder),
+                "--encoder-delay", "0.5",
+                "--headers",
+                buildFieldSection(":method", "GET", ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/simple"),
+                "--frame-after-data", buildFrameB64(0x00, new byte[0]),
+                "--trailers",
+                Base64.getEncoder().encodeToString(
+                        dynamicTrailerSection()),
+                "--wait", "2"), CLIENT_TIMEOUT_SECONDS);
+
+        validateStatus(output.getResponse(), 200);
+        Assert.assertNull("Unexpected protocol error: " + output.getLines(),
+                output.getConnectionError());
+        Assert.assertTrue("Expected the trailer section after a zero-length "
+                        + "DATA frame to be acknowledged, got "
                         + output.getDecoderAcks(),
                 output.getDecoderAcks().contains(Integer.valueOf(0)));
     }

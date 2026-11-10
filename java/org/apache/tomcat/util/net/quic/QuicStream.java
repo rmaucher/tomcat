@@ -112,6 +112,18 @@ public interface QuicStream {
 
 
     /**
+     * Returns whether this stream wrapper was created for a late readable
+     * edge on a request that already completed. Such a dispatch carries no
+     * new request and must be closed without protocol processing.
+     *
+     * @return {@code true} if this is a late duplicate edge
+     */
+    default boolean isLateDuplicate() {
+        return false;
+    }
+
+
+    /**
      * Returns the data the transport has queued as pending to be written on
      * this stream, in write mode, or a buffer with nothing to write when no
      * data is pending. The buffer is owned by the transport; readers must

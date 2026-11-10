@@ -63,8 +63,9 @@
   bindings - see the <code>OpenSSLLifecycleListener</code> configuration in
   the default <code>conf/server.xml</code>; for
   <code>Http3QuicheProtocol</code>, a loadable libquiche; for
-  <code>Http3Ngtcp2Protocol</code>, a system libngtcp2 from the 1.16 series
-  plus libngtcp2_crypto_ossl backed by the system OpenSSL 3.5 or later
+  <code>Http3Ngtcp2Protocol</code>, a system libngtcp2 from the 1.16.x or
+  1.26.x series plus libngtcp2_crypto_ossl backed by the system OpenSSL
+  3.5 or later
   (ngtcp2 uses a normal TLS server context rather than the OpenSSL QUIC API).
   The connector
   fails at bind time when the selected transport is unusable. The sample
@@ -192,9 +193,15 @@
 
     <attribute name="maxFieldSectionSize" required="false">
       <p>The maximum field section size, in bytes, that this endpoint is
-      willing to decode (RFC 9114 Section 4.2.2). The value is advertised to
-      peers via <code>SETTINGS_MAX_FIELD_SECTION_SIZE</code> and enforced on
-      incoming field sections. If not specified, a default of
+      willing to decode (RFC 9114 Section 4.2.2). The value is enforced on
+      incoming field sections. A positive value is advertised to peers via
+      <code>SETTINGS_MAX_FIELD_SECTION_SIZE</code>. A value of
+      <code>0</code> is enforced as an explicit zero-byte local limit but
+      is not advertised, so peers apply the RFC 9114 default of unlimited.
+      A negative value is treated locally as <code>0</code> and is likewise
+      not advertised. Values above <code>Integer.MAX_VALUE</code> are
+      clamped to <code>Integer.MAX_VALUE</code> for both the local limit
+      and the advertisement. If not specified, a default of
       <code>16384</code> is used.</p>
     </attribute>
 
@@ -237,6 +244,12 @@
       disables the dynamic table
        entirely. If not specified, a default of <code>4096</code> is
       used.</p>
+      <p>QPACK encoder-stream instructions are re-assembled in the
+      per-stream read buffer. If this capacity is increased significantly,
+      increase <code>readBufferSize</code> as well: a legal
+      Huffman-encoded insert may be up to approximately 15/4 of the table
+      capacity in wire bytes, and an instruction that cannot fit in the
+      read buffer is rejected with <code>H3_EXCESSIVE_LOAD</code>.</p>
     </attribute>
 
     <attribute name="server" required="false">
@@ -321,6 +334,8 @@
     <li>allowedTrailerHeaders</li>
     <li>maxHeaderCount</li>
     <li>maxThreads</li>
+    <li>maxTrailerCount</li>
+    <li>maxTrailerSize</li>
     <li>relaxedPathChars</li>
     <li>relaxedQueryChars</li>
   </ul>
@@ -387,9 +402,13 @@
   announce itself automatically; set its <code>altService</code> attribute
   when an announcement from the HTTP/3 side is wanted.</p>
 
-  <p>Response compression is not implemented for HTTP/3. The HTTP/1.1
-  connector's compression configuration does not apply to HTTP/3
-  responses; any content coding must be applied by the application.</p>
+  <p>Response compression is supported for HTTP/3. The connector applies
+  the same <code>compression</code>, <code>compressionMinSize</code>,
+  <code>compressibleMimeType</code>, <code>noCompressionEncodings</code>
+  and <code>noCompressionUserAgents</code> configuration as the HTTP/1.1
+  connector. When compression is used, the response body is GZIP encoded
+  and carried in HTTP/3 <code>DATA</code> frames; the content coding is
+  applied by the connector, not by the application.</p>
 
 </section>
 

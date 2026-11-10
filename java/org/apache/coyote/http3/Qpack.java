@@ -440,8 +440,8 @@ final class Qpack {
      *
      * @return The size in bytes
      */
-    public static int entrySize(String name, String value) {
-        return 32 + name.length() + (value != null ? value.length() : 0);
+    public static long entrySize(String name, String value) {
+        return 32L + name.length() + (value != null ? value.length() : 0);
     }
 
 

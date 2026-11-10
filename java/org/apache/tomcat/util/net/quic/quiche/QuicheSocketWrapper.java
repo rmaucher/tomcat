@@ -568,11 +568,15 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
                 stream.setReadState(QuicStream.ReadState.RESET_REMOTE);
                 throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
             }
-            // No QUICHE_ERR_STREAM_STOPPED branch: quiche's read path
-            // (do_stream_recv / recv_buf.emit_or_discard) can only surface
-            // Done, data, or StreamReset - StreamStopped belongs to the send
-            // direction (stream_send/capacity/shutdown), and a locally-sent
-            // STOP_SENDING does not reset our read side anyway.
+            if (rc == QuicheBindings.QUICHE_ERR_STREAM_STOPPED) {
+                // quiche 0.30's do_stream_recv does not currently surface
+                // this code, but the C API documents it for reads after a
+                // local STOP_SENDING. Treat it as the terminal local read
+                // state so a future quiche release cannot fall through to a
+                // generic I/O error.
+                stream.setReadState(QuicStream.ReadState.RESET_LOCAL);
+                throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
+            }
             if (rc == QuicheBindings.QUICHE_ERR_INVALID_STREAM_STATE) {
                 // The stream is gone from the connection's map: normally a
                 // completed stream collected after its FIN byte was
@@ -726,9 +730,24 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void flushBlocking() throws IOException {
+        checkNotClosed();
         writeLock.lock();
         try {
             super.flushBlocking();
+            // super.flushBlocking() may just have created a new held-back
+            // tail from the bytes it drained. Release it here as well: the
+            // SocketWrapperBase contract requires a blocking flush to empty
+            // the buffers, and a first flush would otherwise leave the final
+            // <=128 bytes in finTail until the next write or conclusion.
+            QuicheStreamWrapper stream = liveStream();
+            if (stream == null) {
+                finTail = null;
+                finTailPos = 0;
+                return;
+            }
+            long deadline = System.nanoTime() +
+                    TimeUnit.MILLISECONDS.toNanos(blockingWriteTimeoutMs());
+            releaseFinTail(stream, true, deadline);
         } finally {
             writeLock.unlock();
         }
@@ -775,10 +794,10 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
         if (!dataLeft && finTail != null) {
             // A non-blocking flush must actually flush the held-back tail
             // instead of reporting "nothing left" while the last <=128 bytes
-            // are still in Java. A blocking flush reaches the same state
-            // through doWrite(true); a streaming/asynchronous response that
-            // relies on flush would otherwise stall until the next write or
-            // the conclusion.
+            // are still in Java. The blocking flush path performs the
+            // equivalent step explicitly in flushBlocking(), so a streaming
+            // or asynchronous response that relies on flush does not stall
+            // until the next write or the conclusion.
             QuicheStreamWrapper stream = liveStream();
             if (stream == null) {
                 finTail = null;
@@ -1193,14 +1212,23 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
             // The false→true transition: register the stream in the
             // connection's write re-arm index (re-arm sweep work set) before
             // the latch becomes observable to the writable sweep.
-            stream.getConnection().addWriteRearm(stream);
+            QuicheConnectionWrapper conn = stream.getConnection();
+            conn.addWriteRearm(stream);
             if (stream.isDeregistered() || stream.isFreed()) {
                 // A close raced this registration (setDeregistered() clears
                 // the latch and releases once, but it may have done so before
                 // our add). Release our own unit after the add so the entry
                 // cannot survive on a stream that is no longer in the map.
-                stream.getConnection().removeWriteRearm(stream);
+                conn.removeWriteRearm(stream);
                 stream.clearWriteInterest();
+            } else {
+                // Kick once for the false->true transition so an
+                // already-writable stream is serviced without waiting for
+                // new network input or a timer.
+                QuicheEndpoint ep = conn.getEndpoint();
+                if (ep != null) {
+                    ep.kickPollLoop(conn);
+                }
             }
         }
     }
@@ -1265,38 +1293,51 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void doClose() {
+        // Serialise against asynchronous writers that may still be draining
+        // the staging buffers. Without the lock, a writer that passed
+        // checkNotClosed() can race the socketBufferHandler=null release
+        // below and dereference the cleared field.
+        writeLock.lock();
         try {
-            QuicheStreamWrapper stream = getSocket();
-            if (stream != null) {
-                // Remove the stream from the endpoint's bookkeeping. This
-                // must run on the poll thread: the poll loop must not be
-                // mid-sweep over the stream's state when it is removed.
-                if (!endpoint.isPollThread()) {
-                    onPollThreadVoid(() -> endpoint.closeStreamByHandler(stream));
+            try {
+                QuicheStreamWrapper stream = getSocket();
+                if (stream != null) {
+                    // Remove the stream from the endpoint's bookkeeping. This
+                    // must run on the poll thread: the poll loop must not be
+                    // mid-sweep over the stream's state when it is removed.
+                    if (!endpoint.isPollThread()) {
+                        onPollThreadVoid(() -> endpoint.closeStreamByHandler(stream));
+                    } else {
+                        endpoint.closeStreamByHandler(stream);
+                    }
+                }
+            } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
+                if (isInterrupted(t)) {
+                    // The calling request handler was interrupted - by the
+                    // executor shutdown at endpoint stop - while this close
+                    // hopped to the poll thread. Expected shutdown noise, not a
+                    // transport failure: stopInternal() frees (or retains) the
+                    // whole connection regardless, so no native state is left
+                    // behind by the skipped stream removal.
+                    if (log.isDebugEnabled()) {
+                        log.debug(sm.getString("socketWrapper.quicCloseInterrupted"), t);
+                    }
                 } else {
-                    endpoint.closeStreamByHandler(stream);
+                    // A close failure leaves native state behind; surface it
+                    // unconditionally rather than hiding it behind a debug
+                    // guard.
+                    log.error(sm.getString("socketWrapper.quicCloseError"), t);
                 }
-            }
-        } catch (Throwable t) {
-            ExceptionUtils.handleThrowable(t);
-            if (isInterrupted(t)) {
-                // The calling request handler was interrupted - by the
-                // executor shutdown at endpoint stop - while this close
-                // hopped to the poll thread. Expected shutdown noise, not a
-                // transport failure: stopInternal() frees (or retains) the
-                // whole connection regardless, so no native state is left
-                // behind by the skipped stream removal.
-                if (log.isDebugEnabled()) {
-                    log.debug(sm.getString("socketWrapper.quicCloseInterrupted"), t);
-                }
-            } else {
-                // A close failure leaves native state behind; surface it
-                // unconditionally rather than hiding it behind a debug
-                // guard.
-                log.error(sm.getString("socketWrapper.quicCloseError"), t);
+            } finally {
+                // Release point of the documented post-close contract: read
+                // paths guard on the null handler, write paths never touch it.
+                finTail = null;
+                finTailPos = 0;
+                socketBufferHandler = null;
             }
         } finally {
-            socketBufferHandler = null;
+            writeLock.unlock();
         }
     }
 
@@ -1402,40 +1443,29 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
                             }
                         }
                     } else {
-                        // The vectored path calls doWrite() without taking
-                        // writeLock - shared upstream behaviour. Safety
-                        // rests on two preconditions, not one: the NIO2
-                        // machinery keeps at most one operation state per
-                        // wrapper in flight, so no second vectored writer
-                        // overlaps this loop; and flushNonBlocking() -
-                        // called from the poll thread's opportunistic
-                        // write-ready flush as well as from the worker-side
-                        // dispatch re-arm and sendfile - takes writeLock,
-                        // which this loop does not hold and which therefore
-                        // cannot exclude it, but reaches doWrite() only
-                        // through staged residue (socketBufferHandler write
-                        // buffer / nonBlockingWriteBuffer), which a
-                        // contract-conforming producer has already drained
-                        // before issuing a vectored write. Note when
-                        // touching either wrapper: doWrite() also mutates
-                        // the finTail/finTailPos conclusion bookkeeping,
-                        // which every other writer holds under writeLock -
-                        // relaxing either precondition would let this
-                        // unsynchronised loop race that state. The OpenSSL
-                        // twin (QuicOpenSSLSocketWrapper's
-                        // QuicOperationState) states the same rule with the
-                        // same preconditions; keep the two in step.
-                        for (int i = 0; i < length; i++) {
-                            int start = buffers[offset + i].position();
-                            doWrite(false, buffers[offset + i]);
-                            nBytes += buffers[offset + i].position() - start;
-                            if (buffers[offset + i].hasRemaining()) {
-                                // Non-blocking would-block: stop here.
-                                // Writing the next buffer now would append
-                                // its bytes ahead of the undelivered
-                                // remainder and corrupt the byte order.
-                                break;
+                        // The vectored loop mutates the same staging buffers
+                        // and finTail/finTailPos conclusion bookkeeping as
+                        // every other writer. Take writeLock for the whole
+                        // loop: the poll thread's opportunistic
+                        // flushNonBlocking() uses tryLock(), so it cannot
+                        // block here, and the NIO2 machinery keeps at most one
+                        // operation state per wrapper in flight.
+                        writeLock.lock();
+                        try {
+                            for (int i = 0; i < length; i++) {
+                                int start = buffers[offset + i].position();
+                                doWrite(false, buffers[offset + i]);
+                                nBytes += buffers[offset + i].position() - start;
+                                if (buffers[offset + i].hasRemaining()) {
+                                    // Non-blocking would-block: stop here.
+                                    // Writing the next buffer now would append
+                                    // its bytes ahead of the undelivered
+                                    // remainder and corrupt the byte order.
+                                    break;
+                                }
                             }
+                        } finally {
+                            writeLock.unlock();
                         }
                     }
                 } catch (IOException ioe) {
@@ -1452,11 +1482,11 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
 
     /**
      * SSLSupport implementation for QUIC streams on the quiche transport.
-     * quiche exposes none of the per-connection TLS details (cipher suite,
-     * session id, peer chain) through its C API, so those report
-     * "unavailable" ({@code null}), which is what
-     * {@code QuicOpenSSLSocketWrapper}'s support does for its unknowns.
-     * QUIC always runs over TLS 1.3 (RFC 9001 Section 4.2).
+     * The quiche C API exposes no negotiated cipher suite or legacy session
+     * id, and only a leaf peer certificate plus a serialized session (not the
+     * Java-style peer chain), so those report "unavailable" ({@code null}),
+     * matching what {@code QuicOpenSSLSocketWrapper}'s support does for its
+     * unknowns. QUIC always runs over TLS 1.3 (RFC 9001 Section 4.2).
      */
     private static class QuicheSSLSupport implements SSLSupport {
         private final QuicheSocketWrapper wrapper;

@@ -194,9 +194,12 @@ public abstract class QuicSocketWrapper extends SocketWrapperBase<QuicStream> {
     /**
      * Returns the remote address. The value is captured when the connection
      * was accepted and does not track QUIC connection migration (RFC 9000
-     * Section 9): a client that migrates to a new address keeps reporting the
-     * address the connection was accepted from. Whether migration is
-     * supported at all depends on the transport.
+     * Section 9) in the quiche/ngtcp2 transports: a client that migrates to a
+     * new address keeps reporting the address the connection was accepted
+     * from. The OpenSSL transport refreshes the connection's address before
+     * new streams are accepted, so requests that start after migration use
+     * the current peer address while an already-running request keeps the
+     * address its stream was accepted from.
      *
      * @return The remote address
      */

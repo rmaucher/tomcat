@@ -120,6 +120,16 @@ public class QuicConnectionWrapper implements QuicConnection {
     private volatile boolean closed;
 
     /**
+     * Whether the stream-limit GOAWAY notification has already been queued on
+     * this connection. RFC 9114 Section 5.2 requires successive GOAWAY
+     * identifiers not to increase; once the limit notification has been sent,
+     * further refused streams only need their RESET_STREAM, not another
+     * GOAWAY frame appended to the primary stream buffer. Set on the poll
+     * thread.
+     */
+    private volatile boolean streamLimitGoawaySent;
+
+    /**
      * Whether the native SSL object has been freed.
      * Prevents double-free from both explicit cleanup and Cleaner.
      * <p>
@@ -165,6 +175,16 @@ public class QuicConnectionWrapper implements QuicConnection {
      * thread.
      */
     private final AtomicBoolean pendingFree = new AtomicBoolean(false);
+
+    /**
+     * Set when a connection teardown has been started. A teardown is a
+     * one-shot operation: it frees stream and connection SSL objects and runs
+     * native flush callbacks, so a second invocation must not repeat it (for
+     * example after a protocol worker reports a second error, or when the
+     * peer close races a protocol failure). This mirrors the
+     * markTeardownStarted()/CAS protocol of the quiche/ngtcp2 wrappers.
+     */
+    private final AtomicBoolean teardownStarted = new AtomicBoolean(false);
 
     /**
      * The server-initiated unidirectional streams of this connection, keyed
@@ -597,11 +617,44 @@ public class QuicConnectionWrapper implements QuicConnection {
     }
 
     /**
+     * Returns whether the stream-limit GOAWAY notification has already been
+     * queued for this connection.
+     *
+     * @return {@code true} if the notification has been sent
+     */
+    public boolean isStreamLimitGoawaySent() {
+        return streamLimitGoawaySent;
+    }
+
+    /**
+     * Marks the stream-limit GOAWAY notification as sent, so subsequent
+     * stream-limit refusals do not append duplicate frames.
+     *
+     * @param sent {@code true} once the notification has been queued
+     */
+    public void setStreamLimitGoawaySent(boolean sent) {
+        this.streamLimitGoawaySent = sent;
+    }
+
+    /**
      * Checks if the native SSL object has been freed.
      * @return {@code true} if the native SSL object has been freed
      */
     public boolean isFreed() {
         return freed.get();
+    }
+
+    /**
+     * Claims the single connection teardown. The first caller gets
+     * {@code true}; every later caller gets {@code false} and must not repeat
+     * the native teardown/free steps. This mirrors the quiche/ngtcp2
+     * wrappers and prevents repeated {@code failConnection()} calls from
+     * touching an already-freed connection SSL.
+     *
+     * @return {@code true} if this call claimed the teardown
+     */
+    boolean markTeardownStarted() {
+        return !teardownStarted.getAndSet(true);
     }
 
     /**

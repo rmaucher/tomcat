@@ -505,6 +505,11 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                 buffer.put(nativeBuf.asSlice(0, actualLen).asByteBuffer());
                 return actualLen;
             } else if (rc == 0) {
+                // Query SSL_get_error() before any other native call so a hard
+                // failure is not mistaken for a retryable would-block. Only
+                // WANT_READ/WANT_WRITE are retryable; the terminal stream states
+                // are handled below with their specific exceptions.
+                int sslError = QuicBindings.SSL_get_error(ssl, 0);
                 int state = QuicBindings.SSL_get_stream_read_state(ssl);
                 stream.setReadState(QuicStreamWrapper.mapNativeState(state));
 
@@ -515,6 +520,16 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                         state == QuicPoll.SSL_STREAM_STATE_RESET_REMOTE ||
                         state == QuicPoll.SSL_STREAM_STATE_CONN_CLOSED) {
                     throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
+                }
+                if (sslError == QuicBindings.SSL_ERROR_ZERO_RETURN) {
+                    // Clean FIN with no buffered bytes (OpenSSL reports this
+                    // as SSL_ERROR_ZERO_RETURN rather than WANT_READ).
+                    return -1;
+                }
+                if (sslError != QuicBindings.SSL_ERROR_WANT_READ &&
+                        sslError != QuicBindings.SSL_ERROR_WANT_WRITE) {
+                    throw new IOException(sm.getString("socketWrapper.quicReadNativeError",
+                            Integer.valueOf(sslError), QuicDiagnostics.dumpErrorQueue()));
                 }
                 return 0;
             } else {
@@ -542,7 +557,10 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         if (stream == null) {
             return;
         }
-        concludeStream(stream);
+        if (!concludeStream(stream)) {
+            throw new IOException(sm.getString("socketWrapper.quicConcludeFailed",
+                    QuicDiagnostics.dumpErrorQueue()));
+        }
         stream.setConcluded();
     }
 
@@ -742,7 +760,11 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             if (remaining == 0) {
                 // Entire buffer written; conclude the stream if requested.
                 if (conclude) {
-                    concludeStream(stream);
+                    if (!concludeStream(stream)) {
+                        throw new IOException(sm.getString(
+                                "socketWrapper.quicConcludeFailed",
+                                QuicDiagnostics.dumpErrorQueue()));
+                    }
                     stream.setConcluded();
                 }
                 return;
@@ -935,12 +957,13 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      * redundant under the single-tick loop and scale with the whole
      * connection fleet, so they were removed; this is what keeps the
      * per-response worker-hop cost constant in the fleet size.
+     *
+     * @return {@code true} if SSL_stream_conclude() reported success
      */
-    private void concludeStream(QuicStreamWrapper stream) throws IOException {
-        onPollThread(() -> {
-            QuicBindings.SSL_stream_conclude(requireLiveSsl(stream), 0L);
-            return null;
-        });
+    private boolean concludeStream(QuicStreamWrapper stream) throws IOException {
+        return Boolean.TRUE.equals(onPollThread(() ->
+                Boolean.valueOf(QuicBindings.SSL_stream_conclude(
+                        requireLiveSsl(stream), 0L) == 1)));
     }
 
 
@@ -1020,85 +1043,6 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     }
 
 
-    /*
-     * The raw-byte sendfile emulation kept for shape parity with the
-     * quiche transport's copy. Not reachable while processSendfile() above
-     * fails closed (see its guard); wire HTTP/3 DATA-frame framing into it
-     * before making it reachable.
-     */
-    @SuppressWarnings("unused")
-    private SendfileState processSendfileUnframed(SendfileDataBase sendfileData) {
-        try {
-            QuicStreamWrapper stream = liveStream();
-            if (stream == null) {
-                return SendfileState.ERROR;
-            }
-            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(sendfileData.fileName, "r");
-            try {
-                raf.seek(sendfileData.pos);
-                byte[] buf = new byte[65536];
-                long remaining = sendfileData.length;
-                while (remaining > 0) {
-                    int toRead = (int) Math.min(remaining, buf.length);
-                    int bytesRead = raf.read(buf, 0, toRead);
-                    if (bytesRead <= 0) {
-                        break;
-                    }
-                    // The HTTP/3 connector does not use sendfile (responses are
-                    // framed as DATA frames by the processor), so this emulated
-                    // path is defensive only. It writes raw bytes straight to
-                    // the stream via doWrite() - no DATA-frame framing happens
-                    // here - so it must not be used to emit an HTTP/3 message
-                    // body directly.
-                    // doWrite() is non-blocking and may write only part of the
-                    // buffer (or nothing, re-arming write interest). Loop on the
-                    // same buffer until it is fully consumed and advance the
-                    // file offsets only by the bytes actually written so an
-                    // interrupted sendfile resumes at the right offset.
-                    ByteBuffer dataBuf = ByteBuffer.wrap(buf, 0, bytesRead);
-                    long deadline = System.nanoTime() +
-                            TimeUnit.MILLISECONDS.toNanos(STALL_TIMEOUT_MS);
-                    boolean stalled = false;
-                    while (dataBuf.hasRemaining()) {
-                        int startPos = dataBuf.position();
-                        doWrite(false, dataBuf);
-                        int written = dataBuf.position() - startPos;
-                        if (written > 0) {
-                            sendfileData.pos += written;
-                            remaining -= written;
-                            sendfileData.length = remaining;
-                            deadline = System.nanoTime() +
-                                    TimeUnit.MILLISECONDS.toNanos(STALL_TIMEOUT_MS);
-                        } else if (awaitWritable(deadline)) {
-                            // No progress: doWrite() re-armed write interest.
-                            // Park until the poll thread signals a write event
-                            // (QUIC flow control recovered).
-                        } else {
-                            stalled = true;
-                            break;
-                        }
-                    }
-                    if (stalled) {
-                        break;
-                    }
-                }
-                flushNonBlocking();
-                return remaining <= 0 ? SendfileState.DONE : SendfileState.PENDING;
-            } finally {
-                raf.close();
-            }
-        } catch (IOException | RuntimeException e) {
-            // A container calling processSendfile() expects a SendfileState,
-            // not an exception: a RuntimeException from doWrite() (invalid
-            // buffer state, poll-thread failure) would otherwise propagate raw.
-            if (log.isDebugEnabled()) {
-                log.debug(sm.getString("socketWrapper.quicSendfileError"), e);
-            }
-            return SendfileState.ERROR;
-        }
-    }
-
-
     /**
      * Sendfile data for QUIC streams. Since QUIC doesn't support kernel-level
      * zero-copy sendfile, it is emulated by reading from the file and writing
@@ -1147,6 +1091,11 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      */
     @Override
     protected void doClose() {
+        // Serialise against asynchronous writers that may still be draining
+        // the staging buffers. Without the lock, a writer that passed
+        // checkNotClosed() can race the socketBufferHandler=null release
+        // below and dereference the cleared field.
+        writeLock.lock();
         try {
             QuicStreamWrapper stream = getSocket();
             if (stream != null) {
@@ -1180,6 +1129,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             // Release point of the documented post-close contract (above);
             // the read paths guard on it, the write paths never touch it.
             socketBufferHandler = null;
+            writeLock.unlock();
         }
     }
 

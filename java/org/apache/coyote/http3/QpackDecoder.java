@@ -61,7 +61,7 @@ public class QpackDecoder {
     /**
      * Current memory size of the dynamic table.
      */
-    private int currentTableSize = 0;
+    private long currentTableSize = 0;
 
     /**
      * Maximum table size (soft limit, can be reduced by encoder).
@@ -108,7 +108,7 @@ public class QpackDecoder {
     private int maxHeaderSize = 8 * 1024;
 
     private int headerCount = 0;
-    private int headerSize = 0;
+    private long headerSize = 0;
 
     /*
      * Whether the cookie header has been counted for the current field
@@ -331,20 +331,18 @@ public class QpackDecoder {
             long absoluteIndex = totalInserts - 1 - relIndex;
             Qpack.HeaderField entry = getDynamicEntryByAbsolute(absoluteIndex);
             addToDynamicTable(entry.name, entry.value);
-        } else {
-            throw new QpackException(sm.getString("qpackdecoder.unknownInstruction", Integer.valueOf(firstByte)));
         }
     }
 
 
     private void addToDynamicTable(String name, String value) throws QpackException {
-        int entrySize = Qpack.entrySize(name, value);
+        long entrySize = Qpack.entrySize(name, value);
         if (entrySize > maxTableSize) {
             // Per RFC 9204 Section 3.2.2, an entry larger than the dynamic
             // table capacity is a connection error of type
             // QPACK_ENCODER_STREAM_ERROR.
             throw new QpackException(sm.getString("qpackdecoder.entryTooLarge",
-                    Integer.valueOf(entrySize), Integer.valueOf(maxTableSize)));
+                    Long.valueOf(entrySize), Integer.valueOf(maxTableSize)));
         }
 
         while (currentTableSize + entrySize > maxTableSize) {
@@ -428,13 +426,14 @@ public class QpackDecoder {
      * length above this bound can never complete from the bytes the read
      * buffer retains and must fail the connection rather than stall the
      * stream. The bound is a superset of every legal entry: an entry's size
-     * is 32 plus the UTF-8 byte length of name and value (RFC 9204 Section
-     * 3.2.1); Huffman-decoded characters consume at most 30 bits each (the
+     * is 32 plus the decoded byte length of name and value (RFC 9204 Section
+     * 3.2.1; this decoder represents each decoded wire byte as one
+     * ISO-8859-1 char, so the Java string length is that byte length);
+     * Huffman-decoded characters consume at most 30 bits each (the
      * longest code of the RFC 7541 Appendix B table, QpackHuffman), so N
      * decoded characters occupy at most 30N/8 = 15N/4 encoded bytes plus
      * one partial trailing byte per string, raw literals use exactly one
-     * byte per character, and the UTF-8 byte length is never below the
-     * character count, so a legal entry's combined encoded length is at
+     * byte per character, so a legal entry's combined encoded length is at
      * most 15/4 times the size budget plus a small padding allowance:
      * ceil(30N/8) + ceil(30M/8) <= (30(N+M) + 14) / 8 <= 15S/4 + 2 for
      * N+M <= S. Based on the hard (advertised) capacity, which is stable
@@ -773,8 +772,6 @@ public class QpackDecoder {
                     return;
                 }
                 emitPostBaseNameRefEntry(index, value, emitter);
-            } else {
-                throw new QpackException(sm.getString("qpackdecoder.unknownInstruction", Integer.valueOf(b)));
             }
         }
     }
@@ -850,7 +847,7 @@ public class QpackDecoder {
 
 
     private void emit(String name, String value, HeaderEmitter emitter) throws QpackException, Http3Exception {
-        int inc = Qpack.entrySize(name, value);
+        long inc = Qpack.entrySize(name, value);
         if ("cookie".equals(name)) {
             // Only count the cookie header once since HTTP/3 splits it into
             // multiple headers to aid compression
@@ -869,7 +866,7 @@ public class QpackDecoder {
         }
         if (maxHeaderSize >= 0 && headerSize > maxHeaderSize) {
             throw new Http3Exception(sm.getString("qpackdecoder.headerSizeExceeded",
-                    Integer.valueOf(headerSize), Integer.valueOf(maxHeaderSize)),
+                    Long.valueOf(headerSize), Integer.valueOf(maxHeaderSize)),
                     Http3Error.H3_MESSAGE_ERROR);
         }
         if (log.isTraceEnabled()) {

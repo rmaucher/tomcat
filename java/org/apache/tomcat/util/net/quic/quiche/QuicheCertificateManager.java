@@ -71,10 +71,13 @@ class QuicheCertificateManager {
 
     /**
      * Server-advertised limit for client-initiated unidirectional streams.
-     * HTTP/3 needs three (control, QPACK encoder, QPACK decoder); the value
-     * is generous to leave headroom, the memory cost is negligible.
+     * HTTP/3 needs three (control, QPACK encoder, QPACK decoder). Keep a
+     * small headroom for unknown/grease streams, but do not multiply the
+     * per-stream read buffers: each client uni stream materializes a full
+     * {@code readBufferSize} buffer, so 128 streams cost 2 MiB per
+     * connection with the default 16 KiB buffer.
      */
-    private static final long INITIAL_MAX_STREAMS_UNI = 128;
+    private static final long INITIAL_MAX_STREAMS_UNI = 16;
 
     private static final long INITIAL_MAX_DATA = 16L * 1024 * 1024;
 
@@ -270,12 +273,20 @@ class QuicheCertificateManager {
             throws IOException {
         if (sslHostConfig.getCertificateVerification() !=
                 SSLHostConfig.CertificateVerification.NONE) {
-            // quiche's server config exposes no client-auth hook (and the
-            // OpenSSL QUIC endpoint does not implement one either): make the
-            // ignored setting visible rather than silently dropping it.
+            // quiche's server config exposes no client-auth hook. Make the
+            // ignored setting visible rather than silently dropping it, and
+            // fail closed when the administrator required client auth: a
+            // "required" policy that is silently downgraded would leave the
+            // endpoint accepting unauthenticated clients.
+            SSLHostConfig.CertificateVerification verification =
+                    sslHostConfig.getCertificateVerification();
             log.warn(sm.getString("quicheEndpoint.clientAuthUnsupported",
-                    sslHostConfig.getHostName(),
-                    sslHostConfig.getCertificateVerification().name()));
+                    sslHostConfig.getHostName(), verification.name()));
+            if (verification == SSLHostConfig.CertificateVerification.REQUIRED) {
+                throw new IllegalStateException(sm.getString(
+                        "quicheEndpoint.clientAuthRequiredUnsupported",
+                        sslHostConfig.getHostName(), verification.name()));
+            }
         }
         SSLHostConfigCertificate certificate = resolveCertificate(sslHostConfig);
 
@@ -418,7 +429,7 @@ class QuicheCertificateManager {
      */
     private SSLHostConfigCertificate resolveCertificate(SSLHostConfig sslHostConfig)
             throws IOException {
-        Collection<SSLHostConfigCertificate> certificates = sslHostConfig.getCertificates(true);
+        Collection<SSLHostConfigCertificate> certificates = sslHostConfig.getCertificates();
         if (certificates.isEmpty()) {
             throw new IOException(sm.getString("quicheEndpoint.certificateLoadFailed",
                     sslHostConfig.getHostName(), "no certificate configured"));

@@ -124,6 +124,25 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
 
 
     @Test
+    public void testClientSettingsEnableConnectInvalidValueRejected()
+            throws Exception {
+        startHttp3Server();
+
+        // RFC 9220 Section 3 inherits RFC 8441 Section 3: the value of
+        // SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08) MUST be 0 or 1. A value
+        // outside that range is an invalid SETTINGS parameter and is rejected
+        // as a connection error of type H3_SETTINGS_ERROR.
+        ClientOutput output = runClient(rawCommandWith(
+                "--control", buildSettingsFrameB64(8, 2),
+                "--no-request", "--timeout",
+                Long.toString(NO_RESPONSE_TIMEOUT_SECONDS)),
+                CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_SETTINGS_ERROR);
+    }
+
+
+    @Test
     public void testClientSettingsReservedIdRejected() throws Exception {
         startHttp3Server();
 
@@ -228,6 +247,29 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
         String settings = buildSettingsFrameB64(1, 4096);
         ClientOutput output = runClient(rawCommandWith(
                 "--control", buildFramesB64(settings, settings),
+                "--no-request", "--timeout",
+                Long.toString(NO_RESPONSE_TIMEOUT_SECONDS)),
+                CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_FRAME_UNEXPECTED);
+    }
+
+
+    @Test
+    public void testClientSecondSettingsOversizedFrame() throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 7.2.4: a second SETTINGS frame is a connection
+        // error of type H3_FRAME_UNEXPECTED. The duplicate check must run
+        // on the parsed frame header, before the control-stream payload
+        // size limit: an oversized declared length must not replace the
+        // required classification with H3_EXCESSIVE_LOAD (or delay it
+        // until the payload has arrived).
+        String control = buildFramesB64(
+                buildSettingsFrameB64(1, 4096),
+                buildDeclaredFrameB64(0x04, 20000, new byte[64]));
+        ClientOutput output = runClient(rawCommandWith(
+                "--control", control,
                 "--no-request", "--timeout",
                 Long.toString(NO_RESPONSE_TIMEOUT_SECONDS)),
                 CLIENT_TIMEOUT_SECONDS);

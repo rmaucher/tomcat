@@ -79,12 +79,20 @@ import org.apache.tomcat.util.threads.LimitLatch;
  * <li>Uses SSL_read_ex()/SSL_write_ex2() for stream I/O</li>
  * </ul>
  * <p>
+ * OpenSSL exposes no accessor for the per-connection local address of a QUIC
+ * connection, so {@code getLocalAddress()} reports the configured bind address
+ * (the wildcard address for the default bind) rather than the interface address
+ * a particular client connected to. The remote address is read from
+ * {@code SSL_get_peer_addr()} at accept.
+ * <p>
  * This endpoint is server-authentication TLS 1.3 only: it never requests a
- * client certificate, so a host configured with
- * {@code certificateVerification="want"/"required"} (or a trust store) is
- * served as a plain server-auth connection. The configuration build warns
- * once per affected host ({@code quicEndpoint.clientAuthUnsupported}) rather
- * than dropping the setting silently, matching the quiche transport.
+ * client certificate. A host configured with
+ * {@code certificateVerification="want"} is served as a plain server-auth
+ * connection and warned about ({@code quicEndpoint.clientAuthUnsupported});
+ * {@code certificateVerification="required"} fails the bind, because silently
+ * dropping a mandatory client-authentication setting would serve that host
+ * unauthenticated. This matches the quiche transport's warning for the
+ * optional case.
  */
 public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
@@ -293,6 +301,15 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     private long pollFailureCount = 0;
     private long lastPollFailureLog = 0;
     private static final long POLL_FAILURE_LOG_INTERVAL_MS = 60_000;
+
+    // Attacker-influenced per-connection/per-stream warnings. A client can
+    // trigger these repeatedly (no ALPN, critical-stream closure, failed
+    // resets), so each warning is emitted at most once per interval instead of
+    // at the per-connection/per-stream rate. Accessed on the poll thread only.
+    private static final long SECURITY_WARNING_LOG_INTERVAL_MS = 60_000;
+    private long lastAlpnNotServedLogMs = 0;
+    private long lastCriticalStreamClosedLogMs = 0;
+    private long lastStreamResetFailedLogMs = 0;
 
     // Set once the transport/application stream-limit mismatch has been
     // reported, so the (level-triggered per-connection) warning logs once per
@@ -519,6 +536,16 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * is queued on the level-triggered listener event.
      */
     private long lastPausedLogMs = 0;
+
+    /**
+     * Last time (ms) the stream-limit refusal warning was logged, plus the
+     * cumulative refusal count. The warning is rate-limited because a client
+     * that keeps opening streams beyond the configured limit reaches this path
+     * per stream and could otherwise flood the log.
+     */
+    private long streamLimitWarnCount = 0;
+    private long lastStreamLimitWarnLogMs = 0;
+    private static final long STREAM_LIMIT_LOG_INTERVAL_MS = 60_000;
 
     /**
      * Poll timeout in milliseconds used while the endpoint has connections or
@@ -750,6 +777,16 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         if (!QUIC_AVAILABLE) {
             throw new IllegalStateException(sm.getString("quicEndpoint.quicNotAvailable"));
         }
+        // A poll thread that survived stopInternal()'s bounded join still owns
+        // the native listener/poll set/SSL_CTX/wakeup objects. AbstractEndpoint
+        // calls bind() before startInternal(), so the startInternal() guard
+        // alone would let bind() overwrite those live objects first. Refuse
+        // here, before allocating or replacing any native state.
+        Thread oldPollThread = pollThread;
+        if (oldPollThread != null && oldPollThread.isAlive()) {
+            throw new IllegalStateException(sm.getString(
+                    "quicEndpoint.pollThreadStillRunning", getName()));
+        }
 
         // QUIC mandates TLS (RFC 9001) and the transport needs the native
         // SSL_CTX to exist first, so - unlike NioEndpoint, which opens the
@@ -945,9 +982,13 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             return true;
         }
 
-        log.warn(sm.getString("quicEndpoint.alpnNotServed",
-                Long.toHexString(conn.getSslAddress()),
-                String.valueOf(negotiated)));
+        long now = System.currentTimeMillis();
+        if (now - lastAlpnNotServedLogMs >= SECURITY_WARNING_LOG_INTERVAL_MS) {
+            lastAlpnNotServedLogMs = now;
+            log.warn(sm.getString("quicEndpoint.alpnNotServed",
+                    Long.toHexString(conn.getSslAddress()),
+                    String.valueOf(negotiated)));
+        }
         failConnection(conn, NO_APPLICATION_PROTOCOL_ERROR,
                 "Negotiated application protocol is not served");
         return false;
@@ -1020,12 +1061,19 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      */
     @Override
     protected void createSSLContext(SSLHostConfig sslHostConfig) throws IllegalArgumentException {
-        MemorySegment sslCtx = certManager.getSslCtx();
-        if (!sslCtx.equals(MemorySegment.NULL)) {
-            sslHostConfig.setEnabledProtocols(new String[] { "TLSv1.3" });
-            String[] ciphers = OpenSSLContext.getCiphers(sslCtx);
-            if (ciphers != null) {
-                sslHostConfig.setEnabledCiphers(ciphers);
+        // The native SSL_CTX can be freed concurrently by release() (stop /
+        // unbind) or replaced by swapConfig() on a JMX reload. The manager's
+        // lifecycle methods are synchronized on the manager instance; hold
+        // the same monitor while the pointer is dereferenced for the ciphers
+        // so a stale SSL_CTX can never be touched.
+        synchronized (certManager) {
+            MemorySegment sslCtx = certManager.getSslCtx();
+            if (!sslCtx.equals(MemorySegment.NULL)) {
+                sslHostConfig.setEnabledProtocols(new String[] { "TLSv1.3" });
+                String[] ciphers = OpenSSLContext.getCiphers(sslCtx);
+                if (ciphers != null) {
+                    sslHostConfig.setEnabledCiphers(ciphers);
+                }
             }
         }
         for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates()) {
@@ -1068,7 +1116,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     /**
      * Reloads all SSL host configurations with a single rebuild of the
      * native certificate configuration (instead of one rebuild per host as
-     * in the base implementation).
+     * in the base implementation). The rebuild uses the current in-memory
+     * {@link SSLHostConfig} objects; it does not re-read configuration files.
      */
     @Override
     public void reloadSslHostConfigs() {
@@ -1076,8 +1125,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             // Re-register each host (what the base class reload does: the
             // same in-memory SSLHostConfig through addSslHostConfig, which
             // refreshes the per-host TLS information) without triggering a
-            // native rebuild for every host; the configuration files are
-            // re-read by the single reloadCertificates() call below.
+            // native rebuild for every host; the single reloadCertificates()
+            // call below rebuilds from the current in-memory configurations.
             SSLHostConfig sslHostConfig = sslHostConfigs.get(hostName.toLowerCase(Locale.ENGLISH));
             if (sslHostConfig == null) {
                 throw new IllegalArgumentException(baseSm.getString("endpoint.unknownSslHostName", hostName));
@@ -1113,11 +1162,15 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         }
         if (pollThread != null && pollThread.isAlive()) {
             final QuicCertConfig toInstall = newConfig;
-            if (!submitPollTask(() -> certManager.swapConfig(toInstall, reason))) {
+            // The task owns the new snapshot until it runs. If the mailbox is
+            // closed/opened while it is still queued, discardPollTasks() calls
+            // onDiscard() instead of dropping the task silently; without this
+            // the native X509/EVP_PKEY objects and the arena would leak.
+            Runnable installTask = new CertInstallTask(toInstall, reason);
+            if (!submitPollTask(installTask)) {
                 // The mailbox was closed between the liveness check and the
                 // submission (the endpoint finished stopping): the swap will
-                // never run. The configuration was never installed, so no
-                // connection references it - release it here, pairing the
+                // never run. Release the configuration here, pairing the
                 // certificate free with the arena close as every other
                 // discard site does (free() does not close the arena).
                 toInstall.free();
@@ -1129,6 +1182,36 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             // reason the drain of the poll-thread queue is during stop.
             assertNativeAccess("swapCertConfig");
             certManager.swapConfig(newConfig, reason);
+        }
+    }
+
+
+    /**
+     * Mailbox task that installs a certificate snapshot on the poll thread.
+     * Implementing {@link QuicNativeMailbox.DiscardListener} as well as
+     * {@link Runnable} lets the mailbox release the snapshot if the task is
+     * discarded by a stop/open before it ever runs.
+     */
+    private final class CertInstallTask
+            implements Runnable, QuicNativeMailbox.DiscardListener {
+
+        private final QuicCertConfig config;
+        private final String reason;
+
+        private CertInstallTask(QuicCertConfig config, String reason) {
+            this.config = config;
+            this.reason = reason;
+        }
+
+        @Override
+        public void run() {
+            certManager.swapConfig(config, reason);
+        }
+
+        @Override
+        public void onDiscard() {
+            config.free();
+            CertificateLoader.closeQuietly(config.arena);
         }
     }
 
@@ -1274,6 +1357,10 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     // sockaddr_in and sockaddr_in6.
                     actualPort = ((nameAddr.get(ValueLayout.JAVA_BYTE, 2) & 0xFF) << 8)
                             | (nameAddr.get(ValueLayout.JAVA_BYTE, 3) & 0xFF);
+                } else {
+                    int errno = QuicBindings.errno();
+                    throw new IOException(sm.getString("quicEndpoint.getsocknameError",
+                            QuicBindings.strerror(errno), Integer.valueOf(errno)));
                 }
             }
             bindAddress = new InetSocketAddress(bindAddr, actualPort);
@@ -1843,6 +1930,32 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                         Long.toHexString(conn.getSslAddress())), t);
             }
         }
+        // Complete frees for connections that were torn down and retained
+        // before stop() (their teardown removed them from the connections map)
+        // once their handler has finished. Connections still owned by a
+        // running handler stay in stoppedBusyConnections for the start-time
+        // sweep; a connection whose handler completed during this stop must
+        // not leak its native SSL just because it is absent from the
+        // connections map.
+        java.util.Iterator<QuicConnectionWrapper> retainedIterator =
+                stoppedBusyConnections.iterator();
+        while (retainedIterator.hasNext()) {
+            QuicConnectionWrapper conn = retainedIterator.next();
+            if (conn.hasActiveHandlers()) {
+                continue;
+            }
+            setConnectionProtocolDataPending(conn, false);
+            drainPendingStreamFrees();
+            drainCleanerStreamFrees();
+            drainCleanerConnectionFrees();
+            try {
+                conn.freeSslOnce();
+            } catch (Throwable t) {
+                log.warn(sm.getString("quicEndpoint.connectionSslFreeError",
+                        Long.toHexString(conn.getSslAddress())), t);
+            }
+            retainedIterator.remove();
+        }
         // Drops the retention entries: every wrapper in the map has either
         // been freed above or parked into stoppedBusyConnections (with its
         // pending-free claim and its own retention), so no Cleaner can free
@@ -2033,6 +2146,15 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      */
     private boolean hasActiveRequestHandlers() {
         for (QuicConnectionWrapper conn : connections.values()) {
+            if (conn.hasActiveHandlers()) {
+                return true;
+            }
+        }
+        // Tear down connections removed from the connections map while a
+        // handler was still active are retained in stoppedBusyConnections;
+        // they must be included in the wait or their worker is interrupted
+        // before it can finish and queue its deferred free.
+        for (QuicConnectionWrapper conn : stoppedBusyConnections) {
             if (conn.hasActiveHandlers()) {
                 return true;
             }
@@ -2347,6 +2469,11 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     + Long.toHexString(conn.getSslAddress())
                     + ") until active handlers complete");
         }
+        // Retention: a connection removed from the connections map by a
+        // deferred teardown must still be visible to stopInternal()'s handler
+        // wait/cleanup and to the start-time retention sweep. The worker that
+        // brings activeHandlers to zero removes it after freeing.
+        stoppedBusyConnections.add(conn);
     }
 
 
@@ -2430,327 +2557,327 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         // layout and the field offsets used to read it come from the single
         // definition in QuicPoll, so the two ABI assumptions (LP64
         // time_t/suseconds_t) can never drift apart.
-        Arena timerArena = Arena.ofConfined();
-        MemorySegment timerTv = timerArena.allocate(QuicPoll.TIMEVAL_LAYOUT);
-        MemorySegment timerInf = timerArena.allocate(ValueLayout.JAVA_INT);
-        // Absolute System.currentTimeMillis() of the engine-wide deadline the
-        // reactor reported on the last tick, or 0 while unknown.
-        long quicDeadlineAbsMs = 0;
-        // True once at least one tick has run, so the cached deadline above
-        // can be trusted for wait-capping.
-        boolean haveQuicDeadline = false;
-        // Due-tick coalescing state (see DUE_TICK_FLOOR_BASE_MS): the current
-        // adaptive floor and the absolute time from which the next
-        // deadline-driven tick may run. Both are zero while no deadline is
-        // overdue or the floor is disabled.
-        long dueTickFloorMs = 0;
-        long nextDueTickFreeAtMs = 0;
+        try (Arena timerArena = Arena.ofConfined()) {
+            MemorySegment timerTv = timerArena.allocate(QuicPoll.TIMEVAL_LAYOUT);
+            MemorySegment timerInf = timerArena.allocate(ValueLayout.JAVA_INT);
+            // Absolute System.currentTimeMillis() of the engine-wide deadline the
+            // reactor reported on the last tick, or 0 while unknown.
+            long quicDeadlineAbsMs = 0;
+            // True once at least one tick has run, so the cached deadline above
+            // can be trusted for wait-capping.
+            boolean haveQuicDeadline = false;
+            // Due-tick coalescing state (see DUE_TICK_FLOOR_BASE_MS): the current
+            // adaptive floor and the absolute time from which the next
+            // deadline-driven tick may run. Both are zero while no deadline is
+            // overdue or the floor is disabled.
+            long dueTickFloorMs = 0;
+            long nextDueTickFreeAtMs = 0;
 
-        while (running && !Thread.interrupted()) {
-            try {
-                  // Sleep here until the next UDP packet, a mailbox kick or
-                  // the timeout. The mailbox/SSL_poll interplay no longer
-                  // depends on the poll timeout for hop latency: every task
-                  // submission kicks the wait, and tasks queued after the
-                  // drain below are picked up immediately on the next
-                  // iteration.
-                long waitMs;
-                if (mailbox.hasPollTasks()) {
-                    waitMs = PENDING_TASK_POLL_TIMEOUT_MS;
-                } else if (isIdle()) {
-                    waitMs = IDLE_POLL_TIMEOUT_MS;
-                } else {
-                    waitMs = Math.min(pollTimeoutMs,
-                            NATIVE_POLL_TIMEOUT_CAP_MS);
-                }
-                if (quicDeadlineAbsMs != 0) {
-                    waitMs = Math.max(0, Math.min(waitMs,
-                            quicDeadlineAbsMs - System.currentTimeMillis()));
-                }
-                int waitEvents = quicWakeup.await(waitMs);
-                quicWakeup.consumeWake();
-
-                   // Hop native operations from executor worker threads to this
-                   // thread before touching the poll set or calling SSL_poll.
-                boolean ranHops = drainPollTasks();
-                boolean deferredFrees = mailbox.hasDeferredStreamFrees();
-
-                 // Nothing can have changed since the last tick when the wait
-                 // hit its timeout, no hop ran, no free is queued and no QUIC
-                 // timer is due: tick, poll set rebuild and SSL_poll() can
-                 // all be skipped, keeping an iteration with idle connections
-                 // down to the bare wake. (First iteration: no deadline is
-                 // cached yet, so the tick boots the engine and the event
-                 // scan.)
-                long nowMs = System.currentTimeMillis();
-                // A failed wait is signalled by the negative return value
-                // (QuicWakeup.await() contract: treat the iteration as
-                // no-progress and back off). Handle it explicitly rather than
-                // relying on the two's-complement bits of -1 to fall out of
-                // the bit test: treat it as a possible event so the
-                // iteration still runs the engine tick (a broken wake
-                // descriptor must not stop the engine, and the due-tick park
-                // below must not spin on an instantly failing await), and
-                // keep waitEvents negative through to the bottom of the loop,
-                // so the "wait timed out" shortcut does not engage there and
-                // the no-progress backoff sleeps a bounded amount per
-                // iteration instead of spinning.
-                boolean sockWake = waitEvents < 0 ||
-                        (waitEvents & QuicWakeup.EVENT_SOCK) != 0;
-                boolean deadlineDue = quicDeadlineAbsMs != 0 &&
-                        quicDeadlineAbsMs <= nowMs;
-                boolean reactiveWake = ranHops || deferredFrees || sockWake ||
-                        !haveQuicDeadline;
-
-                  // The due-tick coalescing floor: while the deadline stays
-                  // overdue (the engine's own deadline chatter at idle) the
-                  // next due-driven tick waits out the floor - which grows
-                  // with each consecutive silent due tick up to the cap - so
-                  // an idle fleet is ticked a bounded number of times per
-                  // second. Any reactive wake (packet, hop, queued free)
-                  // resets the floor: real work always runs at full speed,
-                  // and the first due tick after it, too.
-                if (reactiveWake) {
-                    dueTickFloorMs = 0;
-                    nextDueTickFreeAtMs = 0;
-                }
-                boolean dueTickHeld = deadlineDue && !reactiveWake &&
-                        dueTickFloorCapMs > 0 &&
-                        nowMs < nextDueTickFreeAtMs;
-                if (dueTickHeld) {
-                    // Park until the floor releases the next due tick instead
-                    // of burning the interval on deadline-due wakes.
-                    long remain = nextDueTickFreeAtMs - nowMs;
-                    quicWakeup.await(remain);
-                    continue;
-                }
-                boolean tickNeeded = reactiveWake || deadlineDue;
-                if (!tickNeeded) {
-                    continue;
-                }
-
-                // One engine tick services everything: the receive pump
-                // (arrival of packets, demux to the connections), all
-                // channels (timers, retransmission, pending send queue) and
-                // the pending listener handshakes. Doing it once here instead
-                // of once per poll item is what removes the per-item engine
-                // cost from SSL_poll(), and the EXPLICIT event-handling mode
-                // of the connections (configureExplicitEventHandling) removes
-                // the per-API-call engine ticks the implicit default would
-                // run from the event handlers and the mailbox hops - their
-                // output is flushed by the flush tick at the bottom of this
-                // iteration instead. Tick even while connections is empty:
-                // during an accept burst the map is empty until the first
-                // accept, and the handshake only progresses on engine ticks.
-                QuicBindings.SSL_handle_events(listener);
-                quicDeadlineAbsMs = listenerQuicDeadlineMs(timerTv, timerInf);
-                haveQuicDeadline = true;
-                if (deadlineDue && !reactiveWake && dueTickFloorCapMs > 0) {
-                    dueTickFloorMs = (dueTickFloorMs == 0)
-                            ? DUE_TICK_FLOOR_BASE_MS
-                            : Math.min(dueTickFloorMs * 2, dueTickFloorCapMs);
-                    nextDueTickFreeAtMs = nowMs + dueTickFloorMs;
-                }
-
-                pollSet.rebuild();
-                pollSet.resetResultCount();
-
-                  // SSL_poll() in non-blocking mode (timeout zero), with
-                  // SSL_POLL_FLAG_NO_HANDLE_EVENTS: readiness of each item is
-                  // tested and reported against the state the tick above just
-                  // produced, without OpenSSL ticking the engine again per
-                  // item.
-                int sslPollResult = QuicPoll.poll(
-                            pollSet.getNativeArray(),
-                            pollSet.size(),
-                            0,
-                            QuicPoll.SSL_POLL_FLAG_NO_HANDLE_EVENTS,
-                            pollSet.getResultCountSegment()
-                    );
-
-                   // The tick above has flushed any pending packets (including
-                   // RESET_STREAM frames) to the network, so it is now safe to
-                   // free the stream SSL objects deferred by the close paths.
-                drainPendingStreamFrees();
-
-                   // Run the stream SSL free requests the Cleaner handed over
-                    // from the GC thread. Deciding here (on the poll thread)
-                    // serializes them with the connection teardown sequence.
-                    // The connection free requests are drained after the
-                    // stream ones: per SSL_new_stream(3) the streams go
-                    // first.
-                drainCleanerStreamFrees();
-                drainCleanerConnectionFrees();
-
-                long resultCount = pollSet.getResultCount();
-                if (sslPollResult <= 0 && resultCount <= 0) {
-                       // Per SSL_poll(3) (OpenSSL 3.5+) this combination (0
-                       // with no events) indicates a basic usage error. Log
-                       // it, rate-limited, instead of failing silently. Back
-                       // off before the next iteration like the no-progress
-                       // path below, otherwise a persistent failure here
-                       // spins the CPU at 100%.
-                    long now = System.currentTimeMillis();
-                    if (now - lastPollUsageErrorLogMs >= 30000) {
-                        lastPollUsageErrorLogMs = now;
-                        log.warn(sm.getString("quicEndpoint.pollUsageError",
-                                    Integer.valueOf(sslPollResult)));
+            while (running && !Thread.interrupted()) {
+                try {
+                      // Sleep here until the next UDP packet, a mailbox kick or
+                      // the timeout. The mailbox/SSL_poll interplay no longer
+                      // depends on the poll timeout for hop latency: every task
+                      // submission kicks the wait, and tasks queued after the
+                      // drain below are picked up immediately on the next
+                      // iteration.
+                    long waitMs;
+                    if (mailbox.hasPollTasks()) {
+                        waitMs = PENDING_TASK_POLL_TIMEOUT_MS;
+                    } else if (isIdle()) {
+                        waitMs = IDLE_POLL_TIMEOUT_MS;
+                    } else {
+                        waitMs = Math.min(pollTimeoutMs,
+                                NATIVE_POLL_TIMEOUT_CAP_MS);
                     }
-                    Thread.sleep(1);
-                    continue;
-                }
-
-                boolean processedAnything = false;
-                  // A zero result count means SSL_poll found nothing on any
-                  // item - an item it failed to poll reports F and is counted
-                  // (FAIL_ITEM increments the result count), so nothing is
-                  // pending and every revents is zero. The revents sync and
-                  // the item scan are both O(poll set); skipping them here
-                  // keeps a ticked iteration over an otherwise idle fleet
-                  // (the keep-alive-only case) at zero Java-side scan work.
-                  // The scan runs only when the native readout actually
-                  // reported something.
-                if (resultCount > 0) {
-                    // SSL_POLL_EVENT_F is an *error* flag in OpenSSL 3.5:
-                    // SSL_poll sets it on an item it failed to poll and
-                    // zeroes the revents of every item after it. It must
-                    // never be cleared silently - doing so both hides the
-                    // failure and starves all subsequent items. It is
-                    // handled per-item below.
-                    pollSet.syncRevents();
-
-                    // Process items with events. Follow OpenSSL reference
-                    // priority: ERROR -> IN -> OUT.
-                    for (int slot = 0; slot < pollSet.size(); slot++) {
-                        QuicPollItem item = pollSet.itemAt(slot);
-                        // A handler that ran earlier in this same iteration
-                        // may have removed the item from the poll set (and
-                        // freed the SSL it refers to). Skip items that are
-                        // no longer members of the set.
-                        if (pollSet.get(item.getSsl().address()) != item) {
-                            continue;
-                        }
-                        long revents = item.getRevents();
-                        if (revents == 0) {
-                            continue;
-                        }
-
-                        // F means SSL_poll failed to poll this item and
-                        // zeroed the revents of all items after it. Evict
-                        // the item before anything else, otherwise it would
-                        // silently starve the rest of the poll set on every
-                        // iteration. A failing listener is retained (see
-                        // handlePollFailure); that does not count as
-                        // progress, otherwise the no-progress backoff below
-                        // is defeated and the loop spins at full CPU while
-                        // the failure persists.
-                        if ((revents & QuicPoll.SSL_POLL_EVENT_F) != 0) {
-                            if (handlePollFailure(item)) {
-                                processedAnything = true;
-                            }
-                            continue;
-                        }
-                        processedAnything = handlePollItemEvents(item,
-                                revents, processedAnything);
+                    if (quicDeadlineAbsMs != 0) {
+                        waitMs = Math.max(0, Math.min(waitMs,
+                                quicDeadlineAbsMs - System.currentTimeMillis()));
                     }
-                }
+                    int waitEvents = quicWakeup.await(waitMs);
+                    quicWakeup.consumeWake();
 
-                  // Emit any pending protocol data queued for the peer on a
-                  // server-initiated stream. For HTTP/3 these are the QPACK
-                  // decoder instructions (Section Acknowledgment, Stream
-                  // Cancellation, Insert Count Increment) that must not be
-                  // left waiting for feedback that is only queued, not sent,
-                  // when no client unidirectional stream data arrives
-                  // (RFC 9204 Sections 2.2.2.1, 2.2.2.2, 2.2.2.3). The sweep
-                  // is skipped entirely while no connection has anything
-                  // queued, and walks only the marked connections instead of
-                  // the fleet: a connection enters the set through the mark
-                  // queue, and leaves it when its flush drains the queue
-                  // (flag cleared), when it tears down, or - if the flush
-                  // only got part way out (no re-drive of a blocked send by
-                  // the transport here) - it stays for the next sweep.
-                boolean protocolDataFlushed = false;
-                if (protocolDataPendingCount.get() > 0) {
-                    QuicConnectionWrapper marked;
-                    while ((marked = protocolDataMarks.poll()) != null) {
-                        protocolDataConns.add(marked);
-                    }
-                    if (!protocolDataConns.isEmpty()) {
-                        protocolDataRetry.clear();
-                        for (QuicConnectionWrapper conn : protocolDataConns) {
-                            if (conn.isClosed() || conn.isFreed() ||
-                                    !conn.isProtocolDataPending()) {
-                                // Dropping the entry is final: a pending
-                                // re-mark after this point (new instructions
-                                // queued) re-adds it through the mark queue.
-                                continue;
-                            }
-                            QuicConnectionManager connManager =
-                                    conn.getQuicConnectionManager();
-                            if (connManager == null) {
-                                continue;
-                            }
-                            connManager.flushPendingProtocolData(conn);
-                            protocolDataFlushed = true;
-                            if (conn.isProtocolDataPending()) {
-                                protocolDataRetry.add(conn);
-                            }
-                        }
-                        protocolDataConns.clear();
-                        protocolDataConns.addAll(protocolDataRetry);
-                        protocolDataRetry.clear();
-                    }
-                }
+                       // Hop native operations from executor worker threads to this
+                       // thread before touching the poll set or calling SSL_poll.
+                    boolean ranHops = drainPollTasks();
+                    boolean deferredFrees = mailbox.hasDeferredStreamFrees();
 
-                  // Flush tick for EXPLICIT event handling (see
-                  // configureExplicitEventHandling): the event handlers above
-                  // and the protocol-data sweep queue their output into the
-                  // stream send queues instead of flushing it to the network
-                  // with an engine tick per call, so one engine tick here
-                  // moves everything this iteration produced onto the wire.
-                  // Without it that output would wait for the loop's next
-                  // wake - bounded in any case (the delivered work re-armed
-                  // engine timers, the deadline refresh right after this
-                  // tick reads them, and the poll timeout caps the wait),
-                  // but pointlessly late; with it the flush stays on the
-                  // poll thread inside the same iteration, where the
-                  // per-call implicit ticks used to run.
-                if (processedAnything || protocolDataFlushed) {
+                     // Nothing can have changed since the last tick when the wait
+                     // hit its timeout, no hop ran, no free is queued and no QUIC
+                     // timer is due: tick, poll set rebuild and SSL_poll() can
+                     // all be skipped, keeping an iteration with idle connections
+                     // down to the bare wake. (First iteration: no deadline is
+                     // cached yet, so the tick boots the engine and the event
+                     // scan.)
+                    long nowMs = System.currentTimeMillis();
+                    // A failed wait is signalled by the negative return value
+                    // (QuicWakeup.await() contract: treat the iteration as
+                    // no-progress and back off). Handle it explicitly rather than
+                    // relying on the two's-complement bits of -1 to fall out of
+                    // the bit test: treat it as a possible event so the
+                    // iteration still runs the engine tick (a broken wake
+                    // descriptor must not stop the engine, and the due-tick park
+                    // below must not spin on an instantly failing await), and
+                    // keep waitEvents negative through to the bottom of the loop,
+                    // so the "wait timed out" shortcut does not engage there and
+                    // the no-progress backoff sleeps a bounded amount per
+                    // iteration instead of spinning.
+                    boolean sockWake = waitEvents < 0 ||
+                            (waitEvents & QuicWakeup.EVENT_SOCK) != 0;
+                    boolean deadlineDue = quicDeadlineAbsMs != 0 &&
+                            quicDeadlineAbsMs <= nowMs;
+                    boolean reactiveWake = ranHops || deferredFrees || sockWake ||
+                            !haveQuicDeadline;
+
+                      // The due-tick coalescing floor: while the deadline stays
+                      // overdue (the engine's own deadline chatter at idle) the
+                      // next due-driven tick waits out the floor - which grows
+                      // with each consecutive silent due tick up to the cap - so
+                      // an idle fleet is ticked a bounded number of times per
+                      // second. Any reactive wake (packet, hop, queued free)
+                      // resets the floor: real work always runs at full speed,
+                      // and the first due tick after it, too.
+                    if (reactiveWake) {
+                        dueTickFloorMs = 0;
+                        nextDueTickFreeAtMs = 0;
+                    }
+                    boolean dueTickHeld = deadlineDue && !reactiveWake &&
+                            dueTickFloorCapMs > 0 &&
+                            nowMs < nextDueTickFreeAtMs;
+                    if (dueTickHeld) {
+                        // Park until the floor releases the next due tick instead
+                        // of burning the interval on deadline-due wakes.
+                        long remain = nextDueTickFreeAtMs - nowMs;
+                        quicWakeup.await(remain);
+                        continue;
+                    }
+                    boolean tickNeeded = reactiveWake || deadlineDue;
+                    if (!tickNeeded) {
+                        continue;
+                    }
+
+                    // One engine tick services everything: the receive pump
+                    // (arrival of packets, demux to the connections), all
+                    // channels (timers, retransmission, pending send queue) and
+                    // the pending listener handshakes. Doing it once here instead
+                    // of once per poll item is what removes the per-item engine
+                    // cost from SSL_poll(), and the EXPLICIT event-handling mode
+                    // of the connections (configureExplicitEventHandling) removes
+                    // the per-API-call engine ticks the implicit default would
+                    // run from the event handlers and the mailbox hops - their
+                    // output is flushed by the flush tick at the bottom of this
+                    // iteration instead. Tick even while connections is empty:
+                    // during an accept burst the map is empty until the first
+                    // accept, and the handshake only progresses on engine ticks.
                     QuicBindings.SSL_handle_events(listener);
                     quicDeadlineAbsMs = listenerQuicDeadlineMs(timerTv, timerInf);
-                }
+                    haveQuicDeadline = true;
+                    if (deadlineDue && !reactiveWake && dueTickFloorCapMs > 0) {
+                        dueTickFloorMs = (dueTickFloorMs == 0)
+                                ? DUE_TICK_FLOOR_BASE_MS
+                                : Math.min(dueTickFloorMs * 2, dueTickFloorCapMs);
+                        nextDueTickFreeAtMs = nowMs + dueTickFloorMs;
+                    }
 
-                  // No item produced progress on this iteration. Either
-                  // SSL_poll returned failure (0) with an item reporting F,
-                  // or it reported events that every handler treated as a
-                  // no-op - a persistent listener EL is the level-triggered
-                  // case (see handleListenerError). Both otherwise make the
-                  // loop spin at full CPU while the condition persists, so
-                  // back off briefly; the next genuine event still wakes the
-                  // wait. A wait that simply timed out already blocked for
-                  // its whole budget and needs no extra sleep (a failed
-                  // wait is reported as an error, not a timeout, so a
-                  // persistent wait failure backs off here too).
-                boolean pollTimedOut = sslPollResult == 1 && resultCount == 0
-                        && waitEvents == 0;
-                if (!processedAnything && !pollTimedOut) {
-                    Thread.sleep(1);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            } catch (Exception e) {
-                log.error(sm.getString("quicEndpoint.pollLoopError"), e);
-                try {
-                    Thread.sleep(100);
-                } catch (InterruptedException ie) {
+                    pollSet.rebuild();
+                    pollSet.resetResultCount();
+
+                      // SSL_poll() in non-blocking mode (timeout zero), with
+                      // SSL_POLL_FLAG_NO_HANDLE_EVENTS: readiness of each item is
+                      // tested and reported against the state the tick above just
+                      // produced, without OpenSSL ticking the engine again per
+                      // item.
+                    int sslPollResult = QuicPoll.poll(
+                                pollSet.getNativeArray(),
+                                pollSet.size(),
+                                0,
+                                QuicPoll.SSL_POLL_FLAG_NO_HANDLE_EVENTS,
+                                pollSet.getResultCountSegment()
+                        );
+
+                       // The tick above has flushed any pending packets (including
+                       // RESET_STREAM frames) to the network, so it is now safe to
+                       // free the stream SSL objects deferred by the close paths.
+                    drainPendingStreamFrees();
+
+                       // Run the stream SSL free requests the Cleaner handed over
+                        // from the GC thread. Deciding here (on the poll thread)
+                        // serializes them with the connection teardown sequence.
+                        // The connection free requests are drained after the
+                        // stream ones: per SSL_new_stream(3) the streams go
+                        // first.
+                    drainCleanerStreamFrees();
+                    drainCleanerConnectionFrees();
+
+                    long resultCount = pollSet.getResultCount();
+                    if (sslPollResult <= 0 && resultCount <= 0) {
+                           // Per SSL_poll(3) (OpenSSL 3.5+) this combination (0
+                           // with no events) indicates a basic usage error. Log
+                           // it, rate-limited, instead of failing silently. Back
+                           // off before the next iteration like the no-progress
+                           // path below, otherwise a persistent failure here
+                           // spins the CPU at 100%.
+                        long now = System.currentTimeMillis();
+                        if (now - lastPollUsageErrorLogMs >= 30000) {
+                            lastPollUsageErrorLogMs = now;
+                            log.warn(sm.getString("quicEndpoint.pollUsageError",
+                                        Integer.valueOf(sslPollResult)));
+                        }
+                        Thread.sleep(1);
+                        continue;
+                    }
+
+                    boolean processedAnything = false;
+                      // A zero result count means SSL_poll found nothing on any
+                      // item - an item it failed to poll reports F and is counted
+                      // (FAIL_ITEM increments the result count), so nothing is
+                      // pending and every revents is zero. The revents sync and
+                      // the item scan are both O(poll set); skipping them here
+                      // keeps a ticked iteration over an otherwise idle fleet
+                      // (the keep-alive-only case) at zero Java-side scan work.
+                      // The scan runs only when the native readout actually
+                      // reported something.
+                    if (resultCount > 0) {
+                        // SSL_POLL_EVENT_F is an *error* flag in OpenSSL 3.5:
+                        // SSL_poll sets it on an item it failed to poll and
+                        // zeroes the revents of every item after it. It must
+                        // never be cleared silently - doing so both hides the
+                        // failure and starves all subsequent items. It is
+                        // handled per-item below.
+                        pollSet.syncRevents();
+
+                        // Process items with events. Follow OpenSSL reference
+                        // priority: ERROR -> IN -> OUT.
+                        for (int slot = 0; slot < pollSet.size(); slot++) {
+                            QuicPollItem item = pollSet.itemAt(slot);
+                            // A handler that ran earlier in this same iteration
+                            // may have removed the item from the poll set (and
+                            // freed the SSL it refers to). Skip items that are
+                            // no longer members of the set.
+                            if (pollSet.get(item.getSsl().address()) != item) {
+                                continue;
+                            }
+                            long revents = item.getRevents();
+                            if (revents == 0) {
+                                continue;
+                            }
+
+                            // F means SSL_poll failed to poll this item and
+                            // zeroed the revents of all items after it. Evict
+                            // the item before anything else, otherwise it would
+                            // silently starve the rest of the poll set on every
+                            // iteration. A failing listener is retained (see
+                            // handlePollFailure); that does not count as
+                            // progress, otherwise the no-progress backoff below
+                            // is defeated and the loop spins at full CPU while
+                            // the failure persists.
+                            if ((revents & QuicPoll.SSL_POLL_EVENT_F) != 0) {
+                                if (handlePollFailure(item)) {
+                                    processedAnything = true;
+                                }
+                                continue;
+                            }
+                            processedAnything = handlePollItemEvents(item,
+                                    revents, processedAnything);
+                        }
+                    }
+
+                      // Emit any pending protocol data queued for the peer on a
+                      // server-initiated stream. For HTTP/3 these are the QPACK
+                      // decoder instructions (Section Acknowledgment, Stream
+                      // Cancellation, Insert Count Increment) that must not be
+                      // left waiting for feedback that is only queued, not sent,
+                      // when no client unidirectional stream data arrives
+                      // (RFC 9204 Sections 2.2.2.1, 2.2.2.2, 2.2.2.3). The sweep
+                      // is skipped entirely while no connection has anything
+                      // queued, and walks only the marked connections instead of
+                      // the fleet: a connection enters the set through the mark
+                      // queue, and leaves it when its flush drains the queue
+                      // (flag cleared), when it tears down, or - if the flush
+                      // only got part way out (no re-drive of a blocked send by
+                      // the transport here) - it stays for the next sweep.
+                    boolean protocolDataFlushed = false;
+                    if (protocolDataPendingCount.get() > 0) {
+                        QuicConnectionWrapper marked;
+                        while ((marked = protocolDataMarks.poll()) != null) {
+                            protocolDataConns.add(marked);
+                        }
+                        if (!protocolDataConns.isEmpty()) {
+                            protocolDataRetry.clear();
+                            for (QuicConnectionWrapper conn : protocolDataConns) {
+                                if (conn.isClosed() || conn.isFreed() ||
+                                        !conn.isProtocolDataPending()) {
+                                    // Dropping the entry is final: a pending
+                                    // re-mark after this point (new instructions
+                                    // queued) re-adds it through the mark queue.
+                                    continue;
+                                }
+                                QuicConnectionManager connManager =
+                                        conn.getQuicConnectionManager();
+                                if (connManager == null) {
+                                    continue;
+                                }
+                                connManager.flushPendingProtocolData(conn);
+                                protocolDataFlushed = true;
+                                if (conn.isProtocolDataPending()) {
+                                    protocolDataRetry.add(conn);
+                                }
+                            }
+                            protocolDataConns.clear();
+                            protocolDataConns.addAll(protocolDataRetry);
+                            protocolDataRetry.clear();
+                        }
+                    }
+
+                      // Flush tick for EXPLICIT event handling (see
+                      // configureExplicitEventHandling): the event handlers above
+                      // and the protocol-data sweep queue their output into the
+                      // stream send queues instead of flushing it to the network
+                      // with an engine tick per call, so one engine tick here
+                      // moves everything this iteration produced onto the wire.
+                      // Without it that output would wait for the loop's next
+                      // wake - bounded in any case (the delivered work re-armed
+                      // engine timers, the deadline refresh right after this
+                      // tick reads them, and the poll timeout caps the wait),
+                      // but pointlessly late; with it the flush stays on the
+                      // poll thread inside the same iteration, where the
+                      // per-call implicit ticks used to run.
+                    if (processedAnything || protocolDataFlushed) {
+                        QuicBindings.SSL_handle_events(listener);
+                        quicDeadlineAbsMs = listenerQuicDeadlineMs(timerTv, timerInf);
+                    }
+
+                      // No item produced progress on this iteration. Either
+                      // SSL_poll returned failure (0) with an item reporting F,
+                      // or it reported events that every handler treated as a
+                      // no-op - a persistent listener EL is the level-triggered
+                      // case (see handleListenerError). Both otherwise make the
+                      // loop spin at full CPU while the condition persists, so
+                      // back off briefly; the next genuine event still wakes the
+                      // wait. A wait that simply timed out already blocked for
+                      // its whole budget and needs no extra sleep (a failed
+                      // wait is reported as an error, not a timeout, so a
+                      // persistent wait failure backs off here too).
+                    boolean pollTimedOut = sslPollResult == 1 && resultCount == 0
+                            && waitEvents == 0;
+                    if (!processedAnything && !pollTimedOut) {
+                        Thread.sleep(1);
+                    }
+                } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
+                } catch (Exception e) {
+                    log.error(sm.getString("quicEndpoint.pollLoopError"), e);
+                    try {
+                        Thread.sleep(100);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
                 }
             }
-        }
 
-        timerArena.close();
+        }
 
         if (log.isDebugEnabled()) {
             log.debug("QUIC poll loop stopped");
@@ -2903,7 +3030,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     break;
                 case INCOMING_CONNECTION:
                     try {
-                        handleIncomingConnection(item);
+                        handleIncomingConnection();
                     } catch (Exception ex) {
                         log.warn(sm.getString(
                                 "quicEndpoint.incomingConnectionError"), ex);
@@ -2912,6 +3039,10 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 case INCOMING_STREAM:
                     try {
                         handleIncomingStream(item);
+                    } catch (IOException ioe) {
+                        log.warn(sm.getString(
+                                "quicEndpoint.incomingStreamError"), ioe);
+                        failConnectionAfterStreamIoError(item, ioe);
                     } catch (Exception ex) {
                         log.warn(sm.getString(
                                 "quicEndpoint.incomingStreamError"), ex);
@@ -2920,6 +3051,10 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 case READABLE:
                     try {
                         dispatchStreamEvent(item, SocketEvent.OPEN_READ);
+                    } catch (IOException ioe) {
+                        log.warn(sm.getString(
+                                "quicEndpoint.readEventDispatchError"), ioe);
+                        failConnectionAfterStreamIoError(item, ioe);
                     } catch (Exception ex) {
                         log.warn(sm.getString(
                                 "quicEndpoint.readEventDispatchError"), ex);
@@ -2950,6 +3085,36 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         }
 
         return event.countsAsProgress() || processedAnything;
+    }
+
+
+    /**
+     * Fails the connection behind a poll item after a hard stream read/hand-off
+     * IOException. A hard stream I/O failure is not recoverable for the stream;
+     * leaving the connection running with a half-registered stream would strand
+     * the request. The item may already have been deregistered by the cleanup
+     * path, so only Java references are used here.
+     *
+     * @param item The poll item whose handler raised the error
+     * @param ioe  The hard I/O error
+     */
+    private void failConnectionAfterStreamIoError(QuicPollItem item, IOException ioe) {
+        Object data = item.getAppData();
+        QuicConnectionWrapper conn = null;
+        if (data instanceof QuicStreamWrapper stream) {
+            conn = stream.getConnection();
+        } else if (data instanceof QuicConnectionWrapper connection) {
+            conn = connection;
+        }
+        if (conn == null) {
+            return;
+        }
+        try {
+            failConnection(conn, getDefaultStreamErrorCode(),
+                    "Stream I/O failure: " + ioe);
+        } catch (Throwable t) {
+            log.warn(sm.getString("quicEndpoint.connectionTeardownError"), t);
+        }
     }
 
 
@@ -3067,6 +3232,15 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * @param reason           A short description of the error (for logging)
      */
     public void failConnection(QuicConnectionWrapper conn, long protocolErrorCode, String reason) {
+        // A connection that is already closed or freed (for example after a
+        // peer close, a previous protocol error, or a race with another
+        // worker's failConnection hop) must not be touched again. Without
+        // this guard SSL_shutdown_ex/SSL_handle_events below would run on a
+        // freed SSL pointer. A connection already closing is left to its
+        // normal drain/ECD path, as in the quiche/ngtcp2 implementations.
+        if (conn == null || conn.isClosed() || conn.isFreed() || conn.isClosing()) {
+            return;
+        }
         if (log.isDebugEnabled()) {
             log.debug(reason + " conn=0x" + Long.toHexString(conn.getSsl().address())
                     + " protocolErrorCode=0x" + Long.toHexString(protocolErrorCode));
@@ -3168,61 +3342,140 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * documented accessors {@code BIO_ADDR_family()},
      * {@code BIO_ADDR_rawaddress()} and {@code BIO_ADDR_rawport()}.
      * <p>
-     * The address is captured once, at accept. QUIC connection migration
-     * (RFC 9000 Section 9) can legitimately move a live connection to a new
-     * client address afterwards; this endpoint does not re-read the peer
-     * address on migration, so {@code getRemoteAddr()} - and everything
-     * derived from it, such as {@code RemoteCIDRValve} decisions - keeps
-     * reporting the address the connection was accepted from. That matches
-     * the per-connection address semantics HTTP has always had over TCP, but
-     * is surprising for QUIC, where the same connection can outlive the
-     * reported address.
+     * The address is first captured at accept and refreshed before new
+     * incoming streams are accepted, so a request that starts after QUIC
+     * connection migration (RFC 9000 Section 9) reports the address it was
+     * actually received from. An already-running request keeps the address
+     * captured when its stream was accepted; that matches the per-request
+     * address semantics HTTP has always had over TCP and prevents the remote
+     * address from changing under an in-flight request.
      *
      * @param connSsl the connection SSL object
      * @param conn the connection wrapper to update
      */
     private void populatePeerAddress(MemorySegment connSsl, QuicConnectionWrapper conn)
             throws java.net.UnknownHostException {
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment bioAddr = arena.allocate(128);
-            int rc = QuicBindings.SSL_get_peer_addr(connSsl, bioAddr);
-            if (rc != 1) {
-                if (log.isDebugEnabled()) {
-                    log.debug("SSL_get_peer_addr rc=" + rc + " errors=" + QuicDiagnostics.dumpErrorQueue());
-                }
-                return;
+        MemorySegment bioAddr = QuicBindings.BIO_ADDR_new();
+        if (bioAddr == null || bioAddr.equals(MemorySegment.NULL)) {
+            if (log.isDebugEnabled()) {
+                log.debug("BIO_ADDR_new failed; peer address unavailable: "
+                        + QuicDiagnostics.dumpErrorQueue());
             }
-            int family = QuicBindings.BIO_ADDR_family(bioAddr);
-            if (family != QuicBindings.AF_INET && family != QuicBindings.AF_INET6) {
-                if (log.isDebugEnabled()) {
-                    log.debug("SSL_get_peer_addr unsupported family=" + family);
-                }
-                return;
-            }
-            // BIO_ADDR_rawport() hands back sin_port/sin6_port as the host
-            // reads it from the socket struct: the two memory bytes are
-            // network order, so the 16-bit result is the port byte-swapped
-            // on a little-endian host and already the plain port value on a
-            // big-endian one - twiddle only in the first case.
-            int rawPort = QuicBindings.BIO_ADDR_rawport(bioAddr) & 0xFFFF;
-            int port = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN
-                    ? ((rawPort & 0xFF) << 8) | (rawPort >>> 8)
-                    : rawPort;
-
-            int addrLen = family == QuicBindings.AF_INET ? 4 : 16;
-            MemorySegment rawAddr = arena.allocate(addrLen);
-            MemorySegment lenPtr = arena.allocate(ValueLayout.JAVA_LONG);
-            int addrRc = QuicBindings.BIO_ADDR_rawaddress(bioAddr, rawAddr, lenPtr);
-            long copied = lenPtr.get(ValueLayout.JAVA_LONG, 0);
-            if (addrRc != 1 || copied != addrLen) {
-                if (log.isDebugEnabled()) {
-                    log.debug("BIO_ADDR_rawaddress rc=" + addrRc + " len=" + copied);
-                }
-                return;
-            }
-            byte[] addr = rawAddr.toArray(ValueLayout.JAVA_BYTE);
-            conn.setRemoteAddress(new InetSocketAddress(InetAddress.getByAddress(addr), port));
+            return;
         }
+        try {
+            try (Arena arena = Arena.ofConfined()) {
+                int rc = QuicBindings.SSL_get_peer_addr(connSsl, bioAddr);
+                if (rc != 1) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("SSL_get_peer_addr rc=" + rc + " errors="
+                                + QuicDiagnostics.dumpErrorQueue());
+                    }
+                    return;
+                }
+                int family = QuicBindings.BIO_ADDR_family(bioAddr);
+                if (family != QuicBindings.AF_INET && family != QuicBindings.AF_INET6) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("SSL_get_peer_addr unsupported family=" + family);
+                    }
+                    return;
+                }
+                // BIO_ADDR_rawport() hands back sin_port/sin6_port as the host
+                // reads it from the socket struct: the two memory bytes are
+                // network order, so the 16-bit result is the port byte-swapped
+                // on a little-endian host and already the plain port value on a
+                // big-endian one - twiddle only in the first case.
+                int rawPort = QuicBindings.BIO_ADDR_rawport(bioAddr);
+                int port = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN
+                        ? ((rawPort & 0xFF) << 8) | (rawPort >>> 8)
+                        : rawPort;
+
+                int addrLen = family == QuicBindings.AF_INET ? 4 : 16;
+                MemorySegment rawAddr = arena.allocate(addrLen);
+                MemorySegment lenPtr = arena.allocate(ValueLayout.JAVA_LONG);
+                int addrRc = QuicBindings.BIO_ADDR_rawaddress(bioAddr, rawAddr, lenPtr);
+                long copied = lenPtr.get(ValueLayout.JAVA_LONG, 0);
+                if (addrRc != 1 || copied != addrLen) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("BIO_ADDR_rawaddress rc=" + addrRc + " len=" + copied);
+                    }
+                    return;
+                }
+                byte[] addr = rawAddr.toArray(ValueLayout.JAVA_BYTE);
+                conn.setRemoteAddress(unmapIpv4Mapped(
+                        new InetSocketAddress(InetAddress.getByAddress(addr), port)));
+            }
+        } finally {
+            QuicBindings.BIO_ADDR_free(bioAddr);
+        }
+    }
+
+
+    /**
+     * Refreshes a live connection's remote address from OpenSSL before new
+     * streams are accepted. {@code SSL_get_peer_addr()} returns the channel's
+     * current peer address, which follows a validated client migration
+     * (RFC 9000 Section 9). Called on the poll thread only while the
+     * connection's SSL is live; failures leave the previously captured
+     * address in place, matching the pre-refresh behaviour.
+     *
+     * @param conn The connection to refresh
+     */
+    private void refreshPeerAddress(QuicConnectionWrapper conn) {
+        if (conn == null || conn.isClosed() || conn.isFreed()) {
+            return;
+        }
+        try {
+            populatePeerAddress(conn.getSsl(), conn);
+        } catch (java.net.UnknownHostException e) {
+            if (log.isDebugEnabled()) {
+                log.debug("Could not refresh peer address for conn=0x"
+                        + Long.toHexString(conn.getSslAddress()), e);
+            }
+        }
+    }
+
+
+    /**
+     * Converts an IPv4-mapped IPv6 address ({@code ::ffff/96}, RFC 4291
+     * Section 2.5.5.2) to the plain IPv4 address it carries. A dual-stack
+     * wildcard bind delivers IPv4 datagrams with v4-mapped sockaddrs; the
+     * java.net transports report the IPv4 form of such peers, so address-based
+     * valves and access logs must see the same form here. Mirrors
+     * {@code QuicheBindings.unmapIpv4Mapped()}.
+     *
+     * @param address The address to normalise, may be {@code null}
+     *
+     * @return The plain IPv4 address when {@code address} was mapped,
+     *         otherwise the original address
+     *
+     * @throws java.net.UnknownHostException If the four-byte address cannot be
+     *         constructed (never for a valid v4-mapped address)
+     */
+    private static InetSocketAddress unmapIpv4Mapped(InetSocketAddress address)
+            throws java.net.UnknownHostException {
+        if (address == null) {
+            return null;
+        }
+        InetAddress addr = address.getAddress();
+        if (!(addr instanceof java.net.Inet6Address)) {
+            return address;
+        }
+        byte[] b = addr.getAddress();
+        if (b.length != 16) {
+            return address;
+        }
+        for (int i = 0; i < 10; i++) {
+            if (b[i] != 0) {
+                return address;
+            }
+        }
+        if ((b[10] & 0xFF) != 0xFF || (b[11] & 0xFF) != 0xFF) {
+            return address;
+        }
+        return new InetSocketAddress(
+                InetAddress.getByAddress(new byte[] { b[12], b[13], b[14], b[15] }),
+                address.getPort());
     }
 
 
@@ -3320,7 +3573,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     }
 
 
-    private void handleIncomingConnection(QuicPollItem listenerItem) throws Exception {
+    private void handleIncomingConnection() throws Exception {
         if (paused) {
             // A paused endpoint accepts no new connections (the contract every
             // AbstractEndpoint implementation honours). Existing connections
@@ -3381,11 +3634,37 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             return;
         }
 
+        // The accepted connection does not consistently inherit the
+        // context's write modes in this OpenSSL build (the QUIC connection's
+        // default stream mode reads back as zero here), so apply the stream
+        // write modes explicitly to the connection. Stream SSL objects
+        // created from it inherit them: without
+        // SSL_MODE_ENABLE_PARTIAL_WRITE a would-blocked stream write stays
+        // in an all-or-nothing retry state, and without
+        // SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER the retry from a freshly
+        // staged remainder buffer fails with SSL_R_BAD_WRITE_RETRY.
+        long streamWriteModeRc = QuicBindings.SSL_ctrl(connSsl,
+                QuicBindings.SSL_CTRL_MODE,
+                QuicBindings.SSL_MODE_ENABLE_PARTIAL_WRITE |
+                        QuicBindings.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER,
+                MemorySegment.NULL);
+        long streamWriteModes = QuicBindings.SSL_MODE_ENABLE_PARTIAL_WRITE |
+                QuicBindings.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER;
+        if ((streamWriteModeRc & streamWriteModes) != streamWriteModes) {
+            // Without these modes a stream write that would-blocks has to be
+            // retried with the exact same buffer address, which the write
+            // paths (staging into a fresh buffer per attempt) cannot honour.
+            openssl_h.SSL_free(connSsl);
+            throw new IOException(sm.getString("quicEndpoint.contextCreateError"));
+        }
+
         QuicConnectionWrapper conn = new QuicConnectionWrapper(connSsl,
                 getCleanerConnectionFrees());
         connections.put(connSsl.address(), conn);
         QuicPollItem connItem = null;
         try {
+            // OpenSSL exposes no per-connection local-address accessor; report
+            // the configured bind address (wildcard for the default bind).
             conn.setLocalAddress(bindAddress);
             // Resolve the peer (client) address so request.getRemoteAddr()/
             // getPeerAddr() report the real client address (e.g. for
@@ -3420,8 +3699,19 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
             QuicConnectionManager connManager =
                     getQuicProtocol().createQuicConnectionManager();
-            connManager.connectionOpen(conn);
+            // Register the manager before connectionOpen(): if the protocol
+            // callback throws after creating per-connection state, teardown
+            // can still call connectionClose(); and if it fails the connection
+            // inline the manager must already be reachable from the wrapper.
             conn.setQuicConnectionManager(connManager);
+            connManager.connectionOpen(conn);
+            if (!isConnectionLive(conn)) {
+                // connectionOpen() may fail the connection (or another
+                // protocol callback may have done so), in which case the
+                // native connection SSL is already freed/deferred. Do not
+                // continue with bootstrap on freed native state.
+                return;
+            }
 
             // Accept the client's streams and create the server's, honouring the
             // order the protocol bootstrap requires (see bootstrapIncomingStreams).
@@ -3452,9 +3742,10 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 log.debug("handleIncomingConnection: conn=0x" + Long.toHexString(connSsl.address()) +
                         " bidiAccepted=" + bidiAccepted + " uniAccepted=" + uniAccepted);
             }
-        } catch (Exception e) {
+        } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             log.warn(sm.getString("quicEndpoint.connectionSetupError",
-                    Long.toHexString(connSsl.address())), e);
+                    Long.toHexString(connSsl.address())), t);
             abortConnectionSetup(conn);
         }
     }
@@ -3463,21 +3754,32 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     /**
      * Applies the per-connection transport settings immediately after the
      * connection object is created: non-blocking mode, multi-stream
-     * (no-default-stream) mode and EXPLICIT event-handling mode. All are best
-     * effort - a failure is logged and the connection continues with
-     * OpenSSL's defaults, matching the previous inline behaviour.
+     * (no-default-stream) mode and EXPLICIT event-handling mode. The blocking
+     * mode and default stream mode are required for HTTP/3 (HTTP/3 needs
+     * stream-aware, non-blocking operation), so a failure aborts the connection
+     * setup; the EXPLICIT mode is an optimisation and remains best effort.
      *
      * @param connSsl The connection SSL (live)
+     *
+     * @throws IOException If a required transport setting could not be applied
      */
-    private void configureConnectionTransport(MemorySegment connSsl) {
-        QuicBindings.SSL_set_blocking_mode(connSsl, 0);
+    private void configureConnectionTransport(MemorySegment connSsl) throws IOException {
+        int blockingRc = QuicBindings.SSL_set_blocking_mode(connSsl, 0);
+        if (blockingRc != 1) {
+            throw new IOException(sm.getString("quicEndpoint.sslSetBlockingModeError",
+                    Integer.valueOf(blockingRc)));
+        }
 
         // Disable default stream mode: HTTP/3 requires explicit stream
         // management (multi-stream mode). Without this, OpenSSL may
         // auto-associate a single stream with the connection object, causing
         // conflicts when we create multiple streams.
-        QuicBindings.SSL_set_default_stream_mode(
+        int streamModeRc = QuicBindings.SSL_set_default_stream_mode(
                 connSsl, QuicBindings.SSL_DEFAULT_STREAM_MODE_NONE);
+        if (streamModeRc != 1) {
+            throw new IOException(sm.getString("quicEndpoint.setDefaultStreamModeError",
+                    Integer.valueOf(streamModeRc)));
+        }
 
         configureExplicitEventHandling(connSsl);
     }
@@ -3561,10 +3863,16 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * additional error code).
      *
      * @param connSsl The connection SSL (live)
+     *
+     * @throws IOException If the policy could not be applied
      */
-    private void configureIncomingStreamPolicy(MemorySegment connSsl) {
+    private void configureIncomingStreamPolicy(MemorySegment connSsl) throws IOException {
         int policyRc = QuicBindings.SSL_set_incoming_stream_policy(
                 connSsl, QuicBindings.SSL_INCOMING_STREAM_POLICY_ACCEPT, 0L);
+        if (policyRc != 1) {
+            throw new IOException(sm.getString("quicEndpoint.setIncomingStreamPolicyError",
+                    Integer.valueOf(policyRc)));
+        }
         if (log.isDebugEnabled()) {
             log.debug("SSL_set_incoming_stream_policy(ACCEPT) rc=" + policyRc);
         }
@@ -3641,7 +3949,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * @return a two element array {uniAccepted, bidiAccepted}
      */
     private int[] bootstrapIncomingStreams(MemorySegment connSsl, QuicConnectionWrapper conn,
-            QuicPollItem connItem) {
+            QuicPollItem connItem) throws IOException {
         // Gate stream processing (including the inline pre-read of client UNI
         // streams below) on the negotiated ALPN being one the application
         // protocol serves. The ALPN select callback normally rejects an
@@ -3697,7 +4005,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
 
     /**
-     * Tears down a connection whose setup in {@link #handleIncomingConnection(QuicPollItem)}
+     * Tears down a connection whose setup in {@link #handleIncomingConnection()}
      * failed. The teardown itself is {@link #teardownConnection}'s single
      * implementation - the two used to be near-copies that had already begun
      * to diverge under failure, so the common body lives in one place. The
@@ -3720,8 +4028,19 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * the failure happened before it existed).
      */
     private void abortConnectionSetup(QuicConnectionWrapper conn) {
+        if (conn == null) {
+            return;
+        }
         try {
-            teardownConnection(conn, null);
+            // An inline protocol failure (failConnection) may already have
+            // torn the connection down and freed its SSL. Calling teardown
+            // again on that wrapper would run native stream/connection frees
+            // and flush callbacks on freed pointers; the teardown-started CAS
+            // is the authoritative guard, but skip the call entirely when the
+            // SSL is known to be gone.
+            if (!conn.isFreed()) {
+                teardownConnection(conn, null);
+            }
         } catch (Throwable t) {
             log.warn(sm.getString("quicEndpoint.connectionSetupAbortError"), t);
         }
@@ -3888,6 +4207,14 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     log.debug("Server unidirectional stream index " + index +
                             " already exists; stopping creation for this pass");
                 }
+                // Clear OSU interest: otherwise the level-triggered OSU event
+                // (stream credit is still available) re-enters this method and
+                // immediately breaks here on every poll iteration when the
+                // protocol manager fails to advance past the existing index.
+                // A later client-data trigger may re-add OSU, but it will not
+                // be re-armed by this no-progress path.
+                connItem.setWantEvents(connItem.getWantEvents() &
+                        ~QuicPoll.SSL_POLL_EVENT_OSU);
                 break;
             }
             MemorySegment streamSsl = newUniStream(connItem.getSsl(), streamInfo);
@@ -3986,7 +4313,14 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     // parked in a synchronous read or write on the stream.
                     streamWrapper.signalReadWaiter();
                     streamWrapper.signalWriteWaiter();
-                    if (sw.getStreamType() == QuicPoll.SSL_STREAM_TYPE_BIDI) {
+                    if (sw.getStreamType() == QuicPoll.SSL_STREAM_TYPE_BIDI &&
+                            !streamWrapper.isClosed()) {
+                        // Do not dispatch terminal events to a wrapper whose
+                        // request already completed: its close path may have
+                        // failed to remove it from streamWrappers (for example
+                        // a timed-out onPollThread hop), but processing it
+                        // again would run handler code on a released wrapper.
+                        // quiche/ngtcp2 apply the same guard.
                         streamWrapperList.add(streamWrapper);
                     }
                 }
@@ -4120,8 +4454,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * ERROR dispatch on connection close (the wake-up OPEN_READ dispatch may
      * still be owned by a worker) and for dispatch events that find the
      * processing claim busy (the lost-claim fallbacks in the stream dispatch
-     * paths; the call site in {@link QuicSocketProcessor#doRun()} is
-     * currently unreached scaffolding - see that class' comment).
+     * paths; the call site in {@link QuicSocketProcessor#doRun()} is the live
+     * async-completion/dispatch path - see that class' comment).
      * <p>
      * Waiting for the flag on the poll thread would stall every other
      * connection for as long as the owner's handler runs, so the attempt is
@@ -4239,6 +4573,12 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             return;
         }
 
+        // A client may have migrated since the connection was accepted
+        // (RFC 9000 Section 9). Refresh before accepting new streams so the
+        // socket wrappers created for this batch report the address the
+        // packets actually came from.
+        refreshPeerAddress(conn);
+
         long revents = connItem.getRevents();
         if (log.isDebugEnabled()) {
             log.debug("handleIncomingStream called, revents=0x" + Long.toHexString(revents));
@@ -4348,7 +4688,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      *
      * @return the number of bytes appended (possibly 0)
      */
-    private int drainStreamInto(QuicStreamWrapper stream, MemorySegment ssl, ByteBuffer readBuf) {
+    private int drainStreamInto(QuicStreamWrapper stream, MemorySegment ssl, ByteBuffer readBuf)
+            throws IOException {
         int space = readBuf.remaining();
         if (space <= 0) {
             return 0;
@@ -4376,8 +4717,24 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             }
 
             if (rc == 0) {
+                // SSL_get_error() must be read before any other native call;
+                // only WANT_READ/WANT_WRITE are retryable. A clean FIN is
+                // reported as ZERO_RETURN (equivalent to EOF), and a hard
+                // read failure with a still-OK stream state must surface as
+                // IOException instead of being treated as would-block.
+                int sslError = QuicBindings.SSL_get_error(ssl, 0);
                 stream.setReadState(QuicStreamWrapper.mapNativeState(
                         QuicBindings.SSL_get_stream_read_state(ssl)));
+                if (sslError == QuicBindings.SSL_ERROR_ZERO_RETURN) {
+                    stream.setReadState(QuicStream.ReadState.FINISHED);
+                } else if (sslError != QuicBindings.SSL_ERROR_WANT_READ &&
+                        sslError != QuicBindings.SSL_ERROR_WANT_WRITE) {
+                    throw new IOException(sm.getString(
+                            "quicEndpoint.streamReadNativeError",
+                            Long.valueOf(stream.getStreamId()),
+                            Integer.valueOf(sslError),
+                            QuicDiagnostics.dumpErrorQueue()));
+                }
             }
             return 0;
         }
@@ -4402,7 +4759,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * @return the number of bytes appended
      */
     private int drainStreamImmediately(MemorySegment streamSsl, long streamId,
-            String kind, QuicStreamWrapper stream, ByteBuffer readBuf) {
+            String kind, QuicStreamWrapper stream, ByteBuffer readBuf)
+            throws IOException {
         int totalRead = 0;
         for (int attempt = 0; attempt < READ_DRAIN_MAX_ATTEMPTS; attempt++) {
             if (readBuf.remaining() == 0) {
@@ -4460,7 +4818,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * stream FINISHED, data which arrived but was not read is no longer
      * retrievable, so acceptance and the first read must stay adjacent.
      */
-    private void readBidiStreamImmediately(MemorySegment streamSsl, long streamId, QuicConnectionWrapper conn) {
+    private void readBidiStreamImmediately(MemorySegment streamSsl, long streamId, QuicConnectionWrapper conn)
+            throws IOException {
         QuicStreamWrapper stream = locateImmediatelyReadableStream(streamId, conn);
         if (stream == null) {
             return;
@@ -4491,7 +4850,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * #readBidiStreamImmediately}) and hands the buffered bytes to the
      * application protocol inline.
      */
-    private void readUnidirectionalStreamImmediately(MemorySegment streamSsl, long streamId, QuicConnectionWrapper conn) {
+    private void readUnidirectionalStreamImmediately(MemorySegment streamSsl, long streamId, QuicConnectionWrapper conn)
+            throws IOException {
         QuicStreamWrapper stream = locateImmediatelyReadableStream(streamId, conn);
         if (stream == null) {
             return;
@@ -4550,7 +4910,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      */
     private int acceptStreams(MemorySegment connSsl, long acceptFlag,
             QuicConnectionWrapper conn, String logPrefix,
-            boolean readImmediately) {
+            boolean readImmediately) throws IOException {
         int accepted = 0;
         for (int attempt = 0; attempt < MAX_ACCEPT_PER_EVENT; attempt++) {
             if (!isConnectionLive(conn)) {
@@ -4755,6 +5115,12 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      *            freed (used to flush a queued CONNECTION_CLOSE)
      */
     private void teardownConnection(QuicConnectionWrapper conn, Runnable afterStreamsFreed) {
+        if (conn == null || conn.isFreed() || !conn.markTeardownStarted()) {
+            // Already torn down (or its SSL is already gone): repeating the
+            // native stream/connection frees and flush callbacks would use a
+            // freed connection SSL. The first caller owns the whole teardown.
+            return;
+        }
         assertNativeAccess("teardownConnection");
         conn.setClosed();
         QuicConnectionManager connManager = conn.getQuicConnectionManager();
@@ -4828,7 +5194,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
 
     private void processAcceptedStream(MemorySegment streamSsl, long streamId,
-            int streamType, QuicConnectionWrapper conn) {
+            int streamType, QuicConnectionWrapper conn) throws IOException {
         if (log.isDebugEnabled()) {
             log.debug("Stream accepted: id=" + streamId + " type=" + streamType);
         }
@@ -4836,81 +5202,156 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         QuicStreamWrapper stream = new QuicStreamWrapper(
                  streamSsl, streamId, streamType, conn,
                  ByteBuffer.allocate(readBufferSize));
+        try {
 
-         // Reference: stream monitors ER | EW base events only.
-         // R and W are managed separately via pe_resume_read/pe_pause_write.
-        long events = QuicPoll.SSL_POLL_EVENT_ER |
-                  QuicPoll.SSL_POLL_EVENT_EW;
-        QuicPollItem streamItem = new QuicPollItem(streamSsl, events, stream);
-        stream.setPollItem(streamItem);
+            // Reference: stream monitors ER | EW base events only.
+            // R and W are managed separately via pe_resume_read/pe_pause_write.
+            long events = QuicPoll.SSL_POLL_EVENT_ER |
+                      QuicPoll.SSL_POLL_EVENT_EW;
+            QuicPollItem streamItem = new QuicPollItem(streamSsl, events, stream);
+            stream.setPollItem(streamItem);
 
-        // Check the concurrent stream limit before tracking the stream: a
-        // refused stream must not enter the connection's stream map, since
-        // deregistration derives the active-stream decrement from map
-        // membership (see deregisterAndReleaseStream()) and a refused stream
-        // was never counted by incrementActiveStreams().
-        if (streamType == QuicPoll.SSL_STREAM_TYPE_BIDI) {
-            QuicConnectionManager connManager = conn.getQuicConnectionManager();
-            if (connManager != null) {
-                QuicConnectionManager.ConnectionState state = connManager.getState(conn);
-                if (state != null && !state.canAcceptStream(streamId)) {
-                    log.warn(sm.getString("quicEndpoint.streamLimitReached",
-                                  Long.toHexString(conn.getSslAddress()),
-                                  Long.valueOf(streamId)));
-                          // Inform the client that no new streams will be
-                          // accepted so it stops creating them (HTTP/3
-                          // GOAWAY, RFC 9114 Section 7.2.6).
-                    sendStreamLimitNotification(connManager, state);
-                    // Tell the peer why this stream is refused BEFORE the
-                    // stream SSL is freed: freeing without a prior reset
-                    // makes OpenSSL emit a spurious error-0 (NO_ERROR)
-                    // RESET_STREAM, which gives the client no signal to back
-                    // off (resetStream warns if the reset itself fails).
-                    resetStream(stream, getStreamRejectErrorCode());
-                    // The abandoned stream owes the protocol its
-                    // abandonment bookkeeping (for HTTP/3: a QPACK Stream
-                    // Cancellation, RFC 9204 Section 2.2.2.2) even though no
-                    // processor ever read a byte of it.
-                    connManager.noteStreamRejected(conn, streamId);
-                    // The stream was never tracked or counted: releasing it
-                    // leaves the active-stream counter unchanged.
-                    closeStreamByHandler(stream);
-                    return;
+            // Check the concurrent stream limit before tracking the stream: a
+            // refused stream must not enter the connection's stream map, since
+            // deregistration derives the active-stream decrement from map
+            // membership (see deregisterAndReleaseStream()) and a refused stream
+            // was never counted by incrementActiveStreams().
+            if (streamType == QuicPoll.SSL_STREAM_TYPE_BIDI) {
+                QuicConnectionManager connManager = conn.getQuicConnectionManager();
+                if (connManager != null) {
+                    QuicConnectionManager.ConnectionState state = connManager.getState(conn);
+                    if (state != null && !state.canAcceptStream(streamId)) {
+                        long now = System.currentTimeMillis();
+                        long count = ++streamLimitWarnCount;
+                        if (now - lastStreamLimitWarnLogMs >= STREAM_LIMIT_LOG_INTERVAL_MS) {
+                            lastStreamLimitWarnLogMs = now;
+                            log.warn(sm.getString("quicEndpoint.streamLimitReached",
+                                    Long.toHexString(conn.getSslAddress()),
+                                    Long.valueOf(streamId), Long.valueOf(count)));
+                        }
+                        // A single GOAWAY announces that the peer must stop
+                        // opening streams; successive identifiers may not
+                        // increase, so repeated refusals must not append
+                        // duplicate frames to the primary stream buffer.
+                        if (!conn.isStreamLimitGoawaySent()) {
+                            conn.setStreamLimitGoawaySent(true);
+                            // Inform the client that no new streams will be
+                            // accepted so it stops creating them (HTTP/3
+                            // GOAWAY, RFC 9114 Section 7.2.6).
+                            sendStreamLimitNotification(connManager, state);
+                        }
+                        // Tell the peer why this stream is refused BEFORE the
+                        // stream SSL is freed: freeing without a prior reset
+                        // makes OpenSSL emit a spurious error-0 (NO_ERROR)
+                        // RESET_STREAM, which gives the client no signal to back
+                        // off (resetStream warns if the reset itself fails).
+                        resetStream(stream, getStreamRejectErrorCode());
+                        // The refused stream is deliberately not tracked in the
+                        // connection's stream map (see the comment above). Free its
+                        // SSL *before* handing the rejection to the protocol: the
+                        // noteStreamRejected() callback can fail the connection
+                        // when the QPACK decoder backlog is full, and a connection
+                        // teardown must never free the connection before an
+                        // untracked stream SSL that still references it. The
+                        // reset above already pumped the engine so the RESET_STREAM
+                        // frame has been flushed.
+                        stream.setDeregistered();
+                        boolean freed = false;
+                        try {
+                            freed = stream.freeSslIfIdle();
+                        } catch (Throwable t) {
+                            log.warn(sm.getString("quicEndpoint.streamSslFreeError",
+                                    Long.toHexString(stream.getSslAddress())), t);
+                        }
+                        try {
+                            if (freed) {
+                                // The abandoned stream owes the protocol its
+                                // abandonment bookkeeping (for HTTP/3: a QPACK
+                                // Stream Cancellation, RFC 9204 Section 2.2.2.2)
+                                // even though no processor ever read a byte of it.
+                                connManager.noteStreamRejected(conn, streamId);
+                            } else if (log.isDebugEnabled()) {
+                                log.debug("Rejected stream " + streamId
+                                        + " is still-owned; deferring its SSL free");
+                            }
+                        } finally {
+                            // Remove the never-promoted poll item and release the
+                            // wrapper bookkeeping. The SSL free above (or the
+                            // deferred worker free) is already CAS-guarded, so the
+                            // close path is a no-op for the native object.
+                            closeStreamByHandler(stream);
+                        }
+                        return;
+                    }
+                    state.incrementActiveStreams();
+                    state.setLastProcessedStreamId(streamId);
                 }
-                state.incrementActiveStreams();
-                state.setLastProcessedStreamId(streamId);
             }
-        }
 
-        conn.getStreams().put(streamId, stream);
+            conn.getStreams().put(streamId, stream);
 
-        // Park the stream outside the poll set: it is promoted once the
-        // server control stream exists (immediately below, or by
-        // addPendingStreamsToPollSet), so stream events are only delivered
-        // once the connection's HTTP/3 state (server control stream /
-        // SETTINGS created via QuicConnectionManager) exists.
-        conn.getPendingStreams().add(stream);
+            // Park the stream outside the poll set: it is promoted once the
+            // server control stream exists (immediately below, or by
+            // addPendingStreamsToPollSet), so stream events are only delivered
+            // once the connection's HTTP/3 state (server control stream /
+            // SETTINGS created via QuicConnectionManager) exists.
+            conn.getPendingStreams().add(stream);
 
-        if (streamType == QuicPoll.SSL_STREAM_TYPE_BIDI) {
+            if (streamType == QuicPoll.SSL_STREAM_TYPE_BIDI) {
 
-                // If the primary server unidirectional stream already
-                // exists, promote this stream immediately
-            if (conn.getServerUniStream(0) != null) {
-                conn.getPendingStreams().remove(stream);
-                    // Pre-read stream data into buffer before adding to poll set,
-                    // since processSocketInline will read from the buffer first.
-                    // If we don't pre-read, SSL_handle_events may process FIN before data read.
-                readBidiStreamImmediately(streamSsl, streamId, conn);
-                addPendingStreamToPollSet(stream, streamItem);
+                    // If the primary server unidirectional stream already
+                    // exists, promote this stream immediately
+                if (conn.getServerUniStream(0) != null) {
+                    conn.getPendingStreams().remove(stream);
+                        // Pre-read stream data into buffer before adding to poll set,
+                        // since processSocketInline will read from the buffer first.
+                        // If we don't pre-read, SSL_handle_events may process FIN before data read.
+                    readBidiStreamImmediately(streamSsl, streamId, conn);
+                    addPendingStreamToPollSet(stream, streamItem);
+                } else {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Bidirectional stream " + streamId + " (read deferred, pending poll set)");
+                    }
+                }
             } else {
                 if (log.isDebugEnabled()) {
-                    log.debug("Bidirectional stream " + streamId + " (read deferred, pending poll set)");
+                    log.debug("Unidirectional stream " + streamId + " (type=" + streamType + ", read deferred, pending poll set)");
                 }
             }
-        } else {
-            if (log.isDebugEnabled()) {
-                log.debug("Unidirectional stream " + streamId + " (type=" + streamType + ", read deferred, pending poll set)");
+        } catch (Exception e) {
+            // A setup/hand-off failure before the stream is fully registered
+            // must not leave an untracked stream SSL behind: a later connection
+            // teardown cannot see it in the stream map and would free the
+            // connection before the stream SSL. Remove whatever tracking was
+            // established, release the SSL if no worker owns it, then let the
+            // caller abort the connection setup.
+            cleanupAcceptedStream(stream);
+            throw e;
+        }
+    }
+
+
+    /**
+     * Best-effort removal/release of a partially processed accepted stream.
+     * Called when {@link #processAcceptedStream} fails before returning.
+     *
+     * @param stream The partially registered stream
+     */
+    private void cleanupAcceptedStream(QuicStreamWrapper stream) {
+        try {
+            deregisterAndReleaseStream(stream);
+        } catch (Throwable t) {
+            log.warn(sm.getString("quicEndpoint.streamSslFreeError",
+                    Long.toHexString(stream.getSslAddress())), t);
+        }
+        try {
+            if (!stream.isFreed()) {
+                stream.setDeregistered();
+                stream.freeSslIfIdle();
             }
+        } catch (Throwable t) {
+            log.warn(sm.getString("quicEndpoint.streamSslFreeError",
+                    Long.toHexString(stream.getSslAddress())), t);
         }
     }
 
@@ -4920,7 +5361,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * Reference: app_read_cb reads from the stream and processes the data.
      * Data is passed to QuicConnectionManager for control stream processing.
      */
-    private void readUnidirectionalStream(QuicStreamWrapper stream, QuicPollItem item) {
+    private void readUnidirectionalStream(QuicStreamWrapper stream, QuicPollItem item)
+            throws IOException {
         // Defensive: the stream's native SSL object may have been freed by
         // connection teardown before this dispatch ran.
         if (!isStreamLive(stream)) {
@@ -5122,8 +5564,13 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             return;
         }
         if (state.isCriticalClientUniStream(stream.getStreamId())) {
-            log.warn(sm.getString("quicEndpoint.criticalStreamClosed",
-                    Long.valueOf(stream.getStreamId())));
+            long now = System.currentTimeMillis();
+            if (now - lastCriticalStreamClosedLogMs >=
+                    SECURITY_WARNING_LOG_INTERVAL_MS) {
+                lastCriticalStreamClosedLogMs = now;
+                log.warn(sm.getString("quicEndpoint.criticalStreamClosed",
+                        Long.valueOf(stream.getStreamId())));
+            }
             failConnection(conn, state.getClosedCriticalStreamErrorCode(),
                     "Client closed critical unidirectional stream " +
                     stream.getStreamId());
@@ -5136,6 +5583,9 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
    * Called on every poll iteration to ensure no streams are missed.
    */
     private void acceptPendingBidiStreams(QuicPollItem connItem, QuicConnectionWrapper conn) throws Exception {
+        // The peer may have migrated before this closing-path accept; use the
+        // current peer address for any wrapper created for these streams.
+        refreshPeerAddress(conn);
         int accepted = acceptStreams(connItem.getSsl(),
                   QuicPoll.SSL_ACCEPT_STREAM_UNI, conn,
                   "acceptPendingStreams: accepted UNI", false) +
@@ -5373,7 +5823,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     }
 
 
-    private void dispatchStreamEvent(QuicPollItem item, SocketEvent event) {
+    private void dispatchStreamEvent(QuicPollItem item, SocketEvent event)
+            throws IOException {
         // The poll loop routes any item with R/W that has no IC/IS/OS/CC
         // counterpart here. Connection poll items (app data =
         // QuicConnectionWrapper, requested with the all-events want mask)
@@ -5514,7 +5965,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * @param stream  The stream
      */
     private void prefetchStreamData(QuicOpenSSLSocketWrapper wrapper,
-            QuicStreamWrapper stream) {
+            QuicStreamWrapper stream) throws IOException {
         SocketBufferHandler socketBufferHandler = wrapper.getSocketBufferHandler();
         ByteBuffer socketBuf = socketBufferHandler.getReadBuffer();
         socketBufferHandler.configureReadBufferForWrite();
@@ -5606,7 +6057,11 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             stream.clearProcessing();
             wakeClaimWaiters(stream, conn);
             if (conn != null) {
-                conn.decrActiveHandlers();
+                // Queue any deferred stream SSL free and release the
+                // scheduling active-handler reference before failing the
+                // connection; the teardown drains pending stream frees before
+                // freeing the connection SSL.
+                finishStreamDispatch(stream, conn, true);
                 if (!conn.isClosing() && !conn.isClosed()) {
                     failConnection(conn, getConnectionRejectErrorCode(),
                             "No executor available for the dispatch of stream " +
@@ -5642,7 +6097,11 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 conn.decrQueuedDispatch(stream);
                 stream.clearProcessing();
                 wakeClaimWaiters(stream, conn);
-                conn.decrActiveHandlers();
+                // Queue any deferred stream SSL free and release the
+                // active-handler reference before failing the connection.
+                // The teardown drains pending stream frees before the
+                // connection SSL free, preserving SSL_new_stream(3) order.
+                finishStreamDispatch(stream, conn, true);
                 if (!conn.isClosing() && !conn.isClosed()) {
                     failConnection(conn, getConnectionRejectErrorCode(),
                             "Executor rejected the dispatch for stream " +
@@ -5664,8 +6123,9 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * active-handler accounting have a single owner: the poll path (through
      * the {@link #dispatchToExecutor} lambda, {@code longRearm} {@code
      * true}) and the processor-driven async re-dispatch path (through
-     * {@code QuicSocketProcessor.doRun()}, {@code longRearm} {@code false}
-     * - currently unreached scaffolding, see that class' comment).
+     * {@code QuicSocketProcessor.doRun()}, {@code longRearm} {@code false};
+     * that is the live async-completion/dispatch path, see that class'
+     * comment).
      *
      * @param longRearm {@code true} for poll-path dispatches, where a LONG
      *            return means the processor wants to keep the stream open for
@@ -5759,7 +6219,17 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             // until then, so its Cleaner cannot free the connection SSL
             // under a live stream reference.
             if (!submitPollTask(() -> {
-                drainPendingStreamFrees();
+                if (!conn.isFreed()) {
+                    // The close frame queued by failConnection()/stop may
+                    // still be pending: the teardown callback flushed it while
+                    // the active handler's stream SSLs were still alive, which
+                    // is not a reliable transmission point. Now that the last
+                    // stream SSL has been drained above, drive the engine once
+                    // more to flush the CONNECTION_CLOSE before freeing the
+                    // connection SSL (otherwise SSL_free discards the frame).
+                    drainPendingStreamFrees();
+                    flushConnectionClose(conn.getSsl());
+                }
                 conn.freeSslOnce();
                 stoppedBusyConnections.remove(conn);
             })) {
@@ -6232,10 +6702,16 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             // The reset never landed within the retry budget: the intended
             // error code is lost and OpenSSL will emit a spurious error-0
             // RESET_STREAM when the stream is later freed. Surface it so the
-            // transport behavior can be diagnosed.
-            log.warn(sm.getString("quicEndpoint.streamResetFailed",
-                    Long.valueOf(stream.getStreamId()),
-                    Long.valueOf(appErrorCode)));
+            // transport behavior can be diagnosed, but rate-limit it: a client
+            // can trigger the failure repeatedly.
+            long now = System.currentTimeMillis();
+            if (now - lastStreamResetFailedLogMs >=
+                    SECURITY_WARNING_LOG_INTERVAL_MS) {
+                lastStreamResetFailedLogMs = now;
+                log.warn(sm.getString("quicEndpoint.streamResetFailed",
+                        Long.valueOf(stream.getStreamId()),
+                        Long.valueOf(appErrorCode)));
+            }
         }
         return resetDone;
     }
@@ -6376,18 +6852,23 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             return;
         }
 
-        try {
-            if (wrapper != null) {
-                try {
-                    processSocketInline(wrapper, clean ? SocketEvent.DISCONNECT : SocketEvent.ERROR);
-                } catch (Exception e) {
-                    ExceptionUtils.handleThrowable(e);
-                }
-            }
-        } finally {
-            stream.clearProcessing();
-            wakeClaimWaiters(stream, conn);
+        if (wrapper != null) {
+            // Hand the claimed processing flag to the normal executor dispatch
+            // instead of running handler.process() on the poll thread. The
+            // poll thread must never acquire the wrapper's writeLock through
+            // application handler code: an async writer may hold that lock
+            // while waiting for this same poll thread to service its native
+            // hop, which would deadlock the whole endpoint.
+            // runStreamDispatch()/finishStreamDispatch() take over the claim
+            // release, active-handler accounting and the deferred stream SSL
+            // free.
+            dispatchToExecutor(wrapper, stream,
+                    clean ? SocketEvent.DISCONNECT : SocketEvent.ERROR, true);
+            return;
         }
+
+        stream.clearProcessing();
+        wakeClaimWaiters(stream, conn);
 
         // Defer the native free until the next poll iteration, after
         // SSL_poll() has flushed any pending packets (for example a
@@ -6405,15 +6886,17 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     // ------------------------------------- Socket Processor
 
     /*
-     * Currently unreached scaffolding: this processor is only ever created
-     * through AbstractEndpoint.processSocket() -> createSocketProcessor(),
-     * and no code path dispatches a QUIC wrapper through processSocket -
-     * this endpoint runs its own dispatchToExecutor() ->
-     * executor.execute(lambda) path, so the claim/requeue/cache logic below
-     * has no production caller today. The override exists because
-     * AbstractEndpoint declares createSocketProcessor() abstract. Reason
-     * about dispatch from dispatchToExecutor()/runStreamDispatch(), not
-     * from this class. (The quiche endpoint has the same unreached shape.)
+     * Socket processor used for events that arrive through
+     * {@link AbstractEndpoint#processSocket}. The poll loop's own dispatches
+     * use {@code dispatchToExecutor()}, but async servlet completion,
+     * dispatch, error and timeout events from {@code AbstractProcessor}
+     * reach this class through
+     * {@code SocketWrapperBase.processSocket()} ->
+     * {@code AbstractEndpoint.processSocket()} ->
+     * {@code createSocketProcessor()}. It is therefore a live dispatch path
+     * and must keep the same claim, active-handler and requeue accounting as
+     * the poll-path dispatch. (The quiche endpoint's own processor has the
+     * same live role.)
      */
     private class QuicSocketProcessor extends SocketProcessorBase<QuicStream> {
 

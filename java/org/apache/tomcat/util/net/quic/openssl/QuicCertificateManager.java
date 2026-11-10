@@ -104,6 +104,21 @@ public class QuicCertificateManager {
 
     private final MemorySegment sslMethod;
 
+    /**
+     * Set once the PSK-only SSL option could not be aligned with the current
+     * configuration snapshot, so the (unlikely) failure does not repeat on
+     * every reload.
+     */
+    private boolean pskOptionWarned;
+
+    /**
+     * Last time the missing-certificate warning was emitted for an SNI host,
+     * so a client repeatedly requesting a configured-but-unloadable host
+     * cannot flood the log at handshake rate.
+     */
+    private long lastSniMissingLogMs;
+    private static final long SNI_MISSING_LOG_INTERVAL_MS = 60_000;
+
 
     /**
      * Creates the certificate manager for an endpoint.
@@ -155,7 +170,7 @@ public class QuicCertificateManager {
      *
      * @throws Exception If the context or a callback could not be created
      */
-    public void initialize(QuicCertConfig initialConfig)
+    public synchronized void initialize(QuicCertConfig initialConfig)
             throws Exception {
         certConfig = initialConfig;
         createNativeSslContext();
@@ -169,7 +184,7 @@ public class QuicCertificateManager {
      * @return The native SSL_CTX, or {@link MemorySegment#NULL} before
      *         {@link #initialize} has run
      */
-    public MemorySegment getSslCtx() {
+    public synchronized MemorySegment getSslCtx() {
         return sslCtx;
     }
 
@@ -193,27 +208,44 @@ public class QuicCertificateManager {
 
         // ngtcp2 uses a normal TLS_server_method context; QUIC mandates TLS
         // 1.3, so constrain the protocol range explicitly. This is harmless
-        // for the OpenSSL QUIC method as well.
-        openssl_h_Macros.SSL_CTX_set_min_proto_version(sslCtx,
+        // for the OpenSSL QUIC method as well. A failure must abort rather
+        // than silently allowing a wider protocol range (the shared manager
+        // also serves the ngtcp2 TLS_server_method context).
+        long minVersionRc = openssl_h_Macros.SSL_CTX_set_min_proto_version(sslCtx,
                 openssl_h.TLS1_3_VERSION());
-        openssl_h_Macros.SSL_CTX_set_max_proto_version(sslCtx,
+        long maxVersionRc = openssl_h_Macros.SSL_CTX_set_max_proto_version(sslCtx,
                 openssl_h.TLS1_3_VERSION());
+        if (minVersionRc < 1 || maxVersionRc < 1) {
+            throw new java.io.IOException(sm.getString(
+                    "quicEndpoint.tlsVersionSetError",
+                    Long.valueOf(minVersionRc), Long.valueOf(maxVersionRc)));
+        }
 
-        // Enable partial writes on every stream this context produces: the
-        // mode set here is inherited by each connection's default mode and
-        // each stream's SSL mode (quic_impl.c seeds them from the context).
+        // Enable partial and moving-buffer writes on the TLS context. The
+        // standard TLS stack (used by the ngtcp2 transport's
+        // TLS_server_method context) copies these modes into each
+        // connection; the OpenSSL QUIC endpoint additionally applies them
+        // explicitly to accepted QUIC connections, whose default stream
+        // mode is not populated from the context in this build.
         // Without SSL_MODE_ENABLE_PARTIAL_WRITE, SSL_write_ex() on a QUIC
         // stream is an all-or-nothing writer: a write that only gets a
         // prefix appended arms an internal retry state that rejects every
         // later call not presenting the exact same buffer address and
         // length (SSL_R_BAD_WRITE_RETRY), permanently wedging the stream's
         // send side - and every write path in this package stages into a
-        // fresh buffer per attempt. With the mode set, a partial acceptance
-        // simply returns the accepted count and the caller re-presents the
-        // remainder from a new buffer.
-        if (openssl_h.SSL_CTX_ctrl(sslCtx, QuicBindings.SSL_CTRL_MODE,
-                QuicBindings.SSL_MODE_ENABLE_PARTIAL_WRITE,
-                MemorySegment.NULL) == 0) {
+        // fresh buffer per attempt. Without
+        // SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, a write that would-blocks
+        // before accepting any byte may only be retried with the exact same
+        // address; the retry from a freshly staged remainder buffer would
+        // otherwise fail with the same SSL_R_BAD_WRITE_RETRY. With both
+        // modes set, a partial acceptance simply returns the accepted count
+        // and a would-block retry may re-present the remainder from a new
+        // buffer.
+        long ctxModeRc = openssl_h.SSL_CTX_ctrl(sslCtx, QuicBindings.SSL_CTRL_MODE,
+                QuicBindings.SSL_MODE_ENABLE_PARTIAL_WRITE |
+                        QuicBindings.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER,
+                MemorySegment.NULL);
+        if (ctxModeRc == 0) {
             throw new java.io.IOException(
                     sm.getString("quicEndpoint.contextCreateError"));
         }
@@ -271,12 +303,21 @@ public class QuicCertificateManager {
             return;
         }
         QuicCertConfig config = certConfig;
-        if (config != null && config.pskOnly) {
+        boolean wantOption = config != null && config.pskOnly;
+        if (wantOption) {
             openssl_h_Compatibility.SSL_CTX_set_options(sslCtx,
                     QuicBindings.SSL_OP_ALLOW_NO_DHE_KEX);
         } else {
             openssl_h_Compatibility.SSL_CTX_clear_options(sslCtx,
                     QuicBindings.SSL_OP_ALLOW_NO_DHE_KEX);
+        }
+        boolean optionSet =
+                (openssl_h_Compatibility.SSL_CTX_get_options(sslCtx)
+                        & QuicBindings.SSL_OP_ALLOW_NO_DHE_KEX) != 0;
+        if (optionSet != wantOption && !pskOptionWarned) {
+            pskOptionWarned = true;
+            log.warn(sm.getString("quicEndpoint.pskOnlyOptionRejected",
+                    Boolean.valueOf(wantOption)));
         }
     }
 
@@ -295,7 +336,7 @@ public class QuicCertificateManager {
      * @param newConfig The configuration to install
      * @param reason    A short description of what triggered the reload
      */
-    public void swapConfig(QuicCertConfig newConfig, String reason) {
+    public synchronized void swapConfig(QuicCertConfig newConfig, String reason) {
         QuicCertConfig oldConfig = certConfig;
         certConfig = newConfig;
         if (oldConfig != null) {
@@ -320,7 +361,7 @@ public class QuicCertificateManager {
      * endpoint's bind-resource cleanup after the poll thread has stopped, so
      * no handshake can be applying certificates concurrently.
      */
-    public void release() {
+    public synchronized void release() {
         if (sslCtx != null && !sslCtx.equals(MemorySegment.NULL)) {
             try {
                 openssl_h.SSL_CTX_free(sslCtx);
@@ -653,8 +694,12 @@ public class QuicCertificateManager {
         // Presenting the default host's certificate would silently serve a
         // name-mismatched identity; apply nothing so the handshake fails
         // visibly for this host.
-        log.error(sm.getString("quicEndpoint.sniHostCertificateMissing",
-                hostKey));
+        long now = System.currentTimeMillis();
+        if (now - lastSniMissingLogMs >= SNI_MISSING_LOG_INTERVAL_MS) {
+            lastSniMissingLogMs = now;
+            log.error(sm.getString("quicEndpoint.sniHostCertificateMissing",
+                    hostKey));
+        }
         return List.of();
     }
 
@@ -787,11 +832,11 @@ public class QuicCertificateManager {
      * Sets up the TLS 1.3 pre-shared key find-session callback on the
      * SSL_CTX using {@link CertificateLoader#installFindSessionCallback} (the
      * same installation used by the socket connector), with a per-connection
-     * resolver (one listener serves every configured host). Unlike the ALPN
-     * callback, a failure to install this callback is not fatal for an
-     * endpoint without pre-shared keys, but the callback stub itself is
-     * installed unconditionally: hosts may gain pre-shared keys on a
-     * configuration reload and the context-level callback is created once.
+     * resolver (one listener serves every configured host). The callback stub
+     * is installed unconditionally because hosts may gain pre-shared keys on a
+     * configuration reload and the context-level callback is created once, so
+     * an installation failure aborts the bind rather than surfacing later as a
+     * connection that cannot complete a pre-shared-key handshake.
      *
      * @throws java.io.IOException If the callback could not be installed
      */

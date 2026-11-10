@@ -709,9 +709,11 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
 
 
     /**
-     * Sets the maximum number of trailer headers allowed per request.
+     * Sets the maximum number of trailer headers allowed per request. A
+     * negative value disables the limit.
      *
-     * @param maxTrailerCount the maximum trailer count
+     * @param maxTrailerCount the maximum trailer count, or a negative value
+     *                        for no limit
      */
     public void setMaxTrailerCount(int maxTrailerCount) {
         this.maxTrailerCount = maxTrailerCount;
@@ -721,7 +723,7 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     /**
      * Returns the maximum number of trailer headers allowed per request.
      *
-     * @return the maximum trailer count
+     * @return the maximum trailer count, or a negative value if unlimited
      */
     public int getMaxTrailerCount() {
         return maxTrailerCount;
@@ -735,9 +737,11 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
 
 
     /**
-     * Sets the maximum size of trailer headers in bytes.
+     * Sets the maximum size of trailer headers in bytes. A negative value
+     * disables the limit.
      *
-     * @param maxTrailerSize the maximum trailer size
+     * @param maxTrailerSize the maximum trailer size, or a negative value
+     *                       for no limit
      */
     public void setMaxTrailerSize(int maxTrailerSize) {
         this.maxTrailerSize = maxTrailerSize;
@@ -747,7 +751,7 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     /**
      * Returns the maximum size of trailer headers in bytes.
      *
-     * @return the maximum trailer size
+     * @return the maximum trailer size, or a negative value if unlimited
      */
     public int getMaxTrailerSize() {
         return maxTrailerSize;

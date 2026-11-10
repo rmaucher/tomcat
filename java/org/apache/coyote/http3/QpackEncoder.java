@@ -247,7 +247,7 @@ public class QpackEncoder {
      * @param target        Output buffer
      * @param index         Static table index or dynamic table relative index
      * @param isStatic      true for static table, false for dynamic table
-     * @param valueBytes    Literal value (UTF-8 encoded)
+     * @param valueBytes    Literal value (ISO-8859-1, one byte per char)
      */
     private void encodeNameRefLiteral(ByteBuffer target, int index, boolean isStatic, byte[] valueBytes) {
         // Per RFC 9204 Section 4.5.4: 01 N T iRP(m=4) Name Index
@@ -264,8 +264,8 @@ public class QpackEncoder {
      * H=0 (not Huffman for name).
      *
      * @param target    Output buffer
-     * @param nameBytes Literal name (UTF-8 encoded)
-     * @param valueBytes Literal value (UTF-8 encoded)
+     * @param nameBytes Literal name (ISO-8859-1, one byte per char)
+     * @param valueBytes Literal value (ISO-8859-1, one byte per char)
      */
     private void encodeNameValueLiteral(ByteBuffer target, byte[] nameBytes, byte[] valueBytes) {
         // Per RFC 9204 Section 4.5.6: 001 N H NameLen(3+) + Name + Value

@@ -717,3 +717,52 @@ is per-request socket-wrapper construction and the poll loop's per-iteration
 work-set bookkeeping, not libngtcp2 scaling; the idle path is event-gated
 and linear. On this host the ranking is OpenSSL > ngtcp2 ~= quiche for
 request throughput, and quiche > ngtcp2 > OpenSSL for idle cost.
+
+## 10. November 9, 2026 regression check
+
+Quick re-run of the same harness on the tree carrying the HTTP/3 review
+fixes (H3-01 to H3-08), to check the fixes had not moved the reference
+numbers. Same host, server, shapes and `us/req` metric; 12 s load
+windows after the 1x32 warm-up, idle 1000/4000 with the standard settle
+and keepalive. The host was also running its local model server, so
+absolute rps has a few percent of run-to-run drift; `us/req` is the
+comparison metric.
+
+| shape | OpenSSL rps / us/req | quiche rps / us/req | ngtcp2 rps / us/req |
+|---|---|---|---|
+| 1x1 | 279 / 176.4 | 6,092 (cc) / 29.7 | 6,668 / 33.1 |
+| 1x32 | 18,067 (cc) / 13.8 | 6,717 (cc) / 25.9 | 7,232 (cc) / 94.9 |
+| 8x25 | 98,097 / 10.1 | 91,005 / 10.9 | 83,264 / 11.9 |
+| 32x32 | 84,302 / 11.7 | 88,150 / 11.2 | 77,431 / 12.8 |
+| idle 1000 | 2.67 % | 0.47 % | 1.17 % |
+| idle 4000 | 30.17 % | 1.30 % | 3.60 % |
+
+- OpenSSL and quiche match the tables above (quiche's 8x25/32x32 are
+  at/above the recorded 78-79k / 12.6-14.0 and 72.9k / 13.6 plateaus).
+- The first fixed-build run measured OpenSSL 8x25 at 88k / 11.3 us/req
+  and 32x32 at 75.6k / 13.0, a ~10 % regression against both this file
+  and a same-day pre-fix A/B. The cause was the H3-02 fix's eager
+  `readTrailerSectionIfAvailable()` call on the dispatch path: it added
+  one socket read (a poller hop) to every request, including body-less
+  GETs with no trailers. Trailer decoding is now lazy (on
+  `isTrailerFieldsReady()` or in the after-response scan), restoring
+  OpenSSL 8x25 to 98.1k / 10.1 and 32x32 to 84.3k / 11.7. Quiche and
+  ngtcp2 shared the same processor cost; quiche recovered as well.
+- ngtcp2 was initially below the 82,176 rps / 12.0 us/req recorded in
+  section 9 (72-76k / 13.2-13.7 in repeated runs). This was not caused by
+  the HTTP/3 review fixes: replacing only `tomcat-coyote.jar` with the
+  fixed build against the benchmark `tomcat-coyote-ffm.jar` kept 8x25 at
+  83.4k / 11.9, while replacing only the ffm jar with the current tree's
+  ngtcp2 code dropped it to 72.0k / 13.7. Bisecting the ngtcp2 ffm jar
+  located the change at commit `b47f8f5fe1` ("Suppress late reset edges
+  on finalised ngtcp2 streams", N-16); N-15 measured 82-85k / 11.7-12.0,
+  N-16 69-76k / 13.2-14.2 in alternating runs. The `readShutdown`
+  tombstones stayed bounded (~34 per connection), so this was not set
+  growth, and the hot-path suppression added by N-16 was the culprit.
+  N-16 has been reverted; repeated post-revert runs measure 8x25 at
+  82.3-83.4k / 11.9-12.1 and 32x32 at 77.4-78.4k / 12.7-12.8, matching or
+  exceeding section 9. The revert gives up N-16's late-reset suppression,
+  so the original correctness defect needs a follow-up fix that does not
+  add per-request work to the ngtcp2 poller path. The full HTTP/3 suite
+  passes in both OpenSSL and ngtcp2 modes.
+

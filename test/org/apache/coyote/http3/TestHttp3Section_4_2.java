@@ -16,14 +16,22 @@
  */
 package org.apache.coyote.http3;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Map;
 
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServlet;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+
 import org.junit.Assert;
 import org.junit.Test;
 
+import org.apache.catalina.Context;
 import org.apache.catalina.connector.Connector;
+import org.apache.catalina.startup.Tomcat;
 
 /**
  * Tests for the response message requirements of
@@ -72,6 +80,37 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
                 response.getHeader("link"));
         Assert.assertEquals("Hello over HTTP/3",
                 response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testEarlyHintsNotOvertakenByFinalResponse() throws Exception {
+        startHttp3Server();
+
+        // Force the transport to accept only a prefix of the interim 103
+        // HEADERS frame: the peer advertises a 26-byte per-stream
+        // flow-control window, one byte short of the encoded early-hints
+        // frame (27 bytes). If the interim frame were written non-blocking,
+        // its remainder would be staged in SocketWrapperBase's non-blocking
+        // write buffer, which a later blocking final-response write overtakes
+        // (a blocking write appends to the socket buffer and flushBlocking()
+        // writes that before draining the staging buffer). The client must
+        // decode the complete 103 HEADERS frame before the final 200
+        // response.
+        ClientOutput output = runClient(rawCommandWith("--headers",
+                buildFieldSection(":method", "GET", ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/earlyHints"),
+                "--max-stream-data", "26", "--timeout", "5"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        Assert.assertEquals(Arrays.asList(103, 200), response.getStatuses());
+        Assert.assertEquals("</large>; rel=preload",
+                response.getHeader("link"));
+        Assert.assertEquals("Hello over HTTP/3", response.getBodyAsString());
+        Assert.assertNull(output.getStreamError());
+        Assert.assertNull(output.getConnectionError());
     }
 
 
@@ -184,6 +223,28 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
 
 
     @Test
+    public void testHeadLargeBodyNoDataFrame() throws Exception {
+        startHttp3Server();
+
+        // A write larger than the container output buffer is passed straight
+        // to the processor before commit. The void-output decision is made
+        // when the final HEADERS frame is written, so the processor must
+        // re-check it before emitting that first chunk as DATA.
+        ClientOutput output = runClient(rawCommandWith("--headers",
+                buildFieldSection(":method", "HEAD", ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/large")),
+                CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertEquals("262144", response.getHeader("content-length"));
+        Assert.assertEquals("HEAD response must not carry DATA frames",
+                0, response.getBody().length);
+    }
+
+
+    @Test
     public void testNotFound() throws Exception {
         startHttp3Server();
 
@@ -225,5 +286,55 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
                 response.getHeader("content-type"));
         Assert.assertNotNull("content-length must be retained",
                 response.getHeader("content-length"));
+    }
+
+
+    @Test
+    public void testSecurityHeadersRetainedUnderPeerFieldSectionLimit()
+            throws Exception {
+        startHttp3Server(TestHttp3Section_4_2::addSecurityServlet);
+
+        // A peer advertising a tiny SETTINGS_MAX_FIELD_SECTION_SIZE must not
+        // cause security-response-policy fields to be dropped from responses
+        // to that peer. They are in the essential set and are retained even
+        // when the resulting section exceeds the advisory limit.
+        ClientOutput output = runClient(rawCommandWith(
+                "--control", buildSettingsFrameB64(6, 200),
+                "--headers",
+                buildFieldSection(simpleGetHeaders("/security"))),
+                CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertNotNull("Strict-Transport-Security must be retained",
+                response.getHeader("strict-transport-security"));
+        Assert.assertNotNull("Content-Security-Policy must be retained",
+                response.getHeader("content-security-policy"));
+        Assert.assertNotNull("X-Frame-Options must be retained",
+                response.getHeader("x-frame-options"));
+        Assert.assertNull("The non-essential date field should be dropped",
+                response.getHeader("date"));
+    }
+
+
+    private static void addSecurityServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "security", new SecurityServlet());
+        ctxt.addServletMapping("/security", "security");
+    }
+
+
+    private static class SecurityServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            resp.setContentType("text/plain");
+            resp.setHeader("Strict-Transport-Security", "max-age=31536000");
+            resp.setHeader("Content-Security-Policy", "default-src 'self'");
+            resp.setHeader("X-Frame-Options", "DENY");
+            resp.getWriter().print("security");
+        }
     }
 }

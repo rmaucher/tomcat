@@ -63,6 +63,16 @@ final class Http3Settings {
                 throw error(Http3Error.H3_SETTINGS_ERROR, "http3Settings.duplicateIdentifier",
                         Long.valueOf(identifier));
             }
+            // RFC 9220 Section 3 inherits RFC 8441 Section 3: the value of
+            // SETTINGS_ENABLE_CONNECT_PROTOCOL MUST be 0 or 1. An invalid
+            // value of a defined setting is a connection error of type
+            // H3_SETTINGS_ERROR.
+            if (identifier == Constants.H3_SETTINGS_ENABLE_CONNECT_PROTOCOL &&
+                    value > 1) {
+                throw error(Http3Error.H3_SETTINGS_ERROR,
+                        "http3Settings.invalidValue",
+                        Long.valueOf(identifier), Long.valueOf(value));
+            }
             settings.put(identifier, value);
             if (log.isTraceEnabled()) {
                 log.trace(sm.getString("http3Settings.debug", Long.valueOf(identifier), Long.valueOf(value)));
@@ -165,9 +175,14 @@ final class Http3Settings {
             Qpack.encodeQuicInteger(buffer, Constants.H3_SETTINGS_QPACK_BLOCKED_STREAMS);
             Qpack.encodeQuicInteger(buffer, qpackBlockedStreams);
         }
-        // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 Section 4.2.2) is advisory;
-        // 0 (the default) means unlimited and is not sent. Clamp the
-        // configured value with the shared bound the decoder-side consumer
+        // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 Section 4.2.2) is advisory.
+        // Only positive values are advertised; the RFC default when the
+        // setting is absent is unlimited (there is no "0 means unlimited"
+        // value on the wire). Locally the decoder clamps non-positive
+        // configured values to 0 (AbstractHttp3Protocol.getMaxFieldSectionSizeInt),
+        // so a configured 0 is an explicit zero-byte limit and a negative
+        // value is likewise enforced as 0 even though it is not advertised.
+        // Clamp the configured value with the shared bound the decoder-side consumer
         // (AbstractHttp3Protocol.getMaxFieldSectionSizeInt) also applies: a value of
         // 2^62 or more does not fit a QUIC varint (RFC 9000 Section 16 caps
         // it at 62 payload bits), so writing it raw would merge its top bit

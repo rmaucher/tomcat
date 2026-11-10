@@ -187,8 +187,16 @@ public class QuicNativeMailbox {
      * racing stop-path submission may have left behind.
      */
     public void open() {
-        discardPollTasks();
-        closed = false;
+        // Keep the discard and the reopen atomic against submitPollTask();
+        // otherwise a worker that checks closed between the discard and the
+        // closed=false write sees "closed" and has its task rejected even
+        // though the mailbox is about to be usable again. discardPollTasks()
+        // must still run while closed is true so onDiscard notifications also
+        // cannot resubmit during the discard.
+        synchronized (submitLock) {
+            discardPollTasks();
+            closed = false;
+        }
     }
 
 

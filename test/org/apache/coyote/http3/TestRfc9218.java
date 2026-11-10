@@ -229,6 +229,43 @@ public class TestRfc9218 extends Http3TestBase {
 
 
     @Test
+    public void testEmptyPriorityUpdateAppliesDefaults() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3ConnectionManager manager = new Http3ConnectionManager(protocol);
+        Http3ConnectionManager.ConnectionState state =
+                new Http3ConnectionManager.ConnectionState(null);
+
+        // Establish a non-default signal first so the empty update's effect
+        // is observable.
+        state.applyPriorityUpdate(0,
+                Priority.parsePriority(new StringReader("u=6, i")));
+
+        java.lang.reflect.Method process =
+                Http3ConnectionManager.class.getDeclaredMethod(
+                        "processPriorityUpdateFrame",
+                        Http3ConnectionManager.ConnectionState.class,
+                        java.nio.ByteBuffer.class, Integer.TYPE, Long.TYPE);
+        process.setAccessible(true);
+        java.nio.ByteBuffer payload = java.nio.ByteBuffer.wrap(
+                priorityUpdatePayload(0, null));
+        process.invoke(manager, state, payload, Integer.valueOf(
+                payload.remaining()), Long.valueOf(H3_PRIORITY_UPDATE_REQUEST));
+
+        Http3Processor processor = new Http3Processor(protocol, null);
+        processor.setStreamId(0);
+        state.registerPriorityConsumer(processor, 0);
+
+        // An empty Structured Fields Dictionary is valid and represents the
+        // RFC 9218 default parameters, so the update must replace the older
+        // non-default signal.
+        Assert.assertEquals(Priority.DEFAULT_URGENCY,
+                processor.getUrgency());
+        Assert.assertEquals(Priority.DEFAULT_INCREMENTAL,
+                processor.getIncremental());
+    }
+
+
+    @Test
     public void testPriorityUpdateInvalidFieldValueIgnored() throws Exception {
         startHttp3Server();
 

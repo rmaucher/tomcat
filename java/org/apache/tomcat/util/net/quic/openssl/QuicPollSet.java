@@ -158,6 +158,25 @@ public class QuicPollSet {
             // is the only signal that it happened.
             log.warn(sm.getString("quicPollSet.duplicateAdd",
                     Long.toHexString(key)));
+            long newAddress = item.getSsl().address();
+            if (newAddress != key) {
+                // The set's lookup key must always match the descriptor's
+                // current SSL address. Move the existing item to the new key
+                // before updating its SSL pointer; if another item already
+                // owns that address, leave the old mapping intact rather than
+                // corrupting both entries.
+                boolean moved = items.remove(key, previous);
+                if (moved) {
+                    QuicPollItem collision = items.putIfAbsent(newAddress, previous);
+                    if (collision != null) {
+                        items.putIfAbsent(key, previous);
+                        log.error(sm.getString("quicPollSet.duplicateAddress",
+                                Long.toHexString(newAddress)));
+                        item.dispose();
+                        return;
+                    }
+                }
+            }
             previous.setSsl(item.getSsl());
             previous.setWantEvents(item.getWantEvents());
             previous.setAppData(item.getAppData());
@@ -369,8 +388,22 @@ public class QuicPollSet {
     private void grow() {
         int newCapacity = capacity + GROWTH_INCREMENT;
         Arena oldArena = arrayArena;
-        arrayArena = Arena.ofShared();
-        nativeArray = arrayArena.allocate(STRIDE * newCapacity);
+        Arena newArena = Arena.ofShared();
+        MemorySegment newArray;
+        try {
+            newArray = newArena.allocate(STRIDE * newCapacity);
+        } catch (Throwable t) {
+            // Do not leave the new arena open or replace the current array
+            // when the allocation failed; keep the old generation intact.
+            try {
+                newArena.close();
+            } catch (Throwable closeFailure) {
+                // Ignore - the original allocation failure is more useful.
+            }
+            throw t;
+        }
+        arrayArena = newArena;
+        nativeArray = newArray;
         capacity = newCapacity;
         QuicPollItem[] newSlots = new QuicPollItem[capacity];
         System.arraycopy(slots, 0, newSlots, 0, count);

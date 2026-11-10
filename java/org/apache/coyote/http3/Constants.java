@@ -111,10 +111,10 @@ public final class Constants {
      * exercise the requirement that unknown frame types are ignored
      * (RFC 9114 Sections 7.2.8 and 11.2.1): values of the form
      * {@code 0x1f * N + 0x21} for non-negative integer {@code N}. These
-     * types have no defined semantics - {@code 0x21} itself was used by
-     * early drafts of the priority work; published RFC 9218 defines only
-     * PRIORITY_UPDATE - and receipt of any member of the family MUST be
-     * ignored (RFC 9114 Section 9). This is distinct from the HTTP/2 frame
+     * types have no defined semantics - RFC 9218 defines only
+     * PRIORITY_UPDATE and does not assign a meaning to this family - and
+     * receipt of any member of the family MUST be ignored (RFC 9114
+     * Section 9). This is distinct from the HTTP/2 frame
      * types classified by {@link #isHttp2ReservedFrame(long)}, whose
      * receipt MUST be treated as a connection error of type
      * H3_FRAME_UNEXPECTED.

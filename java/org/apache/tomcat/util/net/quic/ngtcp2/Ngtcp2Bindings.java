@@ -76,6 +76,26 @@ public final class Ngtcp2Bindings {
     static final int NGTCP2_MAX_UDP_PAYLOAD_SIZE = 1200;
     static final int NGTCP2_STATELESS_RESET_TOKENLEN = 16;
 
+    /**
+     * Server-advertised limit for client-initiated unidirectional streams.
+     * HTTP/3 needs three (control, QPACK encoder, QPACK decoder). Keep a
+     * small headroom for unknown/grease streams, but do not multiply the
+     * per-stream read buffers: each client uni stream materializes a full
+     * {@code readBufferSize} buffer, so 128 streams cost 2 MiB per
+     * connection with the default 16 KiB buffer.
+     */
+    private static final long INITIAL_MAX_STREAMS_UNI = 16;
+
+    /**
+     * Receive flow-control windows advertised to the peer. The binding
+     * copies received stream data into Java heap until the handler reads it,
+     * so these windows directly bound the per-connection heap exposure.
+     * Match the quiche transport's 16 MiB limit rather than the previous
+     * 32 MiB, which doubled the Java-heap cost per established connection.
+     */
+    private static final long INITIAL_MAX_DATA = 16L * 1024 * 1024;
+    private static final long INITIAL_MAX_STREAM_DATA = 16L * 1024 * 1024;
+
     // quiche-compatible facade return values used by the ported endpoint.
     static final long NGTCP2_ERR_DONE = -1;
     static final long NGTCP2_ERR_STREAM_RESET = -2;
@@ -335,6 +355,9 @@ public final class Ngtcp2Bindings {
     private static final MethodHandle ngtcp2ConnExtendMaxStreamsBidi$handle = createHandle(
             "ngtcp2_conn_extend_max_streams_bidi",
             FunctionDescriptor.ofVoid(openssl_h.C_POINTER, ValueLayout.JAVA_LONG));
+    private static final MethodHandle ngtcp2ConnExtendMaxStreamsUni$handle = createHandle(
+            "ngtcp2_conn_extend_max_streams_uni",
+            FunctionDescriptor.ofVoid(openssl_h.C_POINTER, ValueLayout.JAVA_LONG));
     private static final MethodHandle ngtcp2ConnExtendMaxStreamOffset$handle = createHandle(
             "ngtcp2_conn_extend_max_stream_offset",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, openssl_h.C_POINTER,
@@ -566,7 +589,12 @@ public final class Ngtcp2Bindings {
                     "1.16.x/1.26.x"));
         }
         if (NGTCP2_AVAILABLE) {
-            cryptoOsslInit();
+            int cryptoRc = cryptoOsslInit();
+            if (cryptoRc != 0) {
+                MISSING_SYMBOLS.add("ngtcp2_crypto_ossl_init");
+                log.warn(sm.getString("ngtcp2Bindings.cryptoInitFailed",
+                        String.valueOf(cryptoRc)));
+            }
         }
     }
 
@@ -687,6 +715,10 @@ public final class Ngtcp2Bindings {
         boolean closed;
         boolean nativeOpen;
         boolean readReported;
+        /** The local read side was shut down; late resets are not delivered. */
+        boolean readShutdown;
+        /** The endpoint wrapper was discarded; a late edge is a duplicate. */
+        boolean discarded;
 
         StreamState(long id) {
             this.id = id;
@@ -847,6 +879,8 @@ public final class Ngtcp2Bindings {
             return;
         }
         dropBufferedReads(st, ss);
+        ss.readShutdown = true;
+        ss.discarded = true;
         ss.finReceived = true;
         ss.finDelivered = true;
         ss.resetRemoteDelivered = true;
@@ -919,6 +953,9 @@ public final class Ngtcp2Bindings {
         // Shared because the stop path flushes GOAWAY/close packets from the
         // thread that stops the connector, not only from the poll thread.
         Arena arena = Arena.ofShared();
+        MemorySegment conn = MemorySegment.NULL;
+        MemorySegment ssl = MemorySegment.NULL;
+        MemorySegment osslCtx = MemorySegment.NULL;
         try {
             MemorySegment connPtr = arena.allocate(ValueLayout.ADDRESS);
             MemorySegment dcid = arena.allocate(CID_SIZE);
@@ -946,16 +983,19 @@ public final class Ngtcp2Bindings {
             MemorySegment params = arena.allocate(PARAMS_SIZE);
             ngtcp2TransportParamsDefault(NGTCP2_TRANSPORT_PARAMS_V1, params);
             params.set(ValueLayout.JAVA_LONG,
-                    PARAMS_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, 32L * 1024 * 1024);
+                    PARAMS_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+                    INITIAL_MAX_STREAM_DATA);
             params.set(ValueLayout.JAVA_LONG,
-                    PARAMS_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, 32L * 1024 * 1024);
+                    PARAMS_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+                    INITIAL_MAX_STREAM_DATA);
             params.set(ValueLayout.JAVA_LONG, PARAMS_INITIAL_MAX_STREAM_DATA_UNI,
-                    32L * 1024 * 1024);
+                    INITIAL_MAX_STREAM_DATA);
             params.set(ValueLayout.JAVA_LONG, PARAMS_INITIAL_MAX_DATA,
-                    32L * 1024 * 1024);
+                    INITIAL_MAX_DATA);
             params.set(ValueLayout.JAVA_LONG, PARAMS_INITIAL_MAX_STREAMS_BIDI,
                     maxStreams > 0 ? maxStreams : 1);
-            params.set(ValueLayout.JAVA_LONG, PARAMS_INITIAL_MAX_STREAMS_UNI, 128);
+            params.set(ValueLayout.JAVA_LONG, PARAMS_INITIAL_MAX_STREAMS_UNI,
+                    INITIAL_MAX_STREAMS_UNI);
             params.set(ValueLayout.JAVA_LONG, PARAMS_MAX_IDLE_TIMEOUT,
                     (idleTimeoutMs > 0 ? idleTimeoutMs : 30000) * 1_000_000L);
             params.set(ValueLayout.JAVA_LONG, PARAMS_ACTIVE_CONNECTION_ID_LIMIT, 4);
@@ -970,30 +1010,36 @@ public final class Ngtcp2Bindings {
                 arena.close();
                 return MemorySegment.NULL;
             }
-            MemorySegment conn = connPtr.get(openssl_h.C_POINTER, 0);
+            conn = connPtr.get(openssl_h.C_POINTER, 0);
             if (conn.equals(MemorySegment.NULL)) {
                 arena.close();
                 return MemorySegment.NULL;
             }
 
-            MemorySegment ssl = openssl_h.SSL_new(sslCtx);
+            ssl = openssl_h.SSL_new(sslCtx);
             if (ssl.equals(MemorySegment.NULL)) {
                 ngtcp2ConnDel(conn);
+                conn = MemorySegment.NULL;
                 arena.close();
                 return MemorySegment.NULL;
             }
             MemorySegment osslPtr = arena.allocate(ValueLayout.ADDRESS);
             if ((int) cryptoOsslCtxNew$handle.invokeExact(osslPtr, ssl) != 0) {
                 openssl_h.SSL_free(ssl);
+                ssl = MemorySegment.NULL;
                 ngtcp2ConnDel(conn);
+                conn = MemorySegment.NULL;
                 arena.close();
                 return MemorySegment.NULL;
             }
-            MemorySegment osslCtx = osslPtr.get(openssl_h.C_POINTER, 0);
+            osslCtx = osslPtr.get(openssl_h.C_POINTER, 0);
             if ((int) cryptoOsslConfigureServer$handle.invokeExact(ssl) != 0) {
                 cryptoOsslCtxDel(osslCtx);
+                osslCtx = MemorySegment.NULL;
                 openssl_h.SSL_free(ssl);
+                ssl = MemorySegment.NULL;
                 ngtcp2ConnDel(conn);
+                conn = MemorySegment.NULL;
                 arena.close();
                 return MemorySegment.NULL;
             }
@@ -1012,6 +1058,18 @@ public final class Ngtcp2Bindings {
         } catch (Throwable t) {
             if (log.isDebugEnabled()) {
                 log.debug("ngtcp2_accept failed", t);
+            }
+            // Free anything created before the failure. The explicit error
+            // returns above already free their objects and return directly,
+            // so they never reach this catch.
+            if (!osslCtx.equals(MemorySegment.NULL)) {
+                cryptoOsslCtxDel(osslCtx);
+            }
+            if (!ssl.equals(MemorySegment.NULL)) {
+                openssl_h.SSL_free(ssl);
+            }
+            if (!conn.equals(MemorySegment.NULL)) {
+                ngtcp2ConnDel(conn);
             }
             arena.close();
             return MemorySegment.NULL;
@@ -1528,6 +1586,25 @@ public final class Ngtcp2Bindings {
         return ss == null || (ss.reads.isEmpty() && ss.finDelivered);
     }
 
+    /**
+     * Whether the endpoint wrapper for this stream has been discarded while
+     * the native stream still exists. A readable edge for such a stream is a
+     * late duplicate for a request that has already completed.
+     *
+     * @param conn The connection
+     * @param id   The stream identifier
+     *
+     * @return {@code true} if the endpoint wrapper was discarded
+     */
+    static boolean ngtcp2_conn_stream_discarded(MemorySegment conn, long id) {
+        ConnState st = state(conn);
+        if (st == null) {
+            return false;
+        }
+        StreamState ss = st.streams.get(Long.valueOf(id));
+        return ss != null && ss.discarded;
+    }
+
     static boolean ngtcp2_conn_stream_readable(MemorySegment conn, long id) {
         ConnState st = state(conn);
         if (st == null) {
@@ -1855,6 +1932,14 @@ public final class Ngtcp2Bindings {
         }
     }
 
+    private static void extendMaxStreamsUni(MemorySegment conn) {
+        try {
+            ngtcp2ConnExtendMaxStreamsUni$handle.invokeExact(conn, 1L);
+        } catch (Throwable t) {
+            // Ignore: the peer will simply reopen after the next close.
+        }
+    }
+
     private static void extendFlowControl(ConnState st, long id, int n) {
         try {
             // The stream handle returns int; invokeExact must see that exact
@@ -2028,6 +2113,11 @@ public final class Ngtcp2Bindings {
                     // sequential requests (the default is 100), which looks like
                     // a connection stall at exactly the configured stream cap.
                     extendMaxStreamsBidi(conn);
+                } else if ((id & 0x03) == 2) {
+                    // Recycle the client-initiated unidirectional stream
+                    // credit as well; otherwise the peer is limited to the
+                    // initial uni-stream limit for the connection lifetime.
+                    extendMaxStreamsUni(conn);
                 }
                 // NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET only says that
                 // an application error code was supplied - a locally generated
@@ -2068,6 +2158,11 @@ public final class Ngtcp2Bindings {
             ConnState st = stateFromUserData(userData);
             if (st != null) {
                 StreamState ss = st.stream(Long.valueOf(id));
+                if (ss.readShutdown) {
+                    // The endpoint already finalised this stream's read side;
+                    // a late RESET_STREAM must not recreate a read edge.
+                    return 0;
+                }
                 ss.resetRemote = true;
                 ss.resetRemoteDelivered = false;
                 ss.readReported = false;
@@ -2955,6 +3050,10 @@ public final class Ngtcp2Bindings {
                 // in6_pktinfo: { in6_addr addr; uint ifindex; }
                 to.set(ValueLayout.JAVA_SHORT, 0, (short) AF_INET6);
                 to.set(ValueLayout.JAVA_SHORT, 2, (short) 0);
+                // sin6_flowinfo is part of SocketAddrV6 equality/hash and
+                // ngtcp2's path lookup; a reused buffer must not leak a
+                // stale value here.
+                to.set(ValueLayout.JAVA_INT, 4, 0);
                 MemorySegment.copy(cbuf, off + CMSG_DATA_OFFSET, to, 8, 16);
                 // Preserve the arrival interface as sin6_scope_id: ngtcp2
                 // round-trips the sockaddr into send_info, and the send-side
@@ -2963,12 +3062,20 @@ public final class Ngtcp2Bindings {
                 to.set(ValueLayout.JAVA_INT, 24,
                         cbuf.get(ValueLayout.JAVA_INT, off + CMSG_DATA_OFFSET + 16));
                 toLenOut.set(ValueLayout.JAVA_INT, 0, 28);
-            } else if (level == SOL_UDP && type == UDP_GRO
-                    && cmsgLen >= CMSG_HEADER_SIZE + 2) {
+            } else if (level == SOL_UDP && type == UDP_GRO) {
                 // Coalesced GRO read: every segment but the last has this
-                // exact size; the read cannot be split without it.
-                groSegOut[0] = cbuf.get(ValueLayout.JAVA_SHORT,
-                        off + CMSG_DATA_OFFSET) & 0xFFFF;
+                // exact size; the read cannot be split without it. Linux
+                // writes the kernel gso_size as a 32-bit int; accept the
+                // 16-bit form as well for older/alternate providers. Reading
+                // the native width (rather than assuming the low half of an
+                // int) also works on big-endian LP64.
+                if (cmsgLen >= CMSG_HEADER_SIZE + 4) {
+                    groSegOut[0] = cbuf.get(ValueLayout.JAVA_INT,
+                            off + CMSG_DATA_OFFSET);
+                } else if (cmsgLen >= CMSG_HEADER_SIZE + 2) {
+                    groSegOut[0] = cbuf.get(ValueLayout.JAVA_SHORT,
+                            off + CMSG_DATA_OFFSET) & 0xFFFF;
+                }
             }
             off += (cmsgLen + 7) & ~7L;
         }

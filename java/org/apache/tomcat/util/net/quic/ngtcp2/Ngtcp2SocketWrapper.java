@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.Callable;
@@ -135,6 +136,16 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
             // mapped form for the native sockaddr paths).
             this.remoteAddress = Ngtcp2Bindings.unmapIpv4Mapped(conn.getRemoteAddress());
             this.localAddress = Ngtcp2Bindings.unmapIpv4Mapped(conn.getLocalAddress());
+            if (this.localAddress != null && this.localAddress.getPort() == 0) {
+                // IP_PKTINFO/IPV6_PKTINFO carries no port, so the connection's
+                // local address parsed from the datagram has port 0. Restore
+                // the listener port for request/access-log reporting.
+                int localPort = endpoint.getLocalPort();
+                if (localPort > 0 && this.localAddress.getAddress() != null) {
+                    this.localAddress = new InetSocketAddress(
+                            this.localAddress.getAddress(), localPort);
+                }
+            }
             // Deliberately do not copy the connection's negotiated protocol
             // to the stream wrapper (see the OpenSSL endpoint's note):
             // AbstractProtocol would try to resolve it as an upgrade.
@@ -724,9 +735,24 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void flushBlocking() throws IOException {
+        checkNotClosed();
         writeLock.lock();
         try {
             super.flushBlocking();
+            // super.flushBlocking() may just have created a new held-back
+            // tail from the bytes it drained. Release it here as well: the
+            // SocketWrapperBase contract requires a blocking flush to empty
+            // the buffers, and a first flush would otherwise leave the final
+            // <=128 bytes in finTail until the next write or conclusion.
+            Ngtcp2StreamWrapper stream = liveStream();
+            if (stream == null) {
+                finTail = null;
+                finTailPos = 0;
+                return;
+            }
+            long deadline = System.nanoTime() +
+                    TimeUnit.MILLISECONDS.toNanos(blockingWriteTimeoutMs());
+            releaseFinTail(stream, true, deadline);
         } finally {
             writeLock.unlock();
         }
@@ -751,6 +777,11 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
 
 
     private boolean flushNonBlockingLocked() throws IOException {
+        if (socketBufferHandler == null) {
+            // Closed (see the doClose() contract): nothing to stage into or
+            // drain, and no data is left for the caller to care about.
+            return false;
+        }
         boolean dataLeft = !socketBufferHandler.isWriteBufferEmpty();
         if (dataLeft) {
             doWrite(false);
@@ -1150,8 +1181,16 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
             // Latch async read interest so the readable sweep can deliver
             // another OPEN_READ when the stream still has buffered data but
             // no new network edge arrives (a large frame whose payload is
-            // drained in bounded chunks is the common case).
-            stream.getConnection().addReadInterestRearm(stream);
+            // drained in bounded chunks is the common case). Kick the loop
+            // once for the false->true transition so a stream that is
+            // already readable level-wise is serviced without waiting for
+            // new traffic.
+            Ngtcp2ConnectionWrapper conn = stream.getConnection();
+            conn.addReadInterestRearm(stream);
+            Ngtcp2Endpoint ep = conn.getEndpoint();
+            if (ep != null) {
+                ep.kickPollLoop(conn);
+            }
         }
     }
 
@@ -1163,14 +1202,23 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
             // The false→true transition: register the stream in the
             // connection's write re-arm index (re-arm sweep work set) before
             // the latch becomes observable to the writable sweep.
-            stream.getConnection().addWriteRearm(stream);
+            Ngtcp2ConnectionWrapper conn = stream.getConnection();
+            conn.addWriteRearm(stream);
             if (stream.isDeregistered() || stream.isFreed()) {
                 // A close raced this registration (setDeregistered() clears
                 // the latch and releases once, but it may have done so before
                 // our add). Release our own unit after the add so the entry
                 // cannot survive on a stream that is no longer in the map.
-                stream.getConnection().removeWriteRearm(stream);
+                conn.removeWriteRearm(stream);
                 stream.clearWriteInterest();
+            } else {
+                // Kick once for the false->true transition so an
+                // already-writable stream is serviced without waiting for
+                // new network input or a timer.
+                Ngtcp2Endpoint ep = conn.getEndpoint();
+                if (ep != null) {
+                    ep.kickPollLoop(conn);
+                }
             }
         }
     }
@@ -1235,38 +1283,51 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void doClose() {
+        // Serialise against asynchronous writers that may still be draining
+        // the staging buffers. Without the lock, a writer that passed
+        // checkNotClosed() can race the socketBufferHandler=null release
+        // below and dereference the cleared field.
+        writeLock.lock();
         try {
-            Ngtcp2StreamWrapper stream = getSocket();
-            if (stream != null) {
-                // Remove the stream from the endpoint's bookkeeping. This
-                // must run on the poll thread: the poll loop must not be
-                // mid-sweep over the stream's state when it is removed.
-                if (!endpoint.isPollThread()) {
-                    onPollThreadVoid(() -> endpoint.closeStreamByHandler(stream));
+            try {
+                Ngtcp2StreamWrapper stream = getSocket();
+                if (stream != null) {
+                    // Remove the stream from the endpoint's bookkeeping. This
+                    // must run on the poll thread: the poll loop must not be
+                    // mid-sweep over the stream's state when it is removed.
+                    if (!endpoint.isPollThread()) {
+                        onPollThreadVoid(() -> endpoint.closeStreamByHandler(stream));
+                    } else {
+                        endpoint.closeStreamByHandler(stream);
+                    }
+                }
+            } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
+                if (isInterrupted(t)) {
+                    // The calling request handler was interrupted - by the
+                    // executor shutdown at endpoint stop - while this close
+                    // hopped to the poll thread. Expected shutdown noise, not a
+                    // transport failure: stopInternal() frees (or retains) the
+                    // whole connection regardless, so no native state is left
+                    // behind by the skipped stream removal.
+                    if (log.isDebugEnabled()) {
+                        log.debug(sm.getString("socketWrapper.quicCloseInterrupted"), t);
+                    }
                 } else {
-                    endpoint.closeStreamByHandler(stream);
+                    // A close failure leaves native state behind; surface it
+                    // unconditionally rather than hiding it behind a debug
+                    // guard.
+                    log.error(sm.getString("socketWrapper.quicCloseError"), t);
                 }
-            }
-        } catch (Throwable t) {
-            ExceptionUtils.handleThrowable(t);
-            if (isInterrupted(t)) {
-                // The calling request handler was interrupted - by the
-                // executor shutdown at endpoint stop - while this close
-                // hopped to the poll thread. Expected shutdown noise, not a
-                // transport failure: stopInternal() frees (or retains) the
-                // whole connection regardless, so no native state is left
-                // behind by the skipped stream removal.
-                if (log.isDebugEnabled()) {
-                    log.debug(sm.getString("socketWrapper.quicCloseInterrupted"), t);
-                }
-            } else {
-                // A close failure leaves native state behind; surface it
-                // unconditionally rather than hiding it behind a debug
-                // guard.
-                log.error(sm.getString("socketWrapper.quicCloseError"), t);
+            } finally {
+                // Release point of the documented post-close contract: read
+                // paths guard on the null handler, write paths never touch it.
+                finTail = null;
+                finTailPos = 0;
+                socketBufferHandler = null;
             }
         } finally {
-            socketBufferHandler = null;
+            writeLock.unlock();
         }
     }
 
@@ -1372,40 +1433,29 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
                             }
                         }
                     } else {
-                        // The vectored path calls doWrite() without taking
-                        // writeLock - shared upstream behaviour. Safety
-                        // rests on two preconditions, not one: the NIO2
-                        // machinery keeps at most one operation state per
-                        // wrapper in flight, so no second vectored writer
-                        // overlaps this loop; and flushNonBlocking() -
-                        // called from the poll thread's opportunistic
-                        // write-ready flush as well as from the worker-side
-                        // dispatch re-arm and sendfile - takes writeLock,
-                        // which this loop does not hold and which therefore
-                        // cannot exclude it, but reaches doWrite() only
-                        // through staged residue (socketBufferHandler write
-                        // buffer / nonBlockingWriteBuffer), which a
-                        // contract-conforming producer has already drained
-                        // before issuing a vectored write. Note when
-                        // touching either wrapper: doWrite() also mutates
-                        // the finTail/finTailPos conclusion bookkeeping,
-                        // which every other writer holds under writeLock -
-                        // relaxing either precondition would let this
-                        // unsynchronised loop race that state. The OpenSSL
-                        // twin (QuicOpenSSLSocketWrapper's
-                        // QuicOperationState) states the same rule with the
-                        // same preconditions; keep the two in step.
-                        for (int i = 0; i < length; i++) {
-                            int start = buffers[offset + i].position();
-                            doWrite(false, buffers[offset + i]);
-                            nBytes += buffers[offset + i].position() - start;
-                            if (buffers[offset + i].hasRemaining()) {
-                                // Non-blocking would-block: stop here.
-                                // Writing the next buffer now would append
-                                // its bytes ahead of the undelivered
-                                // remainder and corrupt the byte order.
-                                break;
+                        // The vectored loop mutates the same staging buffers
+                        // and finTail/finTailPos conclusion bookkeeping as
+                        // every other writer. Take writeLock for the whole
+                        // loop: the poll thread's opportunistic
+                        // flushNonBlocking() uses tryLock(), so it cannot
+                        // block here, and the NIO2 machinery keeps at most one
+                        // operation state per wrapper in flight.
+                        writeLock.lock();
+                        try {
+                            for (int i = 0; i < length; i++) {
+                                int start = buffers[offset + i].position();
+                                doWrite(false, buffers[offset + i]);
+                                nBytes += buffers[offset + i].position() - start;
+                                if (buffers[offset + i].hasRemaining()) {
+                                    // Non-blocking would-block: stop here.
+                                    // Writing the next buffer now would append
+                                    // its bytes ahead of the undelivered
+                                    // remainder and corrupt the byte order.
+                                    break;
+                                }
                             }
+                        } finally {
+                            writeLock.unlock();
                         }
                     }
                 } catch (IOException ioe) {

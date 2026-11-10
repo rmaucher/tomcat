@@ -78,8 +78,9 @@ public class Http3ConnectionManager implements QuicConnectionManager {
     private final AbstractHttp3Protocol protocol;
 
     /**
-     * Maximum number of decoder instructions (Section Acknowledgment and
-     * Stream Cancellation) that may be pending per connection. When the
+     * Maximum number of decoder instructions (Section Acknowledgment,
+     * Stream Cancellation and Insert Count Increment) that may be pending
+     * per connection. When the
      * limit is reached the connection is failed instead of accumulating
      * unbounded state on the shared QUIC poll thread: a peer that never
      * reads its QPACK decoder stream must not be able to grow per-
@@ -480,6 +481,18 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // unprocessed, and every request on the connection may be retried.
         long identifier =
                 lastProcessedStreamId < 0 ? 0 : lastProcessedStreamId + 4;
+        // The largest client-initiated bidirectional stream ID is 2^62-4
+        // (RFC 9000 Section 2.1: the 62-bit stream ID space with the low
+        // two bits set to the client-initiated bidirectional pattern).
+        // "lastProcessedStreamId + 4" can therefore reach 2^62, which is
+        // outside the QUIC varint domain and would be silently mis-encoded
+        // by Qpack.encodeQuicInteger(). Clamp to the largest valid stream
+        // ID; RFC 9114 Section 5.2 also states 2^62-4 is the largest
+        // identifier a server may send in GOAWAY.
+        long maxClientBidirectionalStreamId = (1L << 62) - 4;
+        if (identifier > maxClientBidirectionalStreamId) {
+            identifier = maxClientBidirectionalStreamId;
+        }
         // Successive GOAWAY identifiers MUST NOT increase (RFC 9114
         // Section 5.2). The last processed ID grows as previously refused
         // rounds are accepted and completed, so clamp against the
@@ -512,7 +525,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
         // The stream type varint has already been read by
         // processClientUniStreamData(). Frames on the control stream are
-        // SETTINGS, GOAWAY and MAX_PUSH_ID; per RFC 9114 Section 6.2.1
+        // SETTINGS, GOAWAY, MAX_PUSH_ID, CANCEL_PUSH and PRIORITY_UPDATE;
+        // per RFC 9114 Section 6.2.1
         // the first frame MUST be SETTINGS (otherwise a connection error
         // of type H3_MISSING_SETTINGS) and a second SETTINGS frame is a
         // connection error of type H3_FRAME_UNEXPECTED (Section 7.2.4).
@@ -589,6 +603,24 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                         Http3Error.H3_FRAME_UNEXPECTED);
             }
 
+            if (frameType == Constants.H3_SETTINGS &&
+                    state.clientSettingsReceived) {
+                // RFC 9114 Section 7.2.4: A receiver MUST treat receipt of a
+                // second SETTINGS frame as a connection error of type
+                // H3_FRAME_UNEXPECTED. Checked on the parsed header, before
+                // any payload-size or completeness limit: the frame type is
+                // already conclusive, and a large declared length must not
+                // replace the required classification with a local
+                // H3_EXCESSIVE_LOAD error or delay it until the payload has
+                // arrived.
+                if (log.isWarnEnabled()) {
+                    log.warn(sm.getString("http3ConnectionManager.duplicateSettings"));
+                }
+                throw new Http3Exception(
+                        sm.getString("http3ConnectionManager.duplicateSettings"),
+                        Http3Error.H3_FRAME_UNEXPECTED);
+            }
+
             if (!isKnownClientControlFrame(frameType)) {
                 // Unknown frame type on the control stream: skip the
                 // payload. Per RFC 9114 Section 9, unknown values in
@@ -641,16 +673,6 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             }
 
             if (frameType == Constants.H3_SETTINGS) {
-                // RFC 9114 Section 7.2.4: A receiver MUST treat receipt of a
-                // second SETTINGS frame as a connection error of type H3_FRAME_UNEXPECTED.
-                if (state.clientSettingsReceived) {
-                    if (log.isWarnEnabled()) {
-                        log.warn(sm.getString("http3ConnectionManager.duplicateSettings"));
-                    }
-                    throw new Http3Exception(
-                            sm.getString("http3ConnectionManager.duplicateSettings"),
-                            Http3Error.H3_FRAME_UNEXPECTED);
-                }
                 ByteBuffer settingsData = data.slice();
                 settingsData.limit((int) frameLength);
                 try {
@@ -905,25 +927,26 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         }
 
         // Parse the Priority Field Value. An unparsable value is ignored
-        // (RFC 9218 Section 7 MAY-level, Section 4 "MUST be ignored").
+        // (RFC 9218 Section 7 MAY-level, Section 4 "MUST be ignored"). An
+        // empty field value is a valid empty Structured Fields Dictionary
+        // and therefore applies the RFC 9218 default parameters; it is
+        // parsed like any other value rather than skipped.
         Priority priority = null;
         int fieldValueLength = frameLength - varintLength;
-        if (fieldValueLength > 0) {
-            byte[] fieldBytes = new byte[fieldValueLength];
-            ByteBuffer fieldData = data.duplicate();
-            fieldData.limit(fieldData.position() + fieldValueLength);
-            fieldData.get(fieldBytes);
-            try {
-                priority = Priority.parsePriority(new StringReader(
-                        new String(fieldBytes, StandardCharsets.US_ASCII)));
-            } catch (IOException ioe) {
-                // Not possible with StringReader
-            } catch (IllegalArgumentException iae) {
-                if (log.isTraceEnabled()) {
-                    log.trace(sm.getString("http3ConnectionManager.priorityUpdateIgnoredValue",
-                            Long.valueOf(elementId), new String(fieldBytes,
-                                    StandardCharsets.US_ASCII)), iae);
-                }
+        byte[] fieldBytes = new byte[fieldValueLength];
+        ByteBuffer fieldData = data.duplicate();
+        fieldData.limit(fieldData.position() + fieldValueLength);
+        fieldData.get(fieldBytes);
+        try {
+            priority = Priority.parsePriority(new StringReader(
+                    new String(fieldBytes, StandardCharsets.US_ASCII)));
+        } catch (IOException ioe) {
+            // Not possible with StringReader
+        } catch (IllegalArgumentException iae) {
+            if (log.isTraceEnabled()) {
+                log.trace(sm.getString("http3ConnectionManager.priorityUpdateIgnoredValue",
+                        Long.valueOf(elementId), new String(fieldBytes,
+                                StandardCharsets.US_ASCII)), iae);
             }
         }
 
@@ -1263,6 +1286,25 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             int pendingCount = state.pendingSectionAcks.size()
                     + state.pendingCancellations.size();
             if (insertDelta > 0 || pendingCount > 0) {
+                // The Insert Count Increment is generated by this flush,
+                // outside noteDecoderInstruction(), so it must be included in
+                // the same pending-instruction cap here. Without this check a
+                // peer that keeps sending encoder instructions and never
+                // reads the server decoder stream could grow the unsent byte
+                // queue without bound (each flush appends a new increment
+                // chunk even when earlier chunks cannot be written).
+                int newInstructions = pendingCount + (insertDelta > 0 ? 1 : 0);
+                if (state.unsentInstructionCount + newInstructions >
+                        MAX_PENDING_DECODER_INSTRUCTIONS) {
+                    if (log.isWarnEnabled()) {
+                        log.warn(sm.getString(
+                                "http3ConnectionManager.pendingDecoderInstructionsFull",
+                                Integer.valueOf(MAX_PENDING_DECODER_INSTRUCTIONS)));
+                    }
+                    connection.failConnection(Http3Error.H3_EXCESSIVE_LOAD.getCode(),
+                            "HTTP/3 QPACK decoder instruction backlog");
+                    return;
+                }
                 // Build the instruction bytes:
                 // Section Acknowledgment (4.4.1): 1 + iRP(m=7) stream ID
                 // Stream Cancellation (4.4.2): 01 + iRP(m=6) stream ID
@@ -1275,6 +1317,25 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // would poison every later flush of this connection).
                 ByteBuffer instructions = ByteBuffer.allocate(
                         32 + Qpack.MAX_IRP_ENCODED_LENGTH * (pendingCount + 1));
+                // The Insert Count Increment must precede the Section
+                // Acknowledgments of this batch. A Section Acknowledgment
+                // advances the peer's Known Received Count to the Required
+                // Insert Count of the acknowledged field section (RFC 9204
+                // Section 2.1.4). An Increment sent after it would then add
+                // the same inserts again and could take the peer's Known
+                // Received Count beyond the number of inserts the encoder
+                // sent - which RFC 9204 Section 4.4.3 requires the encoder
+                // to treat as a connection error (QPACK_DECODER_STREAM_ERROR).
+                // Sending the Increment first saturates the Known Received
+                // Count at totalInserts, after which the acknowledgments
+                // (whose Required Insert Count is at most totalInserts) are
+                // no-ops for the count. This also keeps a partial write safe:
+                // QUIC delivers the decoder stream in order, so a prefix can
+                // only contain the earlier instructions.
+                if (insertDelta > 0) {
+                    // Insert Count Increment (4.4.3): 00 + iRP(m=6) increment
+                    Qpack.encodeIrp(instructions, 0x00, 6, insertDelta);
+                }
                 for (long streamId : state.pendingSectionAcks) {
                     // Section Acknowledgment (4.4.1): 1 + iRP(m=7) stream ID
                     Qpack.encodeIrp(instructions, 0x80, 7, streamId);
@@ -1282,10 +1343,6 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 for (long streamId : state.pendingCancellations) {
                     // Stream Cancellation (4.4.2): 01 + iRP(m=6) stream ID
                     Qpack.encodeIrp(instructions, 0x40, 6, streamId);
-                }
-                if (insertDelta > 0) {
-                    // Insert Count Increment (4.4.3): 00 + iRP(m=6) increment
-                    Qpack.encodeIrp(instructions, 0x00, 6, insertDelta);
                 }
                 instructions.flip();
                 int serialized = pendingCount + (insertDelta > 0 ? 1 : 0);

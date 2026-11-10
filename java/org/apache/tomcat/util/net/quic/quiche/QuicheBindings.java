@@ -1726,6 +1726,10 @@ public final class QuicheBindings {
                 // in6_pktinfo: { in6_addr addr; uint ifindex; }
                 to.set(ValueLayout.JAVA_SHORT, 0, (short) AF_INET6);
                 to.set(ValueLayout.JAVA_SHORT, 2, (short) 0);
+                // sin6_flowinfo is part of SocketAddrV6 equality/hash and
+                // quiche's path lookup; a reused buffer must not leak a
+                // stale value here.
+                to.set(ValueLayout.JAVA_INT, 4, 0);
                 MemorySegment.copy(cbuf, off + CMSG_DATA_OFFSET, to, 8, 16);
                 // Preserve the arrival interface as sin6_scope_id: quiche
                 // round-trips the sockaddr into send_info, and the send-side
@@ -1734,12 +1738,20 @@ public final class QuicheBindings {
                 to.set(ValueLayout.JAVA_INT, 24,
                         cbuf.get(ValueLayout.JAVA_INT, off + CMSG_DATA_OFFSET + 16));
                 toLenOut.set(ValueLayout.JAVA_INT, 0, 28);
-            } else if (level == SOL_UDP && type == UDP_GRO
-                    && cmsgLen >= CMSG_HEADER_SIZE + 2) {
+            } else if (level == SOL_UDP && type == UDP_GRO) {
                 // Coalesced GRO read: every segment but the last has this
-                // exact size; the read cannot be split without it.
-                groSegOut[0] = cbuf.get(ValueLayout.JAVA_SHORT,
-                        off + CMSG_DATA_OFFSET) & 0xFFFF;
+                // exact size; the read cannot be split without it. Linux
+                // writes the kernel gso_size as a 32-bit int; accept the
+                // 16-bit form as well for older/alternate providers. Reading
+                // the native width (rather than assuming the low half of an
+                // int) also works on big-endian LP64.
+                if (cmsgLen >= CMSG_HEADER_SIZE + 4) {
+                    groSegOut[0] = cbuf.get(ValueLayout.JAVA_INT,
+                            off + CMSG_DATA_OFFSET);
+                } else if (cmsgLen >= CMSG_HEADER_SIZE + 2) {
+                    groSegOut[0] = cbuf.get(ValueLayout.JAVA_SHORT,
+                            off + CMSG_DATA_OFFSET) & 0xFFFF;
+                }
             }
             off += (cmsgLen + 7) & ~7L;
         }

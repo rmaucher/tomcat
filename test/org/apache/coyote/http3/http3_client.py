@@ -193,9 +193,16 @@ def b64d(text):
     return base64.b64decode(text) if text else b""
 
 
-def make_configuration(host, port, authority, sni, ca):
+def make_configuration(host, port, authority, sni, ca, max_stream_data=None):
     configuration = QuicConfiguration(is_client=True)
     configuration.alpn_protocols = ["h3"]
+    if max_stream_data is not None:
+        # The per-stream receive window this endpoint advertises bounds the
+        # server's writes on the request streams (initial_max_stream_data).
+        # A tiny value makes the server's first response write on a request
+        # stream accept only a prefix, exercising the staging-buffer order
+        # around interim (103) HEADERS frames.
+        configuration.max_stream_data = max_stream_data
     configuration.server_name = sni if sni is not None else None
     if ca is not None:
         configuration.verify_mode = ssl.CERT_REQUIRED
@@ -582,7 +589,7 @@ def _print_request_stream(stream_id, data, decoder):
 
 async def raw_connection(args):
     configuration = make_configuration(args.host, args.port, None, args.sni,
-                                       args.ca)
+                                       args.ca, args.max_stream_data)
     host = args.host
     port = args.port
 
@@ -681,13 +688,17 @@ async def raw_connection(args):
                     client.send(stream_id,
                                 encode_h3_frame(H3_HEADERS,
                                                 b64d(args.trailers)),
-                                fin=not args.no_fin)
-                elif not args.no_fin:
+                                fin=not args.no_fin and args.fin_after is None)
+                elif not args.no_fin and args.fin_after is None:
                     client.send(stream_id, b"", fin=True)
                 elif args.streams > 1:
                     # No payload at all: still write zero bytes so that the
                     # stream ID counter advances for the next stream.
                     client.send(stream_id, b"", fin=False)
+
+        if args.fin_after is not None and request_stream_ids:
+            await asyncio.sleep(args.fin_after)
+            client.send(request_stream_ids[0], b"", fin=True)
 
         if deferred_encoder is not None:
             await asyncio.sleep(args.encoder_after_request)
@@ -978,6 +989,12 @@ def main():
                        help="do not open the client control stream")
     p_raw.add_argument("--no-qpack-streams", action="store_true",
                        help="do not open the client QPACK streams")
+    p_raw.add_argument("--max-stream-data", type=int, default=None,
+                       metavar="N",
+                       help="advertise N as the per-stream flow-control "
+                            "window, so the server's writes are accepted only "
+                            "in small prefixes (exercises the non-blocking "
+                            "staging order)")
     p_raw.add_argument("--decoder", default=None, metavar="B64",
                        help="base64 payload appended to the client QPACK "
                             "decoder stream after the stream type varint "
@@ -1029,6 +1046,10 @@ def main():
                        help="do not open the request stream")
     p_raw.add_argument("--no-fin", action="store_true",
                        help="do not FIN the request stream")
+    p_raw.add_argument("--fin-after", type=float, default=None,
+                       metavar="SECS",
+                       help="FIN the first request stream only after the "
+                            "given delay, after its data/trailers")
     p_raw.add_argument("--declared-frame", default=None,
                        metavar="TYPE,DECLARED,SENT",
                        help="raw frame on the request stream whose header "
