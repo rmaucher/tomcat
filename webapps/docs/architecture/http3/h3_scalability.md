@@ -1,768 +1,189 @@
-# HTTP/3 QUIC endpoint scalability review: OpenSSL vs quiche vs ngtcp2
+# HTTP/3 QUIC endpoint scalability: OpenSSL vs quiche vs ngtcp2
 
-Initial head-to-head review: September 28, 2026. Reworked
-October 5, 2026 after the quiche poll-loop rework (work-gated
-sweeps, timer deadline index, named hops), then the same day
-after the OpenSSL poll-loop rework (EXPLICIT event-handling
-mode, zero-event scan skip, protocol-data mark set), then the
-same day again after the quiche re-arm indexing and the
-stream→socket-wrapper back-pointer, then once more after the
-quiche UDP GSO/GRO poll-loop work (section 4). The OpenSSL
-column was re-measured on November 6, 2026 after commit
-`1ba321e21d` removed the per-item shared arena from
-`QuicPollItem` (section 4) - the earlier October OpenSSL
-figures in this file predate that fix and are obsolete.
-This file now documents the **current** state of all three
-endpoints. Historical quiche figures and the September OpenSSL
-figures have been dropped; for the older campaign and the
-OpenSSL upstream watchlist, `quic_scalability.md` remains the
-reference.
+Tomcat's HTTP/3 connector has three interchangeable QUIC transports. All
+three implement the same Coyote HTTP/3 processor and connector contract;
+they differ in the native library, TLS configuration surface and scaling
+behaviour.
 
-The three backends of the HTTP/3 connector:
+## 1. The three endpoints
 
-- `org.apache.tomcat.util.net.quic.openssl.QuicOpenSSLEndpoint`
-  (OpenSSL 4 QUIC, the default backend), and
-- `org.apache.tomcat.util.net.quic.quiche.QuicheEndpoint`
-  (Cloudflare quiche 0.30.0 via FFM, opt-in), and
-- `org.apache.tomcat.util.net.quic.ngtcp2.Ngtcp2Endpoint`
-  (ngtcp2 1.16 via FFM, backed by the system OpenSSL 3.5+ TLS stack;
-  evaluation and request-path rework in section 9).
-
-## 1. Method
-
-- Tree: current working tree (JDK 26.0.2; quiche 0.30.0 `ffi`
-  release build; OpenSSL the in-tree master build,
-  `/home/opencode/openssl-master`, `libssl.so.4`). The endpoint
-  is switched by restart with
-  `-Dorg.apache.coyote.http3.quicEndpointClass`; the bind log
-  line was checked on every case.
-- Server: `output/build` package, connector `maxThreads=150`,
-  30 s idle timeout, stream cap at the default 100, UDP-only
-  HTTP/3 connector on 8444.
-- Clients: aioquic (same host, loopback) - the harness in
-  `../h3bench` (`bench.py` load/idle modes, `merge.py`
-  aggregator, `run_case.sh` driver). Load mode:
-  `connections x streams` sequential-pipelined GET workers on
-  `/h3test.html` (70 B), 3 s warm-up, 12 s window; idle mode:
-  settled fleet (15 s settle) held with a 12 s client PING for
-  a 40 s poller sample (past the 30 s idle timeout, so a live
-  fleet is what is measured). A JVM-warming 1x32 run precedes
-  every batch.
-- Poller CPU: utime+stime delta of the `*-Poller` LWP (nid via
-  `jcmd Thread.print`), percent of one core; `us/req` is
-  poller-seconds per completed request - the host-independent
-  metric. Raw shards in `h3bench/out.*`; the current quiche
-  column is the `item3` tag (post re-arm indexing and
-  back-pointer), the OpenSSL column the November 6
-  re-measurement after the November 4 poll-item rework, and
-  the ngtcp2 column the November 6 rework run (section 9).
-
-Harness hygiene, learned the hard way and worth repeating:
-
-1. Check the connector's *effective* `maxConcurrentStreams`
-   before trusting any load row (a leftover config once clamped
-   every shape to ~320 rps, and the once-per-endpoint mismatch
-   warning can already be spent).
-2. Never trust a load window that overlaps an idle case's fleet
-   teardown.
-3. Warm the JVM before measuring a poller: cold-JIT rows read
-   2-3x too high.
-
-## 2. Idle fleet (percent of one poll core)
-
-The OpenSSL column is the November 6 re-measurement after the
-November 4 poll-item rework (section 4); the quiche column is
-the October 5 re-measurement after the re-arm indexing and
-back-pointer. The UDP GSO/GRO work does not move this table
-(idle traffic carries nothing worth merging or batching): the
-2000-connection cell re-measured 0.62 % on the GSO/GRO build.
-
-| idle conns, kept alive @12 s | OpenSSL | errs | quiche | errs |
-|---|---|---|---|---|
-| 100 | 0.26 | 0 | 0.20 | 0 |
-| 1000 | 2.57 | 0 | 0.45 | 0 |
-| 2000 | 5.55 | 0 | 0.65 | 0 |
-| 4000 | 29.12 | 0 | 1.15 | 0 |
-| 8000 | 81.45 | 1323 | 1.42 | 0 |
-
-- Quiche is flat: ~0.0002 %/conn (0.2 % at 100 is a
-  small-sample floor - a couple of timer passes over the
-  whole 40 s window). One core carries the full harness
-  range; the wall sits far beyond 8000 settled connections,
-  and the re-run took the 8000 ramp with zero churn where
-  the previous run reported ~25 retries. A connection idle
-  between its 12 s ping and its 30 s idle timeout is swept
-  ~twice per 12 s, not thousands of times.
-- OpenSSL's November 4 poll-item rework (section 4) removes
-  the per-request shared arena and native `SSL_POLL_ITEM`
-  allocation: 1000 idle conns fell from 5.09 to 2.57 % of a
-  core, 2000 from 35.80 to 5.55 %, and 4000 from 86.74 % (894
-  churn errors) to 29.12 % with zero errors. The knee has
-  moved from between 2000-4000 to between 4000-8000; what is
-  left is transport-side. Every arriving datagram and every
-  due engine timer costs one shared-engine tick - a walk of
-  every channel of the listener inside libssl (`ossl_quic_port
-  _subtick`) - and one `SSL_poll()` readout that takes the
-  engine lock per item. O(channels) per O(1) wake over an N
-  connection fleet is the quadratic; no endpoint-side work can
-  move it. Upstream watchlist in `quic_scalability.md`.
-- OpenSSL's per-connection idle cost still grows with the
-  fleet (the quadratic above), but the endpoint-side constant
-  is gone: quiche remains cheaper per idle connection at every
-  measured size, by ~5.7x at 1000 connections, ~8.5x at 2000,
-  ~25x at 4000 and ~57x at 8000 (at 100 connections the
-  small-sample floor makes the ratio ~1.3x - the absolute
-  figure there is noise, not scaling).
-
-## 3. Request load
-
-### quiche (current)
-
-`cc` marks client-process-capped rows (aioquic saturates near
-~8-16k rps per connection; server figures are then lower
-bounds, and `us/req` remains the comparable metric).
-
-| shape | rps | p50 ms | poller % | us/req |
-|---|---|---|---|---|
-| 1x1 | 7156 | 0.16 | 23.2 (client 86 %) | 32.4 |
-| 1x32 | 7738 (cc) | 5.17 | 24.0 | 31.0 |
-| 8x25 | 78,691 | 3.17 | 98.9 (poller-saturated) | 12.6 |
-| 16x16 | 70,865 | 3.90 | 99.5 (poller-saturated) | 14.0 |
-
-The poller-saturated rows are today's machine: the plateau
-moved from the ~66-68k rps / 14.6-15.2 us/req the rework run
-measured (8x25 pristine 66,984 / 14.8 on this host the same
-day) to ~71-79k rps / 12.6-14.0 us/req - the re-arm indexing
-and back-pointer gave the ~+12 % (section 4), and the UDP
-GSO/GRO work (also section 4) added ~+3 % more on the 8x25
-repeat pair (78,734 / 12.6) while pulling the 1x1 per-request
-poller cost down ~12 % (36.9 → 32.4 us/req: the server's
-same-size packet runs merge into one sendmsg - the receive
-side contributes nothing on this host, where separate client
-datagrams never coalesce and every one still arrives as its
-own read). A repeat 32x32 measured 72,853 / 13.6, so
-the rows are reproducible to ~1 %. Aggregate ceiling ~71-79k
-rps at ~99 % poller.
-
-Bulk transfer is the shape send-GSO targets (1 MiB body,
-8x25, client-process-capped at ~3.4 Gb/s loopback):
-
-| quiche 1 MiB bulk (8x25) | rps | p50 ms | poller % |
+| Endpoint | Connector protocol | Native library | Selection |
 |---|---|---|---|
-| pre-GSO (singles only) | 423 | 583 | 88.9 |
-| GSO batching | 427-441 | 569 | 79.4-82.5 |
+| OpenSSL QUIC | `org.apache.coyote.http3.Http3OpenSSLProtocol` | OpenSSL 4.x QUIC API (`libssl.so.4`) through FFM | Default backend |
+| quiche | `org.apache.coyote.http3.Http3QuicheProtocol` | Cloudflare quiche 0.30.0 (`libquiche.so`) through FFM | Opt-in |
+| ngtcp2 | `org.apache.coyote.http3.Http3Ngtcp2Protocol` | ngtcp2 1.16 plus `libngtcp2_crypto_ossl` through FFM, backed by the system OpenSSL 3.5+ TLS stack | Opt-in |
 
-Throughput is client-bound in this shape, so the win shows up
-as poller headroom: ~9 points of one core freed at the same
-rate, with a temporary server-side trace recording ~7.3
-packets per segmented sendmsg on bulk runs.
+- **OpenSSL** uses the server-side QUIC API in OpenSSL 4.x:
+  `SSL_new_listener()`, `SSL_accept_connection()`, `SSL_accept_stream()`,
+  `SSL_poll()` and the per-stream `SSL_read_ex()`/`SSL_write_ex2()` calls.
+  It supports SNI, multiple certificate configurations and PSK
+  configuration. One listener owns one shared QUIC engine, so one engine
+  tick walks all channels of that engine and an idle fleet has a
+  super-linear cost at large connection counts.
+- **quiche** uses a Rust QUIC implementation with TLS inside
+  `libquiche`. Its phase-1 configuration is a single PEM certificate source,
+  so SNI, multiple hosts and the Java keystore/PKCS#12/JKS paths are not
+  available on this backend. Its poll loop is event-gated and its idle cost
+  is the lowest of the three.
+- **ngtcp2** uses `libngtcp2` for QUIC and `libngtcp2_crypto_ossl` for TLS
+  with the system OpenSSL. It preserves the full certificate surface
+  (SNI, multiple hosts, PEM/PKCS#12/JKS, PSK) without requiring OpenSSL 4
+  QUIC support. Request throughput is slightly below OpenSSL; idle cost sits
+  between quiche and OpenSSL.
 
-### The mixed shape (quiche)
+All three support the Servlet asynchronous non-blocking write path
+(`WriteListener`/`isReady()`). quiche and ngtcp2 expose stream write
+capacity directly. OpenSSL exposes the native stream write-buffer
+statistics; the endpoint keeps a stream SSL alive until that buffer drains
+and re-drives latched write interest level-wise because `SSL_poll()` does
+not report W while the send buffer is full even after flow-control credit
+reopens.
 
-1x32 client-capped load measured against a settled 2000-
-connection idle fleet: **7776 rps, 26.1 % poller, 33.5
-us/req** - within a point of the 1x32-solo cost (24.0 %,
-31.0 us/req). An idle fleet of that size adds essentially no
-load-serving cost (the poll loop only ever sweepes
-connections an event touched).
+## 2. Measurement method
 
-### OpenSSL (November 6, after the poll-item rework)
+- Tree: current working tree at the time of measurement, JDK 26.0.2,
+  quiche 0.30.0 release build, OpenSSL 4.x in-tree build, system ngtcp2
+  1.16.
+- Server: `output/build` package, connector `maxThreads=150`,
+  HTTP/3 UDP connector on port 8444 with the default concurrent-stream
+  cap of 100. The connector's default `maxConnections` is 8192; runs
+  beyond 8000 connections raised it to 200000.
+- Clients: aioquic on loopback, `../h3bench` (`bench.py`, `merge.py`,
+  `run_case.sh`).
+- Load mode: `connections x streams` sequential-pipelined GET workers on
+  `/h3test.html` (70 B), 3 s warm-up, 12 s measurement window. A JVM-warming
+  `1x32` run precedes each batch.
+- Idle mode: a settled connection fleet (35 s settle) held with a 12 s
+  client PING over a 40 s poller sample, past the 30 s idle timeout.
+- Poller CPU: utime+stime delta of the endpoint's `*-Poller` LWP, as a
+  percentage of one core. `us/req` is poller-seconds per completed request.
+- Raw shards: `/home/opencode/h3bench/out.perf-*` and `out.ab-*`.
 
-| shape | rps | p50 ms | poller % | us/req |
-|---|---|---|---|---|
-| 1x1 | 277 | 4.54 | 5.2 | 186.6 |
-| 1x32 | 18472 (cc) | 2.08 | 25.6 | 13.8 |
-| 8x25 | 97301 | 2.47 | 99.4 | 10.2 |
-| 8x100 | 96659 | 9.52 | 99.0 | 10.2 |
-| 16x16 | 60330 (cc) | 5.20 | 76.0 | 12.6 |
-| 32x32 | 84857 | 7.02 | 98.7 | 11.6 |
+The benchmark host was shared with an unrelated local model server
+consuming about 430 % CPU. The load runs were taken with a load average
+of 20-24; the idle-limit runs were taken later at a load average of
+roughly 3.5-5.5. Absolute rps was therefore noisy: repeated OpenSSL
+`32x32` runs ranged from 75.6k to 92.3k rps and from 10.7 to 13.1 us/req.
+The tables below are one representative run; use `us/req` and the relative
+ordering for comparison, not absolute rps against a quiet host. `cc` marks
+rows where the client process, rather than the server poller, is the
+limiting factor.
 
-Against the October column in earlier revisions of this file
-(18,187 rps / 22.0 us/req on 8x25; 14,783 / 28.1 on 32x32;
-15,281 / 25.0 on 8x100), the November 4 poll-item rework
-moves 8x25 to 97,301 rps / 10.2 us/req, 32x32 to 84,857 /
-11.6 and 8x100 to 96,659 / 10.2 - roughly 5x the throughput
-at less than half the per-request poller cost. The wide shapes
-are now poller-saturated (~99 %): the aggregate ceiling is the
-shared-engine tick (`ossl_quic_port_subtick`, one channel walk
-per arriving datagram) and the per-item `SSL_poll()` readout,
-plus per-connection stream serialization on the poll thread.
-The 32x32 p99 fell from ~1 s in October to ~103 ms. 1x32 also
-improves to 18,472 rps / 13.8 us/req (client-capped at 96 %).
-1x1 is essentially unchanged - its 277 rps is the client's
-1/p50 over sequential pipelined requests with neither endpoint
-nor client CPU saturated; that p50 remains ~28x quiche's.
+## 3. Idle fleet and connection limit
 
-### The mixed shape (OpenSSL)
+Poller cost as a percentage of one core for a settled keepalive fleet,
+with the number of connection-establishment retries in parentheses:
 
-Same 1x32 against the settled 2000-connection fleet: **16,120
-rps, p50 2.34 ms, 97.7 % poller, 60.6 us/req** - about 4x the
-pre-poll-item-rework mixed figure (3973 rps, p50 8.1 ms, 88 %
-poller, 221 us/req). An idle fleet still taxes this backend:
-each request datagram wakes the shared engine, whose tick
-walks every channel of the listener (section 2), so the mixed
-cost remains ~4.4x the solo 1x32 poller cost. Quiche serves
-the same shape within a point of its solo cost.
+| idle connections | OpenSSL | quiche | ngtcp2 |
+|---|---|---|---|
+| 1000 | 2.50 (0) | 0.60 (0) | 1.30 (0) |
+| 4000 | 32.25 (0) | 1.35 (0) | 3.67 (0) |
+| 8000 | 79.9-81.2 (1,893-1,974) | 1.65-1.87 (0) | 15.9-16.0 (166-294) |
 
-## 4. The poll loops (how each backend scales)
+quiche is effectively flat per connection. ngtcp2 grows linearly and
+remains well below OpenSSL at 8000 connections. OpenSSL's shared-engine
+tick is the dominant cost at large fleets: every arriving datagram and
+every due engine timer walks every channel of the listener. The OpenSSL
+8000-connection row is already past its churn-free limit: the client still
+establishes the full fleet, but only after roughly two thousand retries.
 
-Both endpoints confine native QUIC work to one poll thread with
-worker-hop mailboxes; quiche's poll iteration is now O(work)
-instead of O(live connections):
+The measured idle scalability limit is the largest settled fleet that
+completed without material connection-establishment churn. Beyond that,
+the endpoints still accept connections, but the client retry/error count
+rises sharply; the limit is therefore a handshake/ramp limit rather than a
+hard connection cap.
 
-- **Work-gated sweep.** Each iteration sweeps the union of the
-  poll-thread work sets: connections a datagram was delivered
-  to, connections whose quiche timer expired, and connections
-  holding deferred work (dispatch replays, partially flushed
-  QPACK output, EAGAIN'd sends whose queued output quiche will
-  not re-drive on its own). An iteration whose wait timed out
-  with nothing pending skips the sweep entirely.
-- **Timer deadline index.** A min-heap of stamped
-  (deadline, seq, connection) entries replaces the per-
-  iteration O(fleet) earliest-timer scan and pinpoints the due
-  connections. Entries are pushed when a connection's timer is
-  re-read (after each sweep of that connection); stale and
-  closed-connection entries are dropped lazily (quiche reports
-  a timeout of 0 forever once closed - those reclaims are
-  flag-driven, never timer-driven), and the heap is rebuilt
-  from the per-connection cached deadlines when the stale
-  backlog passes 4x the fleet. quiche timers only move through
-  native calls, and every native call site runs inside a swept
-  connection's `processConnection` or forces a full pass.
-- **Named hops.** Mailbox submissions name the connection whose
-  native state they change. A submission enqueues its task
-  before its mark, and the loop consumes the mark queue both
-  before draining the mailbox and after the recv pass, so a
-  task's effects are always followed by a sweep naming its
-  connection. Full passes remain only for genuinely global
-  events: unattributed submissions (certificate install) and
-  wait failures. A 1 s JVM-side closed-flag scan bounds the
-  teardown latency of any future close path that neither hops
-  nor kicks.
-- **Indexed re-arm sweeps** (October follow-up). The
-  level-triggered readable/writable re-arms and the dropped
-  OPEN_READ replay used to walk the swept connection's live
-  stream map. They now iterate per-connection interest sets -
-  a parked-reader set and a refcounted parked-writer / async
-  write-interest map - maintained at the park/latch points and
-  purged at stream close, so a sweep costs O(interest) not
-  O(streams); and each stream wrapper carries a direct
-  back-pointer to its socket wrapper (published before the
-  wrapper enters the endpoint's maps, dropped at
-  deregistration), so visiting an indexed stream is one field
-  read instead of the endpoint's two-level boxed map lookup.
-- **UDP GSO send / GRO receive** (October follow-up). The send
-  loop now collects runs of equal-size, same-destination
-  packets (up to eight, one possibly short as the final
-  segment) into one segmented `sendmsg` (`UDP_SEGMENT` cmsg,
-  one iovec per staged packet) - measured ~7.3 packets per
-  syscall on bulk runs - and the receive path enables
-   `UDP_GRO`, splitting a coalesced read by its segment-size
-   cmsg and feeding quiche one packet per `quiche_conn_recv`
-   call. That split stays dormant under load on this host:
-   separate datagrams never coalesce over loopback, so merged
-   reads only arrive from a sender's own GSO batch (and every
-   merge does carry the cmsg) - `TestQuicGroSplit` injects
-   such a batch to keep the split suite-covered. Because a
-   segmented `sendmsg` is one atomic submit, a
-  run that meets EAGAIN (nothing reached the socket) is parked
-  whole, address snapshot included, on a per-connection
-  bounded pending queue that the next flush drains before
-  anything newer is pulled from quiche: wire order survives a
-  full socket buffer, and the queue bound caps loss at what
-  the kernel's own limit already imposes. The receive split is
-  gated on the cmsg being present, never on the read merely
-  being large - a path that hands up coalesced bytes without
-  the split information must not be split. Both features are
-  capability-probed once at class init with a live loopback
-  round trip (does a plain socket see the GSO batch split;
-  does a `UDP_GRO` read carry the cmsg) rather than assumed;
-  on this host both verdicts are positive and both are on by
-  default, with every path falling back to the pre-feature
-  singles/segmentation behaviour where the probe says no.
-  (The probe's own founding story: the ephemeral port must be
-  re-read with `getsockname` - an FFM downcall does not
-  propagate `bind(2)`'s sockaddr write-back, so trusting the
-  bind argument sends to port 0 and EINVALs the probe into a
-  false negative.) Measured: the 1x1 per-request poller cost
-  is ~12 % lower, the bulk shape frees ~9 points of the poll
-  core, and the 8x190 cliff row softened further (section 5).
-- **recvmmsg receive batching** (October follow-up). The recv
-  loop now reads with `recvmmsg`: one syscall takes up to
-  eight messages into per-slot mmsghdr slots - each with its
-  own data buffer, control buffer and peer sockaddr, all slot
-  pointers written once at bind - and each message is
-  delivered, GRO-split where its own cmsg says so, exactly as
-  the single-read path does; the control-buffer parse is
-  shared between the two paths. EINTR retries and the
-  EAGAIN-ends-the-pass rule carry over unchanged, the
-  fairness budget bounds messages per iteration as before,
-  and where the symbol cannot be linked the loop stays the
-  plain `recvmsg` one. Measured throughput-neutral at this
-  host's plateau (8x25 65,249 rps vs 65,072-65,258 same-day
-  baselines, 8x190 59,694 vs 59,216, 1x1 5,552-5,920 vs
-  5,553-5,877): the bound there is quiche's per-datagram
-  work on the poll core, not syscall entry, so this is an
-  order-of-magnitude receive-syscall reduction (headroom)
-  rather than a throughput win.
-- `pollTimeoutMs`, `WAIT_CAP_MS` and every connector default are
-  unchanged; there is no new configuration.
+| endpoint | churn-free limit | first material churn | poller at limit |
+|---|---|---|---|
+| OpenSSL | 4000 | 5000 (61 retries, 54.8 %) | 32.25 % |
+| quiche | 12000 (2 retries) | 14000 (108 retries, 3.4 %) | 6.37 % |
+| ngtcp2 | 6000 | 7000 (18 retries, 14.8 %) | 9.87 % |
 
-The OpenSSL poll loop reached for the same properties where
-libssl's API allows it (October rework, extended November 4):
+OpenSSL reaches 6000 connections with 564 retries at 67.2 % poller and
+8000 connections with about 1,900 retries at about 80 % poller. ngtcp2
+reaches 8000 connections with 166-294 retries at about 16 % poller and
+12000 with 3366 retries at 22.8 % poller. quiche reaches 16000
+connections with 819 retries while the poller remains around 3.3 %; its
+limit is therefore client handshake churn, not endpoint CPU. Under the
+default `maxConnections=8192`, quiche is capped at 8192 connections even
+though its idle cost would allow more.
 
-- **EXPLICIT event handling.** Accepted connections - and,
-  through OpenSSL's parent-chain inheritance, every stream of
-  them - are switched to `SSL_VALUE_EVENT_HANDLING_MODE_
-  EXPLICIT`. In the default mode every API call on a QUIC
-  object (`SSL_read_ex`, `SSL_write_ex2`, `SSL_stream_conclude`,
-  `SSL_shutdown`, `SSL_accept_stream`) drives event handling
-  implicitly, which for these objects means one whole-engine
-  tick per call - an O(fleet) channel walk behind every
-  response byte. In EXPLICIT mode the loop's single top-of-
-  iteration tick plus one flush tick at the bottom of any
-  iteration whose event handlers produced output are the only
-  engine walks (the close/teardown and shutdown paths already
-  pumped `SSL_handle_events` explicitly and are unchanged).
-  The mode cannot be set on the listener object, so its
-  accept-path autotick remains - one per new connection, not
-  per request.
-- **Zero-event scan skip.** A zero `SSL_poll()` result count
-  means no item reported anything (items that fail to poll are
-  counted through the F flag), so the revents sync and the
-  full slot scan - two O(poll-set) passes - are skipped
-  entirely; a keepalive-only ticked iteration now runs with
-  zero Java-side scan.
-- **Protocol-data mark set.** The QPACK pending-flush sweep
-  walks a mark queue of the connections that actually hold
-  instructions instead of the whole fleet, mirroring the
-  quiche named-hop pattern (mark enqueued before the count is
-  published; connections whose flush only got part way out
-  stay registered for the next sweep).
-- **Already in place from the September campaign:** one engine
-  tick per iteration instead of per poll item, the O(1)
-  engine-merged next-deadline read (`SSL_get_event_timeout` on
-  the listener), and the adaptive due-tick floor.
-- **No per-item native poll structure** (November 4).
-  `QuicPollItem` used to own an `Arena.ofShared()` plus a native
-  `SSL_POLL_ITEM`, so every accepted request stream paid a
-  `SharedSession` acquire, a native allocation and a release on
-  close just to describe one poll entry. Items now carry only
-  the `SSL*`, wanted events and revents; `QuicPollSet.rebuild()`
-  writes dirty items directly into the poll set's contiguous
-  native array. This removed the last per-request endpoint-side
-  constant factor: 8x25 moved from 18,187 to 97,301 rps and
-  22.0 to 10.2 us/req, while idle 2000 fell from 35.80 to
-  5.55 % and idle 4000 from 86.74 % (894 churn errors) to
-  29.12 % (zero).
+## 4. Request load
 
-What remains OpenSSL-side is inside libssl and no endpoint-
-side work can move it: the O(channels) `ossl_quic_port_subtick`
-walk per engine tick (the section 2 quadratic - every arriving
-datagram costs it once), the O(items) `SSL_poll()` readout that
-takes the engine lock per item, the one engine lock and one
-port per listener (no parallel handshake offload; upstream
-`TODO(QUIC MULTIPORT)`), and the transport-owned socket pump
-and DCID demux - with no app-visible per-tick channel-touch
-set, the quiche work-gated sweep has no portable equivalent
-here. quiche's remaining walls are endpoint code (section 5).
-
-## 5. Stream concurrency and known limits
-
-- **Default cap 100, both backends, fully usable.** Quiche runs
-  1x100 clean at full suite level (zero content-length
-  violations or H3-layer closes); over-cap demand clamps and
-  MAX_STREAMS credit recycles cleanly. The cap is
-  transport-level on OpenSSL (advertised
-  `initial_max_streams_bidi` pinned at 100; the endpoint can
-  only lower enforcement) and configuration on quiche (what the
-  client sees on the wire is what you set).
-- **The >150-streams/conn cliff is root-caused and fixed.**
-  The old signature - poller pinned ~98-99 %, whole-JVM
-  ~130-150 %, clients starving, cliff onset just past the
-  per-connection stream count that keeps several claims busy
-  at once - came from the busy-claim retry in
-  `scheduleStreamDispatch`: a retry whose claim was still
-  held resubmitted *itself* to the mailbox from inside the
-  mailbox drain, so the drain's `while (poll() != null)` loop
-  never saw the queue empty and the retry re-ran at drain
-  rate until its 500 ms budget expired. Temporary counters on
-  the cliff shape measured 381,400,000 retry runs for 249
-  schedules (~1.5M per chain) with the claim essentially never
-  winning inside the budget (2 wins, 128 budget handoffs): the
-  poll thread was doing nothing but retry bookkeeping - task
-  queue churn, hop-interest marks, touched-set inserts and an
-  eventfd write per resubmit. The fix parks the retry as a
-  waiter on the stream instead; the dispatch that releases the
-  claim drains the waiters and re-submits them (one wake per
-  release, races closed by registering before the claim
-  attempt), and the budget remains only as the handoff bound
-  to the readable-sweep replay. Re-measured same host, both
-  binaries (cap500): pre-fix 8x190 7,372 rps / p99 1.63 s /
-  134 us per req; post-fix 59,216 rps / p99 47.6 ms / 16.7 us;
-  8x250 1,476 (recorded pre-fix) to 55,680 rps / p99 64 ms /
-  17.8 us. Zero errors. Plateau shapes are unchanged within
-  run-to-run noise (A/B same day: 8x25 65,258 pre vs 64,616/
-  65,072 post; 1x1 5,553 pre vs 5,716/5,877 post, 1x1 being
-  client-bound at ~84 %). The earlier softening passes
-  (re-arm indexing, GSO) moved the cliff floor ~8k->14k
-  because they reduced how often claims collided, not the
-  retry loop itself. Note the host drifts run-to-run (the
-  pre-fix 8x190 row measured 14,001 in the October re-runs
-  and 7,372 today), so only same-day A/B numbers compare.
-  The <=150 cap recommendation is obsolete: the plateau now
-  extends to at least 250 streams/conn (poller-limited at
-  ~56-59k rps, same ceiling as the default-cap plateau).
-- **Silent stall above ~150 streams/conn (suspect closed).**
-  The two mechanisms the retry storm explains are the poller
-  starvation (no sweeps while the drain spins) and the
-  budget-expiry drop of non-replayable events; both are gone
-  with the fix. The stall had never reproduced on re-run, and
-  a dedicated burst probe on the fixed build (single
-  connection, simultaneous 140/190/250 streams, three runs
-  each, cap 500) completed every stream every time. Kept here
-  as a watch item; unobserved at or below the default cap in
-  the entire history.
-
-## 6. Accept burst
-
-The 8000-connection idle case is also an 8000-handshake ramp
-(300 s budget):
-
-| | established | churn/retry errs |
-|---|---|---|
-| OpenSSL (November 6, 300 s ramp budget) | 8000 | 1323 |
-| OpenSSL (October, 300 s ramp budget) | 8000 | 12512 |
-| OpenSSL (September, 60 s budget) | 7045 | 20077 |
-| quiche (October re-run, 300 s budget) | 8000 | 0 |
-
-Quiche absorbs the full burst essentially clean. OpenSSL still
-settles all 8000 within a generous budget, but the ramp churns
-~1.3k retries - down from 12.5k in October after the poll-item
-rework, and far below September's 20k at a short budget - so a
-short budget can still drop the tail. Both need
-`socket.rxBufSize` sizing and/or a slower client ramp for real
-8k bursts; neither parallelises handshakes off the poll thread.
-
-## 7. Recommendations
-
-- **Default/shipped path stays OpenSSL** (distribution and the
-  JUnit-proven backend). After the November 4 poll-item rework
-  it is the fastest backend on the measured request shapes:
-  ~97k rps on 8x25 and ~85k on 32x32 at ~10-12 us/req, with
-  wide shapes poller-saturated. Its remaining weakness is idle
-  scaling: ~5.6 % of a core at 2000 settled connections, ~29 %
-  at 4000 and ~81 % at 8000 (with ramp churn), so plan at
-  <= ~2000 idle connections per instance and scale
-  horizontally beyond that.
-- **quiche remains the idle-heavy and accept-burst choice**:
-  ~79k rps / ~12.6-14.0 us/req on the wide shapes (slightly
-  below current OpenSSL), but only ~0.45 % / ~1.15 % / ~1.42 %
-  of a core at 1000/4000/8000 settled connections, zero
-  accept-ramp churn, and an idle fleet that costs the load
-  essentially nothing. Worth the opt-in where a single
-  instance must carry many mostly-idle connections, at the
-  cost of a self-distributed native library (Rust+BoringSSL
-  static, no packages). The ~150-streams/conn ceiling it used
-  to carry (section 5) is gone since the October 6 claim-retry
-  fix.
-- **ngtcp2 is the system-OpenSSL alternative**: ~82k rps on
-  8x25 and ~76k on 32x32 at ~12-13 us/req (on par with
-  quiche), idle cost between quiche and OpenSSL, and it needs
-  only the system ngtcp2 1.16 plus OpenSSL 3.5+, not the
-  OpenSSL 4 QUIC API. Viable wherever the system TLS stack is
-  preferred, but currently ~10-16 % behind OpenSSL on request
-  throughput.
-- Verification bar on the current build: full JUnit suite green
-  on the OpenSSL backend (315 run, 0 failures, 0 errors) across
-  three consecutive runs; the quiche backend is green on the
-  same tree (316 run, 0 failures, 0 errors, 19 skipped) for
-  each of the follow-up re-arm, GSO/GRO and claim-retry commits,
-  each with
-  its own stress loops of the parked-reader / write-latch /
-  teardown suites (the GSO/GRO run additionally exercises the
-  batch send path through every handshake - the equal-size
-  Initial runs are what the batching feeds on - and the
-  cmsg-gated receive split through the injected GSO burst of
-  `TestQuicGroSplit`; separate datagrams never merge on this
-  host's loopback, so without that injection no suite or
-  benchmark traffic ever reaches the split).
-
-## 8. Open items
-
-- The quiche >150-streams/conn wall and the silent stall:
-  **closed (October 6)**. The forensic landed on the busy-claim
-  retry of `scheduleStreamDispatch`: it resubmitted itself to
-  the mailbox from inside the mailbox drain, so the drain never
-  terminated while a chain was alive and the retry ran at drain
-  rate for its full 500 ms budget (measured 381M retry runs for
-  249 schedules, the claim winning essentially never) - a
-  poll-thread starvation loop that scales with busy-claim
-  overlap, which is exactly the >150-streams/conn signature.
-  The retry is now release-driven (parked on the stream, woken
-  once by the dispatch clearing the claim). Same-day A/B cap500
-  8x190: 7,372 rps / p99 1.63 s to 59,216 rps / p99 47.6 ms;
-  8x250: 1,476 to 55,680 rps. Plateau shapes unchanged within
-  noise. The stall never reproduced before or after the fix,
-  but budget-drops and poller starvation are both mechanisms it
-  explains, so it is listed as suspect-closed (section 5).
-- Poll-loop GSO/GRO: **done for the quiche backend** (section
-  4, October 6): batched segmented sends with the pending
-  queue for the atomic-EAGAIN case, cmsg-gated receive split,
-  both capability-probed at class init. Two corrections to
-  earlier versions of this item: the "loopback hands up
-  coalesced reads without the `UDP_GRO` cmsg" observation was
-  a probe-tool artifact - Python's `recvmsg` drops that cmsg,
-   a raw reader sees it on every merge - and the host was never
-   missing the API (the very first probe had misnumbered the
-   options; see the section 4 item for the FFM bind write-back
-   trap that then hid the working probe). The cmsg presence
-   gate stays regardless of the host verdict. One more
-   correction from the coverage pass: earlier text credited
-   the 1x1 win partly to receive-side merging of client
-   bursts; separate datagrams never merge over this host's
-   loopback, so no suite or benchmark traffic reaches the
-   split - the 1x1 gain is send-side batching alone, and the
-   split path is exercised only by the capability probe and
-   by `TestQuicGroSplit`'s injected GSO batch. **Open for the
-  OpenSSL backend**: its poll loop is `SSL_poll()`-driven and
-  the batching would have to sit inside the libssl readout,
-  not around the socket.
-- recvmmsg receive batching: **done for the quiche backend**
-  (section 4, October 6). Kept as the receive-side counterpart
-  of the send batching; throughput-neutral at this host's
-  plateau (the poll core is bound by quiche's per-datagram
-  work, not syscall entry), so it buys receive-syscall
-  headroom, not rps. The OpenSSL loop has no socket-level
-  batching point outside libssl's readout.
-- Poller sharding (one endpoint facade over N `SO_REUSEPORT`
-  sockets and N poll threads, with datagram forwarding on owner
-  change): **implemented for the quiche backend and reverted
-  (October 6)**. The two-phase implementation - poll-loop state
-  carved into a per-thread Shard class, then N live shards with
-  per-shard TLS config slots - proved behaviour-neutral every
-  way it was measured: single-flow traffic is structurally
-  shard-local, and the multi-flow plateaus moved by a couple of
-  percent between one shard and four, in both directions, so the
-  capability never earned a demonstrated win. The 100 %-busy
-  single poller that motivated it is not reproducible on the
-  current host (multi-flow shapes run client-bound today), and
-  the implementation carries a cost structure that grows exactly
-  where the payoff was supposed to live: the full pass, the
-  close scan and the sweep rebuild iterate the *shared*
-  connections map on every shard, each filtering its own share
-  out, so per-iteration scan work scales with fleet size times
-  shard count until per-shard owned lists replace the filter.
-  Revisit if a poller-bound reproduction returns - it would want
-  those lists, plus a client fleet that is not itself the
-  bottleneck.
-- OpenSSL: the endpoint-side constant factors are now gone
-  (section 4, including the November 4 poll-item rework); what
-  is left scales with the fleet per engine tick and per
-  `SSL_poll()` readout and lives inside libssl - the engine
-  tick, the shared engine lock, and the invisible per-tick
-  channel-touch set that blocks a work-gated poll-set scan.
-  Upstream watchlist in `quic_scalability.md`.
-- OpenSSL 32x32 p99: improved from ~1 s in October to ~103 ms
-  after the November 4 poll-item rework. The remaining tail is
-  still stream acceptance serialised on the poll thread at high
-  per-connection concurrency; much reduced, not eliminated.
-- OpenSSL 1x1 p50 (~4.5 ms): per-request round-trip cost,
-  unexplained by either CPU; worth a forensic pass.
-
-
-## 9. ngtcp2 backend (initial evaluation and request-path rework, November 6, 2026; regression fix November 8)
-
-### Method
-
-Tree: the ngtcp2 endpoint commit `33268d6bfc`, the benchmark follow-ups
-(recycle client bidirectional stream credit with `MAX_STREAMS`; treat
-ngtcp2's no-timer value as "no deadline" instead of converting it to an
-overflowed past deadline), and the request-path rework described below.
-JDK 26.0.2; system ngtcp2 1.16.0; system OpenSSL 3.5.5. Server: the
-benchmark `tomcat-http3/output/build` tree with the freshly built ngtcp2
-jars, connector protocol `org.apache.coyote.http3.Http3Ngtcp2Protocol`,
-`maxThreads=150`, 30 s idle timeout, default stream cap 100, UDP-only
-HTTP/3 connector on 8444. The `OpenSSLLifecycleListener` was disabled for
-the run: ngtcp2 uses a normal `TLS_server_method` context and must not be
-forced through OpenSSL 4's `OSSL_QUIC_server_method` listener.
-
-Clients and timing are the same harness as sections 2-3: warm 1x32 run,
-3 s warm-up, 12 s load window; idle settle 35 s, 12 s keepalive, 40 s
-poller sample. `us/req` is poller-seconds per completed request.
-
-### Bottlenecks found and fixed
-
-The first measurement of this endpoint was ~8k rps on the wide shapes and
-~1.2k on 1x1. Profiling the poll thread (JFR execution samples, VM
-operations, per-thread CPU from `/proc`) identified six independent
-problems, all in the ngtcp2 adapter rather than in libngtcp2:
-
-1. **Completed stream state was never reclaimed, and every packet scanned
-   the whole stream map.** The adapter keeps a `StreamState` per ngtcp2
-   stream; a long-lived connection accumulated one entry per completed
-   request, and `ngtcp2_conn_send`, `stream_readable_next`,
-   `stream_writable_next` and `has_pending_send` walked that map per
-   packet. The map reached tens of thousands of dead entries within a
-   benchmark window, so cost grew linearly with requests served. The
-   adapter now reclaims a stream when ngtcp2's `stream_close` reports it
-   drained and acknowledged, and the three scans were replaced by work
-   queues (`readableQueue` ordered by stream ID, `sendQueue` round-robin).
-2. **Closing a shared `Arena` per response chunk triggered one VM-wide
-   thread handshake.** Each application write was copied into
-   `Arena.ofShared()` and freed when acked. `SharedSession.close()` cost a
-   `HandshakeAllThreads` VM operation: ~8,000/s from the poll thread, and
-   the VM Thread burned ~60 % of a core. The chunks are created, read and
-   freed on the poll thread (or on the stop thread after the poll loop has
-   exited), so they now use a confined arena. This one fix moved 8x25 from
-   ~13k to ~62k rps.
-3. **Per-datagram and per-packet arena churn.** `ngtcp2_conn_recv`,
-   `ngtcp2_header_info` and `ngtcp2_conn_send` allocated a fresh confined
-   arena for a 40-byte path, a 40-byte parse result and the send vectors
-   on every call. The receive path now reuses the connection's path
-   storage, header parsing uses a poll-loop scratch segment, and the send
-   vectors/`datalen`/`ccerr` are per-connection scratch.
-4. **Flow-control extension threw `WrongMethodTypeException` on every
-   read.** `ngtcp2_conn_extend_max_stream_offset` returns `int`, but the
-   statement-form `invokeExact` expected `void`; the exception was caught
-   and ignored, so the stream window was never extended. The return value
-   is now consumed (the connection-level extension only runs after a
-   successful stream extension).
-5. **Per-request allocation dominated the remaining poller time.** The
-   request stream's pre-read buffer was 16 KiB (it only needs to hold the
-   first frames before the handler reads directly from ngtcp2), and the
-   socket staging buffer was 64 KiB (the ngtcp2 transmit queue is the real
-   send buffer). They are now 1 KiB and the configured application write
-   buffer respectively. The two-level `(connection, stream)` socket-wrapper
-   map was also redundant - every sweep already had a stream back-pointer
-   to its wrapper - and removing it eliminated two `ConcurrentHashMap`
-   operations and two `Long` boxes per request; this was worth ~25 % on
-   the wide shapes on its own.
-6. **`ngtcp2_conn_stream_writable_next` was O(streams^2) per sweep.** Each
-   call re-walked every stream to return one readable result. The
-   level-triggered re-arm already walks only streams with a parked writer
-   or latched write interest, so the edge-triggered loop was removed.
-7. **No intermediate native copy on every stream write.** The socket
-   wrapper copied each payload into a per-call confined arena before
-   `ngtcp2_conn_stream_send` copied it again into the transport-owned chunk
-   that lives until acknowledgement. The send entry point now takes the
-   caller's byte array/slice directly and does the single copy into that
-   chunk, removing one arena acquire/allocate/copy/close per write (the
-   conclude path's empty FIN send no longer allocates at all).
-
-### Idle fleet
-
-| idle conns, kept alive @12 s | ngtcp2 poller % | errs |
-|---|---|---|
-| 1000 | 1.20 | 0 |
-| 4000 | 3.90 | 0 |
-| 8000 | 7.20 | 0 |
-
-ngtcp2 remains cheaper than OpenSSL's shared-engine idle path at every
-measured size after OpenSSL's November 4 poll-item rework (1.20 % vs
-2.57 % at 1000; 3.90 % vs 29.12 % at 4000; 7.20 % vs 81.45 % at 8000) and
-has no OpenSSL-style knee at 4000 connections. It is still somewhat more
-expensive per idle connection than quiche (which is ~0.45 % at 1000 and
-~1.15 % at 4000), but the 8000-connection ramp no longer shows churn (the
-earlier 16.22 % / 65-error row was an accept-ramp artifact; the reworked
-build takes 8000 settled connections with zero errors).
-
-### Request load
-
-`cc` marks client-process-capped rows (`aioquic` saturates before the
-server does; the rps figure is then a lower bound, `us/req` remains
-comparable).
+### OpenSSL
 
 | shape | rps | p50 ms | p99 ms | poller % | us/req | errs |
 |---|---|---|---|---|---|---|
-| 1x1 | 6483 | 0.18 | 0.37 | 25.1 (cc, client 87.9 %) | 38.7 | 0 |
-| 1x32 | 7184 (cc) | 5.58 | 5.81 | 72.1 | 100.3 | 0 |
-| 8x25 | 82,176 | 2.91 | 4.86 | 98.3 (poller-saturated) | 12.0 | 0 |
-| 16x16 | 30,861 (cc) | 10.25 | 11.99 | 99.0 | 32.1 | 0 |
-| 32x32 | 76,078 | 11.74 | 52.78 | 98.1 (poller-saturated) | 12.9 | 0 |
+| 1x1 | 280.1 | 4.41 | 5.57 | 4.33 | 154.7 | 0 |
+| 1x32 (cc) | 18,307.9 | 2.11 | 3.74 | 24.92 | 13.6 | 0 |
+| 8x25 | 98,144.8 | 2.44 | 4.78 | 99.25 | 10.1 | 0 |
+| 32x32 | 82,386.6 | 6.94 | 92.49 | 98.41 | 11.9 | 0 |
 
-The wide shapes are now poller-saturated, so the endpoint has reached the
-same kind of ceiling as quiche and OpenSSL rather than the earlier
-per-request latency wall. For reference, the same harness measured quiche
-at 78,691 rps / 12.6 us/req (8x25) and 72,853 / 13.6 (32x32), and OpenSSL
-(after its November 4 poll-item rework) at 97,301 / 10.2 (8x25) and
-84,857 / 11.6 (32x32). The reworked ngtcp2 endpoint is therefore slightly
-ahead of the quiche baseline on this host and about 84-90 % of the current
-OpenSSL throughput (10-16 % behind), with 1x1 poller cost within ~20 % of
-quiche (38.7 vs 32.4 us/req; that row is client-bound either way).
+### quiche
 
-### Regression fix (November 8, 2026)
+| shape | rps | p50 ms | p99 ms | poller % | us/req | errs |
+|---|---|---|---|---|---|---|
+| 1x1 (cc) | 7,246.2 | 0.15 | 0.37 | 20.50 | 28.3 | 0 |
+| 1x32 (cc) | 7,730.0 | 5.18 | 5.38 | 20.50 | 26.5 | 0 |
+| 8x25 | 93,910.0 | 2.62 | 3.72 | 99.08 | 10.6 | 0 |
+| 32x32 | 93,240.5 | 10.70 | 43.63 | 99.08 | 10.6 | 0 |
 
-The later correctness follow-ups (the D/F series) changed `streamClose`'s
-interpretation of `NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET`. The new
-reading is correct - a locally generated `RESET_STREAM` or `STOP_SENDING`
-sets the flag too - but it also stopped marking the receive side terminal
-at stream close. A fully closed stream then had no pending FIN edge (the
-FIN had already been delivered) and its binding state was reclaimed
-immediately, so the request path lost the terminal read event that lets
-the stream wrapper/handler complete. Re-arming the FIN on any close that
-was not a peer reset restores that edge without resurrecting the old "any
-application error is a remote reset" bug: 8x25 moved from ~69-72k rps /
-~13.8-14.5 us/req back to ~82-84k / ~11.9-12.2, the pre-follow-up
-baseline (83k / 12.0 on the same host); 32x32 measured 78k / 12.7 against
-the recorded 76k / 12.9 plateau.
+### ngtcp2
 
-### Conclusion
+| shape | rps | p50 ms | p99 ms | poller % | us/req | errs |
+|---|---|---|---|---|---|---|
+| 1x1 (cc) | 6,384.8 | 0.18 | 0.39 | 24.50 | 38.4 | 0 |
+| 1x32 (cc) | 7,101.6 | 5.64 | 5.87 | 71.25 | 100.3 | 0 |
+| 8x25 | 85,233.9 | 2.85 | 4.14 | 99.17 | 11.6 | 0 |
+| 32x32 | 77,700.1 | 11.77 | 50.64 | 99.00 | 12.7 | 0 |
 
-The ngtcp2 backend is now a viable scale endpoint on the same order as
-quiche and OpenSSL, while keeping its advantages: the system OpenSSL 3.5+
-TLS stack, SNI/multi-host certificates, PEM/PKCS#12/JKS sources, TLS 1.3
-PSK configuration and full HTTP/3 test coverage. The remaining poller work
-is per-request socket-wrapper construction and the poll loop's per-iteration
-work-set bookkeeping, not libngtcp2 scaling; the idle path is event-gated
-and linear. On this host the ranking is OpenSSL > ngtcp2 ~= quiche for
-request throughput, and quiche > ngtcp2 > OpenSSL for idle cost.
+## 5. Observations
 
-## 10. November 9, 2026 regression check
+- The wide shapes (`8x25`, `32x32`) are poller-saturated on all three
+  backends. OpenSSL leads `8x25` at about 98k rps / 10.1 us/req; quiche
+  leads the measured `32x32` run at about 93k rps / 10.6 us/req; ngtcp2
+  reaches about 85k / 11.6 and 78k / 12.7 respectively.
+- The `1x1` shape is a sequential request/response latency workload, not a
+  throughput ceiling. quiche serves it fastest (about 7.2k rps, p50
+  0.15 ms). OpenSSL's `1x1` is latency-bound (280 rps, p50 4.41 ms) with
+  most of the core idle; ngtcp2 is client-capped at about 6.4k rps.
+- The `1x32` shape is client-capped for all three backends. OpenSSL still
+  serves the highest rate (18.3k rps / 13.6 us/req) because its per-request
+  poller cost is lower than the other two on this shape.
+- Idle cost ranking is quiche < ngtcp2 < OpenSSL. At 8000 connections
+  quiche uses about 1.7 % of a core, ngtcp2 about 16 %, and OpenSSL about
+  80 %. The churn-free idle connection limit ranks the same way: quiche
+  reaches about 12,000 connections, ngtcp2 about 6000, and OpenSSL about
+  4000 before connection-establishment retries rise sharply. quiche's
+  limit is client handshake churn, not endpoint CPU; the default
+  `maxConnections=8192` is the practical cap on that backend unless the
+  connector limit is raised.
+- No performance regression was found in the OpenSSL non-blocking-write
+  work. An A/B run against the parent tree measured the same `32x32` and
+  `8x25` shapes within the run-to-run spread, and a JFR poller profile
+  showed the new stream-drain/close path below sampling visibility
+  (`drainPendingStreamDrains` had zero poller samples, while stream
+  acceptance dominated). The quiche and ngtcp2 endpoint code was unchanged.
 
-Quick re-run of the same harness on the tree carrying the HTTP/3 review
-fixes (H3-01 to H3-08), to check the fixes had not moved the reference
-numbers. Same host, server, shapes and `us/req` metric; 12 s load
-windows after the 1x32 warm-up, idle 1000/4000 with the standard settle
-and keepalive. The host was also running its local model server, so
-absolute rps has a few percent of run-to-run drift; `us/req` is the
-comparison metric.
+## 6. Reproduction
 
-| shape | OpenSSL rps / us/req | quiche rps / us/req | ngtcp2 rps / us/req |
-|---|---|---|---|
-| 1x1 | 279 / 176.4 | 6,092 (cc) / 29.7 | 6,668 / 33.1 |
-| 1x32 | 18,067 (cc) / 13.8 | 6,717 (cc) / 25.9 | 7,232 (cc) / 94.9 |
-| 8x25 | 98,097 / 10.1 | 91,005 / 10.9 | 83,264 / 11.9 |
-| 32x32 | 84,302 / 11.7 | 88,150 / 11.2 | 77,431 / 12.8 |
-| idle 1000 | 2.67 % | 0.47 % | 1.17 % |
-| idle 4000 | 30.17 % | 1.30 % | 3.60 % |
+With the benchmark base and libraries already configured, a load case is:
 
-- OpenSSL and quiche match the tables above (quiche's 8x25/32x32 are
-  at/above the recorded 78-79k / 12.6-14.0 and 72.9k / 13.6 plateaus).
-- The first fixed-build run measured OpenSSL 8x25 at 88k / 11.3 us/req
-  and 32x32 at 75.6k / 13.0, a ~10 % regression against both this file
-  and a same-day pre-fix A/B. The cause was the H3-02 fix's eager
-  `readTrailerSectionIfAvailable()` call on the dispatch path: it added
-  one socket read (a poller hop) to every request, including body-less
-  GETs with no trailers. Trailer decoding is now lazy (on
-  `isTrailerFieldsReady()` or in the after-response scan), restoring
-  OpenSSL 8x25 to 98.1k / 10.1 and 32x32 to 84.3k / 11.7. Quiche and
-  ngtcp2 shared the same processor cost; quiche recovered as well.
-- ngtcp2 was initially below the 82,176 rps / 12.0 us/req recorded in
-  section 9 (72-76k / 13.2-13.7 in repeated runs). This was not caused by
-  the HTTP/3 review fixes: replacing only `tomcat-coyote.jar` with the
-  fixed build against the benchmark `tomcat-coyote-ffm.jar` kept 8x25 at
-  83.4k / 11.9, while replacing only the ffm jar with the current tree's
-  ngtcp2 code dropped it to 72.0k / 13.7. Bisecting the ngtcp2 ffm jar
-  located the change at commit `b47f8f5fe1` ("Suppress late reset edges
-  on finalised ngtcp2 streams", N-16); N-15 measured 82-85k / 11.7-12.0,
-  N-16 69-76k / 13.2-14.2 in alternating runs. The `readShutdown`
-  tombstones stayed bounded (~34 per connection), so this was not set
-  growth, and the hot-path suppression added by N-16 was the culprit.
-  N-16 has been reverted; repeated post-revert runs measure 8x25 at
-  82.3-83.4k / 11.9-12.1 and 32x32 at 77.4-78.4k / 12.7-12.8, matching or
-  exceeding section 9. The revert gives up N-16's late-reset suppression,
-  so the original correctness defect needs a follow-up fix that does not
-  add per-request work to the ngtcp2 poller path. The full HTTP/3 suite
-  passes in both OpenSSL and ngtcp2 modes.
+```sh
+./run_case.sh <tag> load 8 25 8 12
+```
 
+and an idle case is:
+
+```sh
+./run_case.sh <tag> idle 1000 0 2 40 --stagger 0.004 --settle 35 --keepalive 12
+./run_case.sh <tag> idle 8000 0 8 40 --stagger 0.004 --settle 35 \
+    --keepalive 12 --ramp-timeout 300
+```
+
+The endpoint is selected by the `protocol` class on the 8444 connector
+(`Http3OpenSSLProtocol`, `Http3QuicheProtocol` or `Http3Ngtcp2Protocol`)
+and confirmed by the `QUIC endpoint ... bound ... using ...` log line. Use
+`LD_LIBRARY_PATH` for the OpenSSL 4 build, quiche build or system ngtcp2
+libraries as appropriate; do not mix the OpenSSL 4 build with the system
+OpenSSL that ngtcp2's crypto helper links against.

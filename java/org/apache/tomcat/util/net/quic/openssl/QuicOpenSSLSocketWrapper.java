@@ -28,6 +28,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.juli.logging.Log;
@@ -87,6 +88,14 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      * {@code Stream.StreamOutputBuffer}.
      */
     private final ReentrantLock writeLock = new ReentrantLock();
+
+    /**
+     * Latched write interest. The endpoint's poll-loop sweep uses it to
+     * re-drive writes even when OpenSSL reports no W event because the native
+     * send buffer is full (see
+     * {@link QuicOpenSSLEndpoint#addWriteInterest(QuicOpenSSLSocketWrapper)}).
+     */
+    private final AtomicBoolean writeInterest = new AtomicBoolean(false);
 
     /**
      * Creates a new socket wrapper for a QUIC stream.
@@ -565,22 +574,6 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     }
 
 
-    /**
-     * Checks if this stream has been concluded.
-     *
-     * @return {@code true} if this stream has been concluded
-     */
-    @Override
-    public boolean supportsNonBlockingWrites() {
-        // OpenSSL can accept a write into its stream send buffer before the
-        // bytes are actually sent. The generic wrapper cannot observe that
-        // native buffer, so the HTTP/3 output queue keeps the bounded blocking
-        // path for this endpoint until the transport exposes a reliable
-        // sent-vs-buffered signal.
-        return false;
-    }
-
-
     @Override
     public boolean isStreamConcluded() {
         QuicStreamWrapper stream = getSocket();
@@ -990,7 +983,42 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     @Override
     public void registerWriteInterest() {
         // Reference: pe_resume_write adds W to want_events
+        if (writeInterest.compareAndSet(false, true)) {
+            endpoint.addWriteInterest(this);
+        }
         resumeInterest(QuicPoll.SSL_POLL_EVENT_W);
+    }
+
+
+    /**
+     * Clears the latched write interest, releasing the endpoint's sweep entry.
+     */
+    void clearWriteInterest() {
+        if (writeInterest.compareAndSet(true, false)) {
+            endpoint.removeWriteInterest(this);
+        }
+    }
+
+
+    /**
+     * Whether write interest is latched.
+     *
+     * @return {@code true} if the endpoint's sweep must keep checking this
+     *         wrapper
+     */
+    boolean hasWriteInterest() {
+        return writeInterest.get();
+    }
+
+
+    /**
+     * Whether an application write currently holds the staging-buffer lock.
+     *
+     * @return {@code true} if the endpoint's sweep must not dispatch a second
+     *         writer
+     */
+    boolean isWriteLocked() {
+        return writeLock.isLocked();
     }
 
 

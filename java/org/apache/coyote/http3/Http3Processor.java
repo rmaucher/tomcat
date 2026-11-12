@@ -6223,20 +6223,13 @@ class Http3Processor extends AbstractProcessor
 
         /**
          * Whether this response uses the Servlet non-blocking write path.
-         * The mode is sticky once entered. Transports that cannot expose a
-         * reliable native write-ready signal opt out and keep the bounded
-         * blocking path.
+         * The mode is sticky once entered.
          */
         boolean isNonBlockingMode() {
             if (!listenerChecked) {
                 listenerChecked = true;
-                if (processor.getRequest().getResponse().getWriteListener() != null) {
-                    SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
-                    if (!(wrapper instanceof QuicSocketWrapper qw) ||
-                            qw.supportsNonBlockingWrites()) {
-                        nonBlockingMode = true;
-                    }
-                }
+                nonBlockingMode =
+                        processor.getRequest().getResponse().getWriteListener() != null;
             }
             return nonBlockingMode;
         }

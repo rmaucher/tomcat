@@ -34,7 +34,6 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.junit.Assert;
-import org.junit.Assume;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -105,9 +104,6 @@ public class TestAsync extends Http3TestBase {
 
     @Test
     public void testSmallInitialWriteWindow() throws Exception {
-        Assume.assumeTrue("The non-blocking output queue is currently enabled "
-                + "for the quiche and ngtcp2 endpoints only",
-                endpointIsQuiche() || endpointIsNgtcp2());
         // Keep the body large enough for multiple window updates but small
         // enough that the non-container-thread variant completes within the
         // raw client's bounded wait under suite load.
