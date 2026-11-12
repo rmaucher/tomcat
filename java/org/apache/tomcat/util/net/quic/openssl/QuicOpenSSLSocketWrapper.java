@@ -571,6 +571,17 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      * @return {@code true} if this stream has been concluded
      */
     @Override
+    public boolean supportsNonBlockingWrites() {
+        // OpenSSL can accept a write into its stream send buffer before the
+        // bytes are actually sent. The generic wrapper cannot observe that
+        // native buffer, so the HTTP/3 output queue keeps the bounded blocking
+        // path for this endpoint until the transport exposes a reliable
+        // sent-vs-buffered signal.
+        return false;
+    }
+
+
+    @Override
     public boolean isStreamConcluded() {
         QuicStreamWrapper stream = getSocket();
         return (stream != null) && stream.isConcluded();

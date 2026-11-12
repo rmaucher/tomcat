@@ -25,10 +25,12 @@ import java.nio.ByteBuffer;
 import java.nio.channels.CompletionHandler;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -38,6 +40,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import jakarta.servlet.RequestDispatcher;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.WriteListener;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -798,6 +801,161 @@ public class TestHttp3Functional extends Http3TestBase {
                 + "clear response state a non-container thread may still be "
                 + "using", 201,
                 processor.getRequest().getResponse().getStatus());
+    }
+
+
+    @Test
+    public void testNonBlockingWritesQueueUntilWritable() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        ControlledQuicSocketWrapper wrapper =
+                new ControlledQuicSocketWrapper();
+        wrapper.writable = false;
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+        setWriteListener(processor);
+
+        ByteBuffer body = ByteBuffer.wrap(new byte[4096]);
+        processor.getRequest().getResponse().doWrite(body);
+
+        Assert.assertEquals("The non-blocking write must consume the whole "
+                + "application chunk", 4096, body.position());
+        Assert.assertFalse("Queued data must make the stream not-ready",
+                processor.isReadyForWrite());
+        Assert.assertFalse("Non-blocking mode must not call writeBlocking",
+                wrapper.blockingWrite);
+        Assert.assertTrue("Write interest must be armed while data is queued",
+                wrapper.writeInterestCount > 0);
+
+        wrapper.writable = true;
+        Assert.assertFalse("The non-blocking flush must drain the queue",
+                processor.flushBufferedWrite());
+        Assert.assertTrue("A drained live stream must be ready again",
+                processor.isReadyForWrite());
+
+        processor.finishResponse();
+        Method conclude = Http3Processor.class.getDeclaredMethod(
+                "concludeStream", SocketWrapperBase.class);
+        conclude.setAccessible(true);
+        conclude.invoke(processor, wrapper);
+        Assert.assertTrue("The drained response must be concluded",
+                wrapper.concluded);
+    }
+
+
+    @Test
+    public void testNonBlockingFinDeferredUntilQueueDrained()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        ControlledQuicSocketWrapper wrapper =
+                new ControlledQuicSocketWrapper();
+        wrapper.writable = false;
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+        setWriteListener(processor);
+
+        processor.getRequest().getResponse().doWrite(
+                ByteBuffer.wrap(new byte[4096]));
+        processor.finishResponse();
+
+        Method conclude = Http3Processor.class.getDeclaredMethod(
+                "concludeStream", SocketWrapperBase.class);
+        conclude.setAccessible(true);
+        conclude.invoke(processor, wrapper);
+        Assert.assertFalse("FIN must not be sent while frames are queued",
+                wrapper.concluded);
+        Assert.assertFalse("A response with queued bytes is not writable",
+                processor.isReadyForWrite());
+
+        wrapper.writable = true;
+        Assert.assertFalse(processor.flushBufferedWrite());
+        Assert.assertTrue("FIN must be sent after the queue drains",
+                wrapper.concluded);
+    }
+
+
+    @Test
+    public void testNonBlockingCompressedTrailersFollowData()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        ControlledQuicSocketWrapper wrapper =
+                new ControlledQuicSocketWrapper();
+        wrapper.writable = false;
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+        setWriteListener(processor);
+
+        Field outputBufferField = Http3Processor.class.getDeclaredField(
+                "outputBuffer");
+        outputBufferField.setAccessible(true);
+        Object outputBuffer = outputBufferField.get(processor);
+        Method enableCompression = outputBuffer.getClass().getDeclaredMethod(
+                "enableCompression");
+        enableCompression.setAccessible(true);
+        enableCompression.invoke(outputBuffer);
+        processor.getRequest().getResponse().setTrailerFields(
+                () -> Map.of("x-trailer", "value"));
+
+        processor.getRequest().getResponse().doWrite(
+                ByteBuffer.wrap(new byte[1024]));
+        processor.finishResponse();
+
+        Method conclude = Http3Processor.class.getDeclaredMethod(
+                "concludeStream", SocketWrapperBase.class);
+        conclude.setAccessible(true);
+        conclude.invoke(processor, wrapper);
+        Assert.assertFalse("FIN must wait for compressed data and trailers",
+                wrapper.concluded);
+
+        wrapper.writable = true;
+        Assert.assertFalse(processor.flushBufferedWrite());
+        Assert.assertTrue(wrapper.concluded);
+
+        List<Integer> types = wrapper.frameTypes;
+        Assert.assertTrue("Expected HEADERS frames",
+                types.contains(Integer.valueOf(Constants.H3_HEADERS)));
+        Assert.assertTrue("Expected DATA frames for the compressed body",
+                types.contains(Integer.valueOf(Constants.H3_DATA)));
+        Assert.assertEquals("The trailer HEADERS frame must be the last "
+                + "frame before FIN", Integer.valueOf(Constants.H3_HEADERS),
+                types.get(types.size() - 1));
+        Assert.assertTrue("Compressed output must reach the wrapper",
+                wrapper.sentBytes > 0);
+        Assert.assertFalse("The compressed path must not block",
+                wrapper.blockingWrite);
+    }
+
+
+    private static void setWriteListener(Http3Processor processor)
+            throws Exception {
+        Field listenerField = Response.class.getDeclaredField("listener");
+        listenerField.setAccessible(true);
+        listenerField.set(processor.getRequest().getResponse(),
+                new WriteListener() {
+                    @Override
+                    public void onWritePossible() {
+                        // Not used by these direct processor tests.
+                    }
+
+                    @Override
+                    public void onError(Throwable t) {
+                        // Not used by these direct processor tests.
+                    }
+                });
     }
 
 
@@ -1971,6 +2129,81 @@ public class TestHttp3Functional extends Http3TestBase {
                 Semaphore semaphore,
                 VectoredIOCompletionHandler<A> completion) {
             throw new UnsupportedOperationException();
+        }
+    }
+
+
+    /*
+     * Controlled QUIC wrapper used by the non-blocking write tests. It
+     * simulates the wrapper staging buffer: writeNonBlocking() consumes the
+     * whole frame, flushNonBlocking() drains it only while writable.
+     */
+    private static class ControlledQuicSocketWrapper
+            extends StubQuicSocketWrapper {
+
+        private final List<Integer> frameTypes = new ArrayList<>();
+        private int queuedBytes;
+        private int sentBytes;
+        private int writeInterestCount;
+        private boolean writable = true;
+        private boolean blockingWrite;
+        private boolean concluded;
+        private int resetCode = -1;
+
+        @Override
+        protected void writeNonBlocking(ByteBuffer from) {
+            int len = from.remaining();
+            if (len > 0) {
+                frameTypes.add(Integer.valueOf(from.get(from.position()) & 0xFF));
+            }
+            from.position(from.limit());
+            queuedBytes += len;
+        }
+
+        @Override
+        protected void writeBlocking(ByteBuffer from) {
+            blockingWrite = true;
+            int len = from.remaining();
+            from.position(from.limit());
+            queuedBytes += len;
+        }
+
+        @Override
+        protected boolean flushNonBlocking() {
+            if (writable) {
+                sentBytes += queuedBytes;
+                queuedBytes = 0;
+                return false;
+            }
+            return queuedBytes > 0;
+        }
+
+        @Override
+        protected void flushBlocking() {
+            blockingWrite = true;
+            sentBytes += queuedBytes;
+            queuedBytes = 0;
+        }
+
+        @Override
+        public boolean canWrite() {
+            return writable && queuedBytes < 64 * 1024;
+        }
+
+        @Override
+        public void registerWriteInterest() {
+            writeInterestCount++;
+        }
+
+        @Override
+        public void concludeStream() {
+            concluded = true;
+        }
+
+        @Override
+        public boolean resetStream(long appErrorCode) {
+            resetCode = (int) appErrorCode;
+            return true;
         }
     }
 

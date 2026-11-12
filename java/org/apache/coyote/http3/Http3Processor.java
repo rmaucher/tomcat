@@ -23,11 +23,14 @@ import java.io.OutputStream;
 import java.io.StringReader;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
 import java.util.function.Supplier;
 import java.util.zip.GZIPOutputStream;
@@ -206,6 +209,18 @@ class Http3Processor extends AbstractProcessor
      * Output buffer for writing frames.
      */
     private final Http3OutputBuffer outputBuffer;
+
+    /**
+     * Set when the response is complete but the output queue still holds
+     * frames. The FIN is sent when the queue drains.
+     */
+    private boolean finPending = false;
+
+    /**
+     * Set once the FIN has been sent (or the stream was reset), so it cannot
+     * be sent twice.
+     */
+    private boolean finSent = false;
 
     /**
      * Stream ID from the QUIC stream.
@@ -1017,6 +1032,7 @@ class Http3Processor extends AbstractProcessor
     private void failConnection(SocketWrapperBase<?> socketWrapper, Http3Error error) {
         connectionFailed = true;
         reusable = false;
+        outputBuffer.discardPendingFrames();
         QuicConnection conn = quicConnection(socketWrapper);
         if (conn != null) {
             if (log.isDebugEnabled()) {
@@ -1385,8 +1401,12 @@ class Http3Processor extends AbstractProcessor
             log.trace(sm.getString("http3Processor.sendingHeadersFrame",
                     Long.valueOf(streamId)));
         }
-        socketWrapper.write(blocking, frame);
-        socketWrapper.flush(blocking);
+        if (outputBuffer.isNonBlockingMode()) {
+            outputBuffer.writeFrame(frame, true);
+        } else {
+            socketWrapper.write(blocking, frame);
+            socketWrapper.flush(blocking);
+        }
         return frame;
     }
 
@@ -2320,7 +2340,9 @@ class Http3Processor extends AbstractProcessor
             return SocketState.CLOSED;
         }
         try {
-            flushBufferedWrite();
+            if (flushBufferedWrite()) {
+                outputBuffer.flushBlocking();
+            }
         }
         catch (IOException ioe) {
             // A failed final flush means the response was truncated. Reset the
@@ -2340,12 +2362,13 @@ class Http3Processor extends AbstractProcessor
 
     @Override
     protected boolean flushBufferedWrite() throws IOException {
-        outputBuffer.flush();
-        // Blocking QUIC writes drain the whole buffer (or throw), so no
-        // data can remain once the flush succeeds. Returning true would
-        // tell the async state machine that a write is still in progress
-        // and would prevent the async completion from ever finishing.
-        return false;
+        boolean dataLeft = outputBuffer.flushNonBlocking();
+        if (dataLeft) {
+            registerWriteInterest();
+        } else if (finPending) {
+            sendFinIfPossible(getSocketWrapper());
+        }
+        return dataLeft;
     }
 
 
@@ -2431,13 +2454,19 @@ class Http3Processor extends AbstractProcessor
                 responseConcluded || getErrorState().isError()) {
             return false;
         }
-        // HTTP/3 response writes are blocking. Readiness here means that the
-        // stream has not reached a terminal state and the wrapper exists; a
-        // peer that withholds stream flow-control credit can still block a
-        // write up to the wrapper's configured write timeout. The transport
-        // bounds that wait (QuicSocketWrapper.blockingWriteTimeoutMs()), so a
-        // stalled peer cannot pin the worker indefinitely.
-        return true;
+        boolean ready = outputBuffer.isReady();
+        if (!ready) {
+            registerWriteInterest();
+        }
+        return ready;
+    }
+
+
+    private void registerWriteInterest() {
+        SocketWrapperBase<?> wrapper = getSocketWrapper();
+        if (wrapper != null) {
+            wrapper.registerWriteInterest();
+        }
     }
 
 
@@ -2545,8 +2574,8 @@ class Http3Processor extends AbstractProcessor
         // the stream FIN. Without a body the gzip member still has to be
         // emitted, matching the HTTP/1.1 GzipOutputFilter behaviour.
         outputBuffer.end();
-        flushBufferedWrite();
         sendResponseTrailers(socketWrapper);
+        outputBuffer.flush();
         // The FIN is sent by the completion path after the request-stream
         // after-response scan; see the method comment.
     }
@@ -3528,6 +3557,7 @@ class Http3Processor extends AbstractProcessor
      * Resets the QUIC stream with the given HTTP/3 stream error code.
      */
     private void resetStream(SocketWrapperBase<?> socketWrapper, Http3Error error) {
+        outputBuffer.discardPendingFrames();
         if (!streamReset.compareAndSet(false, true)) {
             return;
         }
@@ -4128,12 +4158,37 @@ class Http3Processor extends AbstractProcessor
         // The response is complete from the application's point of view even
         // if the native FIN write fails or the stream was already concluded.
         responseConcluded = true;
-        if (streamReset.get() || connectionFailed) {
+        finPending = true;
+        if (streamReset.get() || connectionFailed || getErrorState().isError()) {
             // A reset or failed connection already terminated the write side
             // with its own error signal. Sending FIN afterwards would violate
             // QUIC stream ordering (RFC 9000 Section 3.5).
+            finPending = false;
+            outputBuffer.discardPendingFrames();
             return;
         }
+        if (outputBuffer.hasPendingData()) {
+            registerWriteInterest();
+            return;
+        }
+        sendFinIfPossible(socketWrapper);
+    }
+
+
+    private void sendFinIfPossible(SocketWrapperBase<?> socketWrapper) {
+        if (!finPending || finSent) {
+            return;
+        }
+        if (streamReset.get() || connectionFailed || getErrorState().isError()) {
+            finPending = false;
+            return;
+        }
+        if (outputBuffer.hasPendingData()) {
+            registerWriteInterest();
+            return;
+        }
+        finPending = false;
+        finSent = true;
         QuicSocketWrapper quicWrapper = quicWrapper(socketWrapper);
         if (quicWrapper != null) {
             if (quicWrapper.isStreamConcluded()) {
@@ -5085,6 +5140,8 @@ class Http3Processor extends AbstractProcessor
         ackSent = false;
         trailersSent = false;
         responseConcluded = false;
+        finPending = false;
+        finSent = false;
         pseudoHeadersDone = false;
         seenPseudoHeaders = 0;
         hostHeaderSeen = false;
@@ -5097,6 +5154,7 @@ class Http3Processor extends AbstractProcessor
         // stream, the close inside emits its trailer bytes into the
         // swallow path instead of a dead QUIC stream.
         outputBuffer.resetCompression();
+        outputBuffer.resetQueue();
         streamReset.set(false);
         pendingFrameType = -1;
         pendingFrameLength = 0;
@@ -6137,7 +6195,15 @@ class Http3Processor extends AbstractProcessor
      * Wraps response body data in HTTP/3 DATA frames (RFC 9114 Section 7.2.1).
      */
     private static class Http3OutputBuffer implements OutputBuffer {
+        private static final int WRITE_QUEUE_HARD_LIMIT = 256 * 1024;
+
         private final Http3Processor processor;
+        private final ReentrantLock writeLock = new ReentrantLock();
+        private final Deque<ByteBuffer> pendingFrames = new ArrayDeque<>();
+        private long pendingBytes = 0;
+        private boolean dataLeft = false;
+        private volatile boolean nonBlockingMode = false;
+        private boolean resetOrFailed = false;
         private long bytesWritten = 0;
         private final ByteBuffer dataFrameBuffer = ByteBuffer.allocate(16384);
         private boolean voidOutput = false;
@@ -6147,6 +6213,215 @@ class Http3Processor extends AbstractProcessor
 
         Http3OutputBuffer(Http3Processor processor) {
             this.processor = processor;
+        }
+
+
+        /**
+         * Whether this response uses the Servlet non-blocking write path.
+         * The mode is sticky once entered. Transports that cannot expose a
+         * reliable native write-ready signal opt out and keep the bounded
+         * blocking path.
+         */
+        boolean isNonBlockingMode() {
+            if (!nonBlockingMode &&
+                    processor.getRequest().getResponse().getWriteListener() != null) {
+                SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
+                if (!(wrapper instanceof QuicSocketWrapper qw) ||
+                        qw.supportsNonBlockingWrites()) {
+                    nonBlockingMode = true;
+                }
+            }
+            return nonBlockingMode;
+        }
+
+
+        void writeFrame(ByteBuffer frame, boolean flushAfter) throws IOException {
+            if (!isNonBlockingMode()) {
+                SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
+                if (wrapper == null) {
+                    return;
+                }
+                wrapper.write(true, frame);
+                if (flushAfter) {
+                    wrapper.flush(true);
+                }
+                return;
+            }
+            appendFrame(frame);
+            if (flushAfter) {
+                flushNonBlocking();
+            }
+        }
+
+
+        private void appendFrame(ByteBuffer frame) throws IOException {
+            writeLock.lock();
+            try {
+                if (resetOrFailed || processor.streamReset.get() ||
+                        processor.connectionFailed) {
+                    frame.position(frame.limit());
+                    return;
+                }
+                int len = frame.remaining();
+                if (len == 0) {
+                    return;
+                }
+                if (pendingBytes + len > WRITE_QUEUE_HARD_LIMIT) {
+                    resetOrFailed = true;
+                    pendingFrames.clear();
+                    pendingBytes = 0;
+                    dataLeft = false;
+                    IOException ioe = new IOException(sm.getString(
+                            "http3Processor.writeQueueFull",
+                            Long.valueOf(processor.streamId),
+                            Integer.valueOf(WRITE_QUEUE_HARD_LIMIT)));
+                    processor.setErrorState(ErrorState.CLOSE_NOW, ioe);
+                    SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
+                    if (wrapper != null) {
+                        processor.handleStreamError(wrapper,
+                                Http3Error.H3_INTERNAL_ERROR);
+                    }
+                    throw ioe;
+                }
+                pendingFrames.addLast(frame);
+                pendingBytes += len;
+                dataLeft = true;
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+
+        boolean flushNonBlocking() throws IOException {
+            writeLock.lock();
+            try {
+                return flushNonBlockingLocked();
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+
+        private boolean flushNonBlockingLocked() throws IOException {
+            SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
+            if (wrapper == null || resetOrFailed) {
+                pendingFrames.clear();
+                pendingBytes = 0;
+                dataLeft = false;
+                return false;
+            }
+            try {
+                boolean wrapperLeft = wrapper.flush(false);
+                if (wrapperLeft) {
+                    dataLeft = true;
+                    processor.registerWriteInterest();
+                    return true;
+                }
+                while (!pendingFrames.isEmpty()) {
+                    if (!wrapper.canWrite()) {
+                        dataLeft = true;
+                        processor.registerWriteInterest();
+                        return true;
+                    }
+                    ByteBuffer frame = pendingFrames.removeFirst();
+                    int len = frame.remaining();
+                    wrapper.write(false, frame);
+                    pendingBytes -= len;
+                }
+                dataLeft = wrapper.flush(false);
+                if (dataLeft) {
+                    processor.registerWriteInterest();
+                }
+                return dataLeft;
+            } catch (IllegalStateException ise) {
+                pendingFrames.clear();
+                pendingBytes = 0;
+                dataLeft = false;
+                return false;
+            }
+        }
+
+
+        void flushBlocking() throws IOException {
+            writeLock.lock();
+            try {
+                SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
+                if (wrapper == null || resetOrFailed) {
+                    pendingFrames.clear();
+                    pendingBytes = 0;
+                    dataLeft = false;
+                    return;
+                }
+                wrapper.flush(true);
+                while (!pendingFrames.isEmpty()) {
+                    ByteBuffer frame = pendingFrames.removeFirst();
+                    int len = frame.remaining();
+                    wrapper.write(true, frame);
+                    pendingBytes -= len;
+                }
+                wrapper.flush(true);
+                dataLeft = false;
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+
+        boolean isReady() {
+            writeLock.lock();
+            try {
+                if (resetOrFailed || dataLeft || !pendingFrames.isEmpty()) {
+                    return false;
+                }
+                SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
+                if (wrapper == null) {
+                    return false;
+                }
+                try {
+                    return wrapper.canWrite();
+                } catch (IllegalStateException ise) {
+                    return false;
+                }
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+
+        boolean hasPendingData() {
+            writeLock.lock();
+            try {
+                return resetOrFailed ? false : dataLeft || !pendingFrames.isEmpty();
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+
+        void discardPendingFrames() {
+            writeLock.lock();
+            try {
+                pendingFrames.clear();
+                pendingBytes = 0;
+                dataLeft = false;
+                resetOrFailed = true;
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+
+        void resetQueue() {
+            writeLock.lock();
+            try {
+                pendingFrames.clear();
+                pendingBytes = 0;
+                dataLeft = false;
+                resetOrFailed = false;
+                nonBlockingMode = false;
+            } finally {
+                writeLock.unlock();
+            }
         }
 
         void setVoidOutput(boolean voidOutput) {
@@ -6247,10 +6522,16 @@ class Http3Processor extends AbstractProcessor
             if (pending == 0) {
                 return 0;
             }
+            boolean nonBlocking = isNonBlockingMode();
             if (compressionEnabled) {
-                return writeCompressed(chunk, pending);
+                writeCompressed(chunk, pending);
+            } else {
+                emitData(chunk, pending);
             }
-            return emitData(chunk, pending);
+            if (nonBlocking) {
+                flushNonBlocking();
+            }
+            return pending;
         }
 
         private int writeCompressed(ByteBuffer chunk, int len) throws IOException {
@@ -6309,6 +6590,7 @@ class Http3Processor extends AbstractProcessor
             int maxPayload = dataFrameBuffer.capacity() - 9;
             int originalLimit = chunk.limit();
             int written = 0;
+            boolean nonBlocking = isNonBlockingMode();
             while (dataLen > 0) {
                 int frameLen = Math.min(dataLen, maxPayload);
                 dataFrameBuffer.clear();
@@ -6323,7 +6605,14 @@ class Http3Processor extends AbstractProcessor
                 chunk.limit(originalLimit);
 
                 dataFrameBuffer.flip();
-                wrapper.write(true, dataFrameBuffer);
+                if (nonBlocking) {
+                    ByteBuffer queued = ByteBuffer.allocate(dataFrameBuffer.remaining());
+                    queued.put(dataFrameBuffer);
+                    queued.flip();
+                    appendFrame(queued);
+                } else {
+                    wrapper.write(true, dataFrameBuffer);
+                }
                 dataLen -= frameLen;
                 written += frameLen;
             }
@@ -6371,9 +6660,10 @@ class Http3Processor extends AbstractProcessor
                 // compressed body.
                 compressionStream.flush();
             }
-            SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
-            if (wrapper != null) {
-                wrapper.flush(true);
+            if (isNonBlockingMode()) {
+                flushNonBlocking();
+            } else {
+                flushBlocking();
             }
         }
 

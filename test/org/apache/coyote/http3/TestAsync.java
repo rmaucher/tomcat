@@ -34,6 +34,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -99,6 +100,41 @@ public class TestAsync extends Http3TestBase {
 
         // Check that the right number of bytes were received
         Assert.assertEquals(targetSize, response.getBody().length);
+    }
+
+
+    @Test
+    public void testSmallInitialWriteWindow() throws Exception {
+        Assume.assumeTrue("The non-blocking output queue is currently enabled "
+                + "for the quiche and ngtcp2 endpoints only",
+                endpointIsQuiche() || endpointIsNgtcp2());
+        // Keep the body large enough for multiple window updates but small
+        // enough that the non-container-thread variant completes within the
+        // raw client's bounded wait under suite load.
+        int blockCount = 4;
+        int targetSize = BLOCK_SIZE * blockCount;
+
+        startHttp3Server(ctxt -> {
+            Wrapper w = Tomcat.addServlet(ctxt, "async",
+                    new AsyncServlet(blockCount, useNonContainerThreadForWrite));
+            w.setAsyncSupported(true);
+            ctxt.addServletMapping("/async", "async");
+        });
+
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers",
+                buildFieldSection(":method", "GET", ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path", "/async"),
+                "--max-stream-data", "8192", "--timeout", "20"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, HttpServletResponse.SC_OK);
+        Assert.assertEquals("The complete response body must arrive after "
+                + "the client opens its flow-control window", targetSize,
+                response.getBody().length);
+        Assert.assertNull(output.getStreamError());
+        Assert.assertNull(output.getConnectionError());
     }
 
 

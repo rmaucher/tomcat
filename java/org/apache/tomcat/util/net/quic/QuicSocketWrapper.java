@@ -145,6 +145,19 @@ public abstract class QuicSocketWrapper extends SocketWrapperBase<QuicStream> {
 
 
     /**
+     * Whether this transport supports the non-blocking write/flush contract
+     * used by the HTTP/3 output queue. Transports with native send-buffer
+     * semantics that the generic wrapper cannot observe may opt out and use
+     * the bounded blocking path instead.
+     *
+     * @return {@code true} if non-blocking queue writes are supported
+     */
+    public boolean supportsNonBlockingWrites() {
+        return true;
+    }
+
+
+    /**
      * Returns whether the write side of the stream has been concluded (the
      * FIN has been sent).
      *
