@@ -71,49 +71,18 @@ enum Http3Error {
 
 
     /**
-     * Returns whether the HTTP/3 processor layer only ever emits this code
-     * as a stream error (QUIC {@code RESET_STREAM}).
-     * <p>
-     * Among the codes this classification covers, all others are connection
-     * errors in the contexts where the processor emits them (RFC 9114
-     * Sections 4.1, 6.2.1, 7.2.3, 7.2.4, 7.2.6, 7.2.7, 7.2.8; RFC 9204
-     * Sections 2.1.2, 2.2.3, 4.2, 6). {@link #H3_MESSAGE_ERROR} is the only
-     * code that reaches a stream-scoped failure through this
-     * classification: it signals a malformed HTTP message (RFC 9114
-     * Section 4.1.2), including a field section that exceeds the advertised
-     * size or header count limits (RFC 9114 Section 4.2.2), where only the
-     * affected stream is failed. Some of these malformed-message emissions
-     * carry this code on the base {@link Http3Exception} type rather than on
-     * {@link Http3StreamException} (for example in
-     * {@link Http3Processor#emitHeader(String, String)}); the processor's
-     * {@code service()} classifies them by error code - using this method -
-     * rather than by exception type, so they also fail only the affected
-     * stream, and the emit sites carry a note.
-     * <p>
-     * This classification therefore drives the base-{@link
-     * Http3Exception} dispatch in both {@code service()} and
-     * {@code isTrailerFieldsReady()}. It does not mean no
-     * other code is ever stream-scoped: the processor resets individual
-     * streams with other codes directly at their sites via
-     * {@code Http3StreamException}/{@code handleStreamError()} - e.g.
-     * {@link #H3_REQUEST_INCOMPLETE}, {@link #H3_FRAME_ERROR} and
-     * {@link #H3_QPACK_DECOMPRESSION_FAILED} (RFC 9204 Section 7.4) -
-     * bypassing this method entirely. A new stream-scoped reset can reuse
-     * {@code handleStreamError()} regardless of what this method returns
-     * for its code.
-     * <p>
-     * This classification covers the explicit protocol error emissions of
-     * the processor layer, not the QUIC endpoint's default stream reset
-     * code: stream-scoped failures handled at the endpoint by its error
-     * event handling reset the individual stream with the connector's
-     * default stream error code
-     * ({@link AbstractHttp3Protocol#getDefaultStreamErrorCode()},
-     * {@link #H3_INTERNAL_ERROR} for a stream-scoped reset), so codes that
-     * are otherwise classified as connection errors can also appear on a
-     * {@code RESET_STREAM} through that path.
+     * Returns whether this code is stream-scoped when emitted by the
+     * processor layer (QUIC {@code RESET_STREAM}) rather than a connection
+     * error. Only {@link #H3_MESSAGE_ERROR} is classified here. Other
+     * stream-scoped resets ({@link #H3_REQUEST_INCOMPLETE},
+     * {@link #H3_FRAME_ERROR}, {@link #H3_QPACK_DECOMPRESSION_FAILED}) are
+     * emitted directly through {@code Http3StreamException} or
+     * {@code handleStreamError()} and bypass this method. The classification
+     * drives the base-{@link Http3Exception} dispatch in {@code service()} and
+     * {@code isTrailerFieldsReady()}.
      *
-     * @return {@code true} if the HTTP/3 processor layer only ever emits
-     *         this code as a stream error
+     * @return {@code true} if the processor layer emits this code only as a
+     *         stream error
      */
     boolean isStreamError() {
         return this == H3_MESSAGE_ERROR;

@@ -199,10 +199,11 @@
       <code>0</code> is enforced as an explicit zero-byte local limit but
       is not advertised, so peers apply the RFC 9114 default of unlimited.
       A negative value is treated locally as <code>0</code> and is likewise
-      not advertised. Values above <code>Integer.MAX_VALUE</code> are
-      clamped to <code>Integer.MAX_VALUE</code> for both the local limit
-      and the advertisement. If not specified, a default of
-      <code>16384</code> is used.</p>
+      not advertised. Positive values above 4473915 (the largest decoded
+      field section that fits the 16 MiB per-frame buffer after the QPACK
+      wire overhead) are clamped to that effective limit for the local
+      decoder, the advertisement and the inbound frame preflight. If not
+      specified, a default of <code>16384</code> is used.</p>
     </attribute>
 
     <attribute name="noCompressionEncodings" required="false">

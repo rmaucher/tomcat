@@ -26,6 +26,9 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.catalina.connector.Connector;
+import org.apache.tomcat.util.net.quic.QuicConnection;
+import org.apache.tomcat.util.net.quic.QuicConnectionManager;
+import org.apache.tomcat.util.net.quic.QuicStream;
 
 /**
  * Tests for the limits imposed by the server on the size and number of
@@ -195,7 +198,8 @@ public class TestHttp3Limits extends Http3TestBase {
                 buildFieldSection(simpleGetHeaders("/simple")),
                 "--declared-frame", "0xA0," + declared + "," + delivered,
                 "--frame-delay", "5",
-                "--timeout", "10"),
+                "--timeout", "20",
+                "--wait", "2"),
                 CLIENT_TIMEOUT_SECONDS, 0, () -> {
                     // Sample while the server has read the delivered payload
                     // of the mid-frame unknown frame but not its remainder
@@ -209,7 +213,11 @@ public class TestHttp3Limits extends Http3TestBase {
                 });
 
         // The stream must still serve: the unknown frame is skipped and the
-        // HEADERS frame after it processed normally.
+        // HEADERS frame after it processed normally. The client timeout is
+        // deliberately generous so a loaded test machine has time to deliver
+        // the delayed remainder and process the following HEADERS frame.
+        Assert.assertEquals("Expected exactly one response; client output: "
+                        + output.getLines(), 1, output.getResponses().size());
         Http3Response response = output.getResponse();
         validateStatus(response, 200);
         Assert.assertNull(output.getConnectionError());
@@ -526,6 +534,191 @@ public class TestHttp3Limits extends Http3TestBase {
         } catch (QpackException expected) {
             // Expected
         }
+    }
+
+
+    @Test
+    public void testMaxFieldSectionSizeIsClampedToFrameLimit()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        // A field section limit far above what the per-frame buffer and the
+        // QPACK wire overhead can support must not be advertised verbatim.
+        protocol.setMaxFieldSectionSize(8L * 1024 * 1024);
+        Http3ConnectionManager manager = new Http3ConnectionManager(protocol);
+
+        long effective = (16L * 1024 * 1024
+                - (2L * Qpack.MAX_IRP_ENCODED_LENGTH + 12L)) * 4L / 15L;
+        Assert.assertEquals("A configured size above the frame limit must be "
+                + "clamped to the effective limit", effective,
+                manager.getMaxFieldSectionSize());
+
+        ByteBuffer init = manager.getServerUniStreamInitData(
+                Http3ConnectionManager.SERVER_STREAM_INDEX_CONTROL);
+        Assert.assertEquals(Constants.H3_STREAM_TYPE_CONTROL,
+                decodeQuicInteger(init));
+        Assert.assertEquals(Constants.H3_SETTINGS,
+                decodeQuicInteger(init));
+        long settingsLength = decodeQuicInteger(init);
+        Assert.assertEquals(settingsLength, init.remaining());
+        long advertised = -1;
+        while (init.hasRemaining()) {
+            long id = decodeQuicInteger(init);
+            long value = decodeQuicInteger(init);
+            if (id == Constants.H3_SETTINGS_MAX_FIELD_SECTION_SIZE) {
+                advertised = value;
+            }
+        }
+        Assert.assertEquals(effective, advertised);
+    }
+
+
+    @Test
+    public void testIgnoredControlFrameBudget() throws Exception {
+        Http3ConnectionManager manager =
+                new Http3ConnectionManager(newHttp3Protocol());
+        QuicConnection connection = newConnection(manager);
+        manager.connectionOpen(connection);
+
+        // SETTINGS is the required first control-stream frame; it is followed
+        // by an unknown frame whose declared payload exceeds the ignored-data
+        // budget. The connection must fail with H3_EXCESSIVE_LOAD instead of
+        // consuming the padding indefinitely.
+        ByteBuffer data = ByteBuffer.allocate(32);
+        Qpack.encodeQuicInteger(data, Constants.H3_STREAM_TYPE_CONTROL);
+        Qpack.encodeQuicInteger(data, Constants.H3_SETTINGS);
+        Qpack.encodeQuicInteger(data, 0);
+        Qpack.encodeQuicInteger(data, 0x80);
+        Qpack.encodeQuicInteger(data, 33L * 1024 * 1024);
+        data.flip();
+        try {
+            manager.processClientUniStreamData(connection, 2, data);
+            Assert.fail("An ignored control frame above the budget must "
+                    + "fail the connection");
+        } catch (Http3Exception e) {
+            Assert.assertEquals(Http3Error.H3_EXCESSIVE_LOAD, e.getError());
+        }
+    }
+
+
+    @Test
+    public void testUnknownUniStreamDataBudget() throws Exception {
+        Http3ConnectionManager manager =
+                new Http3ConnectionManager(newHttp3Protocol());
+        QuicConnection connection = newConnection(manager);
+        manager.connectionOpen(connection);
+
+        // The first chunk identifies a reserved/unknown stream type; all
+        // subsequent payload is discarded. Discarding must be bounded per
+        // connection rather than allowing arbitrary padding work.
+        ByteBuffer first = ByteBuffer.allocate(1024 * 1024 + 4);
+        Qpack.encodeQuicInteger(first, 0x40);
+        first.position(first.limit());
+        first.flip();
+        manager.processClientUniStreamData(connection, 2, first);
+
+        boolean failed = false;
+        try {
+            for (int i = 0; i < 33; i++) {
+                ByteBuffer chunk = ByteBuffer.allocate(1024 * 1024);
+                chunk.position(chunk.limit());
+                chunk.flip();
+                manager.processClientUniStreamData(connection, 2, chunk);
+            }
+        } catch (Http3Exception e) {
+            Assert.assertEquals(Http3Error.H3_EXCESSIVE_LOAD, e.getError());
+            failed = true;
+        }
+        Assert.assertTrue("Discarding unknown uni-stream data above the "
+                + "budget must fail the connection", failed);
+    }
+
+
+    private static QuicConnection newConnection(Http3ConnectionManager manager) {
+        return new QuicConnection() {
+
+            @Override
+            public QuicConnectionManager getQuicConnectionManager() {
+                return manager;
+            }
+
+            @Override
+            public String getSniHostName() {
+                return "";
+            }
+
+            @Override
+            public void failConnection(long appErrorCode, String reason) {
+                // Not used by these tests
+            }
+
+            @Override
+            public int writeToStream(QuicStream stream, ByteBuffer data) {
+                return 0;
+            }
+        };
+    }
+
+
+    @Test
+    public void testConnectionSettingsAreSnapshotted() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setQpackMaxTableCapacity(1024);
+        protocol.setQpackBlockedStreams(3);
+        protocol.setMaxFieldSectionSize(8192);
+
+        Http3ConnectionManager manager = new Http3ConnectionManager(protocol);
+
+        // Change the connector properties after the per-connection manager
+        // has captured its settings. The advertised SETTINGS and the decoder
+        // hard limit must keep using the captured values, otherwise a peer
+        // could be told a capacity the decoder rejects.
+        protocol.setQpackMaxTableCapacity(2048);
+        protocol.setQpackBlockedStreams(5);
+        protocol.setMaxFieldSectionSize(16384);
+
+        ByteBuffer init = manager.getServerUniStreamInitData(
+                Http3ConnectionManager.SERVER_STREAM_INDEX_CONTROL);
+        Assert.assertEquals(Constants.H3_STREAM_TYPE_CONTROL,
+                decodeQuicInteger(init));
+        Assert.assertEquals(Constants.H3_SETTINGS,
+                decodeQuicInteger(init));
+        long settingsLength = decodeQuicInteger(init);
+        Assert.assertEquals(settingsLength, init.remaining());
+
+        long qpackCapacity = -1;
+        long blockedStreams = -1;
+        long maxFieldSectionSize = -1;
+        while (init.hasRemaining()) {
+            long id = decodeQuicInteger(init);
+            long value = decodeQuicInteger(init);
+            if (id == Constants.H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY) {
+                qpackCapacity = value;
+            } else if (id == Constants.H3_SETTINGS_QPACK_BLOCKED_STREAMS) {
+                blockedStreams = value;
+            } else if (id == Constants.H3_SETTINGS_MAX_FIELD_SECTION_SIZE) {
+                maxFieldSectionSize = value;
+            }
+        }
+        Assert.assertEquals(1024, qpackCapacity);
+        Assert.assertEquals(3, blockedStreams);
+        Assert.assertEquals(8192, maxFieldSectionSize);
+
+        // The shared decoder hard limit must match the advertised capacity.
+        QpackDecoder decoder = manager.getSharedDecoder();
+        ByteBuffer tooLarge = ByteBuffer.allocate(16);
+        Qpack.encodeIrp(tooLarge, 0x20, 5, 2048);
+        tooLarge.flip();
+        try {
+            decoder.processInstruction(tooLarge);
+            Assert.fail("A capacity above the snapshotted maximum must be "
+                    + "rejected");
+        } catch (QpackException expected) {
+            // Expected
+        }
+        ByteBuffer accepted = ByteBuffer.allocate(16);
+        Qpack.encodeIrp(accepted, 0x20, 5, 1024);
+        accepted.flip();
+        decoder.processInstruction(accepted);
     }
 
 

@@ -452,19 +452,18 @@ final class Qpack {
      * <pre>
      *  0   1   2   3   4   5   6   7
      * +---+---+---+---+---+---+---+---+
-     * |H |i S(7)                             |
-     * +---+---------------------------------------------------+
-     * | String Length (continued)                         |
-     * +---------------------------------------------------+
-     * ~ String Length (continued)                         ~
-     * +---------------------------------------------------+
-     * | String Data (String Length)                       |
-     * +---------------------------------------------------+
-     * ~ String Data (String Length)                       ~
-     * +---------------------------------------------------+
+     * | H |   String Length (7+)      |
+     * +---+---------------------------+
+     * | String Length (continued)     |
+     * +-------------------------------+
+     * | String Data (String Length)   |
+     * |             ...               |
+     * +-------------------------------+
      * </pre>
      * H = Huffman flag (1 = Huffman-encoded, 0 = literal)
-     * i S(7) = iRP(m=7) string length sharing the first byte
+     * The 7-bit prefix carries the low bits of the string length; lengths
+     * that do not fit the prefix continue in 7-bit groups (RFC 9204
+     * Section 4.1.2).
      * </p>
      *
      * @param source The buffer to read from

@@ -196,7 +196,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testSetCapacityInlineAndOverflow() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
 
         // 001 + iRP(m=5) 1024: prefix overflow then 7-bit groups.
         ByteBuffer capacity = ByteBuffer.wrap(
@@ -212,6 +212,23 @@ public class TestQpackDecoder {
         decoder.processInstruction(
                 insertLiteralName("k", "0123456789"));
         Assert.assertEquals(1, decoder.getTotalInserts());
+    }
+
+
+    @Test
+    public void testDefaultConstructorStartsAtZeroCapacity() throws Exception {
+        QpackDecoder decoder = new QpackDecoder();
+
+        // RFC 9204 Section 3.2.2: the initial dynamic table capacity is zero.
+        // An insert before a Set Dynamic Table Capacity instruction is an
+        // encoder stream error.
+        try {
+            decoder.processInstruction(insertLiteralName("k", "v"));
+            Assert.fail("An insert before Set Dynamic Table Capacity must be "
+                    + "rejected");
+        } catch (QpackException e) {
+            // Expected
+        }
     }
 
 
@@ -269,7 +286,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testInsertWithNameReferenceStatic() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         // Static index 17 has name ":method"; the instruction inserts the
         // name with a literal value (RFC 9204 Section 4.3.2).
         decoder.processInstruction(insertNameRefStatic(STATIC_METHOD_GET,
@@ -288,7 +305,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testInsertWithNameReferenceDynamic() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         decoder.processInstruction(insertLiteralName("foo", "v1"));
         // Relative index 0 = most recently inserted (RFC 9204 Sections
         // 3.2.5, 4.3.2): takes the name "foo" with a new value.
@@ -310,7 +327,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testInsertWithLiteralNameHuffman() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         // 01 H=1 NameLen(5+) with a Huffman coded name.
         ByteBuffer instruction =
                 ByteBuffer.allocate(64);
@@ -361,7 +378,7 @@ public class TestQpackDecoder {
     @Test
     public void testLargeHuffmanInsertWithinTrueExpansionBoundAccepted()
             throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
 
         // RFC 9204 Section 7.4: implementation limits must be large enough
         // to process the largest field the HTTP implementation accepts.
@@ -397,7 +414,7 @@ public class TestQpackDecoder {
     @Test
     public void testInsertLiteralBeyondExpansionBoundRejected()
             throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
 
         // Fail-fast is preserved above the (corrected) bound: a declared
         // value length above 15/4 * (4096 - 32) + 2 = 15242 can never
@@ -422,7 +439,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testDuplicate() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         decoder.processInstruction(insertLiteralName("dup", "a"));
         decoder.processInstruction(duplicate(0));
         Assert.assertEquals(2, decoder.getTotalInserts());
@@ -442,7 +459,7 @@ public class TestQpackDecoder {
     @Test
     public void testStaticIndexOutOfRangeInstructionRejected()
             throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         try {
             // Insert With Name Reference, static table index 99 (iRP(m=6)
             // overflow: 0xFF prefix, +36): the table has indexes 0..98.
@@ -478,7 +495,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testIncompleteInstructionRewindsForRetry() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
 
         ByteBuffer buffer = ByteBuffer.allocate(64);
         buffer.put((byte) 0xC1);    // Insert name ref, static index 1
@@ -509,7 +526,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testAllFieldLineTypes() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         insertSeries(decoder, 4);   // absolute 0..3 = key:v0..key:v3
 
         ByteBuffer block = ByteBuffer.allocate(256);
@@ -547,7 +564,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testBlockedFieldSection() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
 
         ByteBuffer block = ByteBuffer.allocate(64);
         putPrefix(block, 3, 0);     // RIC = 2 with 0 inserts: blocked
@@ -576,7 +593,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testPostBaseAtOrAboveRicRejected() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         insertSeries(decoder, 2);   // absolute 0..1
 
         ByteBuffer block = ByteBuffer.allocate(64);
@@ -602,7 +619,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testReferenceAtOrAboveRicRejected() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         insertSeries(decoder, 2);   // absolute 0..1
 
         ByteBuffer block = ByteBuffer.allocate(64);
@@ -625,7 +642,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testSignBitBaseArithmetic() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         insertSeries(decoder, 3);   // absolute 0..2
 
         ByteBuffer block = ByteBuffer.allocate(64);
@@ -645,7 +662,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testInvalidBaseRejected() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
 
         ByteBuffer block = ByteBuffer.allocate(64);
         // RIC = 2 (encoded 3) with Sign=1 and Delta Base 2: Sign set and
@@ -665,7 +682,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testEncodedInsertCountOutOfRangeRejected() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         insertSeries(decoder, 2);
 
         ByteBuffer block = ByteBuffer.allocate(64);
@@ -687,7 +704,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testEncodedInsertCountWrapAround() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         // MaxEntries = 4096/32 = 128, Full Range = 256. After 200 inserts
         // MaxValue = 200 + 128 = 328 and
         // MaxWrapped = (MaxValue / Full Range) * Full Range = 256.
@@ -729,7 +746,7 @@ public class TestQpackDecoder {
     @Test
     public void testEncodedInsertCountBeyondIntRangeDecodes()
             throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         // More than 2^31 lifetime inserts (Integer.MAX_VALUE + 1 lifted,
         // plus one real insert at absolute index 2^31).
         liftTotalInserts(decoder, 2_147_483_648L);
@@ -757,7 +774,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testNameRefInsertBeyondIntRangeResolves() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         liftTotalInserts(decoder, 2_147_483_648L);
         decoder.processInstruction(insertLiteralName("key", "big"));
         // The live entry now sits at absolute index 2^31.
@@ -788,7 +805,7 @@ public class TestQpackDecoder {
     @Test
     public void testStaticIndexOutOfRangeFieldLineRejected()
             throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
 
         ByteBuffer block = ByteBuffer.allocate(64);
         putPrefix(block, 0, 0);
@@ -812,7 +829,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testHeaderCountLimit() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         decoder.setMaxHeaderCount(1);
 
         ByteBuffer block = ByteBuffer.allocate(64);
@@ -833,7 +850,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testCookieCountedOnce() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         decoder.setMaxHeaderCount(2);
 
         ByteBuffer block = ByteBuffer.allocate(64);
@@ -852,7 +869,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testTruncatedPrefixLeavesBlockUnconsumed() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
 
         // A 1-byte field section whose only byte is the all-ones 8-bit
         // prefix (0xFF) requires continuation bytes that are missing: the
@@ -873,7 +890,7 @@ public class TestQpackDecoder {
 
     @Test
     public void testHeaderSizeLimit() throws Exception {
-        QpackDecoder decoder = new QpackDecoder();
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         // (:method, GET) costs 32 + 7 + 3 = 42 bytes (RFC 9204 Section
         // 3.2.1, RFC 9114 Section 4.2.2 accounting).
         decoder.setMaxHeaderSize(50);

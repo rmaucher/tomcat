@@ -26,10 +26,12 @@ import org.apache.tomcat.util.res.StringManager;
 /**
  * QPACK decoder per RFC 9204.
  * <p>
- * The decoder receives encoder instructions on the encoder stream, emits
- * decoder instructions on the decoder stream, and decodes header blocks from
- * request/response streams. Unlike HPACK, QPACK uses out-of-band dynamic
- * table management.
+ * The decoder consumes encoder instructions from the encoder stream, decodes
+ * field sections from request/response streams and maintains the dynamic
+ * table. It does not write the decoder stream itself: the connection manager
+ * queues and flushes the Section Acknowledgment, Stream Cancellation and
+ * Insert Count Increment instructions on its behalf. Unlike HPACK, QPACK uses
+ * out-of-band dynamic table management.
  */
 public class QpackDecoder {
 
@@ -129,8 +131,14 @@ public class QpackDecoder {
     private long currentRic = -1;
 
 
+    /**
+     * Creates a decoder with the RFC 9204 Section 3.2.2 initial dynamic table
+     * capacity of zero and the default maximum table capacity. The encoder
+     * must send a Set Dynamic Table Capacity instruction before inserting
+     * entries.
+     */
     public QpackDecoder() {
-        this(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+        this(0, Qpack.DEFAULT_TABLE_SIZE);
     }
 
 

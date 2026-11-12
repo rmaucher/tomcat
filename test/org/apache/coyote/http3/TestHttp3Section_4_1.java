@@ -823,6 +823,41 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
     }
 
 
+    @Test
+    public void testConnectionCloseWithShortBodySurfacedAsIOException()
+            throws Exception {
+        shortBodyReadException = null;
+        startHttp3Server(this::addShortBodyServlet);
+
+        // The client sends only part of the declared body and closes the QUIC
+        // connection (CONNECTION_CLOSE) rather than ending the request stream
+        // with a clean FIN. The servlet must see an I/O error, not a clean
+        // EOF that would let it process the truncated body as complete.
+        runClient(rawCommandWith(
+                "--headers",
+                buildFieldSection(":method", "POST", ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/shortbody", "content-length", "10"),
+                "--data", Base64.getEncoder().encodeToString(
+                        "12345".getBytes(StandardCharsets.US_ASCII)),
+                "--no-fin",
+                "--close-error", "0",
+                "--timeout", "1", "--wait", "1"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        long deadline = System.currentTimeMillis() + 5000;
+        while (shortBodyReadException == null &&
+                System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        Assert.assertNotNull("A connection close with a short body must raise "
+                + "an I/O error to the application", shortBodyReadException);
+        Assert.assertTrue("Expected an IOException, got "
+                        + shortBodyReadException.getClass().getName(),
+                shortBodyReadException instanceof IOException);
+    }
+
+
     private void addShortBodyServlet(Context ctxt) {
         Tomcat.addServlet(ctxt, "shortbody", new HttpServlet() {
             private static final long serialVersionUID = 1L;

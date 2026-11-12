@@ -5519,6 +5519,12 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         }
 
         if (error != null) {
+            if (errorCode == 0) {
+                // Unexpected throwable without an HTTP/3 code: use the same
+                // protocol default as the quiche and ngtcp2 endpoints rather
+                // than closing with application error code 0.
+                errorCode = getDefaultStreamErrorCode();
+            }
             failConnection(conn, errorCode,
                     "Protocol connection error on stream " + stream.getStreamId());
             return;

@@ -183,6 +183,7 @@ public abstract class Http3TestBase extends TomcatBaseTest {
      * HTTP/3 error codes (RFC 9114 Section 8.1, RFC 9204 Section 8.3).
      */
     protected static final int H3_NO_ERROR = 0x100;
+    protected static final int H3_INTERNAL_ERROR = 0x102;
     protected static final int H3_STREAM_CREATION_ERROR = 0x103;
     protected static final int H3_CLOSED_CRITICAL_STREAM = 0x104;
     protected static final int H3_FRAME_UNEXPECTED = 0x105;
@@ -198,9 +199,11 @@ public abstract class Http3TestBase extends TomcatBaseTest {
     protected static final int H3_QPACK_DECODER_STREAM_ERROR = 0x202;
 
     /**
-     * Default timeout, in seconds, for a single client invocation.
+     * Default timeout, in seconds, for a single client invocation. The
+     * aioquic raw client uses a shorter internal timeout (see rawRequest())
+     * that leaves room for its shutdown grace period under load.
      */
-    protected static final long CLIENT_TIMEOUT_SECONDS = 30;
+    protected static final long CLIENT_TIMEOUT_SECONDS = 60;
 
     /**
      * The UDP port that the HTTP/3 connector is listening on.
@@ -697,7 +700,13 @@ public abstract class Http3TestBase extends TomcatBaseTest {
      * @return The client output
      */
     protected ClientOutput rawRequest(String... headers) {
-        return runClient(rawCommandWith("--headers", buildFieldSection(headers)),
+        // Use a longer aioquic timeout than the default so a reset or
+        // CONNECTION_CLOSE that needs QUIC retransmission is still observed
+        // when the test machine is busy running the rest of the suite. The
+        // process-level timeout leaves room for the client's shutdown grace
+        // period (cmd_raw allows 2 * timeout + 5 seconds).
+        return runClient(rawCommandWith("--headers",
+                buildFieldSection(headers), "--timeout", "20"),
                 CLIENT_TIMEOUT_SECONDS);
     }
 

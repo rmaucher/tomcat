@@ -34,17 +34,30 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+import jakarta.servlet.RequestDispatcher;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServlet;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Test;
 
+import org.apache.catalina.Context;
+import org.apache.catalina.startup.Tomcat;
 import org.apache.coyote.AbstractProcessor;
+import org.apache.coyote.ActionCode;
+import org.apache.coyote.ContinueResponseTiming;
+import org.apache.coyote.ErrorState;
 import org.apache.coyote.Response;
 import org.apache.coyote.UpgradeToken;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.net.AbstractEndpoint;
+import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
 import org.apache.tomcat.util.net.ApplicationBufferHandler;
 import org.apache.tomcat.util.net.SSLSupport;
 import org.apache.tomcat.util.net.SendfileDataBase;
@@ -65,6 +78,13 @@ public class TestHttp3Functional extends Http3TestBase {
 
     private static final org.apache.coyote.Adapter TEST_ADAPTER =
             new TestAdapter();
+
+    /*
+     * Observation points for the body-capture servlet used by the streaming
+     * request-body error tests.
+     */
+    private static volatile int captureBodyLength;
+    private static volatile Throwable captureReadError;
 
     @Test
     public void testGet() throws Exception {
@@ -242,6 +262,179 @@ public class TestHttp3Functional extends Http3TestBase {
 
 
     @Test
+    public void testStreamedBodyOverrunSurfacedAsIOException()
+            throws Exception {
+        resetBodyCapture();
+        startHttp3Server(this::addBodyCaptureServlet);
+
+        // The first DATA frame fills the pre-dispatch buffer; the second
+        // over-runs Content-Length and is observed by the streaming read.
+        // The application must see an I/O error rather than a clean EOF for
+        // the truncated body (RFC 9114 Section 4.1.2).
+        byte[] first = new byte[64 * 1024];
+        Arrays.fill(first, (byte) 'a');
+        byte[] overrun = new byte[5000];
+        Arrays.fill(overrun, (byte) 'b');
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers",
+                buildFieldSection(":method", "POST",
+                        ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/captureBody",
+                        "content-length",
+                        Integer.toString(first.length + overrun.length - 1)),
+                "--data", Base64.getEncoder().encodeToString(first),
+                "--frame-after-data",
+                buildFrameB64(0x00, overrun),
+                "--timeout", "5"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+        assertBodyCaptureReadFailed();
+    }
+
+
+    @Test
+    public void testControlFrameDuringBodySurfacedAsIOException()
+            throws Exception {
+        resetBodyCapture();
+        startHttp3Server(this::addBodyCaptureServlet);
+
+        // A control-only frame while a declared request body is still
+        // incomplete is a connection error (RFC 9114 Section 4.1). The
+        // application must see an I/O error while reading the body, not a
+        // clean EOF for the truncated body.
+        byte[] body = new byte[64 * 1024];
+        Arrays.fill(body, (byte) 'a');
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers",
+                buildFieldSection(":method", "POST",
+                        ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/captureBody", "content-length",
+                        Integer.toString(body.length + 5000)),
+                "--data", Base64.getEncoder().encodeToString(body),
+                "--frame-after-data", buildFrameB64(0x04, new byte[] { 0 }),
+                "--timeout", "5"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionErrorCode(output, H3_FRAME_UNEXPECTED);
+        assertBodyCaptureReadFailed();
+    }
+
+
+    private void assertConnectionErrorCode(ClientOutput output,
+            int expectedError) {
+        Assert.assertEquals("Expected connection error " + expectedError
+                + " but got " + output.getConnectionError(),
+                Integer.valueOf(expectedError), output.getConnectionError());
+    }
+
+
+    private void resetBodyCapture() {
+        captureBodyLength = -1;
+        captureReadError = null;
+    }
+
+
+    private void assertBodyCaptureReadFailed() {
+        Assert.assertNotNull(
+                "The application was not told that its request body was "
+                        + "truncated or malformed (read bytes: "
+                        + captureBodyLength + ")",
+                captureReadError);
+        Assert.assertTrue("Expected an IOException, got "
+                + captureReadError.getClass().getName(),
+                captureReadError instanceof IOException);
+    }
+
+
+    private void addBodyCaptureServlet(Context ctxt) {
+        Tomcat.addServlet(ctxt, "captureBody", new HttpServlet() {
+
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void doPost(HttpServletRequest req,
+                    HttpServletResponse resp)
+                    throws ServletException, IOException {
+                try {
+                    captureBodyLength = req.getInputStream().readAllBytes().length;
+                } catch (IOException ioe) {
+                    captureReadError = ioe;
+                }
+                resp.getWriter().print("done");
+            }
+        });
+        ctxt.addServletMapping("/captureBody", "captureBody");
+    }
+
+
+    @Test
+    public void testLateContentLengthOverrunAfterBodyCompleteResetsStream()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        AtomicInteger resetCode = new AtomicInteger(-1);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            public boolean resetStream(long appErrorCode) {
+                resetCode.set((int) appErrorCode);
+                return true;
+            }
+        };
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        // Simulate a completed Content-Length body followed by an extra DATA
+        // frame that the after-response scan is about to inspect.
+        Field requestContentLength = Http3Processor.class.getDeclaredField(
+                "requestContentLength");
+        requestContentLength.setAccessible(true);
+        requestContentLength.setLong(processor, 64 * 1024);
+        Field totalDataReceived = Http3Processor.class.getDeclaredField(
+                "totalDataReceived");
+        totalDataReceived.setAccessible(true);
+        totalDataReceived.setLong(processor, 64 * 1024);
+
+        Field inputBufferHasData = Http3Processor.class.getDeclaredField(
+                "inputBufferHasData");
+        inputBufferHasData.setAccessible(true);
+        inputBufferHasData.setBoolean(processor, true);
+        Field inputBufferField =
+                Http3Processor.class.getDeclaredField("inputBuffer");
+        inputBufferField.setAccessible(true);
+        ByteBuffer inputBuffer = (ByteBuffer) inputBufferField.get(processor);
+        byte[] frame = Base64.getDecoder().decode(buildFrameB64(0x00,
+                "extra".getBytes(StandardCharsets.US_ASCII)));
+        inputBuffer.clear();
+        inputBuffer.put(frame);
+        inputBuffer.flip();
+
+        Method decode = Http3Processor.class.getDeclaredMethod(
+                "decodeTrailerSectionAfterResponse", SocketWrapperBase.class);
+        decode.setAccessible(true);
+        try {
+            decode.invoke(processor, wrapper);
+        } catch (InvocationTargetException ite) {
+            throw (Exception) ite.getCause();
+        }
+
+        Assert.assertEquals("The late DATA frame must be rejected with "
+                + "H3_MESSAGE_ERROR", H3_MESSAGE_ERROR, resetCode.get());
+        Field streamReset = Http3Processor.class.getDeclaredField(
+                "streamReset");
+        streamReset.setAccessible(true);
+        Assert.assertTrue("The request stream must be reset",
+                ((AtomicBoolean) streamReset.get(processor)).get());
+    }
+
+
+    @Test
     public void testGetWithDeclaredBodyOverrunStreamReset() throws Exception {
         startHttp3Server();
 
@@ -360,6 +553,33 @@ public class TestHttp3Functional extends Http3TestBase {
 
 
     @Test
+    public void testFinishResponsePropagatesWriteFailure() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        StubReadSocketWrapper wrapper = new StubReadSocketWrapper() {
+            @Override
+            protected void writeBlocking(ByteBuffer from) throws IOException {
+                throw new IOException("test write failure");
+            }
+        };
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        try {
+            processor.finishResponse();
+            Assert.fail("A failed final write must propagate an IOException");
+        } catch (IOException expected) {
+            // Expected; AbstractProcessor.action(CLOSE) uses this to set the
+            // processor error state instead of concluding the stream.
+        }
+    }
+
+
+    @Test
     public void testAbandonedTrailerReadMarksStreamCancellation() throws Exception {
         AbstractHttp3Protocol protocol = newHttp3Protocol();
         Http3Processor processor = new Http3Processor(protocol, null);
@@ -396,6 +616,823 @@ public class TestHttp3Functional extends Http3TestBase {
         cancellationSent.setAccessible(true);
         Assert.assertTrue("An abandoned trailer read must queue the QPACK " +
                 "Stream Cancellation", cancellationSent.getBoolean(processor));
+    }
+
+
+    @Test
+    public void testAdapterExceptionMarksProcessorNotReusable() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setAdapter(new TestAdapter() {
+            @Override
+            public void service(org.apache.coyote.Request req,
+                    org.apache.coyote.Response res) {
+                throw new IllegalStateException("test adapter failure");
+            }
+        });
+        Http3Processor processor =
+                new Http3Processor(protocol, protocol.getAdapter());
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            protected void writeBlocking(ByteBuffer from) {
+                from.position(from.limit());
+            }
+
+            @Override
+            protected void flushBlocking() {
+                // NO-OP
+            }
+
+            @Override
+            protected boolean flushNonBlocking() {
+                return true;
+            }
+        };
+
+        byte[] fieldSection = Base64.getDecoder().decode(buildFieldSection(
+                ":method", "GET", ":scheme", "http",
+                ":authority", "127.0.0.1:80", ":path", "/simple"));
+        wrapper.enqueue(Base64.getDecoder().decode(
+                buildFrameB64(0x01, fieldSection)));
+
+        Assert.assertEquals(SocketState.CLOSED, processor.service(wrapper));
+
+        // The adapter exception must mark the response/request as errored and
+        // prevent recycling into the shared pool, matching HTTP/1.1/HTTP/2.
+        Assert.assertTrue("The response must be marked as an error",
+                processor.getRequest().getResponse().isError());
+        Assert.assertNotNull("The adapter exception must be exposed as the "
+                        + "request error",
+                processor.getRequest().getAttribute(
+                        RequestDispatcher.ERROR_EXCEPTION));
+        processor.recycle();
+        Assert.assertFalse("A processor whose adapter threw must not be "
+                + "returned to the shared pool", processor.isReusable());
+    }
+
+
+    @Test
+    public void testAdapterExceptionAfterCommitResetsStream() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setAdapter(new TestAdapter() {
+            @Override
+            public void service(org.apache.coyote.Request req,
+                    org.apache.coyote.Response res) {
+                res.action(ActionCode.COMMIT, null);
+                try {
+                    res.doWrite(ByteBuffer.wrap(
+                            "partial".getBytes(StandardCharsets.US_ASCII)));
+                } catch (IOException ioe) {
+                    throw new IllegalStateException(
+                            "test adapter write failure", ioe);
+                }
+                throw new IllegalStateException(
+                        "test adapter failure after commit");
+            }
+        });
+        Http3Processor processor =
+                new Http3Processor(protocol, protocol.getAdapter());
+        processor.setStreamId(0);
+
+        AtomicInteger resetCode = new AtomicInteger(-1);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            protected void writeBlocking(ByteBuffer from) {
+                from.position(from.limit());
+            }
+
+            @Override
+            protected void flushBlocking() {
+                // NO-OP
+            }
+
+            @Override
+            public boolean resetStream(long appErrorCode) {
+                resetCode.set((int) appErrorCode);
+                return true;
+            }
+        };
+
+        byte[] fieldSection = Base64.getDecoder().decode(buildFieldSection(
+                ":method", "GET", ":scheme", "http",
+                ":authority", "127.0.0.1:80", ":path", "/error"));
+        wrapper.enqueue(Base64.getDecoder().decode(
+                buildFrameB64(0x01, fieldSection)));
+
+        Assert.assertEquals(SocketState.CLOSED, processor.service(wrapper));
+        Assert.assertEquals("A committed response truncated by an adapter "
+                + "exception must be reset with H3_INTERNAL_ERROR",
+                H3_INTERNAL_ERROR, resetCode.get());
+    }
+
+
+    @Test
+    public void testErrorResponseWriteFailureResetsStream() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setAdapter(new TestAdapter() {
+            @Override
+            public void service(org.apache.coyote.Request req,
+                    org.apache.coyote.Response res) {
+                throw new IllegalStateException("test adapter failure");
+            }
+        });
+        Http3Processor processor =
+                new Http3Processor(protocol, protocol.getAdapter());
+        processor.setStreamId(0);
+
+        AtomicInteger resetCode = new AtomicInteger(-1);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            protected void writeBlocking(ByteBuffer from) throws IOException {
+                throw new IOException("test error-response write failure");
+            }
+
+            @Override
+            protected void flushBlocking() {
+                // NO-OP
+            }
+
+            @Override
+            public boolean resetStream(long appErrorCode) {
+                resetCode.set((int) appErrorCode);
+                return true;
+            }
+        };
+
+        byte[] fieldSection = Base64.getDecoder().decode(buildFieldSection(
+                ":method", "GET", ":scheme", "http",
+                ":authority", "127.0.0.1:80", ":path", "/error"));
+        wrapper.enqueue(Base64.getDecoder().decode(
+                buildFrameB64(0x01, fieldSection)));
+
+        Assert.assertEquals(SocketState.CLOSED, processor.service(wrapper));
+        Assert.assertEquals("A failed 500 response write must reset the "
+                + "stream with H3_INTERNAL_ERROR", H3_INTERNAL_ERROR,
+                resetCode.get());
+    }
+
+
+    @Test
+    public void testNonReusableRecyclePreservesApplicationState()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setAdapter(TEST_ADAPTER);
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+        processor.getRequest().setMethod("POST");
+        processor.getRequest().getResponse().setStatus(201);
+
+        Method setErrorState = AbstractProcessor.class.getDeclaredMethod(
+                "setErrorState", ErrorState.class, Throwable.class);
+        setErrorState.setAccessible(true);
+        setErrorState.invoke(processor, ErrorState.CLOSE_NOW,
+                new IOException("simulated response failure"));
+
+        processor.recycle();
+
+        Assert.assertFalse("The errored processor must not be reusable",
+                processor.isReusable());
+        Assert.assertEquals("Recycling a non-reusable processor must not "
+                + "clear request state a non-container thread may still be "
+                + "using", "POST", processor.getRequest().getMethod());
+        Assert.assertEquals("Recycling a non-reusable processor must not "
+                + "clear response state a non-container thread may still be "
+                + "using", 201,
+                processor.getRequest().getResponse().getStatus());
+    }
+
+
+    @Test
+    public void testSectionAckBacklogAbortsWithExcessiveLoad()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3ConnectionManager manager = new Http3ConnectionManager(protocol);
+        StubQuicConnection connection = new StubQuicConnection() {
+            @Override
+            public QuicConnectionManager getQuicConnectionManager() {
+                return manager;
+            }
+        };
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            public QuicConnection getConnection() {
+                return connection;
+            }
+        };
+        manager.connectionOpen(connection);
+        Http3ConnectionManager.ConnectionState state =
+                manager.getState(connection);
+
+        // Fill the pending Section Acknowledgment queue to the per-connection
+        // limit so the next acknowledgment cannot be queued.
+        Field pendingField = Http3ConnectionManager.ConnectionState.class
+                .getDeclaredField("pendingSectionAcks");
+        pendingField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.List<Long> pending =
+                (java.util.List<Long>) pendingField.get(state);
+        for (int i = 0;
+                i < Http3ConnectionManager.MAX_PENDING_DECODER_INSTRUCTIONS;
+                i++) {
+            pending.add(Long.valueOf(0));
+        }
+
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        Method note = Http3Processor.class.getDeclaredMethod(
+                "noteSectionAcknowledgment");
+        note.setAccessible(true);
+        try {
+            note.invoke(processor);
+            Assert.fail("A full decoder-instruction backlog must not be "
+                    + "silently ignored");
+        } catch (InvocationTargetException ite) {
+            Throwable cause = ite.getCause();
+            Assert.assertTrue("Expected Http3Exception, got " + cause,
+                    cause instanceof Http3Exception);
+            Assert.assertEquals(Http3Error.H3_EXCESSIVE_LOAD,
+                    ((Http3Exception) cause).getError());
+        }
+    }
+
+
+    @Test
+    public void testSectionAckBacklogOnTrailerFailsConnection()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3ConnectionManager manager = new Http3ConnectionManager(protocol);
+        AtomicLong connectionFailure = new AtomicLong(-1);
+        StubQuicConnection connection = new StubQuicConnection() {
+            @Override
+            public QuicConnectionManager getQuicConnectionManager() {
+                return manager;
+            }
+
+            @Override
+            public void failConnection(long appErrorCode, String reason) {
+                connectionFailure.compareAndSet(-1, appErrorCode);
+            }
+        };
+        AtomicLong streamReset = new AtomicLong(-1);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            public QuicConnection getConnection() {
+                return connection;
+            }
+
+            @Override
+            public boolean resetStream(long appErrorCode) {
+                streamReset.compareAndSet(-1, appErrorCode);
+                return true;
+            }
+        };
+        manager.connectionOpen(connection);
+        Http3ConnectionManager.ConnectionState state =
+                manager.getState(connection);
+
+        // Put one dynamic entry in the shared table so a field section with
+        // Required Insert Count = 1 can be decoded, then fill the pending
+        // Section Acknowledgment queue to the per-connection limit. The
+        // trailer decode must fail the connection (H3_EXCESSIVE_LOAD), not
+        // reset only the stream with that connection-level code.
+        QpackDecoder decoder = manager.getSharedDecoder();
+        ByteBuffer capacity = ByteBuffer.allocate(16);
+        Qpack.encodeIrp(capacity, 0x20, 5, Qpack.DEFAULT_TABLE_SIZE);
+        capacity.flip();
+        decoder.processInstruction(capacity);
+        ByteBuffer insert = ByteBuffer.allocate(32);
+        Qpack.encodeIrp(insert, 0x80 | 0x40, 6, 1);
+        Qpack.encodeIrp(insert, 0, 7, 1);
+        insert.put((byte) 'x');
+        insert.flip();
+        decoder.processInstruction(insert);
+
+        Field pendingField = Http3ConnectionManager.ConnectionState.class
+                .getDeclaredField("pendingSectionAcks");
+        pendingField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.List<Long> pending =
+                (java.util.List<Long>) pendingField.get(state);
+        for (int i = 0;
+                i < Http3ConnectionManager.MAX_PENDING_DECODER_INSTRUCTIONS;
+                i++) {
+            pending.add(Long.valueOf(0));
+        }
+
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+        processor.setSharedQpackDecoder(decoder);
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        // A valid field section prefix with Required Insert Count = 1 and no
+        // field lines: the decode succeeds, then the Section Acknowledgment
+        // hits the full backlog.
+        ByteBuffer trailerPayload = ByteBuffer.allocate(2);
+        trailerPayload.put((byte) 0x02);
+        trailerPayload.put((byte) 0x00);
+        Field trailerField = processor.getRequest().getInputBuffer()
+                .getClass().getDeclaredField("trailerPayload");
+        trailerField.setAccessible(true);
+        trailerField.set(processor.getRequest().getInputBuffer(),
+                trailerPayload);
+        Method finish = processor.getRequest().getInputBuffer().getClass()
+                .getDeclaredMethod("finishTrailerSection",
+                        SocketWrapperBase.class);
+        finish.setAccessible(true);
+        finish.invoke(processor.getRequest().getInputBuffer(), wrapper);
+
+        // The application must not see a clean EOF for a request body that
+        // was abandoned by a connection-level failure. The read must report
+        // an I/O error, and the readiness/body-complete answers must agree.
+        Method doRead = processor.getRequest().getInputBuffer().getClass()
+                .getDeclaredMethod("doRead", ApplicationBufferHandler.class);
+        doRead.setAccessible(true);
+        try {
+            doRead.invoke(processor.getRequest().getInputBuffer(),
+                    ApplicationBufferHandler.EMPTY);
+            Assert.fail("A connection-level trailer failure must surface as "
+                    + "an IOException, not a clean EOF");
+        } catch (InvocationTargetException ite) {
+            Throwable cause = ite.getCause();
+            Assert.assertTrue("Expected an IOException, got " + cause,
+                    cause instanceof IOException);
+        }
+
+        Method trailerReady = Http3Processor.class.getDeclaredMethod(
+                "isTrailerFieldsReady");
+        trailerReady.setAccessible(true);
+        Assert.assertEquals("Trailer fields must not be reported ready "
+                + "after a connection-level failure", Boolean.FALSE,
+                trailerReady.invoke(processor));
+
+        Method bodyFullyRead = Http3Processor.class.getDeclaredMethod(
+                "isRequestBodyFullyRead");
+        bodyFullyRead.setAccessible(true);
+        Assert.assertEquals("An incomplete body must not be reported fully "
+                + "read after a connection-level failure", Boolean.FALSE,
+                bodyFullyRead.invoke(processor));
+
+        Method trailerSupported = Http3Processor.class.getDeclaredMethod(
+                "isTrailerFieldsSupported");
+        trailerSupported.setAccessible(true);
+        Assert.assertEquals("Trailer registration must be closed after a "
+                + "connection-level failure", Boolean.FALSE,
+                trailerSupported.invoke(processor));
+
+        Method readyForRead = Http3Processor.class.getDeclaredMethod(
+                "isReadyForRead");
+        readyForRead.setAccessible(true);
+        Assert.assertEquals("An async reader must be woken after a "
+                + "connection-level failure so it observes the error",
+                Boolean.TRUE, readyForRead.invoke(processor));
+
+        Assert.assertEquals("The connection must be failed with "
+                + "H3_EXCESSIVE_LOAD", Http3Error.H3_EXCESSIVE_LOAD.getCode(),
+                connectionFailure.get());
+        Assert.assertEquals("A connection-level error must not be sent as "
+                + "a stream reset", -1, streamReset.get());
+    }
+
+
+    @Test
+    public void testExtendedConnectUsesConnectionSettingsSnapshot()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setEnableConnectProtocol(false);
+        protocol.setAllowSchemeMismatch(true);
+        Http3ConnectionManager manager = new Http3ConnectionManager(protocol);
+        StubQuicConnection connection = new StubQuicConnection() {
+            @Override
+            public QuicConnectionManager getQuicConnectionManager() {
+                return manager;
+            }
+        };
+        manager.connectionOpen(connection);
+        Http3ConnectionManager.ConnectionState state =
+                manager.getState(connection);
+
+        // The connection advertised ENABLE_CONNECT_PROTOCOL as disabled.
+        // Changing the live connector property afterwards must not make this
+        // connection accept an extended CONNECT it never negotiated.
+        protocol.setEnableConnectProtocol(true);
+
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+        processor.setConnectionState(state);
+        processor.emitHeader(":method", "CONNECT");
+        processor.emitHeader(":scheme", "https");
+        processor.emitHeader(":authority", "127.0.0.1:443");
+        processor.emitHeader(":path", "/simple");
+        processor.emitHeader(":protocol", "websocket");
+
+        Method validate = Http3Processor.class.getDeclaredMethod(
+                "validateHeadersInternal");
+        validate.setAccessible(true);
+        try {
+            validate.invoke(processor);
+            Assert.fail("Extended CONNECT accepted although the connection "
+                    + "advertised ENABLE_CONNECT_PROTOCOL as disabled");
+        } catch (InvocationTargetException ite) {
+            Throwable cause = ite.getCause();
+            Assert.assertTrue("Expected Http3Exception, got " + cause,
+                    cause instanceof Http3Exception);
+            Assert.assertEquals(Http3Error.H3_MESSAGE_ERROR,
+                    ((Http3Exception) cause).getError());
+        }
+    }
+
+
+    @Test
+    public void testPausedConnectorRejectsNewStream() throws Exception {
+        // New streams on an already established QUIC connection must be
+        // rejected while the connector is paused, not dispatched. The
+        // request is unprocessed, so H3_REQUEST_REJECTED tells the client it
+        // can retry on another connection.
+        AbstractHttp3Protocol protocol = new Http3OpenSSLProtocol() {
+            @Override
+            public boolean isPaused() {
+                return true;
+            }
+        };
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+        AtomicInteger resetCode = new AtomicInteger(-1);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            public boolean resetStream(long appErrorCode) {
+                resetCode.set((int) appErrorCode);
+                return true;
+            }
+        };
+
+        SocketState state = processor.service(wrapper);
+        Assert.assertEquals(SocketState.CLOSED, state);
+        Assert.assertEquals("A paused connector must reject the new stream "
+                + "with H3_REQUEST_REJECTED", H3_REQUEST_REJECTED,
+                resetCode.get());
+    }
+
+
+    @Test
+    public void testServiceIOExceptionQueuesStreamCancellation()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3ConnectionManager manager = new Http3ConnectionManager(protocol);
+        StubQuicConnection connection = new StubQuicConnection() {
+            @Override
+            public QuicConnectionManager getQuicConnectionManager() {
+                return manager;
+            }
+        };
+        manager.connectionOpen(connection);
+        Http3ConnectionManager.ConnectionState state =
+                manager.getState(connection);
+        AtomicInteger resetCode = new AtomicInteger(-1);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            public QuicConnection getConnection() {
+                return connection;
+            }
+
+            @Override
+            public int read(boolean block, ByteBuffer to) throws IOException {
+                throw new IOException("simulated transport read failure");
+            }
+
+            @Override
+            public boolean resetStream(long appErrorCode) {
+                resetCode.set((int) appErrorCode);
+                return true;
+            }
+        };
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        try {
+            processor.service(wrapper);
+            Assert.fail("Expected the simulated read failure to propagate");
+        } catch (IOException expected) {
+            // Expected
+        }
+        Assert.assertEquals("An IOException that tears down the stream "
+                + "must reset it with H3_INTERNAL_ERROR", H3_INTERNAL_ERROR,
+                resetCode.get());
+
+        Field pendingField = Http3ConnectionManager.ConnectionState.class
+                .getDeclaredField("pendingCancellations");
+        pendingField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Set<Long> pending =
+                (java.util.Set<Long>) pendingField.get(state);
+        Assert.assertTrue("An IOException that tears down the stream must "
+                + "queue a QPACK Stream Cancellation",
+                pending.contains(Long.valueOf(0)));
+    }
+
+
+    @Test
+    public void testServiceErrorStateResetsStream() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setAdapter(TEST_ADAPTER);
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        AtomicInteger resetCode = new AtomicInteger(-1);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            protected void writeBlocking(ByteBuffer from) {
+                from.position(from.limit());
+            }
+
+            @Override
+            protected void flushBlocking() {
+                // NO-OP
+            }
+
+            @Override
+            public boolean resetStream(long appErrorCode) {
+                resetCode.set((int) appErrorCode);
+                return true;
+            }
+        };
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        byte[] fieldSection = Base64.getDecoder().decode(buildFieldSection(
+                ":method", "GET", ":scheme", "http",
+                ":authority", "127.0.0.1:80", ":path", "/simple"));
+        wrapper.enqueue(Base64.getDecoder().decode(
+                buildFrameB64(0x01, fieldSection)));
+
+        Method setErrorState = AbstractProcessor.class.getDeclaredMethod(
+                "setErrorState", ErrorState.class, Throwable.class);
+        setErrorState.setAccessible(true);
+        setErrorState.invoke(processor, ErrorState.CLOSE_NOW,
+                new IOException("simulated response failure"));
+
+        Assert.assertEquals(SocketState.CLOSED, processor.service(wrapper));
+        Assert.assertEquals("An error-state service exit must reset the "
+                + "truncated response with H3_INTERNAL_ERROR",
+                H3_INTERNAL_ERROR, resetCode.get());
+    }
+
+
+    @Test
+    public void testDispatchEndRequestScanFailureResetsStream()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        AtomicInteger resetCode = new AtomicInteger(-1);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            public int read(boolean block, ByteBuffer to) throws IOException {
+                throw new IOException("simulated post-response read failure");
+            }
+
+            @Override
+            public boolean resetStream(long appErrorCode) {
+                resetCode.set((int) appErrorCode);
+                return true;
+            }
+        };
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        Method dispatch = Http3Processor.class.getDeclaredMethod(
+                "dispatchEndRequest");
+        dispatch.setAccessible(true);
+        Assert.assertEquals(SocketState.CLOSED,
+                dispatch.invoke(processor));
+        Assert.assertEquals("A post-response scan I/O failure must reset "
+                + "the stream with H3_INTERNAL_ERROR", H3_INTERNAL_ERROR,
+                resetCode.get());
+    }
+
+
+    @Test
+    public void testInterimResponsesAndConclusionSuppressedAfterReset()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        AtomicBoolean wrote = new AtomicBoolean();
+        AtomicBoolean concluded = new AtomicBoolean();
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            protected void writeBlocking(ByteBuffer from) {
+                wrote.set(true);
+                from.position(from.limit());
+            }
+
+            @Override
+            protected void flushBlocking() {
+                // NO-OP
+            }
+
+            @Override
+            public void concludeStream() {
+                concluded.set(true);
+            }
+        };
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        Field resetField = Http3Processor.class.getDeclaredField(
+                "streamReset");
+        resetField.setAccessible(true);
+        ((AtomicBoolean) resetField.get(processor)).set(true);
+        processor.getRequest().setExpectation(true);
+
+        Method readyForWrite = Http3Processor.class.getDeclaredMethod(
+                "isReadyForWrite");
+        readyForWrite.setAccessible(true);
+        Assert.assertEquals("A reset stream must not be advertised as ready "
+                + "for writing", Boolean.FALSE,
+                readyForWrite.invoke(processor));
+
+        processor.action(ActionCode.ACK, ContinueResponseTiming.ALWAYS);
+        Assert.assertFalse("A 100 Continue response must not be written "
+                + "after the stream was reset", wrote.get());
+
+        processor.action(ActionCode.EARLY_HINTS, null);
+        Assert.assertFalse("A 103 Early Hints response must not be written "
+                + "after the stream was reset", wrote.get());
+
+        Method conclude = Http3Processor.class.getDeclaredMethod(
+                "concludeStream", SocketWrapperBase.class);
+        conclude.setAccessible(true);
+        conclude.invoke(processor, wrapper);
+        Assert.assertFalse("A reset stream must not be concluded with FIN",
+                concluded.get());
+    }
+
+
+    @Test
+    public void testOversizedTrailerAfterResponseResetsStream()
+            throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        AtomicInteger resetCode = new AtomicInteger(-1);
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            public boolean resetStream(long appErrorCode) {
+                resetCode.set((int) appErrorCode);
+                return true;
+            }
+        };
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        // A trailer HEADERS frame whose declared payload exceeds the
+        // trailer field-section wire limit. Only the frame header is needed:
+        // the scan must reject it before trying to read the payload.
+        ByteBuffer frame = ByteBuffer.allocate(8);
+        Qpack.encodeQuicInteger(frame, Constants.H3_HEADERS);
+        Qpack.encodeQuicInteger(frame, 40000);
+        frame.flip();
+
+        Field inputBufferHasData = Http3Processor.class.getDeclaredField(
+                "inputBufferHasData");
+        inputBufferHasData.setAccessible(true);
+        inputBufferHasData.setBoolean(processor, true);
+        Field inputBufferField =
+                Http3Processor.class.getDeclaredField("inputBuffer");
+        inputBufferField.setAccessible(true);
+        ByteBuffer inputBuffer = (ByteBuffer) inputBufferField.get(processor);
+        inputBuffer.clear();
+        inputBuffer.put(frame);
+        inputBuffer.flip();
+
+        Method decode = Http3Processor.class.getDeclaredMethod(
+                "decodeTrailerSectionAfterResponse", SocketWrapperBase.class);
+        decode.setAccessible(true);
+        decode.invoke(processor, wrapper);
+
+        Assert.assertEquals("An oversized after-response trailer section "
+                + "must be rejected as H3_MESSAGE_ERROR", H3_MESSAGE_ERROR,
+                resetCode.get());
+    }
+
+
+    @Test
+    public void testTruncatedTrailerAtFinFailsConnection() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        AtomicLong connectionFailure = new AtomicLong(-1);
+        StubQuicConnection connection = new StubQuicConnection() {
+            @Override
+            public void failConnection(long appErrorCode, String reason) {
+                connectionFailure.compareAndSet(-1, appErrorCode);
+            }
+        };
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            public QuicConnection getConnection() {
+                return connection;
+            }
+
+            @Override
+            public QuicStream getQuicStream() {
+                return new StubQuicStream() {
+                    @Override
+                    public ReadState getReadState() {
+                        return ReadState.FINISHED;
+                    }
+                };
+            }
+        };
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        // A partially read trailer section left staged when the client sent
+        // FIN: the last frame is truncated (RFC 9114 Section 7.1).
+        Field trailerField = processor.getRequest().getInputBuffer()
+                .getClass().getDeclaredField("trailerPayload");
+        trailerField.setAccessible(true);
+        trailerField.set(processor.getRequest().getInputBuffer(),
+                ByteBuffer.wrap(new byte[] { 0x01, 0x02 }));
+
+        Method decode = Http3Processor.class.getDeclaredMethod(
+                "decodeTrailerSectionAfterResponse", SocketWrapperBase.class);
+        decode.setAccessible(true);
+        decode.invoke(processor, wrapper);
+
+        Assert.assertEquals("A truncated trailer section followed by a "
+                + "clean FIN must fail the connection with H3_FRAME_ERROR",
+                Http3Error.H3_FRAME_ERROR.getCode(), connectionFailure.get());
+    }
+
+
+    @Test
+    public void testControlFrameAfterHeadersFailsConnectionAtScan()
+            throws Exception {
+        // Deterministic coverage of the after-response scan: a control-only
+        // frame already in the input buffer after the request headers must
+        // fail the connection with H3_FRAME_UNEXPECTED.
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        AtomicLong connectionFailure = new AtomicLong(-1);
+        StubQuicConnection connection = new StubQuicConnection() {
+            @Override
+            public void failConnection(long appErrorCode, String reason) {
+                connectionFailure.compareAndSet(-1, appErrorCode);
+            }
+        };
+        StubQuicSocketWrapper wrapper = new StubQuicSocketWrapper() {
+            @Override
+            public QuicConnection getConnection() {
+                return connection;
+            }
+        };
+
+        Field hasData = Http3Processor.class.getDeclaredField(
+                "inputBufferHasData");
+        hasData.setAccessible(true);
+        hasData.setBoolean(processor, true);
+        Field bufferField = Http3Processor.class.getDeclaredField(
+                "inputBuffer");
+        bufferField.setAccessible(true);
+        ByteBuffer inputBuffer = (ByteBuffer) bufferField.get(processor);
+        inputBuffer.clear();
+        Qpack.encodeQuicInteger(inputBuffer, Constants.H3_SETTINGS);
+        Qpack.encodeQuicInteger(inputBuffer, 0);
+        inputBuffer.flip();
+
+        Method scan = Http3Processor.class.getDeclaredMethod(
+                "decodeTrailerSectionAfterResponse",
+                SocketWrapperBase.class);
+        scan.setAccessible(true);
+        scan.invoke(processor, wrapper);
+
+        Assert.assertEquals("The after-response scan must classify a "
+                + "control-only frame as H3_FRAME_UNEXPECTED",
+                H3_FRAME_UNEXPECTED, connectionFailure.get());
     }
 
 
@@ -500,10 +1537,10 @@ public class TestHttp3Functional extends Http3TestBase {
 
         // sendResponseHeadersInternal() sets responseStarted only after the
         // final HEADERS frame has been written, so a header-send failure
-        // leaves it false. finishResponse() catches that failure and then
-        // calls sendResponseTrailers(); the trailer HEADERS frame must not
-        // be attempted without a final response head (RFC 9114 Section 4.1).
-        // The stub wrapper throws on any write attempt.
+        // leaves it false. The direct sendResponseTrailers() entry point must
+        // not attempt a trailer HEADERS frame without a final response head
+        // (RFC 9114 Section 4.1). The stub wrapper throws on any write
+        // attempt.
         invokeSendResponseTrailers(processor, new StubReadSocketWrapper());
     }
 
@@ -622,6 +1659,46 @@ public class TestHttp3Functional extends Http3TestBase {
         Assert.assertEquals("readFrame() did not accept the completed frame "
                 + "header", Constants.H3_HEADERS,
                 pendingType.getLong(processor));
+    }
+
+
+    @Test
+    public void testPartialFrameHeaderIsNotReadyForRead() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, TEST_ADAPTER);
+        processor.setStreamId(0);
+
+        StubReadSocketWrapper wrapper = new StubReadSocketWrapper();
+        Method setWrapper = AbstractProcessor.class.getDeclaredMethod(
+                "setSocketWrapper", SocketWrapperBase.class);
+        setWrapper.setAccessible(true);
+        setWrapper.invoke(processor, wrapper);
+
+        Field hasData = Http3Processor.class.getDeclaredField(
+                "inputBufferHasData");
+        hasData.setAccessible(true);
+        hasData.setBoolean(processor, true);
+        Field bufferField = Http3Processor.class.getDeclaredField(
+                "inputBuffer");
+        bufferField.setAccessible(true);
+        ByteBuffer inputBuffer = (ByteBuffer) bufferField.get(processor);
+
+        // A single byte starting a two-byte frame varint cannot be consumed:
+        // the async readiness path must not report it as readable, otherwise
+        // an async read would enter the pump/blocking loop waiting for the
+        // continuation byte.
+        inputBuffer.clear();
+        inputBuffer.put((byte) 0x40);
+        inputBuffer.flip();
+        Assert.assertFalse("A partial frame header must not be reported as "
+                + "ready for reading", processor.isReadyForRead());
+
+        // A complete empty DATA frame is consumable and may be reported ready.
+        inputBuffer.clear();
+        inputBuffer.put(new byte[] { 0x00, 0x00 });
+        inputBuffer.flip();
+        Assert.assertTrue("A complete frame must be reported as ready for "
+                + "reading", processor.isReadyForRead());
     }
 
 

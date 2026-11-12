@@ -43,14 +43,14 @@ import org.apache.catalina.startup.Tomcat;
  * still expected to send the body) and asserts that a client disconnect is
  * reported as an error to the ReadListener.
  *
- * The HTTP/3 processor does not dispatch before the request body is
- * complete: it reads until the stream ends (or the read pump gives up) and
- * then dispatches. The adapted test therefore sends a POST with a declared
- * content length and only part of the body (without ending the stream),
- * keeps the connection open briefly and then closes it. The request is
- * dispatched, the servlet registers the ReadListener, the partial body is
- * delivered and the truncated remainder of the body is reported as end of
- * stream (onAllDataRead) rather than as an error.
+ * The HTTP/3 processor performs a bounded non-blocking pre-dispatch read, so
+ * a request with a partial declared body is dispatched. The adapted test
+ * therefore sends a POST with a declared content length and only part of the
+ * body (without ending the stream), keeps the connection open briefly and
+ * then closes it. The request is dispatched, the servlet registers the
+ * ReadListener, the partial body is delivered and the connection close with
+ * an incomplete body is reported as an error (onError) rather than as a clean
+ * end of stream (onAllDataRead).
  */
 public class TestAsyncReadListener extends Http3TestBase {
 
@@ -95,11 +95,56 @@ public class TestAsyncReadListener extends Http3TestBase {
             }
         }
 
-        Assert.assertNull("Unexpected ReadListener error: "
-                + asyncServlet.error, asyncServlet.error);
-        Assert.assertTrue("onAllDataRead was not called",
-                asyncServlet.allDataRead);
+        Assert.assertNotNull("A connection close with a short body must "
+                + "report an error to the ReadListener", asyncServlet.error);
+        Assert.assertFalse("onAllDataRead must not be called for a "
+                + "truncated body", asyncServlet.allDataRead);
         Assert.assertEquals(PARTIAL_BODY.length, asyncServlet.bytesReceived);
+    }
+
+
+    @Test
+    public void testLocalBodyProtocolError() throws Exception {
+        startHttp3Server(ctxt -> {
+            Wrapper w = Tomcat.addServlet(ctxt, "async", asyncServlet);
+            w.setAsyncSupported(true);
+            ctxt.addServletMapping("/async", "async");
+        });
+
+        // The body crosses the pre-dispatch buffer and the following DATA
+        // frame over-runs Content-Length. The local protocol error must be
+        // delivered to the ReadListener as onError(), not as a clean
+        // onAllDataRead() for the truncated body.
+        byte[] first = new byte[64 * 1024];
+        Arrays.fill(first, (byte) 'a');
+        byte[] overrun = new byte[5000];
+        Arrays.fill(overrun, (byte) 'b');
+        runClient(rawCommandWith(
+                "--headers",
+                buildFieldSection(":method", "POST",
+                        ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/async", "content-length",
+                        Integer.toString(first.length + overrun.length - 1)),
+                "--data", Base64.getEncoder().encodeToString(first),
+                "--frame-after-data", buildFrameB64(0x00, overrun),
+                "--timeout", "5"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        synchronized (asyncServlet) {
+            long deadline = System.currentTimeMillis() + 15000;
+            while (asyncServlet.error == null && !asyncServlet.allDataRead
+                    && System.currentTimeMillis() < deadline) {
+                asyncServlet.wait(
+                        Math.max(10, deadline - System.currentTimeMillis()));
+            }
+        }
+
+        Assert.assertNotNull("A local body protocol error must be reported "
+                + "to the ReadListener", asyncServlet.error);
+        Assert.assertFalse("onAllDataRead must not be called for a "
+                + "truncated body", asyncServlet.allDataRead);
+        Assert.assertEquals(first.length, asyncServlet.bytesReceived);
     }
 
 
@@ -192,7 +237,7 @@ public class TestAsyncReadListener extends Http3TestBase {
             // The client holds the stream open for (timeout + wait) seconds
             // after sending the request. Wait only a fraction of that: the
             // event must arrive while the stream is still half-open.
-            long deadline = System.currentTimeMillis() + 3000;
+            long deadline = System.currentTimeMillis() + 7000;
             while (asyncServlet.error == null && !asyncServlet.allDataRead
                     && System.currentTimeMillis() < deadline) {
                 asyncServlet.wait(
@@ -238,12 +283,12 @@ public class TestAsyncReadListener extends Http3TestBase {
                         "--data", Base64.getEncoder().encodeToString(body),
                         "--no-fin",
                         "--timeout", "2",
-                        "--wait", "6"), CLIENT_TIMEOUT_SECONDS));
+                        "--wait", "8"), CLIENT_TIMEOUT_SECONDS));
         clientThread.setDaemon(true);
         clientThread.start();
 
         synchronized (asyncServlet) {
-            long deadline = System.currentTimeMillis() + 3000;
+            long deadline = System.currentTimeMillis() + 7000;
             while (asyncServlet.error == null && !asyncServlet.allDataRead
                     && System.currentTimeMillis() < deadline) {
                 asyncServlet.wait(
@@ -253,8 +298,10 @@ public class TestAsyncReadListener extends Http3TestBase {
 
         Assert.assertNull("Unexpected ReadListener error: "
                 + asyncServlet.error, asyncServlet.error);
-        Assert.assertEquals("Body bytes were not all delivered",
-                body.length, asyncServlet.bytesReceived);
+        Assert.assertEquals("Body bytes were not all delivered (error="
+                + asyncServlet.error + ", allDataRead="
+                + asyncServlet.allDataRead + ")", body.length,
+                asyncServlet.bytesReceived);
         Assert.assertTrue("onAllDataRead was not called before the stream " +
                 "was closed by the client", asyncServlet.allDataRead);
 

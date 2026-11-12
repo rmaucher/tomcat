@@ -118,7 +118,7 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     /**
      * Whether to enable CONNECT protocol (RFC 9220).
      */
-    private boolean enableConnectProtocol = false;
+    private volatile boolean enableConnectProtocol = false;
 
     /**
      * Whether to advertise the experimental (unregistered) H2 compatible
@@ -737,11 +737,16 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
 
 
     /**
-     * Sets the maximum size of trailer headers in bytes. A negative value
-     * disables the limit.
+     * Sets the maximum decoded size of trailer headers in bytes. A negative
+     * value disables the decoded-size limit.
+     * <p>
+     * A trailer section is carried in a single HEADERS frame, and the
+     * receiver still enforces the local 16 MiB per-frame buffering limit
+     * ({@link Constants#MAX_FRAME_LENGTH}). A negative value therefore does
+     * not allow a trailer section larger than that frame limit.
      *
-     * @param maxTrailerSize the maximum trailer size, or a negative value
-     *                       for no limit
+     * @param maxTrailerSize the maximum decoded trailer size, or a negative
+     *                       value for no decoded-size limit
      */
     public void setMaxTrailerSize(int maxTrailerSize) {
         this.maxTrailerSize = maxTrailerSize;

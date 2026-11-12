@@ -134,14 +134,18 @@ final class Http3Settings {
 
     /**
      * Encodes server SETTINGS into a buffer.
+     * <p>
      * The settings this server can advertise:
-     * - QPACK_MAX_TABLE_CAPACITY (0x01, RFC 9204 Section 5)
-     * - QPACK_BLOCKED_STREAMS (0x07, RFC 9204 Section 5)
-     * - MAX_FIELD_SECTION_SIZE (0x06, RFC 9114 Section 7.2.4.1)
-     * - ENABLE_CONNECT_PROTOCOL (0x08, RFC 9220 Section 5)
-     * - H2_COMPATIBLE_IDENTITY (0x22, unregistered experimental setting)
-     * - reserved experimental identifier (0x21, RFC 9114 Section 7.2.4.1;
-     *   always sent)
+     * <ul>
+     * <li>QPACK_MAX_TABLE_CAPACITY (0x01, RFC 9204 Section 5)</li>
+     * <li>QPACK_BLOCKED_STREAMS (0x07, RFC 9204 Section 5)</li>
+     * <li>MAX_FIELD_SECTION_SIZE (0x06, RFC 9114 Section 7.2.4.1)</li>
+     * <li>ENABLE_CONNECT_PROTOCOL (0x08, RFC 9220 Section 5)</li>
+     * <li>H2_COMPATIBLE_IDENTITY (0x22, unregistered experimental
+     * setting)</li>
+     * <li>reserved experimental identifier (0x21, RFC 9114 Section 7.2.4.1;
+     * always sent)</li>
+     * </ul>
      *
      * @param buffer The buffer to write to
      * @param qpackMaxTableCapacity QPACK max table capacity

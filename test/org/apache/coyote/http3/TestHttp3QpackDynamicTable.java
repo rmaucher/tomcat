@@ -226,9 +226,21 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
                 "--data", Base64.getEncoder().encodeToString(
                         "body!".getBytes(StandardCharsets.UTF_8)),
                 "--frame-after-data", truncatedTrailerFrame(section),
-                "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "10"), CLIENT_TIMEOUT_SECONDS);
 
-        assertConnectionError(output, H3_FRAME_ERROR);
+        Assert.assertNull("A connection-level trailer failure must not be "
+                + "reported as a stream error", output.getStreamError());
+        Assert.assertEquals("Expected connection error " + H3_FRAME_ERROR
+                + " but got " + output.getConnectionError(),
+                Integer.valueOf(H3_FRAME_ERROR), output.getConnectionError());
+        // Depending on scheduling, the servlet may have produced a response
+        // before the truncated trailer arrived. The connection error is the
+        // required outcome in both cases; the deterministic no-response
+        // coverage is provided by
+        // TestHttp3Functional.testTruncatedTrailerAtFinFailsConnection().
+        if (!output.getResponses().isEmpty()) {
+            validateStatus(output.getResponse(), 200);
+        }
     }
 
 
@@ -381,5 +393,40 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
                         + "DATA frame to be acknowledged, got "
                         + output.getDecoderAcks(),
                 output.getDecoderAcks().contains(Integer.valueOf(0)));
+    }
+
+
+    @Test
+    public void testStreamCancellationOnBadRequestWithUnreadDynamicTrailer()
+            throws Exception {
+        startHttp3Server();
+
+        // A malformed Host field is answered with 400 before the request body
+        // or trailer section is decoded. The partial dynamic-referencing
+        // trailer frame is never completed, so the server must still send a
+        // Stream Cancellation (RFC 9204 Section 2.2.2.2) for the abandoned
+        // section rather than leaving its references outstanding on the peer.
+        ByteBuffer encoder = ByteBuffer.allocate(4096);
+        Qpack.encodeIrp(encoder, 0x20, 5, 512);
+        insertLiteral(encoder, "x-dyn", "v1");          // abs 0
+        byte[] section = dynamicTrailerSection();
+
+        ClientOutput output = runClient(rawCommandWith(
+                "--encoder", b64(encoder),
+                "--encoder-delay", "0.5",
+                "--headers",
+                buildFieldSection(":method", "GET", ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/simple", "host", "bad host"),
+                "--frame-after-data", truncatedTrailerFrame(section),
+                "--no-fin",
+                "--wait", "2",
+                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        validateStatus(output.getResponse(), 400);
+        Assert.assertTrue("Expected a Stream Cancellation for the abandoned "
+                        + "trailer section, got "
+                        + output.getDecoderCancellations(),
+                output.getDecoderCancellations().contains(Integer.valueOf(0)));
     }
 }

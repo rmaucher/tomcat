@@ -337,11 +337,22 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                 CLIENT_TIMEOUT_SECONDS);
 
         // The response may already have been sent when the after-response
-        // scan detects the invalid trailing frame, so allow a response here
-        // and assert the connection error directly.
-        Assert.assertEquals("Expected a connection error. Client output: "
-                        + output.getLines(), Integer.valueOf(H3_FRAME_UNEXPECTED),
-                output.getConnectionError());
+        // scan detects the invalid trailing frame, so allow a response here.
+        // If the server aborted the read side before the frame was delivered,
+        // RFC 9114 Section 4.1 permits a complete response with no protocol
+        // error; the deterministic scan coverage is in
+        // TestHttp3Functional.testControlFrameAfterHeadersFailsConnectionAtScan.
+        Integer connectionError = output.getConnectionError();
+        if (connectionError == null) {
+            Assert.assertFalse("Expected either a connection error or a "
+                            + "complete response. Client output: "
+                            + output.getLines(),
+                    output.getResponses().isEmpty());
+        } else {
+            Assert.assertEquals("Expected H3_FRAME_UNEXPECTED. Client output: "
+                            + output.getLines(), Integer.valueOf(H3_FRAME_UNEXPECTED),
+                    connectionError);
+        }
     }
 
 

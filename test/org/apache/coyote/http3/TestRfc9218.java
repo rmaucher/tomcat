@@ -174,6 +174,62 @@ public class TestRfc9218 extends Http3TestBase {
 
 
     /**
+     * The pending-update buffer is bounded by evicting the oldest entry.
+     * Updating an existing element must count as receiving a new signal:
+     * the most recently received update for that element must not be
+     * evicted before older entries for other elements.
+     */
+    @Test
+    public void testPriorityUpdateBufferEvictionUsesLastUpdate()
+            throws Exception {
+        Http3ConnectionManager.ConnectionState state =
+                new Http3ConnectionManager.ConnectionState(null);
+        state.setMaxConcurrentStreams(16);
+        for (long id = 0; id < 16; id++) {
+            state.applyPriorityUpdate(id, new Priority());
+        }
+        // Refresh the oldest entry, then add a new one to force eviction.
+        state.applyPriorityUpdate(0, new Priority());
+        state.applyPriorityUpdate(16, new Priority());
+
+        java.lang.reflect.Field field = Http3ConnectionManager
+                .ConnectionState.class.getDeclaredField(
+                        "pendingPriorityUpdates");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<Long,Priority> pending =
+                (java.util.Map<Long,Priority>) field.get(state);
+        Assert.assertTrue("The most recently updated element must survive "
+                + "eviction", pending.containsKey(Long.valueOf(0)));
+        Assert.assertFalse("An older element must be evicted instead of the "
+                + "refreshed one", pending.containsKey(Long.valueOf(1)));
+    }
+
+
+    @Test
+    public void testPriorityUpdateBufferHasIndependentCap() throws Exception {
+        Http3ConnectionManager.ConnectionState state =
+                new Http3ConnectionManager.ConnectionState(null);
+        // A very large concurrent-stream limit must not allow unbounded
+        // buffering of pre-open PRIORITY_UPDATE signals.
+        state.setMaxConcurrentStreams(1_000_000);
+        for (long id = 0; id < 2000; id++) {
+            state.applyPriorityUpdate(id * 4, new Priority());
+        }
+
+        java.lang.reflect.Field field = Http3ConnectionManager
+                .ConnectionState.class.getDeclaredField(
+                        "pendingPriorityUpdates");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<Long,Priority> pending =
+                (java.util.Map<Long,Priority>) field.get(state);
+        Assert.assertEquals("The pending PRIORITY_UPDATE buffer must have "
+                + "an independent, fixed upper bound", 1024, pending.size());
+    }
+
+
+    /**
      * The request's own Priority header field is older than a PRIORITY_UPDATE
      * that raced ahead of the stream opening. RFC 9218 Section 7: the most
      * recently received PRIORITY_UPDATE overrides any other signal, so once

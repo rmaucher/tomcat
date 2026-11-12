@@ -89,6 +89,30 @@ public class Http3ConnectionManager implements QuicConnectionManager {
     static final int MAX_PENDING_DECODER_INSTRUCTIONS = 10_000;
 
     /**
+     * Maximum number of pre-open PRIORITY_UPDATE signals buffered per
+     * connection. RFC 9218 Section 7 requires servers to buffer the most
+     * recently received signal for each not-yet-opened stream; this bound is
+     * deliberately independent of the configurable concurrent-stream limit
+     * so a large limit cannot turn the buffer into unbounded per-connection
+     * memory.
+     */
+    static final int MAX_PENDING_PRIORITY_UPDATES = 1024;
+
+    /**
+     * Maximum number of ignored control-stream frames per connection.
+     */
+    static final int MAX_IGNORED_FRAMES = 4096;
+
+    /**
+     * Maximum total declared payload of ignored control-stream frames, and
+     * maximum bytes discarded from unknown unidirectional streams, per
+     * connection. RFC 9114 Section 10.5 warns that undefined protocol
+     * elements can be used to waste processing capacity; these bounds keep
+     * the work per connection finite.
+     */
+    static final long MAX_IGNORED_BYTES = 32L * 1024 * 1024;
+
+    /**
      * Shared QPACK decoder for this connection.
      * Per RFC 9204, all streams on a connection share a single decoder with a
      * unified dynamic table (the client's encoder instructions, received on the
@@ -99,9 +123,32 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      */
     private final QpackDecoder sharedDecoder;
 
+    /**
+     * Settings values snapshotted when this per-connection manager is
+     * created. The same values are used for the decoder hard limit, the
+     * request-header limit and the SETTINGS frame, so a runtime change to a
+     * connector property cannot make the advertised and enforced limits
+     * diverge within one connection.
+     */
+    private final long settingsQpackMaxTableCapacity;
+    private final int settingsQpackBlockedStreams;
+    private final long settingsMaxFieldSectionSize;
+    private final boolean settingsEnableConnectProtocol;
+    private final boolean settingsH2CompatibleIdentity;
+
 
     public Http3ConnectionManager(AbstractHttp3Protocol protocol) {
         this.protocol = protocol;
+        this.settingsQpackMaxTableCapacity =
+                Constants.clampToNonNegativeInt(protocol.getQpackMaxTableCapacity());
+        this.settingsQpackBlockedStreams = protocol.getQpackBlockedStreams();
+        long maxFieldSectionSize = protocol.getMaxFieldSectionSize();
+        this.settingsMaxFieldSectionSize =
+                maxFieldSectionSize > Constants.MAX_FIELD_SECTION_SIZE_FOR_FRAME_LIMIT ?
+                        Constants.MAX_FIELD_SECTION_SIZE_FOR_FRAME_LIMIT :
+                        maxFieldSectionSize;
+        this.settingsEnableConnectProtocol = protocol.isEnableConnectProtocol();
+        this.settingsH2CompatibleIdentity = protocol.isH2CompatibleIdentity();
         // The hard limit of the shared decoder must match the
         // SETTINGS_QPACK_MAX_TABLE_CAPACITY value advertised to the peer:
         // per RFC 9204 Section 4.5.1.1 the peer reconstructs the Required
@@ -111,12 +158,10 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // not be floored above 0 (RFC 9204 Section 3.2.3: with a maximum
         // capacity of 0 no entries may be inserted at all); the decoder
         // handles a zero-capacity table.
-        long capacity = protocol.getQpackMaxTableCapacity();
-        int tableCapacity = Constants.clampToNonNegativeInt(capacity);
         // RFC 9204 Section 3.2.2: the dynamic table starts at capacity zero.
         // The encoder must send Set Dynamic Table Capacity before any insert;
         // the hard limit is the value this server advertises.
-        sharedDecoder = new QpackDecoder(0, tableCapacity);
+        sharedDecoder = new QpackDecoder(0, (int) settingsQpackMaxTableCapacity);
         protocol.configureDecoder(sharedDecoder);
     }
 
@@ -128,7 +173,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      */
     @Override
     public void connectionOpen(QuicConnection connection) {
-        ConnectionState state = new ConnectionState(connection);
+        ConnectionState state = new ConnectionState(connection,
+                settingsEnableConnectProtocol);
         // Start from the configured limit. The endpoint later clamps this to
         // the limit the QUIC transport actually advertises to the peer (see
         // the endpoint's transport stream limits handling), so the enforced
@@ -190,6 +236,9 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // buffer to stay in read mode - clear() would have the caller's
         // compact() replay the whole buffer capacity and leave it full.
         if (state.isUniStreamDiscarded(streamId)) {
+            if (state.noteDiscardedUniStreamData(data.remaining())) {
+                throw excessiveIgnoredData(streamId);
+            }
             data.position(data.limit());
             return;
         }
@@ -242,6 +291,9 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                             Long.valueOf(streamType), Long.valueOf(streamId)));
                 }
                 state.markUniStreamDiscarded(streamId);
+                if (state.noteDiscardedUniStreamData(data.remaining())) {
+                    throw excessiveIgnoredData(streamId);
+                }
                 data.position(data.limit());
                 return;
             }
@@ -426,11 +478,9 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
         // Encode SETTINGS payload first to determine its length
         ByteBuffer settingsPayload = ByteBuffer.allocate(64);
-        Http3Settings.encode(settingsPayload, protocol.getQpackMaxTableCapacity(),
-                protocol.getQpackBlockedStreams(),
-                protocol.getMaxFieldSectionSize(),
-                protocol.isEnableConnectProtocol(),
-                protocol.isH2CompatibleIdentity());
+        Http3Settings.encode(settingsPayload, settingsQpackMaxTableCapacity,
+                settingsQpackBlockedStreams, settingsMaxFieldSectionSize,
+                settingsEnableConnectProtocol, settingsH2CompatibleIdentity);
         settingsPayload.flip();
         int settingsLen = settingsPayload.remaining();
 
@@ -634,6 +684,9 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                     log.debug(sm.getString("http3Processor.unexpectedFrameOnStream",
                             Long.valueOf(frameType),
                             Long.valueOf(streamId)));
+                }
+                if (state.noteIgnoredControlFrame(frameLength)) {
+                    throw excessiveIgnoredData(streamId);
                 }
                 long skip = Math.min(frameLength, data.remaining());
                 data.position(data.position() + (int) skip);
@@ -1139,6 +1192,28 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
 
     /**
+     * Returns the snapshotted SETTINGS_QPACK_BLOCKED_STREAMS value for this
+     * connection.
+     *
+     * @return The snapshotted blocked-stream limit
+     */
+    int getQpackBlockedStreams() {
+        return settingsQpackBlockedStreams;
+    }
+
+
+    /**
+     * Returns the snapshotted SETTINGS_MAX_FIELD_SECTION_SIZE value for this
+     * connection.
+     *
+     * @return The snapshotted maximum field section size
+     */
+    long getMaxFieldSectionSize() {
+        return settingsMaxFieldSectionSize;
+    }
+
+
+    /**
      * Notes that a Section Acknowledgment instruction must be emitted for a
      * field section that was decoded on the given stream using
      * representations containing dynamic table references
@@ -1448,6 +1523,22 @@ public class Http3ConnectionManager implements QuicConnectionManager {
     }
 
 
+    /*
+     * The error for an ignored-frame/discarded-data budget exhaustion on the
+     * given stream. Connection-scoped because the per-connection budget is
+     * shared by all of the connection's ignored data.
+     */
+    private Http3Exception excessiveIgnoredData(long streamId) {
+        String message = sm.getString(
+                "http3ConnectionManager.excessiveIgnoredData",
+                Long.valueOf(streamId));
+        if (log.isWarnEnabled()) {
+            log.warn(message);
+        }
+        return new Http3Exception(message, Http3Error.H3_EXCESSIVE_LOAD);
+    }
+
+
     /**
      * {@inheritDoc}
      * <p>
@@ -1469,6 +1560,10 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      */
     public static class ConnectionState implements QuicConnectionManager.ConnectionState {
         private final QuicConnection connection;
+        // ENABLE_CONNECT_PROTOCOL value advertised in this connection's
+        // SETTINGS frame. Kept on the state so request validation follows the
+        // negotiated value even if the connector property changes later.
+        private final boolean enableConnectProtocol;
         private boolean clientSettingsReceived;
         private long maxPushId = -1;
         private long lastGoawayId = -1;
@@ -1523,6 +1618,13 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // the frame's declared length and cleared as its payload is
         // consumed.
         private long controlFrameSkipRemaining;
+        // Budgets for protocol elements this endpoint only ignores. The QUIC
+        // poll thread processes client unidirectional stream data inline, so
+        // an unbounded stream of unknown frames/padding could consume
+        // processing capacity indefinitely (RFC 9114 Section 10.5).
+        private int ignoredControlFrameCount;
+        private long ignoredControlFrameBytes;
+        private long discardedUniStreamBytes;
         // IDs of client-initiated unidirectional streams whose type was
         // unknown, so subsequent data on them is consumed without being
         // re-parsed as a stream type (RFC 9114 Section 9). Entries are
@@ -1609,11 +1711,29 @@ public class Http3ConnectionManager implements QuicConnectionManager {
          */
         private final Object priorityLock = new Object();
         private final Map<Long, Http3Processor> priorityConsumers = new HashMap<>();
-        private final Map<Long, Priority> pendingPriorityUpdates = new LinkedHashMap<>();
+        private final Map<Long, Priority> pendingPriorityUpdates =
+                new LinkedHashMap<>(16, 0.75f, true);
 
 
         ConnectionState(QuicConnection connection) {
+            this(connection, false);
+        }
+
+
+        ConnectionState(QuicConnection connection, boolean enableConnectProtocol) {
             this.connection = connection;
+            this.enableConnectProtocol = enableConnectProtocol;
+        }
+
+
+        /**
+         * Returns whether this connection advertised
+         * {@code SETTINGS_ENABLE_CONNECT_PROTOCOL} (RFC 9220 Section 5).
+         *
+         * @return the per-connection ENABLE_CONNECT_PROTOCOL value
+         */
+        public boolean isEnableConnectProtocol() {
+            return enableConnectProtocol;
         }
 
 
@@ -1697,9 +1817,12 @@ public class Http3ConnectionManager implements QuicConnectionManager {
          * <p>
          * The buffer is bounded by local implementation policy (RFC 9218
          * Section 7): only the most recent signal per element is kept and
-         * the total number of buffered elements is limited to the
-         * connection's concurrent-stream limit (with a floor of 16), the
-         * oldest entries being evicted first.
+         * the total number of buffered elements is limited to the smaller of
+         * {@link #MAX_PENDING_PRIORITY_UPDATES} (1024) and the connection's
+         * concurrent-stream limit (with a floor of 16), the oldest entries
+         * being evicted first. The independent 1024 ceiling prevents a large
+         * configured concurrent-stream limit from turning the buffer into
+         * unbounded per-connection memory.
          *
          * @param prioritizedElementId The target request-stream ID
          * @param priority The parsed priority signal
@@ -1712,8 +1835,10 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                     consumer.setPriority(priority);
                 } else {
                     pendingPriorityUpdates.put(key, priority);
-                    int maxPending = Math.max(16,
-                            (int) Math.min(Integer.MAX_VALUE, maxConcurrentStreams));
+                    int maxPending = Math.min(MAX_PENDING_PRIORITY_UPDATES,
+                            Math.max(16,
+                                    (int) Math.min(Integer.MAX_VALUE,
+                                            maxConcurrentStreams)));
                     if (pendingPriorityUpdates.size() > maxPending) {
                         Iterator<Long> eldest = pendingPriorityUpdates.keySet().iterator();
                         eldest.next();
@@ -1798,6 +1923,37 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
         public void markUniStreamDiscarded(long streamId) {
             discardedUniStreamIds.add(streamId);
+        }
+
+
+        /**
+         * Accounts one ignored control-stream frame and reports whether the
+         * per-connection ignored-frame/frame-byte budget has been exceeded.
+         *
+         * @param payloadLength The declared frame payload length
+         *
+         * @return {@code true} if the budget was exceeded
+         */
+        public boolean noteIgnoredControlFrame(long payloadLength) {
+            ignoredControlFrameCount++;
+            ignoredControlFrameBytes += payloadLength;
+            return ignoredControlFrameCount > MAX_IGNORED_FRAMES ||
+                    ignoredControlFrameBytes > MAX_IGNORED_BYTES;
+        }
+
+
+        /**
+         * Accounts bytes discarded from an unknown unidirectional stream and
+         * reports whether the per-connection discard budget has been
+         * exceeded.
+         *
+         * @param length The number of discarded bytes
+         *
+         * @return {@code true} if the budget was exceeded
+         */
+        public boolean noteDiscardedUniStreamData(long length) {
+            discardedUniStreamBytes += length;
+            return discardedUniStreamBytes > MAX_IGNORED_BYTES;
         }
 
 

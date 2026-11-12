@@ -70,6 +70,26 @@ public final class Constants {
     // Default limits
     public static final int DEFAULT_MAX_FIELD_SECTION_SIZE = 16 * 1024;
 
+    /**
+     * Maximum size of a single buffered frame payload on a request stream.
+     * HTTP/3 has no negotiated frame-size limit, so this is a local
+     * buffering limit; it also bounds the largest field section the receiver
+     * can actually accept.
+     */
+    public static final int MAX_FRAME_LENGTH = 16 * 1024 * 1024;
+
+    /**
+     * Largest decoded field-section size that can be carried in a frame
+     * within {@link #MAX_FRAME_LENGTH}. QPACK's worst-case wire expansion is
+     * 15/4 of the decoded size plus the two prefix iRPs and a little slack
+     * (see {@code Http3Processor.fieldSectionWireLimit()}); a configured
+     * larger field-section size must not be advertised because the frame
+     * would be rejected before decoding.
+     */
+    public static final long MAX_FIELD_SECTION_SIZE_FOR_FRAME_LIMIT =
+            (MAX_FRAME_LENGTH - (2L * Qpack.MAX_IRP_ENCODED_LENGTH + 12L))
+                    * 4L / 15L;
+
     // HTTP/3 settings (RFC 9114 Section 7.2.4.1, RFC 9204 Section 5,
     // RFC 9220 Section 5)
     public static final long H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0x01;
