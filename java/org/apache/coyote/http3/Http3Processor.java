@@ -1401,7 +1401,8 @@ class Http3Processor extends AbstractProcessor
             log.trace(sm.getString("http3Processor.sendingHeadersFrame",
                     Long.valueOf(streamId)));
         }
-        if (outputBuffer.isNonBlockingMode()) {
+        if (getRequest().getResponse().getWriteListener() != null &&
+                outputBuffer.isNonBlockingMode()) {
             outputBuffer.writeFrame(frame, true);
         } else {
             socketWrapper.write(blocking, frame);
@@ -5154,7 +5155,9 @@ class Http3Processor extends AbstractProcessor
         // stream, the close inside emits its trailer bytes into the
         // swallow path instead of a dead QUIC stream.
         outputBuffer.resetCompression();
-        outputBuffer.resetQueue();
+        if (outputBuffer.needsReset()) {
+            outputBuffer.resetQueue();
+        }
         streamReset.set(false);
         pendingFrameType = -1;
         pendingFrameLength = 0;
@@ -6203,6 +6206,8 @@ class Http3Processor extends AbstractProcessor
         private long pendingBytes = 0;
         private boolean dataLeft = false;
         private volatile boolean nonBlockingMode = false;
+        private volatile boolean queueUsed = false;
+        private boolean listenerChecked = false;
         private boolean resetOrFailed = false;
         private long bytesWritten = 0;
         private final ByteBuffer dataFrameBuffer = ByteBuffer.allocate(16384);
@@ -6223,12 +6228,14 @@ class Http3Processor extends AbstractProcessor
          * blocking path.
          */
         boolean isNonBlockingMode() {
-            if (!nonBlockingMode &&
-                    processor.getRequest().getResponse().getWriteListener() != null) {
-                SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
-                if (!(wrapper instanceof QuicSocketWrapper qw) ||
-                        qw.supportsNonBlockingWrites()) {
-                    nonBlockingMode = true;
+            if (!listenerChecked) {
+                listenerChecked = true;
+                if (processor.getRequest().getResponse().getWriteListener() != null) {
+                    SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
+                    if (!(wrapper instanceof QuicSocketWrapper qw) ||
+                            qw.supportsNonBlockingWrites()) {
+                        nonBlockingMode = true;
+                    }
                 }
             }
             return nonBlockingMode;
@@ -6286,6 +6293,7 @@ class Http3Processor extends AbstractProcessor
                 pendingFrames.addLast(frame);
                 pendingBytes += len;
                 dataLeft = true;
+                queueUsed = true;
             } finally {
                 writeLock.unlock();
             }
@@ -6405,9 +6413,15 @@ class Http3Processor extends AbstractProcessor
                 pendingBytes = 0;
                 dataLeft = false;
                 resetOrFailed = true;
+                queueUsed = false;
             } finally {
                 writeLock.unlock();
             }
+        }
+
+
+        boolean needsReset() {
+            return queueUsed || nonBlockingMode;
         }
 
 
@@ -6419,6 +6433,8 @@ class Http3Processor extends AbstractProcessor
                 dataLeft = false;
                 resetOrFailed = false;
                 nonBlockingMode = false;
+                queueUsed = false;
+                listenerChecked = false;
             } finally {
                 writeLock.unlock();
             }
@@ -6522,7 +6538,7 @@ class Http3Processor extends AbstractProcessor
             if (pending == 0) {
                 return 0;
             }
-            boolean nonBlocking = isNonBlockingMode();
+            boolean nonBlocking = nonBlockingMode;
             if (compressionEnabled) {
                 writeCompressed(chunk, pending);
             } else {
@@ -6590,7 +6606,7 @@ class Http3Processor extends AbstractProcessor
             int maxPayload = dataFrameBuffer.capacity() - 9;
             int originalLimit = chunk.limit();
             int written = 0;
-            boolean nonBlocking = isNonBlockingMode();
+            boolean nonBlocking = nonBlockingMode;
             while (dataLen > 0) {
                 int frameLen = Math.min(dataLen, maxPayload);
                 dataFrameBuffer.clear();
@@ -6660,10 +6676,13 @@ class Http3Processor extends AbstractProcessor
                 // compressed body.
                 compressionStream.flush();
             }
-            if (isNonBlockingMode()) {
+            if (nonBlockingMode) {
                 flushNonBlocking();
             } else {
-                flushBlocking();
+                SocketWrapperBase<?> wrapper = processor.getSocketWrapper();
+                if (wrapper != null) {
+                    wrapper.flush(true);
+                }
             }
         }
 
