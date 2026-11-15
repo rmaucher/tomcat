@@ -7571,11 +7571,7 @@ class Http3Processor extends AbstractProcessor
 
         /**
          * Whether this response uses the Servlet non-blocking write path.
-         * The mode is latched on the first call and is sticky for the
-         * response: a response whose first call happens before a
-         * {@code WriteListener} is installed remains on the blocking path,
-         * and a response that has entered the non-blocking path stays on it
-         * even if the listener is later cleared.
+         * The mode is sticky once entered.
          */
         boolean isNonBlockingMode() {
             if (!listenerChecked) {
