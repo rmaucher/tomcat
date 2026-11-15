@@ -85,6 +85,13 @@ public class QpackDecoder {
     private volatile long totalInserts = 0;
 
     /**
+     * Set when the connection owning this decoder is closed. Blocked stream
+     * waits must stop instead of waiting for inserts that can no longer
+     * arrive. Volatile because waiters check it outside the decoder monitor.
+     */
+    private volatile boolean closed = false;
+
+    /**
      * Base value of the field section currently being decoded, in dynamic
      * table absolute index units (RFC 9204 Section 4.5.1.2). Long because
      * the absolute index space is unbounded over a connection's lifetime
@@ -149,13 +156,27 @@ public class QpackDecoder {
      * @param maxTableSize     The initial (soft) table capacity. May be
      *                         reduced by the peer's Set Dynamic Table
      *                         Capacity instruction (RFC 9204 Section 4.3.1).
+     *                         Must be between zero and
+     *                         {@code maxTableSizeHard}.
      * @param maxTableSizeHard The hard limit on the table capacity. A Set
      *                         Dynamic Table Capacity instruction that
      *                         exceeds this limit is a connection error.
      *                         Typically the connector's
-     *                         {@code qpackMaxTableCapacity} setting.
+     *                         {@code qpackMaxTableCapacity} setting. Must
+     *                         not be negative.
+     *
+     * @throws IllegalArgumentException If either value is negative or the
+     *                                  initial capacity exceeds the hard
+     *                                  limit (RFC 9204 Section 3.2.3)
      */
     public QpackDecoder(int maxTableSize, int maxTableSizeHard) {
+        if (maxTableSize < 0 || maxTableSizeHard < 0 ||
+                maxTableSize > maxTableSizeHard) {
+            throw new IllegalArgumentException(sm.getString(
+                    "qpackdecoder.invalidTableCapacity",
+                    Integer.valueOf(maxTableSize),
+                    Integer.valueOf(maxTableSizeHard)));
+        }
         this.maxTableSizeHard = maxTableSizeHard;
         this.maxTableSize = maxTableSize;
     }
@@ -163,16 +184,21 @@ public class QpackDecoder {
 
     /**
      * Decodes a prefixed integer (iRP) per RFC 9204 Section 4.1.1 (the
-     * RFC 7541 Section 5.1 format), narrowed to {@code int}. The top n bits
-     * of the given first byte (i.e. the low n bits, for a mid-byte iRP
-     * following earlier fields) hold the prefix. If the prefix is all ones,
+     * RFC 7541 Section 5.1 format), narrowed to {@code int}. The low n bits
+     * of the given first byte hold the prefix; the remaining bits are flags or
+     * data belonging to the preceding field. If the prefix is all ones,
      * the excess is encoded as 7-bit groups, least significant group first
      * (RFC 7541 Section 5.1 Figure 3), with the high bit as continuation
      * flag.
      * <p>
-     * The {@code Int} name distinguishes this int-narrowing shim from the
-     * identically named long-returning {@link Qpack#decodeIrp(ByteBuffer,
-     * int, int)} it delegates to, which it otherwise shadows.
+     * This narrowing shim is used only for values whose domain is an
+     * implementation limit - the lengths of literal name/value strings on
+     * the encoder and request streams. Table indexes and the encoded field
+     * section prefix must be decoded to {@code long} instead: a value above
+     * {@code Integer.MAX_VALUE} there is an invalid reference or an
+     * impossible Encoded Insert Count, i.e. a connection error (RFC 9204
+     * Sections 2.2.3, 3.1 and 4.5.1.1), not the stream-scoped
+     * RFC 9204 Section 7.4 value-too-large error.
      *
      * @param buffer    Buffer to read continuation bytes from
      * @param n         Prefix size in bits (1-8)
@@ -194,23 +220,23 @@ public class QpackDecoder {
     }
 
 
-    /**
-     * Decodes a full-byte prefixed integer (iRP) per RFC 9204 Section 4.1.1
-     * where the integer occupies the entire first byte, narrowed to
-     * {@code int}; see {@link #decodeIrpIntRest(ByteBuffer, int, int)} for
-     * the naming distinction from the long-returning {@code Qpack} static.
-     *
-     * @param buffer Buffer to read from
-     * @param n      Prefix size in bits (1-8)
-     * @return The decoded integer, or -1 if more data is needed
-     * @throws QpackException If the integer exceeds the maximum permitted value
+    /*
+     * Decodes a field-line table index. Unlike an implementation-limit
+     * literal length, a table index that cannot even be represented in the
+     * 62-bit iRP domain is an invalid reference, not a stream-scoped
+     * value-too-large error: RFC 9204 Sections 3.1 and 2.2.3 require a
+     * connection error, matching the invalid-index handling for representable
+     * values. The same applies to the Required Insert Count prefix (Section
+     * 4.5.1.1), handled separately in decodeHeaderBlockInternal().
      */
-    private static int decodeIrpInt(ByteBuffer buffer, int n) throws QpackException {
-        if (buffer.remaining() == 0) {
-            return -1;
+    private static long decodeFieldIndex(ByteBuffer buffer, int n, int firstByte)
+            throws QpackException {
+        try {
+            return Qpack.decodeIrp(buffer, n, firstByte);
+        } catch (QpackValueTooLargeException e) {
+            throw new QpackException(
+                    sm.getString("qpackdecoder.indexTooLarge"), e);
         }
-        int firstByte = buffer.get() & 0xFF;
-        return decodeIrpIntRest(buffer, n, firstByte);
     }
 
 
@@ -576,6 +602,14 @@ public class QpackDecoder {
      * per-section limits through the four-argument overload below, which
      * temporarily overrides (and then restores) the instance fields.
      *
+     * <p>
+     * Incomplete input handling: if the field-section prefix is incomplete,
+     * the buffer position is restored to where the block started (no bytes
+     * consumed). If a field line is incomplete, the position is restored to
+     * the start of that field line; field lines decoded before it remain
+     * consumed. Callers detect a truncated section by checking
+     * {@code buffer.hasRemaining()} after the call.
+     *
      * @param buffer The buffer containing the header block
      * @param emitter The callback invoked for each decoded header field
      * @throws QpackException If decoding fails
@@ -598,6 +632,13 @@ public class QpackDecoder {
      * (which would race with concurrent decodes). The limits are applied
      * under the decoder monitor and restored on exit, so a concurrent
      * decode either sees its own limits or waits for the monitor.
+     *
+     * <p>
+     * Incomplete input handling is the same as for
+     * {@link #decodeHeaderBlock(ByteBuffer, HeaderEmitter)}: an incomplete
+     * prefix leaves the whole block unconsumed, an incomplete field line
+     * leaves that line unconsumed, and callers detect truncation with
+     * {@code buffer.hasRemaining()}.
      *
      * @param buffer          The buffer containing the header block
      * @param emitter         The callback invoked for each decoded header
@@ -634,7 +675,17 @@ public class QpackDecoder {
 
         // RFC 9204 Section 4.5.1: Encoded Field Section Prefix
         // Required Insert Count (iRP m=8), then Sign bit (S) + Delta Base (iRP m=7)
-        int encodedInsertCount = decodeIrpInt(buffer, 8);
+        // A value beyond the 62-bit iRP domain cannot have been produced by
+        // a conformant encoder: RFC 9204 Section 4.5.1.1 requires a
+        // connection error, not the stream-scoped value-too-large error
+        // used for oversized implementation-limit literals.
+        long encodedInsertCount;
+        try {
+            encodedInsertCount = Qpack.decodeIrp(buffer, 8);
+        } catch (QpackValueTooLargeException e) {
+            throw new QpackException(
+                    sm.getString("qpackdecoder.encodedInsertCountTooLarge"), e);
+        }
         if (encodedInsertCount == -1) {
             // The prefix was not decodable (e.g. an all-ones first byte
             // whose continuation bytes are missing). Rewind like the two
@@ -651,7 +702,7 @@ public class QpackDecoder {
         }
         int secondByte = buffer.get() & 0xFF;
         boolean sign = (secondByte & 0x80) != 0;
-        int deltaBase = decodeIrpIntRest(buffer, 7, secondByte);
+        long deltaBase = Qpack.decodeIrp(buffer, 7, secondByte);
         if (deltaBase == -1) {
             buffer.position(blockStart);
             return;
@@ -661,7 +712,7 @@ public class QpackDecoder {
         long requiredInsertCount = reconstructReqInsertCount(encodedInsertCount);
         if (requiredInsertCount < 0) {
             throw new QpackException(sm.getString("qpackdecoder.encodedInsertCountInvalid",
-                    Integer.valueOf(encodedInsertCount)));
+                    Long.valueOf(encodedInsertCount)));
         }
 
         // Per RFC 9204 Section 4.5.1.2, a field block with a Sign bit of 1
@@ -669,13 +720,20 @@ public class QpackDecoder {
         // the Delta Base.
         if (sign && requiredInsertCount <= deltaBase) {
             throw new QpackException(sm.getString("qpackdecoder.invalidBase",
-                    Long.valueOf(requiredInsertCount), Integer.valueOf(deltaBase)));
+                    Long.valueOf(requiredInsertCount), Long.valueOf(deltaBase)));
         }
 
         // Compute Base per RFC 9204 Section 4.5.1.2. The Base is expressed in
         // dynamic table absolute index units (RFC 9204 Section 3.2.4).
+        // RFC 9204 Section 4.5.1.2 permits an arbitrary Base when the field
+        // section contains no dynamic table references, so Delta Base is
+        // decoded as a long and is not subject to the literal-length limit.
         long sectionBase;
         if (!sign) {
+            if (deltaBase > Long.MAX_VALUE - requiredInsertCount) {
+                throw new QpackException(sm.getString("qpackdecoder.invalidBase",
+                        Long.valueOf(requiredInsertCount), Long.valueOf(deltaBase)));
+            }
             sectionBase = requiredInsertCount + deltaBase;
         } else {
             sectionBase = requiredInsertCount - deltaBase - 1;
@@ -717,7 +775,7 @@ public class QpackDecoder {
             if ((b & 0x80) == 0x80) {
                 // 1 T Index(6+): Indexed Field Line (RFC 9204 Section 4.5.2)
                 boolean isStatic = (b & 0x40) != 0;
-                int index = decodeIrpIntRest(buffer, 6, b);
+                long index = decodeFieldIndex(buffer, 6, b);
                 if (index == -1) {
                     buffer.position(fieldStart);
                     return;
@@ -726,7 +784,7 @@ public class QpackDecoder {
             } else if ((b & 0xC0) == 0x40) {
                 // 01 N T NameIndex(4+): Literal Field Line with Name Reference (Section 4.5.4)
                 boolean isStatic = (b & 0x10) != 0;
-                int index = decodeIrpIntRest(buffer, 4, b);
+                long index = decodeFieldIndex(buffer, 4, b);
                 if (index == -1) {
                     buffer.position(fieldStart);
                     return;
@@ -761,7 +819,7 @@ public class QpackDecoder {
                 emit(name, value, emitter);
             } else if ((b & 0xF0) == 0x10) {
                 // 0001 Index(4+): Indexed Field Line with Post-Base Index (Section 4.5.3)
-                int index = decodeIrpIntRest(buffer, 4, b);
+                long index = decodeFieldIndex(buffer, 4, b);
                 if (index == -1) {
                     buffer.position(fieldStart);
                     return;
@@ -769,7 +827,7 @@ public class QpackDecoder {
                 emitPostBaseIndexedEntry(index, emitter);
             } else if ((b & 0xF0) == 0x00) {
                 // 0000 N NameIdx(3+): Literal Field Line with Post-Base Name Reference (Section 4.5.5)
-                int index = decodeIrpIntRest(buffer, 3, b);
+                long index = decodeFieldIndex(buffer, 3, b);
                 if (index == -1) {
                     buffer.position(fieldStart);
                     return;
@@ -791,20 +849,31 @@ public class QpackDecoder {
      * error, RFC 9204 Section 4.5.2). Dynamic references are relative to
      * Base: a relative index of 0 refers to the entry with absolute index
      * Base - 1 (RFC 9204 Section 3.2.5).
+     * <p>
+     * The index is a {@code long}: a value above {@code Integer.MAX_VALUE}
+     * is necessarily an invalid static table index or an invalid dynamic
+     * table reference, i.e. a connection error, not an implementation-limit
+     * value-too-large error.
      */
-    private Qpack.HeaderField resolveIndexedEntry(int index, boolean isStatic)
+    private Qpack.HeaderField resolveIndexedEntry(long index, boolean isStatic)
             throws QpackException {
         if (isStatic) {
             if (index >= Qpack.STATIC_TABLE_LENGTH) {
-                throw new QpackException(sm.getString("qpackdecoder.invalidIndex", Integer.valueOf(index)));
+                throw new QpackException(sm.getString("qpackdecoder.invalidIndex", Long.valueOf(index)));
             }
-            return Qpack.STATIC_TABLE[index];
+            return Qpack.STATIC_TABLE[(int) index];
         }
         return getDynamicEntryByAbsolute(currentBase - 1 - index);
     }
 
 
-    private void emitIndexedEntry(int index, boolean isStatic, HeaderEmitter emitter) throws QpackException, Http3Exception {
+    /*
+     * The TRACE messages below include decoded field names and values, which
+     * may contain credentials, cookies or tokens (HTTP/3 splits the cookie
+     * header). Enable TRACE only when debugging and treat captured trace logs
+     * as sensitive, matching the warning on the QPACK encoder's header dump.
+     */
+    private void emitIndexedEntry(long index, boolean isStatic, HeaderEmitter emitter) throws QpackException, Http3Exception {
         Qpack.HeaderField entry = resolveIndexedEntry(index, isStatic);
         String name = entry.name;
         String value = entry.value != null ? entry.value : "";
@@ -815,7 +884,7 @@ public class QpackDecoder {
     }
 
 
-    private void emitNameRefEntry(int index, boolean isStatic, String value, HeaderEmitter emitter) throws QpackException, Http3Exception {
+    private void emitNameRefEntry(long index, boolean isStatic, String value, HeaderEmitter emitter) throws QpackException, Http3Exception {
         String name = resolveIndexedEntry(index, isStatic).name;
         if (log.isTraceEnabled()) {
             log.trace("QPACK NameRef: name=" + name + " value=" + value);
@@ -829,12 +898,15 @@ public class QpackDecoder {
      * Section 3.2.6, a post-base index of 0 refers to the entry with
      * absolute index equal to Base.
      */
-    private Qpack.HeaderField resolvePostBaseEntry(int postBaseIndex) throws QpackException {
+    private Qpack.HeaderField resolvePostBaseEntry(long postBaseIndex) throws QpackException {
+        if (postBaseIndex > Long.MAX_VALUE - currentBase) {
+            throw new QpackException(sm.getString("qpackdecoder.dynamicTableIndexInvalid"));
+        }
         return getDynamicEntryByAbsolute(currentBase + postBaseIndex);
     }
 
 
-    private void emitPostBaseIndexedEntry(int postBaseIndex, HeaderEmitter emitter) throws QpackException, Http3Exception {
+    private void emitPostBaseIndexedEntry(long postBaseIndex, HeaderEmitter emitter) throws QpackException, Http3Exception {
         Qpack.HeaderField entry = resolvePostBaseEntry(postBaseIndex);
         String name = entry.name;
         String value = entry.value != null ? entry.value : "";
@@ -845,7 +917,7 @@ public class QpackDecoder {
     }
 
 
-    private void emitPostBaseNameRefEntry(int postBaseIndex, String value, HeaderEmitter emitter) throws QpackException, Http3Exception {
+    private void emitPostBaseNameRefEntry(long postBaseIndex, String value, HeaderEmitter emitter) throws QpackException, Http3Exception {
         String name = resolvePostBaseEntry(postBaseIndex).name;
         if (log.isTraceEnabled()) {
             log.trace("QPACK PostBase NameRef: name=" + name + " value=" + value);
@@ -913,6 +985,31 @@ public class QpackDecoder {
 
 
     /**
+     * Marks this decoder as closed and wakes every stream waiting for
+     * dynamic table inserts. Called by the connection manager when the owning
+     * QUIC connection closes: no further inserts can arrive, so a blocked
+     * stream must stop waiting immediately rather than wait out the
+     * configured blocked-stream timeout.
+     */
+    void close() {
+        synchronized (this) {
+            closed = true;
+            notifyAll();
+        }
+    }
+
+
+    /**
+     * Returns whether this decoder has been marked closed.
+     *
+     * @return {@code true} if the owning connection has closed
+     */
+    boolean isClosed() {
+        return closed;
+    }
+
+
+    /**
      * Reconstructs the Required Insert Count from its encoded value per
      * RFC 9204 Section 4.5.1.1.
      *
@@ -924,7 +1021,7 @@ public class QpackDecoder {
      *         grows past 2^31 on connections with more than 2^31 lifetime
      *         inserts).
      */
-    private long reconstructReqInsertCount(int encoded) {
+    private long reconstructReqInsertCount(long encoded) {
         if (encoded == 0) {
             return 0;
         }

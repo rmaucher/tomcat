@@ -64,6 +64,15 @@ public class QpackEncoder {
 
     /**
      * Encodes response headers into the target buffer.
+     * <p>
+     * The encoder may return {@link State#UNDERFLOW} when the target does not
+     * have room for the complete block. Resuming an interrupted encoding
+     * requires passing the SAME {@link MimeHeaders} instance and a target
+     * buffer that still contains the bytes already written (the field-section
+     * prefix and any field lines emitted before the underflow). Passing a
+     * different headers instance throws {@link IllegalStateException}, and a
+     * fresh target silently loses the prefix and earlier field lines. Call
+     * {@link #resetEncodingState()} before starting an unrelated header block.
      *
      * @param headers The response headers to encode
      * @param target The output buffer
@@ -92,6 +101,24 @@ public class QpackEncoder {
     }
 
 
+    /**
+     * Encodes response headers into the target buffer, optionally forcing
+     * field names to lower case.
+     * <p>
+     * {@code forceLowerCase=false} is intended only for tests or future
+     * callers that know they already supply names in the exact form they
+     * want. It can encode uppercase field names, which HTTP/3 requires to be
+     * lowercase (RFC 9114 Section 4.2). Production response encoding uses the
+     * two-argument overload, which forces lower case. The streaming/resume
+     * contract is the same as for {@link #encode(MimeHeaders, ByteBuffer)}:
+     * resume with the same headers instance and a target that retains the
+     * bytes written before the underflow.
+     *
+     * @param headers The response headers to encode
+     * @param target The output buffer
+     * @param forceLowerCase Whether to lower-case field names before encoding
+     * @return The encoding state
+     */
     public State encode(MimeHeaders headers, ByteBuffer target, boolean forceLowerCase) {
         int it = headersIterator;
         if (headersIterator == -1) {
@@ -130,7 +157,7 @@ public class QpackEncoder {
         while (it < currentHeaders.size()) {
             String name = currentHeaders.getName(it).toString();
             if (forceLowerCase) {
-                name = name.toLowerCase(Locale.US);
+                name = toLowerCase(name);
             }
 
             boolean skip = false;
@@ -163,50 +190,67 @@ public class QpackEncoder {
 
             if (!skip) {
                 String value = currentHeaders.getValue(it).toString();
-
-                // HTTP field values are byte strings (RFC 9110 Section 5.5,
-                // obs-text). Tomcat stores them as ISO-8859-1 characters, as
-                // HTTP/1.1 and HPACK do; encode one wire byte per char rather
-                // than re-encoding as UTF-8 (which would change the bytes and
-                // fail to round-trip through Qpack.decodeString()).
-                byte[] nameBytes = toBytes(name);
-                byte[] valueBytes = toBytes(value);
-
-                StaticTableMatch match = lookupStaticTable(name, value);
-                // Worst case per header: 2 byte field prefix + iRP continuation
-                // bytes for the name index/name length/value length.
-                int required = 22 + nameBytes.length + valueBytes.length;
-
-                if (target.remaining() < required) {
-                    headersIterator = it;
-                    return State.UNDERFLOW;
-                }
-
-                if (log.isTraceEnabled()) {
-                    log.trace(sm.getString("qpackEncoder.encodeHeader", name, value));
-                }
-
-                if (match.exact() >= 0 && shouldIndex(name, value)) {
-                    // Indexed Field Line (RFC 9204 Section 4.5.2)
-                    encodeIndexed(target, match.exact(), true);
-                } else if (match.exact() < 0 && match.nameOnly() >= 0) {
-                    // The name is in the table only as a name-only entry:
-                    // Literal with name reference (RFC 9204 Section 4.5.4)
-                    encodeNameRefLiteral(target, match.nameOnly(), true, valueBytes);
-                } else if (match.firstName() >= 0) {
-                    // An exact match is unavailable (value differs, or the pair
-                    // must not be indexed): reference the name and carry the
-                    // value literally (RFC 9204 Section 4.5.4)
-                    encodeNameRefLiteral(target, match.firstName(), true, valueBytes);
+                if (!isEncodableValue(value)) {
+                    // A null value, a character above ISO-8859-1, or a
+                    // forbidden control character cannot be emitted as a
+                    // valid HTTP field value. Narrowing a wider character
+                    // would change the value (for example U+010A would
+                    // become LF), so drop the field rather than silently
+                    // corrupting it or emitting an invalid field line.
+                    if (log.isDebugEnabled()) {
+                        log.debug(sm.getString(
+                                "qpackEncoder.invalidValueSkipped", name));
+                    }
                 } else {
-                    // Literal with literal name (RFC 9204 Section 4.5.6)
-                    encodeNameValueLiteral(target, nameBytes, valueBytes);
-                }
+                    // HTTP field values are byte strings (RFC 9110 Section
+                    // 5.5, obs-text). Tomcat stores them as ISO-8859-1
+                    // characters, as HTTP/1.1 and HPACK do; encode one wire
+                    // byte per char rather than re-encoding as UTF-8 (which
+                    // would change the bytes and fail to round-trip through
+                    // Qpack.decodeString()).
+                    byte[] nameBytes = toBytes(name);
+                    byte[] valueBytes = toValueBytes(value);
 
-                // The encoder never inserts into a dynamic table and never
-                // sends encoder instructions: only static table references
-                // and literal representations are used, which ensures the
-                // header block is decodable with an empty dynamic table.
+                    StaticTableMatch match = lookupStaticTable(name, value);
+                    // Worst case per header: 2 byte field prefix + iRP
+                    // continuation bytes for the name index/name length/value
+                    // length.
+                    int required = 22 + nameBytes.length + valueBytes.length;
+
+                    if (target.remaining() < required) {
+                        headersIterator = it;
+                        return State.UNDERFLOW;
+                    }
+
+                    if (log.isTraceEnabled()) {
+                        log.trace(sm.getString("qpackEncoder.encodeHeader",
+                                name, value));
+                    }
+
+                    if (match.exact() >= 0 && shouldIndex(name, value)) {
+                        // Indexed Field Line (RFC 9204 Section 4.5.2)
+                        encodeIndexed(target, match.exact(), true);
+                    } else if (match.exact() < 0 && match.nameOnly() >= 0) {
+                        // The table carries this name with an empty value:
+                        // Literal with name reference (RFC 9204 Section 4.5.4)
+                        encodeNameRefLiteral(target, match.nameOnly(), true,
+                                valueBytes);
+                    } else if (match.firstName() >= 0) {
+                        // An exact match is unavailable (value differs, or the
+                        // pair must not be indexed): reference the name and
+                        // carry the value literally (RFC 9204 Section 4.5.4)
+                        encodeNameRefLiteral(target, match.firstName(), true,
+                                valueBytes);
+                    } else {
+                        // Literal with literal name (RFC 9204 Section 4.5.6)
+                        encodeNameValueLiteral(target, nameBytes, valueBytes);
+                    }
+
+                    // The encoder never inserts into a dynamic table and never
+                    // sends encoder instructions: only static table references
+                    // and literal representations are used, which ensures the
+                    // header block is decodable with an empty dynamic table.
+                }
             }
 
             if (++it == currentHeaders.size() && firstPass) {
@@ -295,11 +339,93 @@ public class QpackEncoder {
      * the request decode path.
      */
     private static byte[] toBytes(String s) {
+        if (!isEncodableValue(s)) {
+            throw new IllegalArgumentException(
+                    sm.getString("qpackEncoder.invalidValue"));
+        }
         byte[] bytes = new byte[s.length()];
         for (int i = 0; i < s.length(); i++) {
             bytes[i] = (byte) s.charAt(i);
         }
         return bytes;
+    }
+
+
+    /*
+     * Converts an already validated field value to its one-byte-per-char wire
+     * form. encode() has just run isEncodableValue() on the value, so this
+     * variant does not repeat the scan.
+     */
+    private static byte[] toValueBytes(String s) {
+        byte[] bytes = new byte[s.length()];
+        for (int i = 0; i < s.length(); i++) {
+            bytes[i] = (byte) s.charAt(i);
+        }
+        return bytes;
+    }
+
+
+    /*
+     * Lower-cases a field name only when it actually contains an ASCII
+     * uppercase character. Response header names supplied by Tomcat are
+     * already lower case, so the common path avoids String.toLowerCase() and
+     * its allocation.
+     */
+    private static String toLowerCase(String name) {
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c >= 'A' && c <= 'Z') {
+                return name.toLowerCase(Locale.US);
+            }
+        }
+        return name;
+    }
+
+
+    /*
+     * Whether a field can produce an encoded field line: a valid token name
+     * and a valid field value. Used by the HTTP/3 processor to avoid writing
+     * a HEADERS frame that contains only the QPACK prefix after peer-limit
+     * reduction or value filtering has dropped every trailer field.
+     */
+    static boolean isEncodableField(String name, String value) {
+        return name != null && HttpParser.isToken(name) &&
+                isEncodableValue(value);
+    }
+
+
+    /*
+     * Whether a header value can be represented by one wire byte per char
+     * and contains only characters permitted in an HTTP field value.
+     * RFC 9110 Section 5.5 defines field-value as *field-content, where
+     * field-content is field-vchar [ 1*( SP / HTAB / field-vchar ) field-vchar ]:
+     * a value therefore has no leading or trailing whitespace. Values outside
+     * this set are dropped by encode() (see the qpackEncoder.invalidValueSkipped
+     * message): a non-Latin-1 value must not be silently narrowed, and emitting
+     * a CTL as a raw field byte would let an HTTP/1.1 translation layer see a
+     * header or message boundary that HTTP/3's length-prefixed framing did not
+     * intend.
+     */
+    private static boolean isEncodableValue(String value) {
+        if (value == null) {
+            return false;
+        }
+        int length = value.length();
+        for (int i = 0; i < length; i++) {
+            char c = value.charAt(i);
+            if (i == 0 || i == length - 1) {
+                // The first and last character must be field-vchar (no leading
+                // or trailing SP/HTAB).
+                if (!HttpParser.isFieldVChar(c)) {
+                    return false;
+                }
+            } else {
+                if (!HttpParser.isFieldContent(c)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
 
@@ -324,9 +450,9 @@ public class QpackEncoder {
     /*
      * Usable static table representations (RFC 9204 Appendix A) of one
      * (name, value) pair, as found by lookupStaticTable(): the exact
-     * (name, value) match, the first name-only entry carrying the name
-     * (value {@code null}, e.g. :authority - referenceable by name with a
-     * literal value) and the first entry carrying the name at all, each -1
+     * (name, value) match, the first entry carrying the name with an empty
+     * value (value {@code null}, e.g. :authority - referenceable by name with
+     * a literal value) and the first entry carrying the name at all, each -1
      * when absent.
      */
     private record StaticTableMatch(int exact, int nameOnly, int firstName) {
@@ -352,8 +478,9 @@ public class QpackEncoder {
                 firstName = i;
             }
             if (sf.value == null) {
-                // Name-only entry (e.g., :authority). Remember it so a
-                // Literal Field Line with Name Reference can be used.
+                // Entry carrying the name with an empty value (e.g.,
+                // :authority). Remember it so a Literal Field Line with Name
+                // Reference can be used.
                 if (nameOnly < 0) {
                     nameOnly = i;
                 }

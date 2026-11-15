@@ -116,6 +116,42 @@ public class TestQpackEncoder {
 
 
     @Test
+    public void testControlCharactersInValueAreDropped() throws Exception {
+        // RFC 9110 Section 5.5 permits field-vchar, SP, HTAB and obs-text in
+        // a field value; CR, LF, NUL, DEL and the other CTLs are invalid.
+        // A reflected application value must not be emitted as raw field
+        // bytes that an HTTP/1.1 translation layer could interpret as a
+        // header or message boundary.
+        List<String[]> emitted = decode(encodeFully(new QpackEncoder(),
+                headers("x-bad", "ok\r\nInjected: yes",
+                        "x-nul", "a\u0000b",
+                        "x-del", "a\u007fb",
+                        "x-tab", "a\tb")));
+
+        assertEmitted(emitted, "x-tab", "a\tb");
+    }
+
+
+    @Test
+    public void testLeadingAndTrailingWhitespaceInValueAreDropped()
+            throws Exception {
+        // RFC 9110 Section 5.5: a field value does not include leading or
+        // trailing whitespace. Only SP/HTAB between field-vchars are valid;
+        // empty values are valid, as are internal SP/HTAB.
+        List<String[]> emitted = decode(encodeFully(new QpackEncoder(),
+                headers("x-leading-space", " foo",
+                        "x-trailing-space", "foo ",
+                        "x-leading-tab", "\tfoo",
+                        "x-trailing-tab", "foo\t",
+                        "x-single-space", " ",
+                        "x-empty", "",
+                        "x-middle", "a b\tc")));
+
+        assertEmitted(emitted, "x-empty", "", "x-middle", "a b\tc");
+    }
+
+
+    @Test
     public void testStaticExactMatchUsesIndexedRepresentation()
             throws Exception {
         // ("content-type", "application/json") is static table entry 46
@@ -291,6 +327,34 @@ public class TestQpackEncoder {
                 headers("x-empty", "")));
         Assert.assertEquals("x-empty", emitted.get(0)[0]);
         Assert.assertEquals("", emitted.get(0)[1]);
+    }
+
+
+    @Test
+    public void testInvalidValueCharactersAreSkipped() throws Exception {
+        // Characters above ISO-8859-1 cannot be represented as one wire byte.
+        // Silently narrowing U+010A to 0x0A would inject a line feed into the
+        // field value; the encoder must drop the header instead.
+        List<String[]> emitted = decode(encodeFully(new QpackEncoder(),
+                headers("x-invalid", "A\u010AB", "x-valid", "ok")));
+        Assert.assertEquals(1, emitted.size());
+        Assert.assertEquals("x-valid", emitted.get(0)[0]);
+        Assert.assertEquals("ok", emitted.get(0)[1]);
+    }
+
+
+    @Test
+    public void testNullValueIsSkipped() throws Exception {
+        // A null-valued header can be supplied through the internal Coyote
+        // MimeHeaders API. It cannot be encoded and must be skipped rather
+        // than abort the response with a NullPointerException.
+        MimeHeaders input = new MimeHeaders();
+        input.addValue("x-null");
+        input.addValue("x-valid").setString("ok");
+        List<String[]> emitted = decode(encodeFully(new QpackEncoder(), input));
+        Assert.assertEquals(1, emitted.size());
+        Assert.assertEquals("x-valid", emitted.get(0)[0]);
+        Assert.assertEquals("ok", emitted.get(0)[1]);
     }
 
 

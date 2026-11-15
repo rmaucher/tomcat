@@ -18,6 +18,8 @@ package org.apache.coyote.http3;
 
 import java.io.Serial;
 
+import org.apache.tomcat.util.res.StringManager;
+
 
 /**
  * Indicates that a field section references dynamic table entries that
@@ -39,11 +41,15 @@ public class QpackBlockedException extends QpackException {
     @Serial
     private static final long serialVersionUID = 1L;
 
+    private static final StringManager sm =
+            StringManager.getManager(QpackBlockedException.class);
+
     private final long requiredInsertCount;
 
 
     QpackBlockedException(long requiredInsertCount) {
-        super("QPACK field section blocked: required insert count " + requiredInsertCount);
+        super(sm.getString("qpack.blocked",
+                Long.valueOf(requiredInsertCount)));
         this.requiredInsertCount = requiredInsertCount;
     }
 

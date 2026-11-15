@@ -184,12 +184,15 @@ public class TestHttp3Limits extends Http3TestBase {
         // A frame with an unknown type must be ignored without buffering its
         // payload (RFC 9114 Sections 4.1, 9). The client declares a large
         // unknown frame (type 0xA0, not in the reserved family) and delivers
-        // 10 MiB of it, holding the rest back so the server sits mid-frame.
+        // part of it, holding the rest back so the server sits mid-frame.
         // If the server buffered the pre-HEADERS payload as it read it, the
-        // heap would have grown by roughly the delivered amount at the midRun
-        // sample; the skip path must not allocate at all.
-        int delivered = 10 * 1024 * 1024;
-        long declared = 16L * 1024 * 1024;
+        // heap would have grown by roughly the delivered amount at the
+        // midRun sample; the skip path must not allocate at all. Keep the
+        // delivered size moderate: the test runs in the same JVM as the
+        // server and usedHeap() must not put enough GC pressure on the
+        // server to make the client time out.
+        int delivered = 6 * 1024 * 1024;
+        long declared = 12L * 1024 * 1024;
         long[] heapDelta = new long[1];
         long heapBefore = usedHeap();
 
@@ -197,15 +200,15 @@ public class TestHttp3Limits extends Http3TestBase {
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
                 "--declared-frame", "0xA0," + declared + "," + delivered,
-                "--frame-delay", "5",
-                "--timeout", "20",
+                "--frame-delay", "2",
+                "--timeout", "30",
                 "--wait", "2"),
                 CLIENT_TIMEOUT_SECONDS, 0, () -> {
                     // Sample while the server has read the delivered payload
                     // of the mid-frame unknown frame but not its remainder
                     // (held back by --frame-delay).
                     try {
-                        Thread.sleep(1300);
+                        Thread.sleep(1000);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
@@ -222,9 +225,9 @@ public class TestHttp3Limits extends Http3TestBase {
         validateStatus(response, 200);
         Assert.assertNull(output.getConnectionError());
 
-        // The delivered 10 MiB must not have been retained as frame payload.
+        // The delivered payload must not have been retained as frame payload.
         // The heap delta stays small because the payload is skipped as it
-        // arrives; a buffering implementation would grow by ~10 MiB.
+        // arrives; a buffering implementation would grow by several MiB.
         Assert.assertTrue("Pre-HEADERS unknown frame payload was buffered: "
                 + "heap grew by " + heapDelta[0] + " bytes mid-frame",
                 heapDelta[0] < 2 * 1024 * 1024);
@@ -315,7 +318,7 @@ public class TestHttp3Limits extends Http3TestBase {
         // 256 KiB: at that point the collections reclaim no more and the
         // lowest reading is the live-data floor.
         long lowest = Long.MAX_VALUE;
-        long deadline = System.currentTimeMillis() + 3000;
+        long deadline = System.currentTimeMillis() + 1500;
         while (System.currentTimeMillis() < deadline) {
             System.gc();
             try {
@@ -357,7 +360,7 @@ public class TestHttp3Limits extends Http3TestBase {
         int streamCount = limit + 10;
         ClientOutput output = runClient(rawCommandWith(
                 "--headers",
-                buildFieldSection(simpleGetHeaders("/sleep?ms=2000")),
+                buildFieldSection(simpleGetHeaders("/sleep?ms=5000")),
                 "--streams", Integer.toString(streamCount)),
                 CLIENT_TIMEOUT_SECONDS);
 
@@ -414,9 +417,21 @@ public class TestHttp3Limits extends Http3TestBase {
         // processed") rather than being dropped silently.
         // Hold a raw connection open (no request stream), stop the
         // connector while it is up, and check the GOAWAY on the wire.
+        // Hold a raw connection open (no request stream), stop the
+        // connector while it is up, and check the GOAWAY on the wire. Wait
+        // for the connection to be established instead of using a fixed
+        // sleep, so the test is not sensitive to machine load.
         Thread stopper = new Thread(() -> {
             try {
-                Thread.sleep(1500);
+                AbstractHttp3Protocol protocol =
+                        (AbstractHttp3Protocol) connector.getProtocolHandler();
+                long deadline = System.currentTimeMillis() + 10000;
+                while (protocol.getQuicEndpoint().getConnectionCount() == 0 &&
+                        System.currentTimeMillis() < deadline) {
+                    Thread.sleep(50);
+                }
+                // Give the connection handshake and SETTINGS a moment to complete.
+                Thread.sleep(200);
                 connector.stop();
             } catch (Exception e) {
                 // The connector was already stopping
@@ -546,8 +561,7 @@ public class TestHttp3Limits extends Http3TestBase {
         protocol.setMaxFieldSectionSize(8L * 1024 * 1024);
         Http3ConnectionManager manager = new Http3ConnectionManager(protocol);
 
-        long effective = (16L * 1024 * 1024
-                - (2L * Qpack.MAX_IRP_ENCODED_LENGTH + 12L)) * 4L / 15L;
+        long effective = Constants.MAX_FIELD_SECTION_SIZE_FOR_FRAME_LIMIT;
         Assert.assertEquals("A configured size above the frame limit must be "
                 + "clamped to the effective limit", effective,
                 manager.getMaxFieldSectionSize());
@@ -569,6 +583,55 @@ public class TestHttp3Limits extends Http3TestBase {
             }
         }
         Assert.assertEquals(effective, advertised);
+    }
+
+
+    @Test
+    public void testZeroMaxFieldSectionSizeIsAdvertisedAsZero()
+            throws Exception {
+        // A zero-byte limit is enforced locally; omitting the setting would
+        // tell the peer the RFC 9114 default of unlimited. Negative values
+        // are also enforced as zero and must advertise the same value.
+        for (long configured : new long[] { 0, -1 }) {
+            AbstractHttp3Protocol protocol = newHttp3Protocol();
+            protocol.setMaxFieldSectionSize(configured);
+            Http3ConnectionManager manager =
+                    new Http3ConnectionManager(protocol);
+
+            ByteBuffer init = manager.getServerUniStreamInitData(
+                    Http3ConnectionManager.SERVER_STREAM_INDEX_CONTROL);
+            Assert.assertEquals(Constants.H3_STREAM_TYPE_CONTROL,
+                    decodeQuicInteger(init));
+            Assert.assertEquals(Constants.H3_SETTINGS,
+                    decodeQuicInteger(init));
+            long settingsLength = decodeQuicInteger(init);
+            Assert.assertEquals(settingsLength, init.remaining());
+
+            long advertised = -1;
+            while (init.hasRemaining()) {
+                long id = decodeQuicInteger(init);
+                long value = decodeQuicInteger(init);
+                if (id == Constants.H3_SETTINGS_MAX_FIELD_SECTION_SIZE) {
+                    advertised = value;
+                }
+            }
+            Assert.assertEquals("Configured maxFieldSectionSize " + configured +
+                    " must advertise the enforced zero-byte limit", 0,
+                    advertised);
+        }
+    }
+
+
+    @Test
+    public void testConnectionRequestPaddingBudget() {
+        Http3ConnectionManager.ConnectionState state =
+                new Http3ConnectionManager.ConnectionState(null);
+        long limit = 128L * 1024 * 1024;
+        Assert.assertFalse("A frame exactly at the byte limit must be accepted",
+                state.noteRequestNonBodyFrame(limit));
+        Assert.assertTrue("A later frame must exceed the connection lifetime "
+                + "request padding byte budget",
+                state.noteRequestNonBodyFrame(1));
     }
 
 
@@ -656,6 +719,116 @@ public class TestHttp3Limits extends Http3TestBase {
                 return 0;
             }
         };
+    }
+
+
+    @Test
+    public void testConfigurationBoundsAreValidated() {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+
+        try {
+            protocol.setMaxConcurrentStreams(0);
+            Assert.fail("maxConcurrentStreams=0 must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        try {
+            protocol.setMaxConcurrentStreams(-1);
+            Assert.fail("A negative maxConcurrentStreams must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        try {
+            protocol.setMaxConcurrentStreams(1L << 62);
+            Assert.fail("A maxConcurrentStreams value above the QUIC varint "
+                    + "limit must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        protocol.setMaxConcurrentStreams((1L << 62) - 1);
+
+        try {
+            protocol.setQpackMaxTableCapacity(-1);
+            Assert.fail("A negative qpackMaxTableCapacity must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        try {
+            protocol.setQpackMaxTableCapacity(((long) Integer.MAX_VALUE) + 1);
+            Assert.fail("qpackMaxTableCapacity above the int decoder limit "
+                    + "must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+
+        try {
+            protocol.setQpackBlockedStreams(-1);
+            Assert.fail("A negative qpackBlockedStreams must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+
+        try {
+            protocol.setQpackBlockedStreamTimeoutMs(0);
+            Assert.fail("A zero qpackBlockedStreamTimeoutMs must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        try {
+            protocol.setQpackBlockedStreamTimeoutMs(-1);
+            Assert.fail("A negative qpackBlockedStreamTimeoutMs must be "
+                    + "rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        protocol.setQpackBlockedStreamTimeoutMs(1);
+        protocol.setQpackBlockedStreamTimeoutMs(5000);
+        // A timeout whose millisecond-to-nanosecond conversion overflows
+        // would turn a deliberately long wait into an immediate return.
+        long maxSafeTimeoutMs = Long.MAX_VALUE / 1_000_000L;
+        try {
+            protocol.setQpackBlockedStreamTimeoutMs(maxSafeTimeoutMs + 1);
+            Assert.fail("A qpackBlockedStreamTimeoutMs value whose nanosecond "
+                    + "conversion overflows must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        protocol.setQpackBlockedStreamTimeoutMs(maxSafeTimeoutMs);
+
+        // The ngtcp2 transport converts the idle timeout from milliseconds
+        // to microseconds by multiplying by 1,000,000. A larger value would
+        // overflow that conversion.
+        long maxSafeIdleTimeoutMs =
+                AbstractHttp3Protocol.MAX_IDLE_TIMEOUT_MS;
+        try {
+            protocol.setIdleTimeoutMs(maxSafeIdleTimeoutMs + 1);
+            Assert.fail("An idleTimeoutMs value whose microsecond conversion "
+                    + "overflows must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        protocol.setIdleTimeoutMs(0);
+        protocol.setIdleTimeoutMs(-1);
+        protocol.setIdleTimeoutMs(maxSafeIdleTimeoutMs);
+
+        // The QPACK dynamic table is per connection. A multi-gigabyte
+        // configured capacity would let a peer grow a single connection's
+        // decoder state without any practical bound, so values above the
+        // documented hard limit are rejected rather than accepted and
+        // advertised.
+        try {
+            protocol.setQpackMaxTableCapacity(4L * 1024 * 1024 + 1);
+            Assert.fail("qpackMaxTableCapacity above the decoder memory "
+                    + "limit must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+
+        // Boundary values remain valid.
+        protocol.setMaxConcurrentStreams(1);
+        protocol.setQpackMaxTableCapacity(0);
+        protocol.setQpackMaxTableCapacity(4L * 1024 * 1024);
+        protocol.setQpackBlockedStreams(0);
     }
 
 

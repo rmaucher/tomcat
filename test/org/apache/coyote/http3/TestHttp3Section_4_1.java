@@ -199,6 +199,53 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
+    public void testAuthorityRejectedForNoAuthorityScheme() throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowSchemeMismatch(true);
+
+        // RFC 9114 Section 4.3.1: a scheme without a mandatory authority
+        // component must not carry :authority when the request target has no
+        // authority. urn is such a scheme.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "urn", ":authority", "example.com",
+                ":path", "/simple");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testHostRejectedForNoAuthorityScheme() throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowSchemeMismatch(true);
+
+        // Same rule as testAuthorityRejectedForNoAuthorityScheme, with the
+        // authority supplied by the Host field instead.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "urn", "host", "example.com",
+                ":path", "/simple");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testNoAuthoritySchemeWithoutAuthorityAccepted() throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowSchemeMismatch(true);
+
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "urn", ":path", "/simple");
+
+        Assert.assertNull("A no-authority scheme without an authority must "
+                + "not be rejected as malformed", output.getStreamError());
+    }
+
+
+    @Test
     public void testHttpSchemeRejectedByDefault() throws Exception {
         startHttp3Server();
 
@@ -336,6 +383,115 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         ClientOutput output = rawRequest(":method", "GET",
                 ":scheme", "https", ":authority", "127.0.0.1:" + port,
                 ":path", "/echo?a=<b>");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testRelativePathRejected() throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 4.3.1: :path carries the path-absolute production.
+        // A relative path is not a valid HTTP/3 request target.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":path", "simple");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testDoubleSlashPathRejected() throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 4.3.1: :path is the path-absolute production of
+        // RFC 3986, which requires a non-empty first segment after the
+        // leading slash. "//simple" is a network-path reference, not a
+        // valid HTTP/3 request target.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":path", "//simple");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testAbsoluteUriPathRejected() throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 4.3.1: :path is path-absolute + optional query,
+        // not an absolute-form URI. An absolute URI can also carry a
+        // different authority, which must not be accepted as a request
+        // target.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":path", "https://other.example/simple");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testStarPathRejectedForGet() throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 4.3.1: only OPTIONS may use the asterisk-form
+        // request target.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":path", "*");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testStarPathAcceptedForOptions() throws Exception {
+        startHttp3Server();
+
+        ClientOutput output = rawRequest(":method", "OPTIONS",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":path", "*");
+
+        Assert.assertNull("Asterisk-form must remain valid for OPTIONS",
+                output.getStreamError());
+    }
+
+
+    @Test
+    public void testStarPathWithQueryRejected() throws Exception {
+        startHttp3Server();
+
+        // RFC 9110 Section 7.1: asterisk-form is exactly "*" and carries no
+        // query component. "*?x=1" (and the empty-query form "*?") must be
+        // rejected as a malformed request target even though the path part
+        // alone is valid for OPTIONS.
+        ClientOutput output = rawRequest(":method", "OPTIONS",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":path", "*?x=1");
+        assertStreamError(output, H3_MESSAGE_ERROR);
+
+        output = rawRequest(":method", "OPTIONS",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":path", "*?");
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testExtendedConnectRelativePathRejected() throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setEnableConnectProtocol(true);
+
+        // The extended CONNECT :path has the same path-absolute requirement
+        // as a normal request.
+        ClientOutput output = rawRequest(":method", "CONNECT",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":path", "simple", ":protocol", "websocket");
 
         assertStreamError(output, H3_MESSAGE_ERROR);
     }
@@ -497,6 +653,36 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         Http3Response response = output.getResponse();
         validateStatus(response, 501);
         Assert.assertNull(output.getStreamError());
+    }
+
+
+    @Test
+    public void testConnectTrailersRejected() throws Exception {
+        startHttp3Server();
+
+        // RFC 9114 Section 4.4: after the initial CONNECT HEADERS frame only
+        // DATA frames (and extension frames explicitly permitted by their
+        // definition) may be sent. A second HEADERS frame is an invalid
+        // frame sequence and must be a connection error of type
+        // H3_FRAME_UNEXPECTED, not decoded as a trailer section.
+        String headers = buildFieldSection(":method", "CONNECT",
+                ":authority", "127.0.0.1:" + port);
+        String trailers = buildFieldSection("x-test", "value");
+        ClientOutput output = runClient(rawCommandWith("--headers", headers,
+                "--trailers", trailers, "--timeout", "5"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        // The connector may answer the CONNECT (currently 501) before it
+        // observes the trailing HEADERS frame, because the frames can arrive
+        // in separate QUIC packets. A response is therefore allowed here and
+        // is not a protocol violation: a server may respond before reading
+        // the rest of the request stream. The invariant is that the invalid
+        // frame sequence still causes the mandated connection error.
+        Assert.assertNull("Expected no stream error",
+                output.getStreamError());
+        Assert.assertEquals("A HEADERS frame after a CONNECT header section "
+                + "must fail the connection", Integer.valueOf(H3_FRAME_UNEXPECTED),
+                output.getConnectionError());
     }
 
 
@@ -1160,6 +1346,38 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
+    public void testAsyncTrailerFieldsReadyWithDelayedTrailers()
+            throws Exception {
+        startHttp3Server(this::addAsyncTrailerReadyServlet);
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowedTrailerHeaders("x-test");
+
+        // The trailer section arrives after the request has been dispatched
+        // and after the Content-Length body has been read. Async applications
+        // must still be able to observe the trailer fields through
+        // isTrailerFieldsReady()/getTrailerFields().
+        String initial = buildFieldSection(":method", "POST", ":scheme",
+                "https", ":authority", "127.0.0.1:" + port, ":path",
+                "/asynctrailerready", "content-length", "5");
+        String trailers = buildFieldSection("x-test", "value");
+        ClientOutput output = runClient(rawCommandWith("--headers", initial,
+                "--data", Base64.getEncoder().encodeToString(
+                        "body!".getBytes(StandardCharsets.UTF_8)),
+                "--trailers", trailers, "--trailers-delay", "0.5",
+                "--timeout", "10"), CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertTrue("Expected ready=true and x-test=value in:\n" +
+                response.getBodyAsString(),
+                response.getBodyAsString().contains("ready=true"));
+        Assert.assertTrue("Expected x-test=value in:\n" +
+                response.getBodyAsString(),
+                response.getBodyAsString().contains("x-test=value"));
+    }
+
+
+    @Test
     public void testTruncatedIgnoredFrameAfterTrailerConnectionError()
             throws Exception {
         startHttp3Server();
@@ -1635,6 +1853,14 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
     }
 
 
+    private void addAsyncTrailerReadyServlet(Context ctxt) {
+        Wrapper w = Tomcat.addServlet(ctxt, "asynctrailerready",
+                new AsyncTrailerReadyServlet());
+        w.setAsyncSupported(true);
+        ctxt.addServletMapping("/asynctrailerready", "asynctrailerready");
+    }
+
+
     private static class AsyncTrailerEchoServlet extends HttpServlet {
 
         private static final long serialVersionUID = 1L;
@@ -1670,6 +1896,49 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
     private void addCookieEchoServlet(Context ctxt) {
         Tomcat.addServlet(ctxt, "cookieecho", new CookieEchoServlet());
         ctxt.addServletMapping("/cookieecho", "cookieecho");
+    }
+
+
+    /**
+     * Async servlet that reads the declared body and then waits for a
+     * separately delivered trailer section before reporting the trailer
+     * readiness and fields. The polling loop keeps the test independent of
+     * exact network timings.
+     */
+    private static class AsyncTrailerReadyServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doPost(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            AsyncContext asyncContext = req.startAsync();
+            asyncContext.start(() -> {
+                try {
+                    req.getInputStream().readAllBytes();
+                    long deadline = System.currentTimeMillis() + 5000;
+                    while (!req.isTrailerFieldsReady() &&
+                            System.currentTimeMillis() < deadline) {
+                        Thread.sleep(50);
+                    }
+                    StringBuilder body = new StringBuilder();
+                    body.append("ready=").append(req.isTrailerFieldsReady());
+                    try {
+                        req.getTrailerFields().forEach((name, value) -> body
+                                .append(';').append(name).append('=')
+                                .append(value));
+                    } catch (IllegalStateException e) {
+                        body.append(";ISE");
+                    }
+                    resp.setContentType("text/plain");
+                    resp.setCharacterEncoding("UTF-8");
+                    resp.getWriter().write(body.toString());
+                    asyncContext.complete();
+                } catch (IOException | InterruptedException e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+        }
     }
 
 

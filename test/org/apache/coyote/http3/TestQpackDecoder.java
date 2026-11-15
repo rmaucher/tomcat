@@ -16,6 +16,8 @@
  */
 package org.apache.coyote.http3;
 
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -120,18 +122,18 @@ public class TestQpackDecoder {
      * (iRP m=8), Sign=0, Delta Base (iRP m=7).
      */
     private static void putPrefix(ByteBuffer target, long encodedInsertCount,
-            int deltaBase) {
+            long deltaBase) {
         Qpack.encodeIrp(target, 0, 8, encodedInsertCount);
         Qpack.encodeIrp(target, 0, 7, deltaBase);
     }
 
 
-    private static void putIndexedStatic(ByteBuffer target, int index) {
+    private static void putIndexedStatic(ByteBuffer target, long index) {
         Qpack.encodeIrp(target, 0xC0, 6, index);
     }
 
 
-    private static void putIndexedDynamic(ByteBuffer target, int index) {
+    private static void putIndexedDynamic(ByteBuffer target, long index) {
         Qpack.encodeIrp(target, 0x80, 6, index);
     }
 
@@ -152,12 +154,12 @@ public class TestQpackDecoder {
     }
 
 
-    private static void putPostBaseIndexed(ByteBuffer target, int index) {
+    private static void putPostBaseIndexed(ByteBuffer target, long index) {
         Qpack.encodeIrp(target, 0x10, 4, index);
     }
 
 
-    private static void putPostBaseNameRef(ByteBuffer target, int index,
+    private static void putPostBaseNameRef(ByteBuffer target, long index,
             String value) {
         Qpack.encodeIrp(target, 0x00 | 0x08, 3, index);   // N=1
         putString(target, value);
@@ -233,8 +235,37 @@ public class TestQpackDecoder {
 
 
     @Test
+    public void testConstructorRejectsInvalidTableCapacity() {
+        // An initial soft capacity above the hard limit would violate the
+        // RFC 9204 Section 3.2.3 relationship between the advertised maximum
+        // table capacity and the current capacity.
+        try {
+            new QpackDecoder(4096, 0);
+            Assert.fail("A soft capacity above the hard limit must be "
+                    + "rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        try {
+            new QpackDecoder(-1, 4096);
+            Assert.fail("A negative soft capacity must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        try {
+            new QpackDecoder(0, -1);
+            Assert.fail("A negative hard capacity must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected
+        }
+        new QpackDecoder(0, 0);
+        new QpackDecoder(256, 4096);
+    }
+
+
+    @Test
     public void testSetCapacityAboveHardLimitRejected() throws Exception {
-        QpackDecoder decoder = new QpackDecoder(4096, 0);
+        QpackDecoder decoder = new QpackDecoder(0, 0);
         try {
             // 001 + iRP(m=5) 1 : capacity 1 above the advertised maximum 0
             decoder.processInstruction(ByteBuffer.wrap(new byte[] { 0x21 }));
@@ -703,6 +734,217 @@ public class TestQpackDecoder {
 
 
     @Test
+    public void testEncodedInsertCountBeyondIntRangeRejected() throws Exception {
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        // With MaxEntries = 4096/32 = 128 the full range is 2*128 = 256.
+        // An Encoded Insert Count above Integer.MAX_VALUE certainly could
+        // not have been produced by a conformant encoder and MUST be a
+        // connection error (RFC 9204 Section 4.5.1.1); it must not be
+        // downgraded to the stream-scoped value-too-large error.
+        Qpack.encodeIrp(block, 0, 8, 0x1_0000_0000L);
+        Qpack.encodeIrp(block, 0, 7, 0);
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an impossible Encoded Insert Count");
+        } catch (QpackException e) {
+            Assert.assertFalse("An impossible Encoded Insert Count must be a "
+                    + "fatal QPACK error, not a stream-scoped value-too-large "
+                    + "error", e instanceof QpackValueTooLargeException);
+            Assert.assertFalse("An impossible Encoded Insert Count must not "
+                    + "block the stream", e instanceof QpackBlockedException);
+        }
+    }
+
+
+    @Test
+    public void testStaticIndexBeyondIntRangeRejected() throws Exception {
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        // The static table has 99 entries. Any index above Integer.MAX_VALUE
+        // is invalid, and RFC 9204 Section 3.1 requires a connection error.
+        putPrefix(block, 0, 0);
+        putIndexedStatic(block, 0x1_0000_0000L);
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an invalid static table index");
+        } catch (QpackException e) {
+            Assert.assertFalse("An invalid static table index must not be "
+                    + "reported as a value-too-large stream error",
+                    e instanceof QpackValueTooLargeException);
+        }
+    }
+
+
+    @Test
+    public void testDynamicIndexBeyondIntRangeRejected() throws Exception {
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        // A relative dynamic index above Integer.MAX_VALUE resolves to a
+        // negative absolute index and is an invalid reference, i.e. a
+        // connection error (RFC 9204 Section 2.2.3), not a stream error.
+        putPrefix(block, 0, 0);
+        putIndexedDynamic(block, 0x1_0000_0000L);
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an invalid dynamic table reference");
+        } catch (QpackException e) {
+            Assert.assertFalse("An invalid dynamic table reference must not be "
+                    + "reported as a value-too-large stream error",
+                    e instanceof QpackValueTooLargeException);
+        }
+    }
+
+
+    @Test
+    public void testEncodedInsertCountAboveIrpRangeRejected() throws Exception {
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        // A value beyond the 62-bit iRP domain cannot have been produced by
+        // a conformant encoder and MUST be a connection error (RFC 9204
+        // Section 4.5.1.1), not the stream-scoped value-too-large error.
+        Qpack.encodeIrp(block, 0, 8, 1L << 62);
+        Qpack.encodeIrp(block, 0, 7, 0);
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an impossible Encoded Insert Count");
+        } catch (QpackException e) {
+            Assert.assertFalse("An Encoded Insert Count beyond the 62-bit iRP "
+                    + "domain must be a fatal QPACK error, not a "
+                    + "stream-scoped value-too-large error",
+                    e instanceof QpackValueTooLargeException);
+            Assert.assertFalse("An Encoded Insert Count beyond the iRP domain "
+                    + "must not block the stream",
+                    e instanceof QpackBlockedException);
+        }
+    }
+
+
+    @Test
+    public void testStaticIndexAboveIrpRangeRejected() throws Exception {
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        // An index beyond the 62-bit iRP domain is necessarily an invalid
+        // static table index (RFC 9204 Section 3.1 connection error).
+        putPrefix(block, 0, 0);
+        putIndexedStatic(block, 1L << 62);
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an invalid static table index");
+        } catch (QpackException e) {
+            Assert.assertFalse("A static table index beyond the iRP domain must "
+                    + "not be reported as a value-too-large stream error",
+                    e instanceof QpackValueTooLargeException);
+        }
+    }
+
+
+    @Test
+    public void testDynamicIndexAboveIrpRangeRejected() throws Exception {
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        // A relative dynamic index beyond the 62-bit iRP domain resolves to
+        // an invalid reference (RFC 9204 Section 2.2.3 connection error).
+        putPrefix(block, 0, 0);
+        putIndexedDynamic(block, 1L << 62);
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an invalid dynamic table reference");
+        } catch (QpackException e) {
+            Assert.assertFalse("A dynamic table index beyond the iRP domain "
+                    + "must not be reported as a value-too-large stream error",
+                    e instanceof QpackValueTooLargeException);
+        }
+    }
+
+
+    @Test
+    public void testPostBaseIndexAboveIrpRangeRejected() throws Exception {
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        // A post-base index beyond the 62-bit iRP domain is an invalid
+        // reference and must fail the connection.
+        putPrefix(block, 0, 0);
+        putPostBaseIndexed(block, 1L << 62);
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an invalid post-base reference");
+        } catch (QpackException e) {
+            Assert.assertFalse("A post-base index beyond the iRP domain must "
+                    + "not be reported as a value-too-large stream error",
+                    e instanceof QpackValueTooLargeException);
+        }
+    }
+
+
+    @Test
+    public void testLargeDeltaBaseWithoutDynamicReferencesAccepted()
+            throws Exception {
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        // RFC 9204 Section 4.5.1.2 permits any Base for a field section that
+        // contains no dynamic table references. The Delta Base is an iRP
+        // that the decoder must be able to decode up to 62 bits; a value
+        // above Integer.MAX_VALUE is nevertheless valid here.
+        Qpack.encodeIrp(block, 0, 8, 0);
+        Qpack.encodeIrp(block, 0, 7, 0x1_0000_0000L);
+        putIndexedStatic(block, STATIC_METHOD_GET);
+        block.flip();
+
+        List<String[]> emitted = collect(decoder, block);
+        Assert.assertEquals("GET", emitted.get(0)[1]);
+    }
+
+
+    @Test
+    public void testLargeDeltaBaseWithDynamicReferenceRejected()
+            throws Exception {
+        QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        // A huge Base makes the relative reference resolve to an absolute
+        // index far above the declared Required Insert Count (0); the
+        // reference is invalid and must fail the connection (RFC 9204
+        // Section 2.2.3), not be reported as a stream value-too-large error.
+        Qpack.encodeIrp(block, 0, 8, 0);
+        Qpack.encodeIrp(block, 0, 7, 0x1_0000_0000L);
+        putIndexedDynamic(block, 0);
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an invalid dynamic table reference");
+        } catch (QpackException e) {
+            Assert.assertFalse("An invalid dynamic table reference must not be "
+                    + "reported as a value-too-large stream error",
+                    e instanceof QpackValueTooLargeException);
+        }
+    }
+
+
+    @Test
     public void testEncodedInsertCountWrapAround() throws Exception {
         QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         // MaxEntries = 4096/32 = 128, Full Range = 256. After 200 inserts
@@ -885,6 +1127,24 @@ public class TestQpackDecoder {
                 emitted.isEmpty());
         Assert.assertTrue("Truncated prefix must leave the block unconsumed",
                 block.hasRemaining());
+    }
+
+
+    @Test
+    public void testHttp3ExceptionIsPublicApi() throws Exception {
+        // QpackDecoder.HeaderEmitter declares Http3Exception in its public
+        // method signature, so external implementors must be able to name and
+        // catch the type, and callers need a public way to read the error
+        // code without the package-private Http3Error enum.
+        Assert.assertTrue("Http3Exception must be public because it appears "
+                + "in the public HeaderEmitter signature",
+                Modifier.isPublic(Http3Exception.class.getModifiers()));
+        Method getErrorCode = Http3Exception.class.getMethod("getErrorCode");
+        Assert.assertTrue("Http3Exception.getErrorCode() must be public",
+                Modifier.isPublic(getErrorCode.getModifiers()));
+        Assert.assertEquals("Http3Exception.getErrorCode() must return the "
+                + "numeric HTTP/3 error code", Long.TYPE,
+                getErrorCode.getReturnType());
     }
 
 

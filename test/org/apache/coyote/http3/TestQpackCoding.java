@@ -23,6 +23,8 @@ import java.util.Arrays;
 import org.junit.Assert;
 import org.junit.Test;
 
+import org.apache.coyote.http2.HPackHuffman;
+
 /**
  * In-process unit tests for the QPACK (RFC 9204) and QUIC (RFC 9000
  * Section 16) integer and string primitives that the HTTP/3 and QPACK
@@ -352,6 +354,24 @@ public class TestQpackCoding {
         buffer.put(HUFFMAN_WWW_EXAMPLE_COM);
         buffer.flip();
         Assert.assertEquals("www.example.com", Qpack.decodeString(buffer));
+    }
+
+
+    @Test
+    public void testHuffmanDecoderMatchesHpack() throws Exception {
+        // RFC 9204 Section 4.1.2 reuses the HPACK Huffman code unmodified.
+        // QpackHuffman delegates to the shared HPACK implementation, so both
+        // must decode the same RFC 7541 Appendix C vector identically.
+        ByteBuffer qpackData = ByteBuffer.wrap(HUFFMAN_WWW_EXAMPLE_COM);
+        ByteBuffer hpackData = ByteBuffer.wrap(HUFFMAN_WWW_EXAMPLE_COM);
+        StringBuilder qpackDecoded = new StringBuilder();
+        StringBuilder hpackDecoded = new StringBuilder();
+        QpackHuffman.decode(qpackData, HUFFMAN_WWW_EXAMPLE_COM.length,
+                qpackDecoded);
+        HPackHuffman.decode(hpackData, HUFFMAN_WWW_EXAMPLE_COM.length,
+                hpackDecoded);
+        Assert.assertEquals(hpackDecoded.toString(), qpackDecoded.toString());
+        Assert.assertEquals("www.example.com", qpackDecoded.toString());
     }
 
 

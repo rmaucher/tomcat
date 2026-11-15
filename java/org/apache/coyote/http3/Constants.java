@@ -17,7 +17,9 @@
 package org.apache.coyote.http3;
 
 /**
- * HTTP/3 protocol constants per RFC 9114.
+ * HTTP/3 protocol constants. The core protocol values are defined by RFC
+ * 9114; this class also holds the QPACK constants from RFC 9204 and the
+ * PRIORITY_UPDATE constants from RFC 9218 used by the HTTP/3 implementation.
  */
 public final class Constants {
 
@@ -82,13 +84,50 @@ public final class Constants {
      * Largest decoded field-section size that can be carried in a frame
      * within {@link #MAX_FRAME_LENGTH}. QPACK's worst-case wire expansion is
      * 15/4 of the decoded size plus the two prefix iRPs and a little slack
-     * (see {@code Http3Processor.fieldSectionWireLimit()}); a configured
-     * larger field-section size must not be advertised because the frame
-     * would be rejected before decoding.
+     * (see {@link #fieldSectionWireLimit(long)}); a configured larger
+     * field-section size must not be advertised because the frame would be
+     * rejected before decoding.
      */
     public static final long MAX_FIELD_SECTION_SIZE_FOR_FRAME_LIMIT =
-            (MAX_FRAME_LENGTH - (2L * Qpack.MAX_IRP_ENCODED_LENGTH + 12L))
-                    * 4L / 15L;
+            maxDecodedFieldSectionSizeForFrameLimit();
+
+
+    /**
+     * Returns the worst-case wire size (the maximum undecoded length) of a
+     * field section whose decoded size is at most {@code decodedLimit}
+     * bytes. The bound is 15/4 of the decoded size plus the two prefix iRPs
+     * and a little slack. A negative limit is clamped to zero so the
+     * configured-limit paths agree. The frame-length preflight uses this
+     * function; the settings clamp uses its inverse,
+     * {@link #maxDecodedFieldSectionSizeForFrameLimit()}, evaluated once at
+     * the frame-length limit.
+     *
+     * @param decodedLimit The decoded field-section size limit in bytes
+     * @return The corresponding wire-size bound
+     */
+    public static long fieldSectionWireLimit(long decodedLimit) {
+        if (decodedLimit < 0) {
+            decodedLimit = 0;
+        }
+        if (decodedLimit > (Long.MAX_VALUE - 32L) / 15L) {
+            return Long.MAX_VALUE;
+        }
+        return decodedLimit * 15L / 4L +
+                2L * Qpack.MAX_IRP_ENCODED_LENGTH + 12L;
+    }
+
+
+    /**
+     * Returns the largest decoded field-section size that can be carried
+     * within {@link #MAX_FRAME_LENGTH}, i.e. the inverse of
+     * {@link #fieldSectionWireLimit(long)} at the frame-length limit.
+     *
+     * @return The largest decodable field-section size for a single frame
+     */
+    public static long maxDecodedFieldSectionSizeForFrameLimit() {
+        return (MAX_FRAME_LENGTH -
+                (2L * Qpack.MAX_IRP_ENCODED_LENGTH + 12L)) * 4L / 15L;
+    }
 
     // HTTP/3 settings (RFC 9114 Section 7.2.4.1, RFC 9204 Section 5,
     // RFC 9220 Section 5)
@@ -154,8 +193,9 @@ public final class Constants {
      * by the decoder construction, the field-section limit accessor and
      * the SETTINGS encoding so the bound cannot drift between them: an
      * unclamped negative would reach the wire as its two's-complement
-     * byte sequence, which a conformant peer reads as the start of an
-     * 8-byte varint, and a value above Integer.MAX_VALUE exceeds the
+     * byte sequence with a two-bit prefix that does not represent that
+     * value (for example -1 to -64 are misread as the start of an
+     * 8-byte varint), and a value above Integer.MAX_VALUE exceeds the
      * int-typed limits the decoder enforces.
      *
      * @param value The configured value

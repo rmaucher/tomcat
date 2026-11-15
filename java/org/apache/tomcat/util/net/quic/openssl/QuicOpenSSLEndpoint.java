@@ -364,6 +364,21 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             new ConcurrentHashMap<>();
 
     /**
+     * Stream wrappers whose application-side write interest is latched (see
+     * {@link QuicOpenSSLSocketWrapper#registerWriteInterest()}). OpenSSL's
+     * {@code SSL_POLL_EVENT_W} condition requires free space in the stream's
+     * native write buffer as well as remaining flow-control credit, so a
+     * stream whose buffer is full but whose flow-control window has just
+     * reopened reports no W event even though a write would grow the buffer
+     * and make progress. The poll loop therefore re-checks this work set on
+     * every iteration (the level-triggered counterpart of the quiche/ngtcp2
+     * {@code stream_capacity} re-arm sweep) instead of relying solely on the
+     * edge-shaped W report.
+     */
+    private final Set<QuicOpenSSLSocketWrapper> writeInterestedWrappers =
+            ConcurrentHashMap.newKeySet();
+
+    /**
      * Connections a request handler still owned when {@link #stopInternal()}
      * released the rest of the endpoint. Their native SSL objects (and the
      * stream SSL objects still referenced by the wrapper) are not freed and
@@ -462,6 +477,29 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      */
     ConcurrentLinkedQueue<QuicStreamWrapper.DeferredStreamFree> getCleanerStreamFrees() {
         return mailbox.getCleanerStreamFrees();
+    }
+
+
+    /**
+     * Adds a wrapper to the write-interest work set. Called by the wrapper
+     * when a non-blocking write leaves data behind (or when readiness must be
+     * re-checked before another application write).
+     *
+     * @param wrapper The wrapper with pending write interest
+     */
+    void addWriteInterest(QuicOpenSSLSocketWrapper wrapper) {
+        writeInterestedWrappers.add(wrapper);
+    }
+
+
+    /**
+     * Removes a wrapper from the write-interest work set. Called when the
+     * wrapper drains its buffers, or closes.
+     *
+     * @param wrapper The wrapper whose write interest is cleared
+     */
+    void removeWriteInterest(QuicOpenSSLSocketWrapper wrapper) {
+        writeInterestedWrappers.remove(wrapper);
     }
 
 
@@ -1610,6 +1648,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         // decrement, so a handler count of zero means no further stream free
         // can arrive).
         if (pollThread == null || !pollThread.isAlive()) {
+            mailbox.drainPendingStreamDrains(null, true);
             drainPendingStreamFrees();
             drainCleanerStreamFrees();
             drainCleanerConnectionFrees();
@@ -1655,6 +1694,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 // decrement, so a count of zero means no further stream free
                 // can arrive: drain them, then free (streams-before-connection
                 // per SSL_new_stream(3)).
+                mailbox.drainPendingStreamDrains(conn, false);
                 drainPendingStreamFrees();
                 drainCleanerStreamFrees();
                 drainCleanerConnectionFrees();
@@ -1845,7 +1885,9 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         }
 
         // Free any stream SSL objects whose deferred free the poll loop did
-        // not get to run.
+        // not get to run, including streams still waiting for their native
+        // write buffer to drain: stop cannot wait for ACK processing.
+        mailbox.drainPendingStreamDrains(null, true);
         drainPendingStreamFrees();
 
         // Run any stream SSL free requests the Cleaner handed over. Each is
@@ -1862,6 +1904,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         drainCleanerConnectionFrees();
 
         streamWrappers.clear();
+        writeInterestedWrappers.clear();
 
         // Transmit the CONNECTION_CLOSE frames queued before the executor was
         // shut down. Like failConnection(), drive the engine after the stream
@@ -1904,6 +1947,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     // queueStreamFree precedes its owner's handler decrement,
                     // so a count of zero means no further stream free can
                     // arrive: drain them, then free.
+                    mailbox.drainPendingStreamDrains(conn, false);
                     drainPendingStreamFrees();
                     drainCleanerStreamFrees();
                     drainCleanerConnectionFrees();
@@ -1945,6 +1989,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 continue;
             }
             setConnectionProtocolDataPending(conn, false);
+            mailbox.drainPendingStreamDrains(conn, false);
             drainPendingStreamFrees();
             drainCleanerStreamFrees();
             drainCleanerConnectionFrees();
@@ -2497,6 +2542,73 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
 
     /**
+     * Re-drives write interest level-wise, independent of OpenSSL's W poll
+     * event. A stream whose native write buffer is full reports no W event
+     * even after the peer opens more flow-control credit, because OpenSSL's
+     * writable test also requires free space in that buffer (the buffer is
+     * growable on the next write, so the test is stricter than the actual
+     * write contract). Re-checking the latched interests every iteration lets
+     * the wrapper drain staged bytes, or dispatch OPEN_WRITE so the protocol
+     * can hand more application data to the transport once the stream is
+     * writable again.
+     * <p>
+     * Runs on the poll thread, after the engine tick and SSL_poll. A wrapper
+     * whose write lock is held by an application thread is skipped until that
+     * write finishes; a stream already claimed by an executor dispatch is
+     * left for the next iteration.
+     *
+     * @return {@code true} if a wrapper made progress (drained bytes or had a
+     *         dispatch queued)
+     */
+    private boolean sweepWriteInterestedStreams() {
+        if (writeInterestedWrappers.isEmpty()) {
+            return false;
+        }
+        boolean progress = false;
+        for (QuicOpenSSLSocketWrapper wrapper :
+                new java.util.ArrayList<>(writeInterestedWrappers)) {
+            QuicStreamWrapper stream = wrapper.getSocket();
+            if (stream == null || stream.isFreed() || stream.isDeregistered() ||
+                    wrapper.isClosed()) {
+                wrapper.clearWriteInterest();
+                continue;
+            }
+            QuicConnectionWrapper conn = stream.getConnection();
+            if (conn == null || conn.isClosing() || conn.isClosed() ||
+                    conn.isFreed()) {
+                wrapper.clearWriteInterest();
+                continue;
+            }
+            // An application write owns the staging buffers right now: let it
+            // finish rather than dispatching a second writer into the handler.
+            if (wrapper.isWriteLocked()) {
+                continue;
+            }
+            try {
+                wrapper.flushNonBlocking();
+            } catch (IOException ioe) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Write-interest sweep flush failed on stream " +
+                            stream.getStreamId(), ioe);
+                }
+                wrapper.clearWriteInterest();
+                continue;
+            }
+            if (!wrapper.hasWriteInterest()) {
+                progress = true;
+                continue;
+            }
+            if (stream.compareAndSetProcessing(false, true)) {
+                wrapper.clearWriteInterest();
+                dispatchToExecutor(wrapper, stream, SocketEvent.OPEN_WRITE, true);
+                progress = true;
+            }
+        }
+        return progress;
+    }
+
+
+    /**
      * Main poll loop following the OpenSSL poll-server reference pattern,
      * adapted so the blocking wait is interruptible from other threads, and
      * so the QUIC engine is ticked once per iteration that needs a tick
@@ -2698,6 +2810,10 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                        // The tick above has flushed any pending packets (including
                        // RESET_STREAM frames) to the network, so it is now safe to
                        // free the stream SSL objects deferred by the close paths.
+                       // Streams waiting for their native write buffer to drain are
+                       // re-checked here; only the drained ones move to the free
+                       // queue.
+                    mailbox.drainPendingStreamDrains(null, false);
                     drainPendingStreamFrees();
 
                        // Run the stream SSL free requests the Cleaner handed over
@@ -2781,6 +2897,11 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                                     revents, processedAnything);
                         }
                     }
+
+                    // Re-drive latched write interest level-wise: OpenSSL's
+                    // W event is not reported while the native send buffer is
+                    // full even if flow-control credit has reopened.
+                    processedAnything |= sweepWriteInterestedStreams();
 
                       // Emit any pending protocol data queued for the peer on a
                       // server-initiated stream. For HTTP/3 these are the QPACK
@@ -4057,6 +4178,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         // (empty queues, shared freed CAS). drainPendingStreamFrees() is
         // itself per-item guarded and cannot throw; freeConnectionOrDefer
         // is last so no later step can be skipped by it.
+        mailbox.drainPendingStreamDrains(conn, false);
         drainPendingStreamFrees();
         freeConnectionOrDefer(conn);
     }
@@ -5171,7 +5293,11 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             }
             // Free stream SSL objects whose free closeAllStreams() / the
             // workers deferred, before dropping the connection reference: per
-            // SSL_new_stream(3) every stream SSL must be freed first.
+            // SSL_new_stream(3) every stream SSL must be freed first. Streams
+            // still waiting for their write buffer to drain are force-freed
+            // now: the connection is going away, so delivery can no longer be
+            // guaranteed and the stream SSL must not outlive the connection.
+            mailbox.drainPendingStreamDrains(conn, false);
             drainPendingStreamFrees();
             freeConnectionOrDefer(conn);
         } catch (Throwable t) {
@@ -5558,7 +5684,10 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * @param conn The QUIC connection
      */
     private void checkClientUniStreamClosed(QuicStreamWrapper stream, QuicConnectionWrapper conn) {
-        if (stream.getReadState() != QuicStream.ReadState.FINISHED) {
+        QuicStream.ReadState readState = stream.getReadState();
+        if (readState != QuicStream.ReadState.FINISHED &&
+                readState != QuicStream.ReadState.RESET_REMOTE &&
+                readState != QuicStream.ReadState.RESET_LOCAL) {
             return;
         }
         QuicConnectionManager connManager = conn.getQuicConnectionManager();
@@ -6208,7 +6337,11 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             // be freed before the connection SSL - skipping the queue here
             // leaked the stream XSO (which holds a reference on the
             // connection) and with it the whole connection.
-            mailbox.queueStreamFree(stream);
+            // Keep the stream SSL alive until its native write buffer has
+            // drained. The stream may already be deregistered, but OpenSSL
+            // can still hold response bytes accepted from SSL_write_ex2();
+            // freeing the SSL now discards them.
+            mailbox.queueStreamDrain(stream);
         }
         int remaining = conn.decrActiveHandlers();
         if (remaining == 0 && conn.clearPendingFree()) {
@@ -6233,6 +6366,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     // stream SSL has been drained above, drive the engine once
                     // more to flush the CONNECTION_CLOSE before freeing the
                     // connection SSL (otherwise SSL_free discards the frame).
+                    mailbox.drainPendingStreamDrains(conn, false);
                     drainPendingStreamFrees();
                     flushConnectionClose(conn.getSsl());
                 }
@@ -6501,6 +6635,14 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             if (!isStreamLive(stream)) {
                 return;
             }
+            if (stream.getStreamType() == QuicPoll.SSL_STREAM_TYPE_WRITE) {
+                // A server-initiated unidirectional stream reached a
+                // terminal/error state (for example the peer sent
+                // STOP_SENDING). The protocol must classify its own critical
+                // streams (HTTP/3 control and QPACK streams) before the
+                // connection can continue.
+                notifyServerUniStreamClosed(stream);
+            }
             // Reference: handle_read_stream_state / handle_write_stream_state
             if ((revents & QuicPoll.SSL_POLL_EVENT_ER) != 0) {
                 int nativeReadState = QuicBindings.SSL_get_stream_read_state(
@@ -6513,6 +6655,15 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 }
                 if (nativeReadState == QuicPoll.SSL_STREAM_STATE_RESET_LOCAL ||
                         nativeReadState == QuicPoll.SSL_STREAM_STATE_RESET_REMOTE) {
+                    // A reset terminates the stream just like a FIN. If this
+                    // is an identified critical client unidirectional stream
+                    // (HTTP/3 control or QPACK), fail the connection with
+                    // H3_CLOSED_CRITICAL_STREAM, matching the quiche and
+                    // ngtcp2 endpoints.
+                    QuicConnectionWrapper resetConn = stream.getConnection();
+                    if (resetConn != null) {
+                        checkClientUniStreamClosed(stream, resetConn);
+                    }
                     // The stream was reset. Record the failure on the socket
                     // wrapper so the processor's error dispatch carries a
                     // throwable: the container's async error handling (and
@@ -6742,7 +6893,11 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             wasTracked = conn.getStreams().remove(stream.getStreamId()) != null;
             conn.getPendingStreams().remove(stream);
         }
-        streamWrappers.remove(stream.getSslAddress());
+        QuicOpenSSLSocketWrapper wrapper =
+                streamWrappers.remove(stream.getSslAddress());
+        if (wrapper != null) {
+            wrapper.clearWriteInterest();
+        }
         QuicPollItem removedItem = pollSet.remove(stream.getSslAddress());
         if (removedItem == null) {
             // The poll item was never promoted into the poll set (e.g. a
@@ -6788,6 +6943,13 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             if (wasTracked) {
                 state.decrementActiveStreams();
             }
+            if (stream.getReadState() == QuicStream.ReadState.RESET_REMOTE) {
+                // A peer reset abandons the request stream. If no processor
+                // observed the reset (for example the stream was reset before
+                // dispatch), the protocol still owes its encoder a QPACK
+                // Stream Cancellation (RFC 9204 Section 2.2.2.2).
+                connManager.noteStreamAbandoned(conn, stream.getStreamId());
+            }
         } else if (streamType == QuicPoll.SSL_STREAM_TYPE_READ) {
             // Client-initiated unidirectional stream terminated while the
             // connection stays open: let the protocol drop any state it kept
@@ -6817,7 +6979,29 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             wrapper.signalReadWaiter();
             wrapper.signalWriteWaiter();
         }
-        mailbox.queueStreamFree(stream);
+        mailbox.queueStreamDrain(stream);
+    }
+
+
+    private void notifyServerUniStreamClosed(QuicStreamWrapper stream) {
+        QuicConnectionWrapper conn = stream.getConnection();
+        if (conn == null || conn.isClosed() || conn.isFreed() ||
+                conn.isClosing()) {
+            return;
+        }
+        QuicConnectionManager connManager = conn.getQuicConnectionManager();
+        if (connManager == null) {
+            return;
+        }
+        long streamId = stream.getStreamId();
+        if (streamId < 3 || (streamId & 3) != 3) {
+            return;
+        }
+        long index = (streamId - 3) / 4;
+        if (index > Integer.MAX_VALUE) {
+            return;
+        }
+        connManager.serverUniStreamClosed(conn, (int) index);
     }
 
 
@@ -6885,7 +7069,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         // connection SSL (SSL_new_stream(3)), which the teardown paths
         // preserve by draining the pending stream frees before freeing the
         // connection.
-        mailbox.queueStreamFree(stream);
+        mailbox.queueStreamDrain(stream);
     }
 
 

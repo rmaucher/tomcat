@@ -692,6 +692,68 @@ public abstract class Http3TestBase extends TomcatBaseTest {
 
 
     /**
+     * Build a QPACK field section without validating field values. Unlike
+     * {@link #buildFieldSection(String...)}, this bypasses the production
+     * encoder's control-character filtering so receiver-side validation can
+     * be exercised with raw invalid values.
+     *
+     * @param headers
+     *            The field section contents as
+     *            {@code name, value, name, value, ...}
+     * @return The base64 encoded field section
+     */
+    protected String buildFieldSectionUnvalidated(String... headers) {
+        ByteBuffer buffer = ByteBuffer.allocate(65536);
+        // Required Insert Count 0, Delta Base 0.
+        buffer.put((byte) 0x00);
+        buffer.put((byte) 0x00);
+        for (int i = 0; i + 1 < headers.length; i += 2) {
+            byte[] name = headers[i].getBytes(StandardCharsets.ISO_8859_1);
+            byte[] value =
+                    headers[i + 1].getBytes(StandardCharsets.ISO_8859_1);
+            // Literal Field Line with Literal Name: 001 N=1 H=0 NameLen(3+).
+            Qpack.encodeIrp(buffer, 0x30, 3, name.length);
+            buffer.put(name);
+            // Non-Huffman value string literal: H=0, length prefix 7 bits.
+            Qpack.encodeIrp(buffer, 0x00, 7, value.length);
+            buffer.put(value);
+        }
+        byte[] result = new byte[buffer.position()];
+        buffer.rewind();
+        buffer.get(result);
+        return Base64.getEncoder().encodeToString(result);
+    }
+
+
+    /**
+     * Send a raw mode GET request using field values that may be invalid on
+     * the wire (the production encoder's value filtering is bypassed).
+     *
+     * @param path
+     *            The request path
+     * @param extraHeaders
+     *            The extra headers as {@code name, value, ...}
+     * @return The client output
+     */
+    protected ClientOutput rawGetUnvalidated(String path,
+            String... extraHeaders) {
+        String[] all = new String[8 + extraHeaders.length];
+        all[0] = ":method";
+        all[1] = "GET";
+        all[2] = ":scheme";
+        all[3] = "https";
+        all[4] = ":authority";
+        all[5] = "127.0.0.1:" + port;
+        all[6] = ":path";
+        all[7] = path;
+        System.arraycopy(extraHeaders, 0, all, 8, extraHeaders.length);
+        return runClient(rawCommandWith("--headers",
+                buildFieldSectionUnvalidated(all), "--timeout", "20"),
+                CLIENT_TIMEOUT_SECONDS);
+    }
+
+
+    /**
      * Send a raw mode request with the given field section contents.
      *
      * @param headers

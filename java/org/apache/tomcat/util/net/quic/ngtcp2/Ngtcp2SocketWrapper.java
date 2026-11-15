@@ -440,7 +440,7 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
             if (nRead > 0) {
                 return nRead;
             }
-            int limit = socketBufferHandler.getReadBuffer().capacity();
+            int limit = socketBufferHandler.getReadBufferSize();
             if (to.remaining() >= limit) {
                 // Direct path: read straight from the QUIC stream into the
                 // caller's buffer, up to its full remaining space.
@@ -702,7 +702,18 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
         checkNotClosed();
         writeLock.lock();
         try {
-            super.writeBlocking(from);
+            // With no staged output, forward the caller's buffer straight to
+            // the ngtcp2 send queue instead of copying it through the socket
+            // write buffer. HTTP/3 HEADERS frames and small bodies are the
+            // common blocking writes and this avoids allocating/filling the
+            // per-request staging buffer. Pending non-blocking output still
+            // goes through the base implementation to preserve ordering.
+            if (nonBlockingWriteBuffer.isEmpty() &&
+                    socketBufferHandler.isWriteBufferEmpty()) {
+                doWrite(true, from);
+            } else {
+                super.writeBlocking(from);
+            }
         } finally {
             writeLock.unlock();
         }

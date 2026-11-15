@@ -88,10 +88,12 @@
     <attribute name="altService" required="false">
       <p>The alternative service which should be advertised as available to
       clients via the <code>Alt-Svc</code> response header. The value is a
-      protocol identifier, for example <code>h3</code>; the port advertised
+      protocol identifier, for example <code>h3</code>, and must be a valid
+      HTTP token (RFC 9110 Section 5.6.2); the port advertised
       is the port of the request the header is added to. An
       <code>Alt-Svc</code> header set by the application takes precedence.
-      If not specified, no <code>Alt-Svc</code> header is added.</p>
+      A <code>null</code> or empty value disables the header. If not
+      specified, no <code>Alt-Svc</code> header is added.</p>
     </attribute>
 
     <attribute name="allowSchemeMismatch" required="false">
@@ -159,10 +161,14 @@
       <p>A boolean value which controls whether Extended CONNECT (RFC 9220)
       is permitted. When enabled, the value <code>1</code> is advertised to
       peers via <code>SETTINGS_ENABLE_CONNECT_PROTOCOL</code> and requests
-      carrying a <code>:protocol</code> pseudo-header are accepted. Note
-      that the tunnel established by Extended CONNECT cannot yet carry
-      application data because HTTP datagrams (RFC 9297) are not yet
-      implemented. If not specified, this attribute is set to
+      carrying a <code>:protocol</code> pseudo-header are accepted. RFC 9220
+      tunnels carry application data in ordinary HTTP/3 DATA frames; HTTP
+      datagrams (RFC 9297) are a separate extension used by WebTransport and
+      are not required for a CONNECT tunnel. Note that the current Servlet
+      container implementation intercepts every CONNECT request (plain or
+      Extended) with a <code>501</code> response before the application, so
+      enabling this attribute does not currently make an application-visible
+      CONNECT tunnel available. If not specified, this attribute is set to
       <code>false</code>.</p>
     </attribute>
 
@@ -179,31 +185,56 @@
       10.1). If no packet is received from the peer for this duration the
       connection is closed. The value is also advertised to the peer in the
       TLS transport parameters so that both endpoints agree on the timeout.
-      If not specified, a default of <code>30000</code> (30 seconds) is
-      used.</p>
+      The OpenSSL endpoint can reject the feature request if the first TLS
+      flight has already been generated, in which case the OpenSSL default
+      applies and a warning is logged. Zero or a negative value leaves the
+      transport default in place. Values above
+      <code>9223372036854</code> (the largest millisecond value whose
+      conversion to microseconds does not overflow a Java <code>long</code>)
+      are rejected with an <code>IllegalArgumentException</code>. If not
+      specified, a default of <code>30000</code> (30 seconds) is used.</p>
     </attribute>
 
     <attribute name="maxConcurrentStreams" required="false">
       <p>The maximum number of active request streams permitted for any one
-      connection. If a client attempts to open more active streams than this
-      limit, the additional streams are refused. The effective limit is
-      clamped to the limit the QUIC transport actually advertises to the
-      peer. If not specified, a default of <code>100</code> is used.</p>
+      connection. The value must be greater than zero and no greater than
+      <code>2^62 - 1</code> (the largest value a QUIC variable-length integer
+      can carry, RFC 9000 Section 16); values outside this range are rejected
+      with an <code>IllegalArgumentException</code>. If a client attempts to
+      open more active streams than this limit, the additional streams are
+      refused. The effective limit is clamped to the limit the QUIC transport
+      actually advertises to the peer. If not specified, a default of
+      <code>100</code> is used.</p>
     </attribute>
 
     <attribute name="maxFieldSectionSize" required="false">
       <p>The maximum field section size, in bytes, that this endpoint is
       willing to decode (RFC 9114 Section 4.2.2). The value is enforced on
-      incoming field sections. A positive value is advertised to peers via
+      incoming field sections and advertised to peers via
       <code>SETTINGS_MAX_FIELD_SECTION_SIZE</code>. A value of
-      <code>0</code> is enforced as an explicit zero-byte local limit but
-      is not advertised, so peers apply the RFC 9114 default of unlimited.
-      A negative value is treated locally as <code>0</code> and is likewise
-      not advertised. Positive values above 4473915 (the largest decoded
-      field section that fits the 16 MiB per-frame buffer after the QPACK
-      wire overhead) are clamped to that effective limit for the local
-      decoder, the advertisement and the inbound frame preflight. If not
-      specified, a default of <code>16384</code> is used.</p>
+      <code>0</code> is enforced as an explicit zero-byte local limit and
+      is advertised as <code>0</code>, so peers do not apply the RFC 9114
+      default of unlimited. A negative value is treated locally as
+      <code>0</code> and is likewise advertised as <code>0</code>. Positive
+      values above 4473915 (the largest decoded field section that fits the
+      16 MiB per-frame buffer after the QPACK wire overhead) are clamped to
+      that effective limit for the local decoder, the advertisement and the
+      inbound frame preflight. If not specified, a default of
+      <code>16384</code> is used.</p>
+      <p>The limit is a <em>decoded</em> field-section size. The receiver's
+      frame preflight and pending-payload buffer retain the corresponding
+      <em>wire</em> bytes, bounded by
+      <code>Constants.fieldSectionWireLimit(limit)</code> (approximately
+      15/4 times the decoded limit plus 32 bytes, and in practice by the
+      16 MiB per-frame limit). Each stream can therefore retain up to that
+      wire-side bound while its field section is being assembled; the
+      worst-case per-connection buffering is the wire-side bound per stream
+      multiplied by <code>maxConcurrentStreams</code> (plus any trailer
+      sections when <code>maxTrailerSize</code> is negative, also capped at
+      16 MiB per stream). The default limits are deliberately small;
+      raising this value to the effective maximum should account for the
+      configured concurrency using the wire-side bound, not the decoded
+      limit.</p>
     </attribute>
 
     <attribute name="noCompressionEncodings" required="false">
@@ -229,22 +260,59 @@
     <attribute name="qpackBlockedStreams" required="false">
       <p>The maximum number of request streams per connection that may block
       waiting for dynamic table entries announced on the peer's QPACK encoder
-      stream (RFC 9204 Section 2.1.2). A positive value is advertised to
-      peers via <code>SETTINGS_QPACK_BLOCKED_STREAMS</code>. A value of
-      <code>0</code> disables stream blocking: field sections that reference
-      entries not yet present in the dynamic table are then treated as a
-      decompression failure. If not specified, a default of <code>0</code>
-      is used.</p>
+      stream (RFC 9204 Section 2.1.2). The value must be zero or greater; a
+      negative value is rejected with an <code>IllegalArgumentException</code>.
+      A positive value is advertised to peers via
+      <code>SETTINGS_QPACK_BLOCKED_STREAMS</code>. A value of <code>0</code>
+      disables stream blocking: field sections that reference entries not yet
+      present in the dynamic table are then treated as a decompression
+      failure. If not specified, a default of <code>0</code> is used.</p>
+      <p>Each blocked request can wait up to
+      <code>qpackBlockedStreamTimeoutMs</code> for an insert that never
+      arrives. With a positive value and a large <code>maxThreads</code>
+      or <code>maxConcurrentStreams</code> configuration, a peer can occupy
+      many container request threads for that duration. The default of
+      <code>0</code> avoids this; increase the value only for clients known
+      to use the dynamic table and keep it small relative to the thread
+      pool.</p>
+    </attribute>
+
+    <attribute name="qpackBlockedStreamTimeoutMs" required="false">
+      <p>The maximum time in milliseconds a request stream may block waiting
+      for an insert on the peer's QPACK encoder stream (RFC 9204 Section
+      2.1.2) when <code>qpackBlockedStreams</code> is positive. The value must
+      be greater than zero and at most <code>9223372036854</code> (the largest
+      millisecond value whose conversion to nanoseconds does not overflow a
+      Java <code>long</code>); out-of-range values are rejected with an
+      <code>IllegalArgumentException</code>. A blocked stream pins one
+      container worker thread for up to this duration. If not specified, a
+      default of <code>5000</code> (five seconds) is used.</p>
     </attribute>
 
     <attribute name="qpackMaxTableCapacity" required="false">
-      <p>The maximum QPACK dynamic table capacity in bytes. The value is
-      advertised to peers via <code>SETTINGS_QPACK_MAX_TABLE_CAPACITY</code>
-      and the local decoder is sized to match, as required for
-      interoperability (RFC 9204 Section 5). A value of <code>0</code>
-      disables the dynamic table
-       entirely. If not specified, a default of <code>4096</code> is
-      used.</p>
+      <p>The maximum QPACK dynamic table capacity in bytes. The value must be
+      between <code>0</code> and <code>4194304</code> (4 MiB); values
+      outside this range are rejected with an
+      <code>IllegalArgumentException</code>. The value is advertised to peers
+      via <code>SETTINGS_QPACK_MAX_TABLE_CAPACITY</code> and the local decoder
+      is sized to match, as required for interoperability (RFC 9204
+      Section 5). A value of <code>0</code> disables the dynamic table
+      entirely. If not specified, a default of <code>4096</code> is used.</p>
+      <p>The dynamic table is per connection. Its ring array, entry objects
+      and retained name/value strings all scale with this capacity, so the
+      decoder can use several times the configured value in memory for each
+      connection. The 4 MiB hard limit bounds that amplification; raising the
+      value should account for the number of concurrent connections.
+      Encoder instructions are decoded into temporary strings before the
+      entry-size check rejects an oversized entry, so a large capacity also
+      allows a correspondingly larger transient allocation while instruction
+      bytes are being processed.</p>
+      <p>QPACK encoder-stream instructions are processed on the QUIC poll
+      thread for the connection. A peer that continuously churns the table,
+      or a large request field section being decoded on a worker thread while
+      the poll thread waits for the shared decoder lock, can delay other
+      connection events. The default capacity is small; raising it increases
+      both the memory and the possible processing time per instruction.</p>
       <p>QPACK encoder-stream instructions are re-assembled in the
       per-stream read buffer. If this capacity is increased significantly,
       increase <code>readBufferSize</code> as well: a legal
@@ -303,8 +371,12 @@
       most <code>65536</code> bytes by the quiche endpoint, whose native read
       buffer is capped at the maximum datagram size; the OpenSSL endpoint
       reads up to the buffer's remaining capacity in a single call. Either
-      way, larger values are filled by repeated reads. If not specified, a
-      default of <code>16384</code> is used.</p>
+      way, larger values are filled by repeated reads. Control-stream frames
+      and QPACK encoder-stream instructions are re-assembled in this buffer;
+      a value substantially below the largest SETTINGS frame or QPACK
+      instruction the deployment must accept causes conformant peers to be
+      rejected with <code>H3_EXCESSIVE_LOAD</code> rather than merely slowed
+      down. If not specified, a default of <code>16384</code> is used.</p>
     </attribute>
 
     <attribute name="dueTickFloorMs" required="false">
@@ -341,9 +413,23 @@
     <li>relaxedQueryChars</li>
   </ul>
 
+  <p>For HTTP/3, a negative <code>maxTrailerSize</code> disables the decoded
+  trailer-size limit, but the receiver still enforces the 16 MiB per-frame
+  buffering limit. As with <code>maxFieldSectionSize</code>, trailer payload
+  is retained per request stream, so the per-connection worst case scales
+  with <code>maxConcurrentStreams</code>.</p>
+
   <p>Note that send file support is not available over QUIC: response
   bodies are always written through the output buffer as HTTP/3
   <code>DATA</code> frames.</p>
+
+  <p>At <code>TRACE</code> level the HTTP/3 implementation logs encoded and
+  decoded header names and values, which may include authorization tokens,
+  cookies and other credentials. At <code>DEBUG</code> level, exception
+  messages for malformed headers can include raw field names, field values,
+  <code>Host</code> values and SNI names. Treat both <code>TRACE</code> and
+  <code>DEBUG</code> logs as potentially sensitive and restrict access to
+  them.</p>
 
   </subsection>
 

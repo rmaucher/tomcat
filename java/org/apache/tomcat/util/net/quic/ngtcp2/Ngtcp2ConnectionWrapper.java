@@ -66,6 +66,14 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
             new ConcurrentHashMap<>();
 
     /**
+     * Connection IDs registered for this connection in the endpoint's demux
+     * map. Lets connection teardown remove only this connection's entries
+     * instead of scanning the whole fleet-sized map. Poll-thread confined,
+     * like the register/remove CID callbacks.
+     */
+    private final Set<CidKey> cids = ConcurrentHashMap.newKeySet();
+
+    /**
      * The negotiated ALPN protocol (e.g., "h3").
      */
     private volatile String negotiatedProtocol;
@@ -972,6 +980,36 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
      */
     public ConcurrentHashMap<Long, Ngtcp2StreamWrapper> getStreams() {
         return streams;
+    }
+
+
+    /**
+     * Records a connection ID owned by this connection.
+     *
+     * @param cid The demux-map key
+     */
+    void addCid(CidKey cid) {
+        cids.add(cid);
+    }
+
+
+    /**
+     * Forgets a connection ID retired by the peer.
+     *
+     * @param cid The demux-map key
+     */
+    void removeCid(CidKey cid) {
+        cids.remove(cid);
+    }
+
+
+    /**
+     * Returns the connection IDs currently owned by this connection.
+     *
+     * @return the CID keys
+     */
+    Set<CidKey> getCids() {
+        return cids;
     }
 
 

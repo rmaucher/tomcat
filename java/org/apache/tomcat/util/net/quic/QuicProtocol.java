@@ -56,8 +56,10 @@ public interface QuicProtocol {
      * streams at all, so on that transport the "transport default" resolves
      * to the smallest HTTP/3-usable value (one stream).
      *
-     * @return The configured maximum number of concurrent streams;
-     *         {@code 0} or less to use the transport default
+     * @return The configured maximum number of concurrent streams.
+     *         Implementations may interpret {@code 0} or less as "use the
+     *         transport default"; the HTTP/3 connector instead requires and
+     *         enforces a positive value.
      */
     long getMaxConcurrentStreams();
 

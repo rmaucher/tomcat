@@ -91,12 +91,27 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
 
 
     @Test
+    public void testClientControlStreamReset() throws Exception {
+        startHttp3Server();
+
+        // A peer RESET_STREAM terminates the control stream just as a FIN
+        // does. RFC 9114 Section 6.2.1 requires the receiver to treat closure
+        // of either control stream as a connection error of type
+        // H3_CLOSED_CRITICAL_STREAM.
+        ClientOutput output = runClient(rawCommandWith("--reset-control", "1",
+                "--no-request", "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_CLOSED_CRITICAL_STREAM);
+    }
+
+
+    @Test
     public void testClientPushStreamRejected() throws Exception {
         startHttp3Server();
 
         // Push streams are server-initiated only (RFC 9114 Section 6.2.2):
         // a client-initiated stream of type 0x01 is a connection error of
-        // type H3_STREAM_CREATION_ERROR (0x101).
+        // type H3_STREAM_CREATION_ERROR (0x103).
         ClientOutput output = runClient(rawCommandWith(
                 "--uni", "1,,1",
                 "--no-request", "--timeout", "3"),
@@ -173,6 +188,29 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_SETTINGS_ERROR);
+    }
+
+
+    @Test
+    public void testClientSettingsTooManyIdentifiers() throws Exception {
+        startHttp3Server();
+
+        // Unknown settings are ignored, so they do not need to be retained.
+        // A SETTINGS frame carrying an excessive number of identifiers is a
+        // resource-limit violation and is rejected with H3_EXCESSIVE_LOAD.
+        int count = 1025;
+        long[] settings = new long[count * 2];
+        for (int i = 0; i < count; i++) {
+            settings[2 * i] = 0x1000L + i;
+            settings[2 * i + 1] = 0;
+        }
+        ClientOutput output = runClient(rawCommandWith(
+                "--control", buildSettingsFrameB64(settings),
+                "--no-request", "--timeout",
+                Long.toString(NO_RESPONSE_TIMEOUT_SECONDS)),
+                CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_EXCESSIVE_LOAD);
     }
 
 

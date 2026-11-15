@@ -36,7 +36,10 @@ import org.junit.Test;
 
 import org.apache.catalina.Context;
 import org.apache.catalina.connector.Connector;
+import org.apache.catalina.connector.Request;
+import org.apache.catalina.connector.Response;
 import org.apache.catalina.startup.Tomcat;
+import org.apache.catalina.valves.ValveBase;
 
 /**
  * Tests for response compression over HTTP/3. The decision logic is the
@@ -93,6 +96,9 @@ public class TestHttp3Compression extends Http3TestBase {
         ctxt.addServletMapping("/noBody", "noBody");
         Tomcat.addServlet(ctxt, "flushing", new FlushingServlet());
         ctxt.addServletMapping("/flushing", "flushing");
+        Tomcat.addServlet(ctxt, "headerLength",
+                new HeaderContentLengthServlet());
+        ctxt.addServletMapping("/headerLength", "headerLength");
     }
 
 
@@ -162,6 +168,40 @@ public class TestHttp3Compression extends Http3TestBase {
         // The compressed length is unknown: no Content-Length header.
         Assert.assertNull(response.getHeader("content-length"));
         Assert.assertEquals("accept-encoding", response.getHeader("vary"));
+    }
+
+
+    @Test
+    public void testMimeHeadersContentLengthRemovedWhenCompressed()
+            throws Exception {
+        // A Valve (or an application filter using the internal Coyote API) can
+        // add a Content-Length value directly to the response MimeHeaders.
+        // That bypasses the Content-Length special-casing of the Servlet API
+        // and therefore survives CompressionConfig clearing the coyote
+        // contentLength field. The header must not describe the uncompressed
+        // length once the body is gzip-encoded (RFC 9110 Section 8.6).
+        connector = startHttp3Server(ctxt -> {
+            registerServlets(ctxt);
+            ctxt.getPipeline().addValve(new ValveBase() {
+                @Override
+                public void invoke(Request request, Response response)
+                        throws IOException, ServletException {
+                    if ("/headerLength".equals(request.getRequestURI())) {
+                        response.getCoyoteResponse().getMimeHeaders()
+                                .addValue("content-length").setLong(4096);
+                    }
+                    getNext().invoke(request, response);
+                }
+            });
+        });
+        setCompression("on");
+
+        Http3Response response = getCompressed("/headerLength?n=4096");
+
+        assertCompressed(response, LARGE_BODY);
+        Assert.assertNull("A compressed response must not carry a stale "
+                + "uncompressed Content-Length header",
+                response.getHeader("content-length"));
     }
 
 
@@ -477,6 +517,20 @@ public class TestHttp3Compression extends Http3TestBase {
             try (OutputStream out = resp.getOutputStream()) {
                 out.write(body(n));
             }
+        }
+    }
+
+
+    private static class HeaderContentLengthServlet extends HttpServlet {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req,
+                HttpServletResponse resp) throws ServletException, IOException {
+            int n = Integer.parseInt(req.getParameter("n"));
+            resp.setContentType("text/plain");
+            resp.setHeader("Content-Length", Integer.toString(n));
+            resp.getOutputStream().write(body(n));
         }
     }
 

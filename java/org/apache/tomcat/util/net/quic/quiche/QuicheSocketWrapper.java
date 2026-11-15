@@ -431,7 +431,7 @@ public class QuicheSocketWrapper extends QuicSocketWrapper
             if (nRead > 0) {
                 return nRead;
             }
-            int limit = socketBufferHandler.getReadBuffer().capacity();
+            int limit = socketBufferHandler.getReadBufferSize();
             if (to.remaining() >= limit) {
                 // Direct path: read straight from the QUIC stream into the
                 // caller's buffer, up to its full remaining space.

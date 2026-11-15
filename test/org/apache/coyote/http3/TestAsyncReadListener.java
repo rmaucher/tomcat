@@ -310,6 +310,54 @@ public class TestAsyncReadListener extends Http3TestBase {
 
 
     @Test
+    public void testEmptyDataFrameDoesNotBreakReadListener() throws Exception {
+        startHttp3Server(ctxt -> {
+            Wrapper w = Tomcat.addServlet(ctxt, "async", asyncServlet);
+            w.setAsyncSupported(true);
+            ctxt.addServletMapping("/async", "async");
+        });
+
+        // A GET without Content-Length is delimited by the end of the request
+        // stream. The client sends ten body bytes, then a delayed zero-length
+        // DATA frame and finally a delayed FIN. The empty DATA frame must not
+        // make the ReadListener's standard isReady()/read() loop call a read
+        // that returns 0: Catalina's readByte() then throws
+        // BufferUnderflowException and the request fails with onError().
+        byte[] body = "0123456789".getBytes(StandardCharsets.ISO_8859_1);
+        String headers = buildFieldSection(
+                ":method", "GET",
+                ":scheme", "https",
+                ":authority", "127.0.0.1:" + port,
+                ":path", "/async");
+        runClient(rawCommandWith(
+                "--headers", headers,
+                "--data", Base64.getEncoder().encodeToString(body),
+                "--frame-after-data", buildFrameB64(0x00, new byte[0]),
+                "--frame-after-data-delay", "1",
+                "--no-fin",
+                "--fin-after", "2",
+                "--timeout", "5",
+                "--wait", "2"), CLIENT_TIMEOUT_SECONDS);
+
+        synchronized (asyncServlet) {
+            long deadline = System.currentTimeMillis() + 15000;
+            while (asyncServlet.error == null && !asyncServlet.allDataRead
+                    && System.currentTimeMillis() < deadline) {
+                asyncServlet.wait(
+                        Math.max(10, deadline - System.currentTimeMillis()));
+            }
+        }
+
+        Assert.assertNull("An empty DATA frame must not break the ReadListener: "
+                + asyncServlet.error, asyncServlet.error);
+        Assert.assertEquals("Request body bytes were not delivered",
+                body.length, asyncServlet.bytesReceived);
+        Assert.assertTrue("onAllDataRead was not called",
+                asyncServlet.allDataRead);
+    }
+
+
+    @Test
     public void testGetBodyWithoutContentLengthIsRead() throws Exception {
         startHttp3Server(ctxt -> {
             Wrapper w = Tomcat.addServlet(ctxt, "async", asyncServlet);

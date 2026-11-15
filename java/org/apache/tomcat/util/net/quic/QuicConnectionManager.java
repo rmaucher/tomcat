@@ -151,6 +151,24 @@ public interface QuicConnectionManager {
 
 
     /**
+     * Notifies the protocol that a server-initiated unidirectional stream
+     * identified by the protocol-specific creation index has been closed or
+     * reset (or that the peer has requested that it be closed) while the
+     * connection remains open. Protocol-critical streams (for HTTP/3 the
+     * control stream and the QPACK encoder/decoder streams) must be treated
+     * as a connection error by the protocol.
+     *
+     * @param connection The QUIC connection
+     * @param index      The server unidirectional stream index as returned by
+     *                   {@link #nextServerUniStream(QuicConnection)}
+     */
+    default void serverUniStreamClosed(QuicConnection connection, int index) {
+        // NO-OP: protocols without protocol-critical server streams need no
+        // action.
+    }
+
+
+    /**
      * Generates the stream retirement notification (the HTTP/3 GOAWAY
      * frame, RFC 9114 Section 7.2.6) for the given connection and records
      * the identifier it carries on the connection state. The endpoint
@@ -206,6 +224,22 @@ public interface QuicConnectionManager {
      * @param streamId   The ID of the rejected stream
      */
     default void noteStreamRejected(QuicConnection connection, long streamId) {
+        // NO-OP: protocols without per-stream abandonment bookkeeping need
+        // no action.
+    }
+
+
+    /**
+     * Notifies the protocol that a request stream was reset by the peer or
+     * that reading of it was abandoned before all of its application-protocol
+     * field sections were processed. The protocol may need to record the
+     * abandonment independently of the processor that handled the stream (for
+     * HTTP/3: a QPACK Stream Cancellation, RFC 9204 Section 2.2.2.2).
+     *
+     * @param connection The QUIC connection
+     * @param streamId   The ID of the reset/abandoned stream
+     */
+    default void noteStreamAbandoned(QuicConnection connection, long streamId) {
         // NO-OP: protocols without per-stream abandonment bookkeeping need
         // no action.
     }

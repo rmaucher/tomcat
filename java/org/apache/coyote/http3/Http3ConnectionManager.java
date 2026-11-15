@@ -18,6 +18,7 @@ package org.apache.coyote.http3;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
@@ -58,8 +59,10 @@ import org.apache.tomcat.util.res.StringManager;
  * is rejected with H3_STREAM_CREATION_ERROR (RFC 9114 Section 6.2.2)</li>
  * <li>0x02 - QPACK encoder stream (encoder instructions)</li>
  * <li>0x03 - QPACK decoder stream (decoder instructions)</li>
- * <li>any other type - read and discarded, not a connection error
- * (RFC 9114 Section 9)</li>
+ * <li>any other type - read and discarded without considering the stream
+ * type itself a connection error (RFC 9114 Section 9); the per-connection
+ * discard budget can still fail the connection with H3_EXCESSIVE_LOAD if
+ * the peer wastes excessive resources (RFC 9114 Section 10.5)</li>
  * </ul>
  */
 public class Http3ConnectionManager implements QuicConnectionManager {
@@ -90,11 +93,11 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
     /**
      * Maximum number of pre-open PRIORITY_UPDATE signals buffered per
-     * connection. RFC 9218 Section 7 requires servers to buffer the most
-     * recently received signal for each not-yet-opened stream; this bound is
-     * deliberately independent of the configurable concurrent-stream limit
-     * so a large limit cannot turn the buffer into unbounded per-connection
-     * memory.
+     * connection. RFC 9218 Section 7 recommends (SHOULD) that servers buffer
+     * the most recently received signal for each not-yet-opened stream; this
+     * bound is deliberately independent of the configurable concurrent-stream
+     * limit so a large limit cannot turn the buffer into unbounded
+     * per-connection memory.
      */
     static final int MAX_PENDING_PRIORITY_UPDATES = 1024;
 
@@ -111,6 +114,15 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * the work per connection finite.
      */
     static final long MAX_IGNORED_BYTES = 32L * 1024 * 1024;
+
+    /**
+     * Connection-lifetime aggregate for ignored/padding frames on request
+     * streams. The per-request budgets in Http3Processor bound one request,
+     * but a peer can keep opening sequential request streams; this aggregate
+     * keeps the total discard work on one connection finite.
+     */
+    static final int MAX_CONNECTION_NON_BODY_FRAMES = 65536;
+    static final long MAX_CONNECTION_NON_BODY_BYTES = 128L * 1024 * 1024;
 
     /**
      * Shared QPACK decoder for this connection.
@@ -183,7 +195,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         connections.put(connection, state);
         if (log.isDebugEnabled()) {
             log.debug(sm.getString("http3ConnectionManager.connectionOpen",
-                    Integer.valueOf(System.identityHashCode(connection))));
+                    Integer.toHexString(System.identityHashCode(connection))));
         }
     }
 
@@ -196,13 +208,21 @@ public class Http3ConnectionManager implements QuicConnectionManager {
     @Override
     public void connectionClose(QuicConnection connection) {
         // This manager is created per QUIC connection and a ConnectionState is
-        // never reused across connections, so removal is the full cleanup: the
-        // state object and everything it references become unreachable with it
-        // (no explicit reset of its fields is needed).
+        // never reused across connections, so removal starts the full cleanup:
+        // the state object and everything it references become unreachable
+        // once no per-stream processor still holds a reference. A processor
+        // keeps its connectionState (and the state can keep processors through
+        // priorityConsumers) until that processor is recycled, so the graph is
+        // not necessarily unreachable immediately on this call. No explicit
+        // field reset is needed; the eventual GC reclaims the graph. Wake any
+        // request streams blocked waiting for QPACK inserts: with the
+        // connection gone no insert can arrive, so they must not wait out the
+        // configured blocked-stream timeout.
+        sharedDecoder.close();
         connections.remove(connection);
         if (log.isDebugEnabled()) {
             log.debug(sm.getString("http3ConnectionManager.connectionClose",
-                    Integer.valueOf(System.identityHashCode(connection))));
+                    Integer.toHexString(System.identityHashCode(connection))));
         }
     }
 
@@ -222,7 +242,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      */
     @Override
     public void processClientUniStreamData(QuicConnection connection, long streamId, ByteBuffer data)
-            throws Http3Exception, QpackException {
+            throws Http3Exception {
         ConnectionState state = connections.get(connection);
         if (state == null) {
             return;
@@ -460,6 +480,29 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
 
     /**
+     * {@inheritDoc}
+     * <p>
+     * The server control stream (index 0) and the QPACK encoder/decoder
+     * streams (indices 1 and 2) are critical: RFC 9114 Section 6.2.1 and
+     * RFC 9204 Section 4.2 require a connection error of type
+     * H3_CLOSED_CRITICAL_STREAM when either control stream or either QPACK
+     * stream is closed. Closing a server extension stream that is not one of
+     * these three indices is not critical for HTTP/3.
+     */
+    @Override
+    public void serverUniStreamClosed(QuicConnection connection, int index) {
+        ConnectionState state = connections.get(connection);
+        if (state != null && index >= SERVER_STREAM_INDEX_CONTROL &&
+                index <= SERVER_STREAM_INDEX_QPACK_DECODER) {
+            connection.failConnection(
+                    Http3Error.H3_CLOSED_CRITICAL_STREAM.getCode(),
+                    sm.getString("http3ConnectionManager.serverUniStreamClosed",
+                            Integer.valueOf(index)));
+        }
+    }
+
+
+    /**
      * Creates the data for the server control stream.
      * Per RFC 9114 Section 6.2.1, the control stream (stream type 0x00)
      * must begin with the SETTINGS frame, which MUST be the first frame
@@ -468,20 +511,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * @return ByteBuffer containing the server control stream data
      */
     private ByteBuffer createServerControlStreamData() {
-        ByteBuffer buffer = ByteBuffer.allocate(256);
-
-        // Write stream type: control stream (0) - QUIC varint
-        Qpack.encodeQuicInteger(buffer, Constants.H3_STREAM_TYPE_CONTROL);
-
-        // Write SETTINGS frame - QUIC varint type + length + payload
-        Qpack.encodeQuicInteger(buffer, Constants.H3_SETTINGS);
-
-        // Encode SETTINGS payload first to determine its length
-        ByteBuffer settingsPayload = ByteBuffer.allocate(64);
-        Http3Settings.encode(settingsPayload, settingsQpackMaxTableCapacity,
-                settingsQpackBlockedStreams, settingsMaxFieldSectionSize,
-                settingsEnableConnectProtocol, settingsH2CompatibleIdentity);
-        settingsPayload.flip();
+        ByteBuffer settingsPayload = encodeServerSettings();
         int settingsLen = settingsPayload.remaining();
 
         // Debug: log payload bytes
@@ -489,11 +519,24 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             StringBuilder sb = new StringBuilder("SETTINGS payload (");
             sb.append(settingsLen).append(" bytes): ");
             while (settingsPayload.hasRemaining()) {
-                sb.append(String.format("%02X ", settingsPayload.get()));
+                sb.append(String.format("%02X ",
+                        Integer.valueOf(settingsPayload.get() & 0xFF)));
             }
             settingsPayload.rewind();
             log.trace(sb.toString());
         }
+
+        // A QUIC varint needs at most eight bytes (RFC 9000 Section 16); the
+        // stream type and the SETTINGS frame type are single bytes. Size the
+        // buffer from the actual payload rather than a fixed constant so a
+        // future settings addition cannot overflow it.
+        ByteBuffer buffer = ByteBuffer.allocate(1 + 1 + 8 + settingsLen);
+
+        // Write stream type: control stream (0) - QUIC varint
+        Qpack.encodeQuicInteger(buffer, Constants.H3_STREAM_TYPE_CONTROL);
+
+        // Write SETTINGS frame - QUIC varint type + length + payload
+        Qpack.encodeQuicInteger(buffer, Constants.H3_SETTINGS);
 
         // Write SETTINGS frame length (QUIC varint)
         Qpack.encodeQuicInteger(buffer, settingsLen);
@@ -503,6 +546,32 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
         buffer.flip();
         return buffer;
+    }
+
+
+    /*
+     * Encodes the server SETTINGS payload into a buffer sized from the actual
+     * encoded length. The initial capacity is a guess; a future settings
+     * addition can legitimately exceed it, so grow and retry rather than
+     * letting the fixed buffer overflow at connection open.
+     */
+    private ByteBuffer encodeServerSettings() {
+        int capacity = 64;
+        while (true) {
+            ByteBuffer settingsPayload = ByteBuffer.allocate(capacity);
+            try {
+                Http3Settings.encode(settingsPayload,
+                        settingsQpackMaxTableCapacity,
+                        settingsQpackBlockedStreams,
+                        settingsMaxFieldSectionSize,
+                        settingsEnableConnectProtocol,
+                        settingsH2CompatibleIdentity);
+                settingsPayload.flip();
+                return settingsPayload;
+            } catch (BufferOverflowException boe) {
+                capacity *= 2;
+            }
+        }
     }
 
 
@@ -622,8 +691,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             if (!state.clientControlFirstFrameSeen) {
                 state.clientControlFirstFrameSeen = true;
                 if (frameType != Constants.H3_SETTINGS) {
-                    if (log.isWarnEnabled()) {
-                        log.warn(sm.getString("http3ConnectionManager.missingSettings"));
+                    if (log.isDebugEnabled()) {
+                        log.debug(sm.getString("http3ConnectionManager.missingSettings"));
                     }
                     throw new Http3Exception(
                             sm.getString("http3ConnectionManager.missingSettings"),
@@ -643,8 +712,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // 7.2.1, 7.2.2, 7.2.5, 7.2.8, 11.2.1). Checked on the
                 // header, so a rejected frame cannot claim buffer space
                 // with a large declared length before failing.
-                if (log.isWarnEnabled()) {
-                    log.warn(sm.getString("http3Processor.frameUnexpected",
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("http3Processor.frameUnexpected",
                             Long.valueOf(streamId), Long.valueOf(frameType)));
                 }
                 throw new Http3Exception(
@@ -663,8 +732,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // replace the required classification with a local
                 // H3_EXCESSIVE_LOAD error or delay it until the payload has
                 // arrived.
-                if (log.isWarnEnabled()) {
-                    log.warn(sm.getString("http3ConnectionManager.duplicateSettings"));
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("http3ConnectionManager.duplicateSettings"));
                 }
                 throw new Http3Exception(
                         sm.getString("http3ConnectionManager.duplicateSettings"),
@@ -681,7 +750,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // The only position where a specific frame type is required
                 // is the first frame (SETTINGS, enforced above).
                 if (log.isDebugEnabled()) {
-                    log.debug(sm.getString("http3Processor.unexpectedFrameOnStream",
+                    log.debug(sm.getString(
+                            "http3ConnectionManager.ignoredControlFrame",
                             Long.valueOf(frameType),
                             Long.valueOf(streamId)));
                 }
@@ -704,8 +774,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // (the buffer is the entire retention window). This is an
                 // implementation limit on re-assembly size, signalled with
                 // H3_EXCESSIVE_LOAD rather than letting the stream stall.
-                if (log.isWarnEnabled()) {
-                    log.warn(sm.getString(
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString(
                             "http3ConnectionManager.controlFrameTooLarge",
                             Long.valueOf(frameType), Long.valueOf(frameLength),
                             Integer.valueOf(data.capacity())));
@@ -741,8 +811,10 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                     state.clientSettingsReceived = true;
                     state.setPeerMaxFieldSectionSize(clientSettings.getMaxFieldSectionSize());
                     if (log.isTraceEnabled()) {
-                        log.trace(sm.getString("http3ConnectionManager.settingsReceived",
-                                Long.valueOf(frameType)));
+                        log.trace(sm.getString(
+                                "http3ConnectionManager.settingsReceived",
+                                Long.valueOf(
+                                        clientSettings.getMaxFieldSectionSize())));
                     }
                 } catch (Http3Exception e) {
                     if (log.isDebugEnabled()) {
@@ -768,8 +840,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // receipt MUST be treated as a connection error of type
                 // H3_ID_ERROR.
                 long pushId = readPushId(data, (int) frameLength, Constants.H3_CANCEL_PUSH);
-                if (log.isWarnEnabled()) {
-                    log.warn(sm.getString("http3ConnectionManager.cancelPushUnknown",
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("http3ConnectionManager.cancelPushUnknown",
                             Long.valueOf(pushId)));
                 }
                 throw new Http3Exception(
@@ -836,8 +908,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         int payloadStart = data.position();
         long id = Qpack.decodeQuicInteger(data);
         if (id < 0 || data.position() != payloadStart + frameLength) {
-            if (log.isWarnEnabled()) {
-                log.warn(sm.getString("http3ConnectionManager.pushIdFrameMalformed",
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("http3ConnectionManager.pushIdFrameMalformed",
                         Long.valueOf(frameType), Long.valueOf(frameLength)));
             }
             throw new Http3Exception(
@@ -866,8 +938,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 forMaxPushId ? Constants.H3_MAX_PUSH_ID : Constants.H3_GOAWAY);
         if (forMaxPushId) {
             if (state.getMaxPushId() >= 0 && id < state.getMaxPushId()) {
-                if (log.isWarnEnabled()) {
-                    log.warn(sm.getString("http3ConnectionManager.maxPushIdDecreased",
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("http3ConnectionManager.maxPushIdDecreased",
                             Long.valueOf(id), Long.valueOf(state.getMaxPushId())));
                 }
                 throw new Http3Exception(
@@ -881,8 +953,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             }
         } else {
             if (state.getLastGoawayId() >= 0 && id > state.getLastGoawayId()) {
-                if (log.isWarnEnabled()) {
-                    log.warn(sm.getString("http3ConnectionManager.goawayIdIncreased",
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("http3ConnectionManager.goawayIdIncreased",
                             Long.valueOf(id), Long.valueOf(state.getLastGoawayId())));
                 }
                 throw new Http3Exception(
@@ -930,8 +1002,11 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      */
     private void processPriorityUpdateFrame(ConnectionState state, ByteBuffer data,
             int frameLength, long frameType) throws Http3Exception {
-        // A failed decode consumes bytes; the elementId check below maps
-        // it to the mandated H3_FRAME_ERROR before those bytes are used.
+        // An incomplete decode does not consume bytes: decodeQuicInteger()
+        // restores the buffer position to the start of the integer. The
+        // elementId/varintLength check below maps an incomplete or oversized
+        // field to the mandated H3_FRAME_ERROR before the rest of the payload
+        // is interpreted.
         int varintStart = data.position();
         long elementId = Qpack.decodeQuicInteger(data);
         int varintLength = data.position() - varintStart;
@@ -942,8 +1017,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // of type H3_FRAME_ERROR (the same treatment as the Push ID payload
         // of GOAWAY/MAX_PUSH_ID/CANCEL_PUSH in readPushId()).
         if (elementId < 0 || varintLength > frameLength) {
-            if (log.isWarnEnabled()) {
-                log.warn(sm.getString("http3ConnectionManager.priorityUpdateFrameMalformed",
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("http3ConnectionManager.priorityUpdateFrameMalformed",
                         Long.valueOf(frameType)));
             }
             throw new Http3Exception(
@@ -955,8 +1030,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         if (frameType == Constants.H3_PRIORITY_UPDATE_PUSH) {
             // Push-stream variant: nothing can have been promised - reject
             // with H3_ID_ERROR (RFC 9218 Section 7.2).
-            if (log.isWarnEnabled()) {
-                log.warn(sm.getString("http3ConnectionManager.priorityUpdateNoPushPromise",
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("http3ConnectionManager.priorityUpdateNoPushPromise",
                         Long.valueOf(elementId)));
             }
             throw new Http3Exception(
@@ -969,8 +1044,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // client-initiated bidirectional stream ID or it is a connection
         // error of type H3_ID_ERROR (RFC 9218 Section 7.2).
         if ((elementId & 3) != 0) {
-            if (log.isWarnEnabled()) {
-                log.warn(sm.getString("http3ConnectionManager.priorityUpdateRejectedElementId",
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("http3ConnectionManager.priorityUpdateRejectedElementId",
                         Long.valueOf(elementId)));
             }
             throw new Http3Exception(
@@ -1192,6 +1267,22 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
 
     /**
+     * Accounts one ignored/padding frame on a request stream against the
+     * connection-lifetime request padding budget.
+     *
+     * @param connection The QUIC connection
+     * @param payloadLength The declared frame payload length
+     *
+     * @return {@code true} if the connection budget was exceeded
+     */
+    public boolean noteRequestNonBodyFrame(QuicConnection connection,
+            long payloadLength) {
+        ConnectionState state = connections.get(connection);
+        return state != null && state.noteRequestNonBodyFrame(payloadLength);
+    }
+
+
+    /**
      * Returns the snapshotted SETTINGS_QPACK_BLOCKED_STREAMS value for this
      * connection.
      *
@@ -1278,9 +1369,24 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      */
     @Override
     public void noteStreamRejected(QuicConnection connection, long streamId) {
+        noteStreamAbandoned(connection, streamId);
+    }
+
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * For HTTP/3 a request stream reset by the peer (or abandoned before all
+     * of its encoded field sections were processed) must generate a Stream
+     * Cancellation instruction (RFC 9204 Section 2.2.2.2). This notification
+     * is used when no processor is able to observe the reset itself, for
+     * example a request stream reset before it was dispatched.
+     */
+    @Override
+    public void noteStreamAbandoned(QuicConnection connection, long streamId) {
         if (!noteStreamCancellation(connection, streamId)) {
-            if (log.isWarnEnabled()) {
-                log.warn(sm.getString(
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString(
                         "http3ConnectionManager.pendingDecoderInstructionsFull",
                         Integer.valueOf(MAX_PENDING_DECODER_INSTRUCTIONS)));
             }
@@ -1288,7 +1394,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             // the backlog means the peer never drains the QPACK decoder
             // stream, which must not be able to grow state without bound.
             connection.failConnection(Http3Error.H3_EXCESSIVE_LOAD.getCode(),
-                    "HTTP/3 QPACK decoder instruction backlog");
+                    sm.getString("http3ConnectionManager.qpackDecoderInstructionBacklog"));
         }
     }
 
@@ -1371,13 +1477,13 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 int newInstructions = pendingCount + (insertDelta > 0 ? 1 : 0);
                 if (state.unsentInstructionCount + newInstructions >
                         MAX_PENDING_DECODER_INSTRUCTIONS) {
-                    if (log.isWarnEnabled()) {
-                        log.warn(sm.getString(
+                    if (log.isDebugEnabled()) {
+                        log.debug(sm.getString(
                                 "http3ConnectionManager.pendingDecoderInstructionsFull",
                                 Integer.valueOf(MAX_PENDING_DECODER_INSTRUCTIONS)));
                     }
                     connection.failConnection(Http3Error.H3_EXCESSIVE_LOAD.getCode(),
-                            "HTTP/3 QPACK decoder instruction backlog");
+                            sm.getString("http3ConnectionManager.qpackDecoderInstructionBacklog"));
                     return;
                 }
                 // Build the instruction bytes:
@@ -1507,7 +1613,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * A retained partial (uni-stream type varint, control-stream frame
      * header or QPACK instruction) that cannot complete from the stream
      * read buffer - which is the entire retention window - never will:
-     * resolve the message, log it at warn level and return the connection
+     * resolve the message, log it at debug level (the peer-triggered error is
+     * reported to the peer and not a server fault) and return the connection
      * error of type H3_EXCESSIVE_LOAD, so callers can use
      * {@code throw partialDataTooLarge(streamId)} instead of stalling the
      * stream.
@@ -1516,8 +1623,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         String message = sm.getString(
                 "http3ConnectionManager.partialDataTooLarge",
                 Long.valueOf(streamId));
-        if (log.isWarnEnabled()) {
-            log.warn(message);
+        if (log.isDebugEnabled()) {
+            log.debug(message);
         }
         return new Http3Exception(message, Http3Error.H3_EXCESSIVE_LOAD);
     }
@@ -1532,8 +1639,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         String message = sm.getString(
                 "http3ConnectionManager.excessiveIgnoredData",
                 Long.valueOf(streamId));
-        if (log.isWarnEnabled()) {
-            log.warn(message);
+        if (log.isDebugEnabled()) {
+            log.debug(message);
         }
         return new Http3Exception(message, Http3Error.H3_EXCESSIVE_LOAD);
     }
@@ -1625,6 +1732,10 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         private int ignoredControlFrameCount;
         private long ignoredControlFrameBytes;
         private long discardedUniStreamBytes;
+        // Connection-lifetime request-stream ignored/padding budget. Guarded
+        // by the ConnectionState monitor.
+        private int requestNonBodyFrameCount;
+        private long requestNonBodyFrameBytes;
         // IDs of client-initiated unidirectional streams whose type was
         // unknown, so subsequent data on them is consumed without being
         // re-parsed as a stream type (RFC 9114 Section 9). Entries are
@@ -1943,6 +2054,24 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
 
         /**
+         * Accounts one ignored/padding frame on a request stream against the
+         * connection-lifetime request padding budget.
+         *
+         * @param payloadLength The declared frame payload length
+         *
+         * @return {@code true} if the budget was exceeded
+         */
+        public boolean noteRequestNonBodyFrame(long payloadLength) {
+            synchronized (this) {
+                requestNonBodyFrameCount++;
+                requestNonBodyFrameBytes += payloadLength;
+                return requestNonBodyFrameCount > MAX_CONNECTION_NON_BODY_FRAMES ||
+                        requestNonBodyFrameBytes > MAX_CONNECTION_NON_BODY_BYTES;
+            }
+        }
+
+
+        /**
          * Accounts bytes discarded from an unknown unidirectional stream and
          * reports whether the per-connection discard budget has been
          * exceeded.
@@ -2092,8 +2221,10 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         /**
          * Checks if a new bidirectional stream can be accepted.
          * <p>
-         * The concurrency limit (the peer's SETTINGS_MAX_STREAMS /
-         * MAX_STREAMS credit) caps the number of concurrently open streams.
+         * The concurrency limit (the QUIC transport stream limits advertised
+         * by the peer via the {@code initial_max_streams_bidi} transport
+         * parameter and raised by MAX_STREAMS frames, RFC 9000 Sections
+         * 18.2 and 19.10) caps the number of concurrently open streams.
          * In addition, once a GOAWAY has been sent, a stream with an
          * identifier at or above the GOAWAY identifier must be rejected:
          * RFC 9114 Section 5.2 makes the sender responsible for rejecting

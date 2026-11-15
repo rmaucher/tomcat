@@ -41,11 +41,21 @@ final class Http3Settings {
      */
     private static final long[] RESERVED_SETTING_IDENTIFIERS = {0x00L, 0x02L, 0x03L, 0x04L, 0x05L};
 
+    /**
+     * Maximum number of setting identifiers accepted in one SETTINGS frame.
+     * Unknown settings must be ignored (RFC 9114 Section 7.2.4), so they do
+     * not need to be retained; this bound prevents a tiny SETTINGS payload
+     * from creating thousands of map entries before the unknown entries are
+     * discarded.
+     */
+    private static final int MAX_SETTINGS = 1024;
+
     private final long maxFieldSectionSize;
 
 
     Http3Settings(ByteBuffer payload) throws Http3Exception {
         Map<Long, Long> settings = new HashMap<>();
+        int settingCount = 0;
         while (payload.hasRemaining()) {
             long identifier;
             long value;
@@ -56,6 +66,14 @@ final class Http3Settings {
             value = Qpack.decodeQuicInteger(payload);
             if (identifier == -1 || value == -1) {
                 throw error(Http3Error.H3_FRAME_ERROR, "http3Settings.incomplete");
+            }
+            settingCount++;
+            if (settingCount > MAX_SETTINGS) {
+                // Resource limit: unknown settings are ignored anyway, so a
+                // frame with an excessive number of identifiers is rejected
+                // instead of being retained in the map.
+                throw error(Http3Error.H3_EXCESSIVE_LOAD, "http3Settings.tooMany",
+                        Integer.valueOf(MAX_SETTINGS));
             }
             // Per RFC 9114 Section 7.2.4: a receiver MAY treat a duplicate
             // setting identifier as a connection error of type H3_SETTINGS_ERROR
@@ -152,7 +170,11 @@ final class Http3Settings {
      * @param qpackBlockedStreams Maximum number of streams the local QPACK
      *        decoder may block; advertised only when non-zero (the RFC 9204
      *        Section 5 default)
-     * @param maxFieldSectionSize The maximum field section size to advertise
+     * @param maxFieldSectionSize The maximum field section size to advertise;
+     *        the value is clamped to [0, Integer.MAX_VALUE] so that zero and
+     *        negative values advertise the zero-byte limit the decoder
+     *        actually enforces (RFC 9114 Section 4.2.2 uses the absence of
+     *        the setting to mean unlimited)
      * @param enableConnectProtocol Whether to enable extended CONNECT (RFC 9220)
      * @param h2CompatibleIdentity Whether to advertise the experimental
      *        0x22 H2_COMPATIBLE_IDENTITY setting (unregistered; peers MUST
@@ -179,25 +201,21 @@ final class Http3Settings {
             Qpack.encodeQuicInteger(buffer, Constants.H3_SETTINGS_QPACK_BLOCKED_STREAMS);
             Qpack.encodeQuicInteger(buffer, qpackBlockedStreams);
         }
-        // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 Section 4.2.2) is advisory.
-        // Only positive values are advertised; the RFC default when the
-        // setting is absent is unlimited (there is no "0 means unlimited"
-        // value on the wire). Locally the decoder clamps non-positive
-        // configured values to 0 (AbstractHttp3Protocol.getMaxFieldSectionSizeInt),
-        // so a configured 0 is an explicit zero-byte limit and a negative
-        // value is likewise enforced as 0 even though it is not advertised.
-        // Clamp the configured value with the shared bound the decoder-side consumer
-        // (AbstractHttp3Protocol.getMaxFieldSectionSizeInt) also applies: a value of
-        // 2^62 or more does not fit a QUIC varint (RFC 9000 Section 16 caps
-        // it at 62 payload bits), so writing it raw would merge its top bit
-        // with the 2-bit prefix and silently advertise a limit smaller by
-        // 2^62 (for the exact power of two: zero); the clamp also keeps the
-        // advertisement honest about the limit the decoder enforces.
-        if (maxFieldSectionSize > 0) {
-            Qpack.encodeQuicInteger(buffer, Constants.H3_SETTINGS_MAX_FIELD_SECTION_SIZE);
-            Qpack.encodeQuicInteger(buffer,
-                    Constants.clampToNonNegativeInt(maxFieldSectionSize));
-        }
+        // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 Section 4.2.2) must
+        // advertise the same limit the local decoder enforces. Values are
+        // clamped to [0, Integer.MAX_VALUE] exactly as the decoder-side
+        // consumer (AbstractHttp3Protocol.getMaxFieldSectionSizeInt) clamps
+        // them. This includes an explicit zero: the RFC default when the
+        // setting is absent is unlimited, so omitting the setting while the
+        // local decoder enforces a zero-byte limit would make the peer send
+        // field sections the server is guaranteed to reject. The clamp also
+        // handles a value of 2^62 or more, which does not fit a QUIC varint
+        // (RFC 9000 Section 16 caps it at 62 payload bits); writing it raw
+        // would merge its top bit with the 2-bit prefix and silently
+        // advertise a smaller limit.
+        Qpack.encodeQuicInteger(buffer, Constants.H3_SETTINGS_MAX_FIELD_SECTION_SIZE);
+        Qpack.encodeQuicInteger(buffer,
+                Constants.clampToNonNegativeInt(maxFieldSectionSize));
         if (enableConnectProtocol) {
             Qpack.encodeQuicInteger(buffer, Constants.H3_SETTINGS_ENABLE_CONNECT_PROTOCOL);
             Qpack.encodeQuicInteger(buffer, 1);

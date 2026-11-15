@@ -2396,8 +2396,14 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      */
     private void refreshTimerDeadline(Ngtcp2ConnectionWrapper conn) {
         long t = Ngtcp2Bindings.ngtcp2_conn_timeout_as_millis(conn.getConn());
+        // A zero-millisecond result can persist after handle_expiry/send for
+        // timers whose deadline is already in the past. Re-arming at "now"
+        // makes the same connections due on every subsequent poll iteration
+        // and burns the poll thread in a tight timer sweep (measured up to
+        // ~150k iterations/s on an 8000-connection idle fleet). The poll wait
+        // is millisecond-granular anyway, so give such timers a 1 ms floor.
         conn.setTimerDeadline(t < 0 || t == Long.MAX_VALUE ? Long.MAX_VALUE :
-                System.currentTimeMillis() + t);
+                System.currentTimeMillis() + Math.max(1, t));
         timerHeap.add(new TimerEntry(conn.getTimerDeadlineMs(),
                 conn.getTimerSeq(), conn));
         if (timerHeap.size() > ((connections.size() + pendingConns.size()) << 2) +
@@ -2904,7 +2910,9 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      */
     void registerCid(byte[] cid, Ngtcp2ConnectionWrapper conn) {
         if (cid.length > 0) {
-            cidMap.put(new CidKey(cid), conn);
+            CidKey key = new CidKey(cid);
+            cidMap.put(key, conn);
+            conn.addCid(key);
         }
     }
 
@@ -2914,7 +2922,11 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      */
     void removeCid(byte[] cid) {
         if (cid.length > 0) {
-            cidMap.remove(new CidKey(cid));
+            CidKey key = new CidKey(cid);
+            Ngtcp2ConnectionWrapper conn = cidMap.remove(key);
+            if (conn != null) {
+                conn.removeCid(key);
+            }
         }
     }
 
@@ -2961,7 +2973,10 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         CidKey scidKey = new CidKey(mintedScid, SERVER_CID_LEN);
         CidKey odcidKey = new CidKey(hdrDcid, (int) dcidLen);
         cidMap.put(scidKey, conn);
-        cidMap.putIfAbsent(odcidKey, conn);
+        conn.addCid(scidKey);
+        if (cidMap.putIfAbsent(odcidKey, conn) == null) {
+            conn.addCid(odcidKey);
+        }
         pendingConns.put(conn.getConnAddress(), conn);
         // Run the initial handshake/send pass immediately after the datagram
         // that created this connection has been fed.
@@ -3239,7 +3254,10 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
 
     private void discardPending(Ngtcp2ConnectionWrapper conn) {
         pendingConns.remove(conn.getConnAddress(), conn);
-        cidMap.values().removeIf(v -> v == conn);
+        for (CidKey key : conn.getCids()) {
+            cidMap.remove(key, conn);
+        }
+        conn.getCids().clear();
         conn.setClosed();
         conn.freeConnOnce();
     }
@@ -4142,6 +4160,9 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
     private UniStreamWriteResult flushServerUniStreamWrite(Ngtcp2ConnectionWrapper conn,
             Ngtcp2StreamWrapper stream) {
         if (conn.isClosed() || conn.isFreed() || stream.isFreed()) {
+            if (!conn.isClosed() && !conn.isFreed()) {
+                notifyServerUniStreamClosed(conn, stream);
+            }
             stream.setWriteBuffer(null);
             return UniStreamWriteResult.FAILED;
         }
@@ -4188,13 +4209,36 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             // write so the writable sweep's per-iteration retry stops
             // re-attempting and re-warning on this failure.
             stream.setWriteBuffer(null);
+            notifyServerUniStreamClosed(conn, stream);
             return UniStreamWriteResult.FAILED;
         } catch (RuntimeException e) {
             log.warn(sm.getString("ngtcp2Endpoint.serverUniStreamWriteFailed",
                     Long.valueOf(stream.getStreamId())), e);
             stream.setWriteBuffer(null);
+            notifyServerUniStreamClosed(conn, stream);
             return UniStreamWriteResult.FAILED;
         }
+    }
+
+
+    private void notifyServerUniStreamClosed(Ngtcp2ConnectionWrapper conn,
+            Ngtcp2StreamWrapper stream) {
+        if (conn.isClosed() || conn.isFreed() || conn.isClosing()) {
+            return;
+        }
+        QuicConnectionManager connManager = conn.getQuicConnectionManager();
+        if (connManager == null) {
+            return;
+        }
+        long streamId = stream.getStreamId();
+        if (streamId < 3 || (streamId & 3) != 3) {
+            return;
+        }
+        long index = (streamId - 3) / 4;
+        if (index > Integer.MAX_VALUE) {
+            return;
+        }
+        connManager.serverUniStreamClosed(conn, (int) index);
     }
 
 
@@ -4903,7 +4947,10 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         long addr = conn.getConnAddress();
         connections.remove(addr, conn);
         pendingConns.remove(addr, conn);
-        cidMap.values().removeIf(v -> v == conn);
+        for (CidKey key : conn.getCids()) {
+            cidMap.remove(key, conn);
+        }
+        conn.getCids().clear();
         // Protocol data queued when the connection dies can never be
         // flushed (the flush runs only for registered connections), so
         // clear the mark here to keep the endpoint-wide pending tally
@@ -4997,6 +5044,13 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 (connManager != null) ? connManager.getState(conn) : null;
         if (state != null && stream.getStreamType() == Ngtcp2StreamWrapper.TYPE_BIDI) {
             state.decrementActiveStreams();
+            if (stream.getReadState() == QuicStream.ReadState.RESET_REMOTE) {
+                // A peer reset abandons the request stream. If no processor
+                // observed the reset (for example the stream was reset before
+                // dispatch), the protocol still owes its encoder a QPACK
+                // Stream Cancellation (RFC 9204 Section 2.2.2.2).
+                connManager.noteStreamAbandoned(conn, stream.getStreamId());
+            }
         }
         if (!conn.isClosed() && !conn.isFreed()) {
             if (!stream.isConcluded()) {

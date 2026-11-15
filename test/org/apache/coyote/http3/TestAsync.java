@@ -24,6 +24,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import jakarta.servlet.AsyncContext;
@@ -34,7 +35,6 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.junit.Assert;
-import org.junit.Assume;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -105,9 +105,6 @@ public class TestAsync extends Http3TestBase {
 
     @Test
     public void testSmallInitialWriteWindow() throws Exception {
-        Assume.assumeTrue("The non-blocking output queue is currently enabled "
-                + "for the quiche and ngtcp2 endpoints only",
-                endpointIsQuiche() || endpointIsNgtcp2());
         // Keep the body large enough for multiple window updates but small
         // enough that the non-container-thread variant completes within the
         // raw client's bounded wait under suite load.
@@ -145,6 +142,8 @@ public class TestAsync extends Http3TestBase {
         private final int blockLimit;
         private final boolean useNonContainerThreadForWrite;
         private final transient ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        private final AtomicBoolean writeScheduled = new AtomicBoolean();
+        private final AtomicBoolean completed = new AtomicBoolean();
         private transient volatile Future<?> future;
 
         public AsyncServlet(int blockLimit, boolean useNonContainerThreadForWrite) {
@@ -175,18 +174,32 @@ public class TestAsync extends Http3TestBase {
 
                 @Override
                 public void onWritePossible() throws IOException {
+                    if (completed.get()) {
+                        // The response has already been completed.
+                        return;
+                    }
                     if (useNonContainerThreadForWrite) {
-                        future = scheduler.schedule(new Runnable() {
+                        // Schedule at most one write task at a time. The
+                        // listener can be notified more than once while a
+                        // scheduled task is still pending; scheduling another
+                        // task would let two threads write to the same
+                        // ServletOutputStream concurrently and can make the
+                        // response one block short.
+                        if (writeScheduled.compareAndSet(false, true)) {
+                            future = scheduler.schedule(new Runnable() {
 
-                            @Override
-                            public void run() {
-                                try {
-                                    write();
-                                } catch (IOException ioe) {
-                                    throw new IllegalStateException(ioe);
+                                @Override
+                                public void run() {
+                                    try {
+                                        write();
+                                    } catch (IOException ioe) {
+                                        throw new IllegalStateException(ioe);
+                                    } finally {
+                                        writeScheduled.set(false);
+                                    }
                                 }
-                            }
-                        }, 200, TimeUnit.MILLISECONDS);
+                            }, 200, TimeUnit.MILLISECONDS);
+                        }
                     } else {
                         write();
                     }
@@ -194,11 +207,13 @@ public class TestAsync extends Http3TestBase {
 
 
                 private void write() throws IOException {
-                    while (output.isReady()) {
+                    while (!completed.get() && output.isReady()) {
                         blockCount.incrementAndGet();
                         output.write(bytes);
                         if (blockCount.get() == blockLimit) {
-                            asyncContext.complete();
+                            if (completed.compareAndSet(false, true)) {
+                                asyncContext.complete();
+                            }
                             scheduler.shutdown();
                             return;
                         }
@@ -207,9 +222,12 @@ public class TestAsync extends Http3TestBase {
 
                 @Override
                 public void onError(Throwable t) {
+                    completed.set(true);
+                    writeScheduled.set(false);
                     if (future != null) {
                         future.cancel(false);
                     }
+                    scheduler.shutdownNow();
                     t.printStackTrace();
                 }
             });

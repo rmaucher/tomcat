@@ -154,6 +154,17 @@ public class SocketBufferHandler {
 
 
     /**
+     * Returns the configured size of the read buffer without forcing the
+     * lazily allocated buffer to be created.
+     *
+     * @return the configured read buffer size
+     */
+    public int getReadBufferSize() {
+        return readBufferSize;
+    }
+
+
+    /**
      * Checks whether the read buffer contains any data.
      * @return {@code true} if the read buffer is empty
      */

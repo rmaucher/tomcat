@@ -25,6 +25,8 @@ import jakarta.servlet.AsyncContext;
 import jakarta.servlet.AsyncEvent;
 import jakarta.servlet.AsyncListener;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletOutputStream;
+import jakarta.servlet.WriteListener;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -66,6 +68,57 @@ public class TestAsyncError extends Http3TestBase {
         }
 
         Assert.assertEquals(1, asyncErrorServlet.getErrorCount());
+    }
+
+
+    @Test
+    public void testWriteListenerFailureResetsStreamWithError() throws Exception {
+        startHttp3Server(ctxt -> {
+            Wrapper w = Tomcat.addServlet(ctxt, "asyncWriteError",
+                    new AsyncWriteErrorServlet());
+            w.setAsyncSupported(true);
+            ctxt.addServletMapping("/async-write-error", "asyncWriteError");
+        });
+
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers", buildFieldSection(simpleGetHeaders(
+                        "/async-write-error")),
+                "--wait", "2",
+                "--timeout", "10"), CLIENT_TIMEOUT_SECONDS);
+
+        Assert.assertEquals("A failed non-blocking write must reset the "
+                        + "stream with H3_INTERNAL_ERROR, got "
+                        + output.getLines(),
+                Integer.valueOf(H3_INTERNAL_ERROR), output.getStreamError());
+        Assert.assertNull("The failure must remain stream-scoped",
+                output.getConnectionError());
+    }
+
+
+    private static final class AsyncWriteErrorServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws IOException {
+            req.startAsync();
+            resp.setStatus(HttpServletResponse.SC_OK);
+            resp.setContentType("text/plain");
+            ServletOutputStream output = resp.getOutputStream();
+            output.setWriteListener(new WriteListener() {
+
+                @Override
+                public void onWritePossible() throws IOException {
+                    throw new IOException("write failure");
+                }
+
+                @Override
+                public void onError(Throwable t) {
+                    // NO-OP
+                }
+            });
+        }
     }
 
 

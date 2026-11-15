@@ -81,8 +81,41 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     private static final String ALPN_NAME = Constants.PROTOCOL_NAME;
 
     /**
-     * Maximum QPACK table capacity.
+     * Hard upper bound on the configured QPACK dynamic table capacity.
+     * The dynamic table is per connection and its ring array, entry objects
+     * and retained name/value strings all scale with the configured
+     * capacity. Limiting the advertised capacity keeps a single peer from
+     * being able to amplify the configured value into unbounded
+     * per-connection heap use. The default ({@code 4096}) is far below this
+     * limit; the bound is only relevant to unusual configurations.
      */
+    public static final long MAX_QPACK_TABLE_CAPACITY = 4L * 1024 * 1024;
+
+    /**
+     * Largest stream-count value a QUIC transport parameter can carry:
+     * a QUIC variable-length integer has at most 62 payload bits (RFC 9000
+     * Section 16). The HTTP/3 concurrency limit must stay within this
+     * range so it can be advertised consistently by the transport.
+     */
+    public static final long MAX_CONCURRENT_STREAMS = (1L << 62) - 1;
+
+    /**
+     * Largest blocked-stream timeout whose millisecond-to-nanosecond
+     * conversion does not overflow {@link Long}. Larger values would make the
+     * deadline arithmetic wrap to a negative time and turn a deliberately
+     * long wait into an immediate return.
+     */
+    public static final long MAX_QPACK_BLOCKED_STREAM_TIMEOUT_MS =
+            Long.MAX_VALUE / 1_000_000L;
+
+    /**
+     * Largest idle timeout whose millisecond-to-microsecond conversion used
+     * by the ngtcp2 transport does not overflow {@link Long}. Larger values
+     * would wrap the transport parameter to a negative value.
+     */
+    public static final long MAX_IDLE_TIMEOUT_MS =
+            Long.MAX_VALUE / 1_000_000L;
+
     private long qpackMaxTableCapacity = Qpack.DEFAULT_TABLE_SIZE;
 
     /**
@@ -94,6 +127,16 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
      * failure.
      */
     private volatile int qpackBlockedStreams = 0;
+
+    /**
+     * Timeout in milliseconds for a request stream blocked waiting for QPACK
+     * encoder-stream inserts (RFC 9204 Section 2.1.2). Zero and negative
+     * values are rejected, as are values above
+     * {@link #MAX_QPACK_BLOCKED_STREAM_TIMEOUT_MS} (whose
+     * millisecond-to-nanosecond conversion would overflow); the default is
+     * 5000 ms.
+     */
+    private volatile long qpackBlockedStreamTimeoutMs = 5000;
 
     /**
      * When to respond with a 100 intermediate response to a request that
@@ -208,7 +251,28 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     }
 
 
+    /**
+     * Sets the maximum QPACK dynamic table capacity. The value must be
+     * between {@code 0} and {@link #MAX_QPACK_TABLE_CAPACITY}; a value of
+     * {@code 0} disables the dynamic table. Values outside this range are
+     * rejected because the decoder limits are int-valued, an out-of-range
+     * value would otherwise be silently clamped, and the dynamic table's
+     * per-connection memory scales with the configured capacity.
+     *
+     * @param qpackMaxTableCapacity The maximum QPACK dynamic table capacity
+     *                              in bytes
+     *
+     * @throws IllegalArgumentException If the value is outside the range
+     *         {@code 0} to {@link #MAX_QPACK_TABLE_CAPACITY}
+     */
     public void setQpackMaxTableCapacity(long qpackMaxTableCapacity) {
+        if (qpackMaxTableCapacity < 0 ||
+                qpackMaxTableCapacity > MAX_QPACK_TABLE_CAPACITY) {
+            throw new IllegalArgumentException(sm.getString(
+                    "http3Protocol.invalidQpackMaxTableCapacity",
+                    Long.valueOf(qpackMaxTableCapacity),
+                    Long.valueOf(MAX_QPACK_TABLE_CAPACITY)));
+        }
         this.qpackMaxTableCapacity = qpackMaxTableCapacity;
     }
 
@@ -228,8 +292,60 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     }
 
 
+    /**
+     * Sets the maximum number of request streams per connection that may
+     * block awaiting QPACK encoder stream inserts. The value must be zero or
+     * greater; zero disables blocking. A negative value is rejected rather
+     * than silently treated as zero.
+     *
+     * @param qpackBlockedStreams The maximum number of blocked streams
+     *
+     * @throws IllegalArgumentException If the value is negative
+     */
     public void setQpackBlockedStreams(int qpackBlockedStreams) {
+        if (qpackBlockedStreams < 0) {
+            throw new IllegalArgumentException(sm.getString(
+                    "http3Protocol.invalidQpackBlockedStreams",
+                    Integer.valueOf(qpackBlockedStreams)));
+        }
         this.qpackBlockedStreams = qpackBlockedStreams;
+    }
+
+
+    /**
+     * Returns the timeout, in milliseconds, for a request stream blocked
+     * waiting for QPACK encoder-stream inserts.
+     *
+     * @return The blocked-stream timeout
+     */
+    public long getQpackBlockedStreamTimeoutMs() {
+        return qpackBlockedStreamTimeoutMs;
+    }
+
+
+    /**
+     * Sets the timeout, in milliseconds, for a request stream blocked waiting
+     * for QPACK encoder-stream inserts (RFC 9204 Section 2.1.2). A blocked
+     * stream holds a container worker thread for this duration, so the value
+     * should stay small relative to the thread pool.
+     *
+     * @param qpackBlockedStreamTimeoutMs The timeout in milliseconds; must be
+     *                                    greater than zero and at most
+     *                                    {@link #MAX_QPACK_BLOCKED_STREAM_TIMEOUT_MS}
+     *
+     * @throws IllegalArgumentException If the value is not in the supported
+     *                                  range
+     */
+    public void setQpackBlockedStreamTimeoutMs(long qpackBlockedStreamTimeoutMs) {
+        if (qpackBlockedStreamTimeoutMs < 1 ||
+                qpackBlockedStreamTimeoutMs >
+                        MAX_QPACK_BLOCKED_STREAM_TIMEOUT_MS) {
+            throw new IllegalArgumentException(sm.getString(
+                    "http3Protocol.invalidQpackBlockedStreamTimeout",
+                    Long.valueOf(qpackBlockedStreamTimeoutMs),
+                    Long.valueOf(MAX_QPACK_BLOCKED_STREAM_TIMEOUT_MS)));
+        }
+        this.qpackBlockedStreamTimeoutMs = qpackBlockedStreamTimeoutMs;
     }
 
 
@@ -266,6 +382,21 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     }
 
 
+    /**
+     * Returns the configured maximum field-section size that this endpoint
+     * will decode and advertise via
+     * {@code SETTINGS_MAX_FIELD_SECTION_SIZE}.
+     * <p>
+     * The effective value is clamped by the connection manager to
+     * {@link Constants#MAX_FIELD_SECTION_SIZE_FOR_FRAME_LIMIT} (4473915
+     * bytes, the largest decoded field section that fits the 16 MiB per-frame
+     * buffer) and by the QPACK decoder and SETTINGS encoder to the non-negative
+     * int range. Values above those bounds are clamped for the decoder, the
+     * advertisement and the inbound frame preflight; non-positive values are
+     * enforced and advertised as an explicit zero-byte limit.
+     *
+     * @return the configured maximum field-section size
+     */
     public long getMaxFieldSectionSize() {
         return maxFieldSectionSize;
     }
@@ -279,13 +410,10 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
      * decoder reads as "no limit at all", or to zero, which rejects every
      * non-empty field section.
      * <p>
-     * Non-positive configured values mean different things to the two
-     * consumers of the configured value: {@link Http3Settings#encode} treats
-     * a value that is not positive as "no limit to advertise" and omits the
-     * setting from the server SETTINGS entirely (peers then apply the RFC
-     * 9114 Section 4.2.2 default), while the QPACK decoder enforces its
-     * limit as given - so both a configured zero and a clamped negative
-     * arrive here as 0 and reject every non-empty field section locally.
+     * A configured zero and a negative value both arrive here as 0 and
+     * reject every non-empty field section locally. The SETTINGS encoder
+     * advertises the same clamped value, so the peer sees the zero-byte
+     * limit instead of the RFC 9114 Section 4.2.2 "unlimited" default.
      * The decoder's negative "unlimited" sentinel is deliberately not
      * reachable through this method.
      *
@@ -297,6 +425,19 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     }
 
 
+    /**
+     * Sets the maximum field-section size that this endpoint will decode
+     * and advertise via {@code SETTINGS_MAX_FIELD_SECTION_SIZE}.
+     * <p>
+     * The effective value is clamped to
+     * {@link Constants#MAX_FIELD_SECTION_SIZE_FOR_FRAME_LIMIT} (4473915 bytes)
+     * and to the non-negative int range for the decoder, the advertisement and
+     * the inbound frame preflight. A value of zero is enforced and advertised
+     * as an explicit zero-byte limit; a negative value is treated the same
+     * way.
+     *
+     * @param maxFieldSectionSize The maximum field-section size in bytes
+     */
     public void setMaxFieldSectionSize(long maxFieldSectionSize) {
         this.maxFieldSectionSize = maxFieldSectionSize;
     }
@@ -308,7 +449,31 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     }
 
 
+    /**
+     * Sets the maximum number of concurrent request streams per connection.
+     * The value must be greater than zero and no greater than
+     * {@link #MAX_CONCURRENT_STREAMS} (the 62-bit QUIC varint limit); the
+     * effective limit is then clamped to the stream limit advertised by the
+     * QUIC transport.
+     *
+     * @param maxConcurrentStreams The maximum number of concurrent request
+     *                              streams
+     *
+     * @throws IllegalArgumentException If the value is not greater than
+     *         zero, or exceeds {@link #MAX_CONCURRENT_STREAMS}
+     */
     public void setMaxConcurrentStreams(long maxConcurrentStreams) {
+        if (maxConcurrentStreams < 1) {
+            throw new IllegalArgumentException(sm.getString(
+                    "http3Protocol.invalidMaxConcurrentStreams",
+                    Long.valueOf(maxConcurrentStreams)));
+        }
+        if (maxConcurrentStreams > MAX_CONCURRENT_STREAMS) {
+            throw new IllegalArgumentException(sm.getString(
+                    "http3Protocol.invalidMaxConcurrentStreamsTooLarge",
+                    Long.valueOf(maxConcurrentStreams),
+                    Long.valueOf(MAX_CONCURRENT_STREAMS)));
+        }
         this.maxConcurrentStreams = maxConcurrentStreams;
     }
 
@@ -363,7 +528,26 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     }
 
 
+    /**
+     * Sets the QUIC connection idle timeout. Zero or a negative value leaves
+     * the transport default in place. Values above
+     * {@link #MAX_IDLE_TIMEOUT_MS} are rejected because the ngtcp2 transport
+     * multiplies the millisecond value by 1,000,000 to obtain microseconds;
+     * a larger value would overflow that conversion and produce an invalid
+     * transport parameter.
+     *
+     * @param idleTimeoutMs The idle timeout in milliseconds
+     *
+     * @throws IllegalArgumentException If the value exceeds
+     *                                  {@link #MAX_IDLE_TIMEOUT_MS}
+     */
     public void setIdleTimeoutMs(long idleTimeoutMs) {
+        if (idleTimeoutMs > MAX_IDLE_TIMEOUT_MS) {
+            throw new IllegalArgumentException(sm.getString(
+                    "http3Protocol.invalidIdleTimeout",
+                    Long.valueOf(idleTimeoutMs),
+                    Long.valueOf(MAX_IDLE_TIMEOUT_MS)));
+        }
         this.idleTimeoutMs = idleTimeoutMs;
     }
 
@@ -555,10 +739,20 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
      * from the request).
      *
      * @param altService The alternative service protocol identifier, or
-     *                   {@code null} to announce nothing
+     *                   {@code null}/empty to announce nothing
+     *
+     * @throws IllegalArgumentException If the value is not a valid HTTP
+     *         token (RFC 9110 Section 5.6.2)
      */
     public void setAltService(String altService) {
-        this.altService = altService;
+        if (altService == null || altService.isEmpty()) {
+            this.altService = null;
+        } else if (HttpParser.isToken(altService)) {
+            this.altService = altService;
+        } else {
+            throw new IllegalArgumentException(sm.getString(
+                    "http3Protocol.invalidAltService", altService));
+        }
     }
 
 

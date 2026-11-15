@@ -18,6 +18,7 @@ package org.apache.coyote.http3;
 
 import java.io.ByteArrayOutputStream;
 import java.io.StringReader;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 
 import org.junit.Assert;
@@ -76,6 +77,35 @@ public class TestRfc9218 extends Http3TestBase {
             frames[i + 1] = buildFrameB64(frameType, payloads[i]);
         }
         return buildFramesB64(frames);
+    }
+
+
+    @Test
+    public void testPriorityTrailerFieldIsNotConsumedAsSignal()
+            throws Exception {
+        // RFC 9218 Section 5 defines Priority as a request header field, and
+        // Section 7 defines PRIORITY_UPDATE frames. A Priority field in a
+        // trailer section is not a priority signal; when the operator
+        // explicitly allows it as a trailer, it must be stored as a trailer
+        // field rather than consumed and applied to the request priority.
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setAllowedTrailerHeaders("priority");
+        Http3Processor processor = new Http3Processor(protocol, null);
+        Field trailerMode = Http3Processor.class.getDeclaredField(
+                "trailerMode");
+        trailerMode.setAccessible(true);
+        trailerMode.setBoolean(processor, true);
+
+        processor.emitHeader("priority", "u=1, i");
+
+        Assert.assertEquals("A trailer Priority field must not change the "
+                + "request priority", Priority.DEFAULT_URGENCY,
+                processor.getUrgency());
+        Assert.assertFalse("A trailer Priority field must not change the "
+                + "request priority", processor.getIncremental());
+        Assert.assertNotNull("The allowed trailer field must be stored",
+                processor.getRequest().getMimeTrailerFields()
+                        .getValue("priority"));
     }
 
 

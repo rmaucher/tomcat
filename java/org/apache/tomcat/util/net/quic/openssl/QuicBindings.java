@@ -52,7 +52,9 @@ import org.apache.tomcat.util.openssl.openssl_h;
  * <li>{@code SSL_get_stream_id()}, {@code SSL_get_stream_type()},
  *     {@code SSL_stream_conclude()}, {@code SSL_stream_reset()},
  *     {@code SSL_get_stream_read_state()}, {@code SSL_get_stream_write_state()}</li>
- * <li>{@code SSL_get_value_uint()}, {@code SSL_set_value_uint()},
+ * <li>{@code SSL_get_value_uint()}, {@code SSL_set_value_uint()}
+ *     (including the stream write buffer statistics
+ *     {@code SSL_VALUE_STREAM_WRITE_BUF_SIZE / _USED / _AVAIL}),
  *     {@code SSL_get_peer_addr()} (with the {@code BIO_ADDR_family()} /
  *     {@code BIO_ADDR_rawaddress()} / {@code BIO_ADDR_rawport()} accessors)</li>
  * <li>{@code SSL_get_servername()}, {@code SSL_get0_alpn_selected()},
@@ -647,6 +649,65 @@ public class QuicBindings {
         }
     }
 
+    /**
+     * Reads one of the stream write buffer statistics. These are plain
+     * generic {@code SSL_VALUE_*} values, so this is the
+     * {@code SSL_get_stream_write_buf_*()} macro family from {@code ssl.h}
+     * (the macros expand to {@code SSL_get_generic_value_uint()}).
+     *
+     * @param ssl The stream SSL object
+     * @param id  One of {@link #SSL_VALUE_STREAM_WRITE_BUF_SIZE},
+     *            {@link #SSL_VALUE_STREAM_WRITE_BUF_USED} or
+     *            {@link #SSL_VALUE_STREAM_WRITE_BUF_AVAIL}
+     * @return The statistic, or {@code -1} if the library rejected the query
+     *         (for example because the SSL object is not a QUIC stream or has
+     *         no send buffer)
+     */
+    public static long SSL_get_stream_write_buf_stat(MemorySegment ssl, int id) {
+        try (Arena localArena = Arena.ofConfined()) {
+            MemorySegment value = localArena.allocate(ValueLayout.JAVA_LONG);
+            value.set(ValueLayout.JAVA_LONG, 0, 0L);
+            if (SSL_get_value_uint(ssl, SSL_VALUE_CLASS_GENERIC, id, value) != 1) {
+                return -1L;
+            }
+            return value.get(ValueLayout.JAVA_LONG, 0);
+        }
+    }
+
+    /**
+     * {@code SSL_get_stream_write_buf_size(ssl, &value)}: the size of the
+     * stream's native write buffer.
+     *
+     * @param ssl The stream SSL object
+     * @return The buffer size, or {@code -1} if unavailable
+     */
+    public static long SSL_get_stream_write_buf_size(MemorySegment ssl) {
+        return SSL_get_stream_write_buf_stat(ssl, SSL_VALUE_STREAM_WRITE_BUF_SIZE);
+    }
+
+    /**
+     * {@code SSL_get_stream_write_buf_used(ssl, &value)}: the number of
+     * bytes in the stream's native write buffer that the peer has not yet
+     * acknowledged.
+     *
+     * @param ssl The stream SSL object
+     * @return The used byte count, or {@code -1} if unavailable
+     */
+    public static long SSL_get_stream_write_buf_used(MemorySegment ssl) {
+        return SSL_get_stream_write_buf_stat(ssl, SSL_VALUE_STREAM_WRITE_BUF_USED);
+    }
+
+    /**
+     * {@code SSL_get_stream_write_buf_avail(ssl, &value)}: the number of
+     * bytes the stream's native write buffer can accept without blocking.
+     *
+     * @param ssl The stream SSL object
+     * @return The available byte count, or {@code -1} if unavailable
+     */
+    public static long SSL_get_stream_write_buf_avail(MemorySegment ssl) {
+        return SSL_get_stream_write_buf_stat(ssl, SSL_VALUE_STREAM_WRITE_BUF_AVAIL);
+    }
+
     // SSL_shutdown_ex flags
     /**
      * {@code SSL_shutdown_ex()} flag: close immediately without waiting
@@ -685,6 +746,23 @@ public class QuicBindings {
     public static final int SSL_VALUE_QUIC_IDLE_TIMEOUT = 5;
     /** Stream ID: event handling mode for the object (settable). */
     public static final int SSL_VALUE_EVENT_HANDLING_MODE = 6;
+    /**
+     * Stream-level write buffer statistics (read-only): the size of the
+     * buffer allocated to hold written data until the peer acknowledges it.
+     */
+    public static final int SSL_VALUE_STREAM_WRITE_BUF_SIZE = 7;
+    /**
+     * Stream-level write buffer statistics (read-only): the number of bytes
+     * currently consumed in the write buffer which have yet to be
+     * acknowledged by the peer.
+     */
+    public static final int SSL_VALUE_STREAM_WRITE_BUF_USED = 8;
+    /**
+     * Stream-level write buffer statistics (read-only): the number of bytes
+     * available in the write buffer which have yet to be consumed by a
+     * successful {@code SSL_write_ex2()} call.
+     */
+    public static final int SSL_VALUE_STREAM_WRITE_BUF_AVAIL = 9;
     /** Event handling mode: inherit the mode of the parent object. */
     public static final int SSL_VALUE_EVENT_HANDLING_MODE_INHERIT = 0;
     /**

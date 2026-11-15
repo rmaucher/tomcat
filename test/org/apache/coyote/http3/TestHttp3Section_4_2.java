@@ -17,6 +17,7 @@
 package org.apache.coyote.http3;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Map;
@@ -49,6 +50,70 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
         validateStatus(response, 200);
         Assert.assertNotNull(response.getHeader("content-type"));
         Assert.assertNotNull(response.getHeader("date"));
+    }
+
+
+    @Test
+    public void testInformationalStatusAsFinalResponseReplaced() throws Exception {
+        startHttp3Server(ctxt -> {
+            Tomcat.addServlet(ctxt, "status", new StatusServlet());
+            ctxt.addServletMapping("/status", "status");
+        });
+
+        // RFC 9114 Section 4.1: zero or more interim responses are followed
+        // by exactly one final response. An application-selected 1xx status
+        // must not occupy the final response HEADERS frame (the 102 must be
+        // either sent via the interim path or replaced by a final status).
+        ClientOutput output = rawGet("/status?code=102");
+
+        Http3Response response = output.getResponse();
+        Assert.assertEquals("A final response must not carry a 1xx status",
+                Arrays.asList(Integer.valueOf(500)), response.getStatuses());
+        Assert.assertEquals("body", response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testOutOfRangeStatusReplaced() throws Exception {
+        startHttp3Server(ctxt -> {
+            Tomcat.addServlet(ctxt, "status", new StatusServlet());
+            ctxt.addServletMapping("/status", "status");
+        });
+
+        // RFC 9110 Section 15 requires a three-digit status code in the
+        // 100-599 range. Values outside that range must never be encoded
+        // into :status.
+        Http3Response response = rawGet("/status?code=600").getResponse();
+        Assert.assertEquals("An out-of-range status must be replaced",
+                Arrays.asList(Integer.valueOf(500)), response.getStatuses());
+
+        response = rawGet("/status?code=99").getResponse();
+        Assert.assertEquals("An out-of-range status must be replaced",
+                Arrays.asList(Integer.valueOf(500)), response.getStatuses());
+    }
+
+
+    @Test
+    public void testInvalidStatusDoesNotKeepContentLength() throws Exception {
+        startHttp3Server(ctxt -> {
+            Tomcat.addServlet(ctxt, "statusLength",
+                    new StatusContentLengthServlet());
+            ctxt.addServletMapping("/statusLength", "statusLength");
+        });
+
+        // Replacing an invalid final status with 500 must also discard the
+        // application's framing metadata. A 500 with a stale non-zero
+        // Content-Length and no DATA frames would be a truncated response.
+        for (String code : new String[] { "103", "600" }) {
+            Http3Response response = rawGet(
+                    "/statusLength?code=" + code).getResponse();
+            Assert.assertEquals("Status " + code + " must be replaced",
+                    Arrays.asList(Integer.valueOf(500)), response.getStatuses());
+            Assert.assertNull("Status " + code + " must not keep a stale "
+                    + "Content-Length", response.getHeader("content-length"));
+            Assert.assertEquals("Status " + code + " must not send a body",
+                    0, response.getBody().length);
+        }
     }
 
 
@@ -186,6 +251,28 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
 
 
     @Test
+    public void testContentLengthAndTrailersCanCoexist() throws Exception {
+        startHttp3Server(ctxt -> {
+            Tomcat.addServlet(ctxt, "lengthTrailers",
+                    new LengthTrailersServlet());
+            ctxt.addServletMapping("/lengthTrailers", "lengthTrailers");
+        });
+
+        // RFC 9114 Section 4.1: an HTTP/3 message is a header section, DATA
+        // frames and an optional trailer section. Unlike HTTP/1.1 chunked
+        // framing, a trailer section does not make Content-Length mutually
+        // exclusive with trailers, so a declared length that matches the
+        // DATA payload must be retained.
+        Http3Response response = get("/lengthTrailers");
+
+        validateStatus(response, 200);
+        Assert.assertEquals("5", response.getHeader("content-length"));
+        Assert.assertEquals("body!", response.getBodyAsString());
+        Assert.assertEquals("test", response.getTrailer("x-test-trailer"));
+    }
+
+
+    @Test
     public void testHeadResponse() throws Exception {
         startHttp3Server();
 
@@ -260,11 +347,19 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
 
         // RFC 9114 Section 4.2.2: the peer declared
         // SETTINGS_MAX_FIELD_SECTION_SIZE of 200 bytes. The response to
-        // /simple ({:status, content-type, content-length, date}) does not
-        // fit; the non-essential date field is dropped so the encoded
-        // section stays within the limit.
+        // /simple ({:status, content-type, content-length, date}) is reduced
+        // to fit; Date is mandatory for a 2xx response (RFC 9110 Section
+        // 6.6.1) and must be retained even if the resulting section exceeds
+        // the peer's advisory limit. Non-essential fields, if any, are
+        // dropped.
+        //
+        // QUIC does not order the control stream against request streams.
+        // Delay the request so the server can process the client SETTINGS
+        // first; otherwise the response may legitimately be encoded under
+        // the initial "unlimited" default before the SETTINGS arrive.
         ClientOutput output = runClient(rawCommandWith(
                 "--control", buildSettingsFrameB64(6, 200),
+                "--request-delay", "1.0",
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/simple"))),
                 CLIENT_TIMEOUT_SECONDS);
@@ -278,10 +373,15 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
             size += 32L + header.getKey().length() +
                     header.getValue().length();
         }
-        Assert.assertTrue("Response field section of " + size +
-                " bytes exceeds the declared limit of 200", size <= 200);
-        Assert.assertNull("Expected the non-essential date field to be " +
-                "dropped", response.getHeader("date"));
+        // The mandatory Date field pushes the section over the peer's
+        // advisory limit (RFC 9114 Section 4.2.2 is a SHOULD); RFC 9110
+        // Section 6.6.1 requires Date for a 2xx response and the peer limit
+        // cannot override that requirement.
+        Assert.assertTrue("The response should be over the advisory peer "
+                + "limit because the mandatory Date field is retained, "
+                + "actual size " + size, size > 200);
+        Assert.assertNotNull("The mandatory Date field must be retained",
+                response.getHeader("date"));
         Assert.assertNotNull("content-type must be retained",
                 response.getHeader("content-type"));
         Assert.assertNotNull("content-length must be retained",
@@ -312,7 +412,25 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
                 response.getHeader("content-security-policy"));
         Assert.assertNotNull("X-Frame-Options must be retained",
                 response.getHeader("x-frame-options"));
-        Assert.assertNull("The non-essential date field should be dropped",
+        Assert.assertNotNull("Referrer-Policy must be retained",
+                response.getHeader("referrer-policy"));
+        Assert.assertNotNull("Permissions-Policy must be retained",
+                response.getHeader("permissions-policy"));
+        Assert.assertNotNull("Cross-Origin-Opener-Policy must be retained",
+                response.getHeader("cross-origin-opener-policy"));
+        Assert.assertNotNull("Cross-Origin-Embedder-Policy must be retained",
+                response.getHeader("cross-origin-embedder-policy"));
+        Assert.assertNotNull("Cross-Origin-Resource-Policy must be retained",
+                response.getHeader("cross-origin-resource-policy"));
+        Assert.assertNotNull("Content-Security-Policy-Report-Only must be "
+                + "retained",
+                response.getHeader("content-security-policy-report-only"));
+        Assert.assertNotNull("X-XSS-Protection must be retained",
+                response.getHeader("x-xss-protection"));
+        Assert.assertNotNull("Age is a cache-semantics field and must be "
+                + "retained", response.getHeader("age"));
+        Assert.assertNotNull("Date is a mandatory response field and must be "
+                + "retained even above the peer limit",
                 response.getHeader("date"));
     }
 
@@ -320,6 +438,50 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
     private static void addSecurityServlet(Context ctxt) {
         Tomcat.addServlet(ctxt, "security", new SecurityServlet());
         ctxt.addServletMapping("/security", "security");
+    }
+
+
+    private static class LengthTrailersServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            resp.setContentType("text/plain");
+            resp.setCharacterEncoding(StandardCharsets.ISO_8859_1.name());
+            resp.setContentLength(5);
+            resp.setTrailerFields(() -> Map.of("x-test-trailer", "test"));
+            resp.getOutputStream().write("body!".getBytes(
+                    StandardCharsets.ISO_8859_1));
+        }
+    }
+
+
+    private static class StatusServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            resp.setStatus(Integer.parseInt(req.getParameter("code")));
+            resp.setContentType("text/plain");
+            resp.getWriter().print("body");
+        }
+    }
+
+
+    private static class StatusContentLengthServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            resp.setStatus(Integer.parseInt(req.getParameter("code")));
+            resp.setContentLength(10);
+        }
     }
 
 
@@ -334,6 +496,15 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
             resp.setHeader("Strict-Transport-Security", "max-age=31536000");
             resp.setHeader("Content-Security-Policy", "default-src 'self'");
             resp.setHeader("X-Frame-Options", "DENY");
+            resp.setHeader("Referrer-Policy", "no-referrer");
+            resp.setHeader("Permissions-Policy", "camera=()");
+            resp.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+            resp.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+            resp.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+            resp.setHeader("Content-Security-Policy-Report-Only",
+                    "default-src 'self'");
+            resp.setHeader("X-XSS-Protection", "1; mode=block");
+            resp.setHeader("Age", "42");
             resp.getWriter().print("security");
         }
     }

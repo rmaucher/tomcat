@@ -19,7 +19,13 @@ package org.apache.coyote.http3;
 import java.io.Serial;
 
 
-class Http3Exception extends Exception {
+/**
+ * Signals an HTTP/3 protocol error with its associated error code (RFC 9114
+ * Section 8.1). The exception is part of the public QPACK decoder emitter
+ * contract ({@link QpackDecoder.HeaderEmitter}); constructors remain package
+ * private because only the protocol implementation creates it.
+ */
+public class Http3Exception extends Exception {
 
     @Serial
     private static final long serialVersionUID = 1L;
@@ -41,5 +47,16 @@ class Http3Exception extends Exception {
 
     Http3Error getError() {
         return error;
+    }
+
+
+    /**
+     * Returns the HTTP/3 error code carried by this exception (RFC 9114
+     * Section 8.1).
+     *
+     * @return The HTTP/3 error code
+     */
+    public long getErrorCode() {
+        return error.getCode();
     }
 }

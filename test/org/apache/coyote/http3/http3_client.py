@@ -596,11 +596,13 @@ async def raw_connection(args):
     async with connect(host, port, configuration=configuration,
                        create_protocol=RawH3Protocol) as client:
         # Client control stream (first unidirectional stream, ID 2).
+        control_stream_id = None
         if not args.no_control:
-            stream_id = client.open_stream(is_unidirectional=True)
+            control_stream_id = client.open_stream(is_unidirectional=True)
             control_payload = b64d(args.control) if args.control else \
                 encode_h3_frame(H3_SETTINGS, b"")
-            client.send(stream_id, encode_varint(STREAM_TYPE_CONTROL) +
+            client.send(control_stream_id,
+                        encode_varint(STREAM_TYPE_CONTROL) +
                         control_payload, fin=args.fin_control)
         # Client QPACK streams unless disabled.
         deferred_encoder = None
@@ -649,6 +651,12 @@ async def raw_connection(args):
             stream_id = client.open_stream(is_unidirectional=True)
             client.send(stream_id, encode_varint(stream_type) + data,
                         fin=fin)
+        # Optionally pause before opening the request stream(s). This lets
+        # the server process the control/QPACK streams first when the test
+        # needs the peer's SETTINGS to be in effect before the request.
+        if args.request_delay:
+            await asyncio.sleep(args.request_delay)
+
         # Request stream(s): the first N bidirectional streams, IDs 0, 4, ...
         # Note: the stream ID counter only advances once a stream has been
         # written to, so each stream must be opened and written to before
@@ -682,9 +690,13 @@ async def raw_connection(args):
                     client.send(stream_id,
                                 encode_h3_frame(H3_DATA, b64d(args.data)))
                 if args.frame_after_data:
+                    if args.frame_after_data_delay:
+                        await asyncio.sleep(args.frame_after_data_delay)
                     for frame in args.frame_after_data:
                         client.send(stream_id, b64d(frame))
                 if args.trailers is not None:
+                    if args.trailers_delay:
+                        await asyncio.sleep(args.trailers_delay)
                     client.send(stream_id,
                                 encode_h3_frame(H3_HEADERS,
                                                 b64d(args.trailers)),
@@ -719,6 +731,19 @@ async def raw_connection(args):
             await asyncio.sleep(args.reset_request)
             try:
                 client._quic.reset_stream(request_stream_ids[0], 0x109)
+                client.transmit()
+            except Exception:
+                # The connection is gone; nothing left to reset.
+                pass
+
+        # Optionally reset the client control stream (RESET_STREAM,
+        # RFC 9000 Section 2.4). The receiver must treat closure of a critical
+        # unidirectional stream as H3_CLOSED_CRITICAL_STREAM (RFC 9114
+        # Section 6.2.1).
+        if args.reset_control is not None and control_stream_id is not None:
+            await asyncio.sleep(args.reset_control)
+            try:
+                client._quic.reset_stream(control_stream_id, 0)
                 client.transmit()
             except Exception:
                 # The connection is gone; nothing left to reset.
@@ -989,6 +1014,12 @@ def main():
                        help="do not open the client control stream")
     p_raw.add_argument("--no-qpack-streams", action="store_true",
                        help="do not open the client QPACK streams")
+    p_raw.add_argument("--request-delay", type=float, default=0.0,
+                       metavar="SECS",
+                       help="pause this long after sending the control/QPACK "
+                            "streams before opening the request stream(s), "
+                            "so the server processes the client SETTINGS "
+                            "first")
     p_raw.add_argument("--max-stream-data", type=int, default=None,
                        metavar="N",
                        help="advertise N as the per-stream flow-control "
@@ -1036,9 +1067,18 @@ def main():
                        help="base64 encoded raw HTTP/3 frame sent on the "
                             "request stream after the --data payload "
                             "(repeatable)")
+    p_raw.add_argument("--frame-after-data-delay", type=float, default=0.0,
+                       metavar="SECS",
+                       help="delay before sending the --frame-after-data "
+                            "frames, to exercise frames arriving after "
+                            "dispatch")
     p_raw.add_argument("--trailers", default=None, metavar="B64",
                        help="base64 encoded QPACK field section for request "
                             "trailers (second HEADERS frame)")
+    p_raw.add_argument("--trailers-delay", type=float, default=0.0,
+                       metavar="SECS",
+                       help="delay before sending the request trailers, to "
+                            "exercise trailers arriving after dispatch")
     p_raw.add_argument("--streams", type=int, default=1, metavar="N",
                        help="open N concurrent bidirectional request "
                             "streams with the same request payload")
@@ -1061,6 +1101,10 @@ def main():
                        help="delay before delivering the remainder of a "
                             "--declared-frame payload (lets the server sit "
                             "mid-frame with the declared frame incomplete)")
+    p_raw.add_argument("--reset-control", type=float, default=None,
+                       metavar="SECS",
+                       help="reset the client control stream (RESET_STREAM) "
+                            "after the given delay")
     p_raw.add_argument("--reset-request", type=float, default=None,
                        metavar="SECS",
                        help="reset the first request stream after the given "

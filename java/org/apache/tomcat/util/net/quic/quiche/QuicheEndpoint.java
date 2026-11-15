@@ -4148,6 +4148,9 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
     private UniStreamWriteResult flushServerUniStreamWrite(QuicheConnectionWrapper conn,
             QuicheStreamWrapper stream) {
         if (conn.isClosed() || conn.isFreed() || stream.isFreed()) {
+            if (!conn.isClosed() && !conn.isFreed()) {
+                notifyServerUniStreamClosed(conn, stream);
+            }
             stream.setWriteBuffer(null);
             return UniStreamWriteResult.FAILED;
         }
@@ -4195,13 +4198,36 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
             // write so the writable sweep's per-iteration retry stops
             // re-attempting and re-warning on this failure.
             stream.setWriteBuffer(null);
+            notifyServerUniStreamClosed(conn, stream);
             return UniStreamWriteResult.FAILED;
         } catch (RuntimeException e) {
             log.warn(sm.getString("quicheEndpoint.serverUniStreamWriteFailed",
                     Long.valueOf(stream.getStreamId())), e);
             stream.setWriteBuffer(null);
+            notifyServerUniStreamClosed(conn, stream);
             return UniStreamWriteResult.FAILED;
         }
+    }
+
+
+    private void notifyServerUniStreamClosed(QuicheConnectionWrapper conn,
+            QuicheStreamWrapper stream) {
+        if (conn.isClosed() || conn.isFreed() || conn.isClosing()) {
+            return;
+        }
+        QuicConnectionManager connManager = conn.getQuicConnectionManager();
+        if (connManager == null) {
+            return;
+        }
+        long streamId = stream.getStreamId();
+        if (streamId < 3 || (streamId & 3) != 3) {
+            return;
+        }
+        long index = (streamId - 3) / 4;
+        if (index > Integer.MAX_VALUE) {
+            return;
+        }
+        connManager.serverUniStreamClosed(conn, (int) index);
     }
 
 
@@ -4962,6 +4988,13 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
                 (connManager != null) ? connManager.getState(conn) : null;
         if (state != null && stream.getStreamType() == QuicheStreamWrapper.TYPE_BIDI) {
             state.decrementActiveStreams();
+            if (stream.getReadState() == QuicStream.ReadState.RESET_REMOTE) {
+                // A peer reset abandons the request stream. If no processor
+                // observed the reset (for example the stream was reset before
+                // dispatch), the protocol still owes its encoder a QPACK
+                // Stream Cancellation (RFC 9204 Section 2.2.2.2).
+                connManager.noteStreamAbandoned(conn, stream.getStreamId());
+            }
         }
         if (!conn.isClosed() && !conn.isFreed()) {
             if (!stream.isConcluded()) {

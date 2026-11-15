@@ -36,6 +36,11 @@ final class Qpack {
     /**
      * QPACK static table per RFC 9204 Appendix A.
      * 0-based indexing (99 entries, indices 0 through 98).
+     * <p>
+     * An entry whose value is {@code null} represents an entry whose RFC
+     * value is empty. The encoder uses that representation as a name match
+     * for a Literal Field Line with Name Reference; an empty field value is
+     * never emitted as an Indexed Field Line.
      */
     static final HeaderField[] STATIC_TABLE;
     static final int STATIC_TABLE_LENGTH;
@@ -378,11 +383,21 @@ final class Qpack {
      * excess over the prefix maximum as 7-bit groups, least significant group
      * first (RFC 7541 Section 5.1 Figure 3), with the high bit set on every
      * byte but the last.
+     * <p>
+     * The value MUST be within the iRP domain of RFC 9204 Section 4.1.1,
+     * {@code 0} to {@link #MAX_IRP_VALUE} inclusive. This method performs no
+     * range check: a negative value falls into the in-prefix branch and
+     * produces a byte whose high bits are set (the peer then reads it as an
+     * unterminated continuation), and a value above {@code MAX_IRP_VALUE}
+     * cannot be represented in the 62-bit family. Bounding the input is the
+     * caller's contract; the production callers pass stream IDs, table
+     * indexes, lengths and insert counts that are already bounded.
      *
      * @param target The buffer to write to
      * @param upper  Bits occupying the top (8-n) positions of the first byte
      * @param n      Prefix size in bits (1-8)
-     * @param value  Integer to encode
+     * @param value  Integer to encode, in the range {@code 0} to
+     *               {@link #MAX_IRP_VALUE}
      */
     public static void encodeIrp(ByteBuffer target, int upper, int n, long value) {
         int maxInline = (1 << n) - 1;

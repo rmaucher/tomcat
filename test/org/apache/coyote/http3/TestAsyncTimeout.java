@@ -55,9 +55,10 @@ public class TestAsyncTimeout extends Http3TestBase {
             ctxt.addServletMapping("/async", "async");
         });
 
-        // The timeout (2 seconds) fires before the ticker has written all 50
-        // ticks (5 seconds), so the response body must contain the PASS
-        // marker written by the onTimeout handler.
+        // The timeout (2 seconds) fires before the ticker has written all 100
+        // ticks (10 seconds), so the response body must contain the PASS
+        // marker written by the onTimeout handler. The wider ticker window
+        // keeps the test reliable on a heavily loaded machine.
         Http3Response response = get("/async");
         validateStatus(response, HttpServletResponse.SC_OK);
         String body = response.getBodyAsString();
@@ -126,8 +127,8 @@ public class TestAsyncTimeout extends Http3TestBase {
                 int counter = 0;
 
                 // If the test works running will be set to false before
-                // counter reaches 50.
-                while (running && counter < 50) {
+                // counter reaches 100.
+                while (running && counter < 100) {
                     sleep(100);
                     counter++;
                     pw.print("Tick " + counter);

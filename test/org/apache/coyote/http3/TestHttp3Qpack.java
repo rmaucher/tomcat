@@ -16,6 +16,7 @@
  */
 package org.apache.coyote.http3;
 
+import java.nio.ByteBuffer;
 import java.util.Base64;
 
 import org.junit.Assert;
@@ -34,6 +35,14 @@ public class TestHttp3Qpack extends Http3TestBase {
         for (int i = 0; i < bytes.length; i++) {
             result[i] = (byte) bytes[i];
         }
+        return Base64.getEncoder().encodeToString(result);
+    }
+
+
+    private static String b64(ByteBuffer buffer) {
+        ByteBuffer view = buffer.duplicate();
+        byte[] result = new byte[view.remaining()];
+        view.get(result);
         return Base64.getEncoder().encodeToString(result);
     }
 
@@ -267,5 +276,48 @@ public class TestHttp3Qpack extends Http3TestBase {
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_ENCODER_STREAM_ERROR);
+    }
+
+
+    @Test
+    public void testOversizeEncodedInsertCountRejected() throws Exception {
+        startHttp3Server();
+
+        // An Encoded Insert Count above Integer.MAX_VALUE can never be
+        // produced by a conformant encoder (the encoded value is modulo
+        // 2 * MaxEntries, with MaxEntries bounded by the advertised table
+        // capacity). RFC 9204 Section 4.5.1.1 requires a connection error of
+        // type QPACK_DECOMPRESSION_FAILED, not a stream-scoped
+        // value-too-large error.
+        ByteBuffer block = ByteBuffer.allocate(32);
+        Qpack.encodeIrp(block, 0, 8, 0x1_0000_0000L);
+        Qpack.encodeIrp(block, 0, 7, 0);
+        block.flip();
+
+        ClientOutput output = runClient(rawCommandWith("--headers",
+                b64(block), "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
+    }
+
+
+    @Test
+    public void testOversizeStaticTableIndexRejected() throws Exception {
+        startHttp3Server();
+
+        // An Indexed Field Line with a static table index above
+        // Integer.MAX_VALUE is invalid (the static table has 99 entries).
+        // RFC 9204 Section 3.1 requires a connection error of type
+        // QPACK_DECOMPRESSION_FAILED.
+        ByteBuffer block = ByteBuffer.allocate(32);
+        Qpack.encodeIrp(block, 0, 8, 0);
+        Qpack.encodeIrp(block, 0, 7, 0);
+        Qpack.encodeIrp(block, 0xC0, 6, 0x1_0000_0000L);
+        block.flip();
+
+        ClientOutput output = runClient(rawCommandWith("--headers",
+                b64(block), "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
     }
 }

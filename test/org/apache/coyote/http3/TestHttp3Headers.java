@@ -70,7 +70,8 @@ public class TestHttp3Headers extends Http3TestBase {
         // the message malformed. The production QPACK encoder emits values as
         // raw (non-Huffman) string literals, so this exercises the raw path
         // of the value validation in Http3Processor.emitHeader().
-        ClientOutput output = rawGet("/simple", "x-test", "a\r\nb");
+        ClientOutput output = rawGetUnvalidated("/simple", "x-test",
+                "a\r\nb");
 
         assertStreamError(output, H3_MESSAGE_ERROR);
     }
@@ -80,7 +81,7 @@ public class TestHttp3Headers extends Http3TestBase {
     public void testRawValueWithNulRejected() throws Exception {
         startHttp3Server();
 
-        ClientOutput output = rawGet("/simple", "x-test", "a\0b");
+        ClientOutput output = rawGetUnvalidated("/simple", "x-test", "a\0b");
 
         assertStreamError(output, H3_MESSAGE_ERROR);
     }
@@ -90,8 +91,11 @@ public class TestHttp3Headers extends Http3TestBase {
     public void testRawValueWithLeadingSpaceRejected() throws Exception {
         startHttp3Server();
 
-        // RFC 9110 Section 5.5: a field value must start with a VCHAR.
-        ClientOutput output = rawGet("/simple", "x-test", " leading");
+        // RFC 9110 Section 5.5: a field value must start with a VCHAR. The
+        // production QPACK encoder now filters leading/trailing whitespace, so
+        // bypass it to exercise the decoder's raw-value validation.
+        ClientOutput output = rawGetUnvalidated("/simple", "x-test",
+                " leading");
 
         assertStreamError(output, H3_MESSAGE_ERROR);
     }
@@ -101,8 +105,11 @@ public class TestHttp3Headers extends Http3TestBase {
     public void testRawValueWithTrailingSpaceRejected() throws Exception {
         startHttp3Server();
 
-        // RFC 9110 Section 5.5: a field value must end with a VCHAR.
-        ClientOutput output = rawGet("/simple", "x-test", "trailing ");
+        // RFC 9110 Section 5.5: a field value must end with a VCHAR. The
+        // production QPACK encoder now filters leading/trailing whitespace, so
+        // bypass it to exercise the decoder's raw-value validation.
+        ClientOutput output = rawGetUnvalidated("/simple", "x-test",
+                "trailing ");
 
         assertStreamError(output, H3_MESSAGE_ERROR);
     }
@@ -167,6 +174,77 @@ public class TestHttp3Headers extends Http3TestBase {
 
 
     @Test
+    public void testErrorResponseOmitsAltSvcWithoutAuthorityPort()
+            throws Exception {
+        startHttp3Server(this::addServerNameServlet);
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAltService("h3");
+
+        // The request has a valid :authority without an explicit port and a
+        // malformed Host field, so the protocol answers with a 400 before
+        // CoyoteAdapter can apply the scheme-default port. The Alt-Svc
+        // advertisement must not contain a placeholder or invalid port.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":path", "/serverName",
+                ":authority", "127.0.0.1",
+                "host", "bad host");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 400);
+        Assert.assertNull("Alt-Svc must be omitted when there is no valid "
+                + "request port", response.getHeader("alt-svc"));
+    }
+
+
+    @Test
+    public void testAuthorityPortOutOfRangeRejected() throws Exception {
+        startHttp3Server(this::addServerNameServlet);
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAltService("h3");
+
+        // RFC 3986 Section 3.2.3 defines port as a decimal number in the
+        // range 0-65535. A larger authority port must not be accepted and
+        // reflected into the Alt-Svc response field.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":path", "/serverName",
+                ":authority", "127.0.0.1:65536");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 400);
+        Assert.assertNull("An out-of-range authority port must not appear "
+                + "in Alt-Svc", response.getHeader("alt-svc"));
+    }
+
+
+    @Test
+    public void testErrorResponseCarriesConfiguredServerAndDate()
+            throws Exception {
+        startHttp3Server(this::addServerNameServlet);
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setServer("TestServer");
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAltService("h3");
+
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":path", "/serverName",
+                ":authority", "127.0.0.1:" + port,
+                "host", "bad host");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 400);
+        // RFC 9110 Section 6.6.1: an origin server with a clock MUST send a
+        // Date field in a 4xx response. The connector's configured Server
+        // and Alt-Svc values also apply to responses generated by the
+        // protocol itself, not only to container responses.
+        Assert.assertNotNull("A 400 response must carry a Date field",
+                response.getHeader("date"));
+        Assert.assertEquals("TestServer", response.getHeader("server"));
+        Assert.assertEquals(String.format("h3=\":%d\"",
+                Integer.valueOf(port)), response.getHeader("alt-svc"));
+    }
+
+
+    @Test
     public void testHostHeaderSuppliesAuthority() throws Exception {
         startHttp3Server(this::addServerNameServlet);
 
@@ -196,6 +274,24 @@ public class TestHttp3Headers extends Http3TestBase {
         Http3Response response = output.getResponse();
         validateStatus(response, 200);
         Assert.assertEquals("127.0.0.1:" + port, response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testCaseInsensitiveHostAndAuthorityAccepted() throws Exception {
+        startHttp3Server(this::addServerNameServlet);
+
+        // RFC 3986 Section 3.2.2 and RFC 9110 Section 7.2 define host names
+        // as case-insensitive. A Host value differing only in case from
+        // :authority is consistent and must be accepted.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "https", ":path", "/serverName",
+                ":authority", "localhost:" + port,
+                "host", "LOCALHOST:" + port);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertEquals("localhost:" + port, response.getBodyAsString());
     }
 
 
@@ -515,6 +611,42 @@ public class TestHttp3Headers extends Http3TestBase {
 
         validateStatus(response, 200);
         Assert.assertEquals("h2=\":8443\"", response.getHeader("alt-svc"));
+    }
+
+
+    @Test
+    public void testEmptyAltServiceNotAnnounced() throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAltService("");
+
+        // An empty value is not a usable protocol identifier. It must be
+        // treated like an unset value rather than emitted as
+        // Alt-Svc: =":<port>".
+        Http3Response response = get("/simple");
+
+        validateStatus(response, 200);
+        Assert.assertNull("An empty Alt-Svc value must not be announced",
+                response.getHeader("alt-svc"));
+    }
+
+
+    @Test
+    public void testInvalidAltServiceRejected() throws Exception {
+        startHttp3Server();
+        AbstractHttp3Protocol protocol =
+                (AbstractHttp3Protocol) connector.getProtocolHandler();
+        protocol.setAltService("h3");
+
+        try {
+            protocol.setAltService("h3 not-a-token");
+            Assert.fail("An Alt-Svc value that is not a token must be "
+                    + "rejected");
+        } catch (IllegalArgumentException expected) {
+            // Expected: the invalid value must not be stored.
+        }
+        Assert.assertEquals("An invalid Alt-Svc value must not replace the "
+                + "previous valid value", "h3", protocol.getAltService());
     }
 
 
