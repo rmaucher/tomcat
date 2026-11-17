@@ -142,6 +142,27 @@
       Units are in bytes.</p>
     </attribute>
 
+    <attribute name="connectProtocols" required="false">
+      <p>A comma-separated list of the <code>:protocol</code> values this
+      connector supports for an Extended CONNECT request (RFC 9220 Section 3).
+      Matching is case-insensitive (RFC 9110 Section 7.8) and whitespace
+      around each value is ignored. When <code>enableConnectProtocol</code>
+      is enabled, an Extended CONNECT carrying a <code>:protocol</code>
+      value that is not listed is answered with <code>501</code> by the
+      connector rather than being dispatched to the application; with the
+      default empty list, every Extended CONNECT is answered with
+      <code>501</code>. When <code>enableConnectProtocol</code> is disabled
+      (the default), the peer has not been told that Extended CONNECT is
+      permitted (RFC 9220 Section 3.2), so a request carrying
+      <code>:protocol</code> is rejected earlier by request validation as a
+      malformed message (a stream error of type
+      <code>H3_MESSAGE_ERROR</code>) and the <code>501</code> path is not
+      reached. The configured values are local policy and are not advertised
+      in the HTTP/3 SETTINGS frame; only
+      <code>enableConnectProtocol</code> controls the
+      <code>SETTINGS_ENABLE_CONNECT_PROTOCOL</code> advertisement.</p>
+    </attribute>
+
     <attribute name="continueResponseTiming" required="false">
       <p>When to respond with a <code>100</code> intermediate response code to
       a request containing an <code>Expect: 100-continue</code> header.
@@ -161,15 +182,19 @@
       <p>A boolean value which controls whether Extended CONNECT (RFC 9220)
       is permitted. When enabled, the value <code>1</code> is advertised to
       peers via <code>SETTINGS_ENABLE_CONNECT_PROTOCOL</code> and requests
-      carrying a <code>:protocol</code> pseudo-header are accepted. RFC 9220
-      tunnels carry application data in ordinary HTTP/3 DATA frames; HTTP
-      datagrams (RFC 9297) are a separate extension used by WebTransport and
-      are not required for a CONNECT tunnel. Note that the current Servlet
-      container implementation intercepts every CONNECT request (plain or
-      Extended) with a <code>501</code> response before the application, so
-      enabling this attribute does not currently make an application-visible
-      CONNECT tunnel available. If not specified, this attribute is set to
-      <code>false</code>.</p>
+      carrying a <code>:protocol</code> pseudo-header are accepted, subject to
+      the <code>connectProtocols</code> list. An Extended CONNECT whose
+      <code>:protocol</code> value is not registered in that list is answered
+      with <code>501</code> by the connector. Plain CONNECT and supported
+      Extended CONNECT requests are passed to the application; the current
+      Servlet container implementation then intercepts every CONNECT request
+      (plain or Extended) with a <code>501</code> response before the
+      application, so enabling this attribute does not currently make an
+      application-visible CONNECT tunnel available. RFC 9220 tunnels carry
+      application data in ordinary HTTP/3 DATA frames; HTTP datagrams
+      (RFC 9297) are a separate extension used by WebTransport and are not
+      required for a CONNECT tunnel. If not specified, this attribute is set
+      to <code>false</code>.</p>
     </attribute>
 
     <attribute name="h2CompatibleIdentity" required="false">
@@ -198,8 +223,8 @@
     <attribute name="maxConcurrentStreams" required="false">
       <p>The maximum number of active request streams permitted for any one
       connection. The value must be greater than zero and no greater than
-      <code>2^62 - 1</code> (the largest value a QUIC variable-length integer
-      can carry, RFC 9000 Section 16); values outside this range are rejected
+      <code>2^60</code> (the largest valid QUIC stream count, RFC 9000
+      Sections 4.6 and 18.2); values outside this range are rejected
       with an <code>IllegalArgumentException</code>. If a client attempts to
       open more active streams than this limit, the additional streams are
       refused. The effective limit is clamped to the limit the QUIC transport
@@ -235,6 +260,17 @@
       raising this value to the effective maximum should account for the
       configured concurrency using the wire-side bound, not the decoded
       limit.</p>
+      <p>In addition to the retained wire bytes, each Huffman-coded string
+      literal is decoded before the decoded field-section limit is applied.
+      The shortest RFC 7541 Huffman code is five bits, so the decoded
+      character buffer can temporarily be up to 8/5 times the encoded length
+      (about 1.6 times the wire bound, and about six times the configured
+      decoded limit in the worst case). This transient buffer is released
+      after the literal is decoded, but memory sizing for a raised limit
+      should include it per concurrently decoded stream. The same transient
+      expansion applies while decoding QPACK encoder-stream insertions,
+      bounded by the advertised dynamic-table capacity rather than by
+      <code>maxFieldSectionSize</code>.</p>
     </attribute>
 
     <attribute name="noCompressionEncodings" required="false">
@@ -419,6 +455,23 @@
   is retained per request stream, so the per-connection worst case scales
   with <code>maxConcurrentStreams</code>.</p>
 
+  <p>A DATA or HEADERS frame on a request stream whose declared payload
+  exceeds 16 MiB is rejected at the frame header with
+  <code>RESET_STREAM</code> and error code <code>H3_FRAME_ERROR</code>. The
+  frame is protocol-valid (HTTP/3 has no negotiated frame-size limit), so
+  this is a local implementation limit; for DATA it applies even though the
+  payload could otherwise be streamed.</p>
+
+  <p>For HTTP/3, <code>allowedTrailerHeaders</code> filters the incoming
+  request trailer fields that are exposed to the application, just as it does
+  for chunked HTTP/1.1 input. It has no effect on outgoing response trailer
+  fields; those are filtered by a separate fixed list of field names that
+  cannot appear in trailers (for example <code>Content-Length</code>,
+  <code>Host</code> and <code>TE</code>). The allow-list cannot override that
+  fixed list for incoming trailers either: a field that is prohibited in
+  trailers by RFC 9110 Section 6.5.1 is ignored even when it is explicitly
+  allowed.</p>
+
   <p>Note that send file support is not available over QUIC: response
   bodies are always written through the output buffer as HTTP/3
   <code>DATA</code> frames.</p>
@@ -426,10 +479,70 @@
   <p>At <code>TRACE</code> level the HTTP/3 implementation logs encoded and
   decoded header names and values, which may include authorization tokens,
   cookies and other credentials. At <code>DEBUG</code> level, exception
-  messages for malformed headers can include raw field names, field values,
-  <code>Host</code> values and SNI names. Treat both <code>TRACE</code> and
-  <code>DEBUG</code> logs as potentially sensitive and restrict access to
-  them.</p>
+  messages for malformed headers can include field names, field values,
+  <code>Host</code> values and SNI names; control bytes are rendered as
+  <code>0xNN</code>, but other peer-controlled text remains visible. Treat
+  both <code>TRACE</code> and <code>DEBUG</code> logs as potentially
+  sensitive and restrict access to them.</p>
+
+  </subsection>
+
+
+  <subsection name="Resource Limits">
+
+  <p>In addition to the configurable limits above, the HTTP/3 implementation
+  applies the following fixed per-connection or per-request limits to bound
+  memory and processing. Exceeding a limit is reported to the peer with the
+  error code shown. These values are implementation constants; they are not
+  configurable connector attributes.</p>
+
+  <ul>
+  <li>A SETTINGS frame may carry at most 4096 setting identifiers; exceeding
+  the limit fails the connection with <code>H3_EXCESSIVE_LOAD</code>.</li>
+  <li>Inbound QPACK instructions on the encoder and decoder streams combined
+  are limited to 262144 instructions and 128 MiB of instruction bytes per
+  connection; exceeding either budget fails the connection with
+  <code>H3_EXCESSIVE_LOAD</code>.</li>
+  <li>At most 65536 QPACK decoder instructions (Section Acknowledgment, Stream
+  Cancellation and Insert Count Increment) may be pending per connection;
+  exceeding the pending-instruction limit fails the connection with
+  <code>H3_EXCESSIVE_LOAD</code>.</li>
+  <li>The buffer of pre-open PRIORITY_UPDATE signals holds at most
+  <code>min(4096, max(16, maxConcurrentStreams))</code> entries (the ceiling is
+  4096; the concurrent-stream limit lowers it, with a floor of 16 when that
+  limit is smaller than 16); the oldest least-recently-used entries are
+  evicted. This is a memory bound and does not fail the connection.</li>
+  <li>Known client control-stream frames are limited to 65536 frames and
+  32 MiB of declared payload per connection; exceeding either budget fails the
+  connection with <code>H3_EXCESSIVE_LOAD</code>.</li>
+  <li>Unknown control-stream frames are limited to 16384 frames and 64 MiB of
+  declared payload per connection; data discarded from unknown
+  unidirectional streams is limited to 64 MiB per connection. Exceeding either
+  budget fails the connection with <code>H3_EXCESSIVE_LOAD</code>.</li>
+  <li>Padding and other non-body frames on request streams are limited to
+  16384 frames and 64 MiB per request, and to 262144 frames and 256 MiB for
+  the lifetime of a connection; exceeding either budget fails the connection
+  with <code>H3_EXCESSIVE_LOAD</code>.</li>
+  <li>A DATA or HEADERS frame whose declared payload exceeds 16 MiB is rejected
+  with <code>RESET_STREAM</code> and <code>H3_FRAME_ERROR</code> (see above).</li>
+  <li>At most 64 KiB of request body is buffered before dispatch. The
+  pre-dispatch body buffer is allocated lazily, and grows only as DATA payload
+  actually arrives, so a peer-declared Content-Length (or DATA frame length)
+  cannot force the full allocation before any body byte is received. The
+  remainder is read on demand and does not fail the request.</li>
+  <li>A blocking request-body read waits at most the configured read timeout,
+  or 30 seconds when none is configured, before the stream is reset with
+  <code>H3_REQUEST_INCOMPLETE</code> or <code>H3_REQUEST_CANCELLED</code> and
+  the read fails with a timeout.</li>
+  <li>The QPACK dynamic table capacity is capped at 4 MiB (see
+  <code>qpackMaxTableCapacity</code>).</li>
+  <li>The ordered non-blocking response write queue is bounded to 256 KiB of
+  queued frames after the current application write. One application write
+  larger than that bound is accepted as a single oversized batch at the head
+  of an otherwise empty queue; frames from later writes are counted against
+  the bound. If the bound is exceeded, the frame is dropped and the response
+  stream is reset with <code>H3_INTERNAL_ERROR</code>.</li>
+  </ul>
 
   </subsection>
 

@@ -73,10 +73,13 @@ public final class Constants {
     public static final int DEFAULT_MAX_FIELD_SECTION_SIZE = 16 * 1024;
 
     /**
-     * Maximum size of a single buffered frame payload on a request stream.
-     * HTTP/3 has no negotiated frame-size limit, so this is a local
-     * buffering limit; it also bounds the largest field section the receiver
-     * can actually accept.
+     * Maximum declared payload size of a DATA or HEADERS frame on a request
+     * stream. HTTP/3 has no negotiated frame-size limit, so this is a local
+     * implementation limit. A DATA frame above the limit is rejected with
+     * {@code RESET_STREAM H3_FRAME_ERROR} at stream scope even though its
+     * payload could otherwise be streamed; HEADERS frames above the limit
+     * cannot be buffered. The limit also bounds the largest field section the
+     * receiver can actually accept.
      */
     public static final int MAX_FRAME_LENGTH = 16 * 1024 * 1024;
 
@@ -209,11 +212,10 @@ public final class Constants {
     // Request attribute carrying the :protocol pseudo-header value of an
     // extended CONNECT request (RFC 9220 Section 3). The value is kept
     // separate from the scheme (:scheme and :protocol are distinct
-    // pseudo-headers, RFC 9220 Section 3.1). Note for future readers: no
-    // component in this tree consumes the attribute yet; the pseudo-header
-    // shape is validated and the value stored so applications - and a
-    // future extended-CONNECT feature (e.g. WebSocket over HTTP/3) - can
-    // retrieve it.
+    // pseudo-headers, RFC 9220 Section 3.1). The processor uses the attribute
+    // to answer an unsupported :protocol value with 501 and stores it so
+    // applications - and a future extended-CONNECT feature (e.g. WebSocket
+    // over HTTP/3) - can retrieve it.
     public static final String ATTR_EXTENDED_CONNECT_PROTOCOL =
             "org.apache.coyote.http3.protocol";
 

@@ -197,6 +197,32 @@ public class TestHttp3QpackBlockedStreams extends Http3TestBase {
 
 
     @Test
+    public void testBlockedStreamResetDoesNotFailConnection() throws Exception {
+        startHttp3Server();
+        enableBlockedStreams(4);
+
+        // No --encoder payload: the blocked field section requires an insert
+        // that never arrives. Reset the request stream while the server is
+        // blocked waiting for it. The reset must abandon the blocked decode,
+        // not wait for the blocked-stream timeout and fail the whole
+        // connection (RFC 9204 Sections 2.1.2 and 2.2.2.2).
+        ClientOutput output = runClient(rawCommandWith(
+                "--headers", b64(blockedFieldSection()),
+                "--no-fin",
+                "--reset-request", "0.5",
+                "--timeout", "7",
+                "--wait", "1"), CLIENT_TIMEOUT_SECONDS);
+
+        Assert.assertNull("A reset blocked stream must not fail the "
+                        + "connection: " + output.getLines(),
+                output.getConnectionError());
+
+        // The server stays healthy for subsequent connections.
+        validateStatus(get("/simple"), 200);
+    }
+
+
+    @Test
     public void testBlockedStreamLimitExceeded() throws Exception {
         startHttp3Server();
         enableBlockedStreams(1);

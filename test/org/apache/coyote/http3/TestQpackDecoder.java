@@ -623,6 +623,43 @@ public class TestQpackDecoder {
 
 
     @Test
+    public void testBlockedExceptionLeavesBufferAtBlockStart() throws Exception {
+        QpackDecoder decoder = new QpackDecoder(
+                Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        putPrefix(block, 3, 0);     // RIC = 2 with 0 inserts: blocked
+        putIndexedStatic(block, STATIC_METHOD_GET);
+        block.flip();
+
+        // Place the field section at a non-zero position to prove the
+        // decoder restores the caller's block start rather than position 0.
+        int start = 3;
+        ByteBuffer padded = ByteBuffer.allocate(start + block.remaining());
+        padded.put(new byte[] { 1, 2, 3 });
+        padded.put(block);
+        padded.flip();
+        padded.position(start);
+
+        try {
+            collect(decoder, padded);
+            Assert.fail("Expected the field section to block");
+        } catch (QpackBlockedException e) {
+            Assert.assertEquals("A blocked section must leave the buffer at "
+                    + "the block start for a later re-decode", start,
+                    padded.position());
+        }
+
+        // Once the required inserts have arrived, re-decoding from the same
+        // position must succeed without an explicit rewind.
+        insertSeries(decoder, 2);
+        List<String[]> emitted = collect(decoder, padded);
+        Assert.assertEquals(1, emitted.size());
+        Assert.assertEquals("GET", emitted.get(0)[1]);
+    }
+
+
+    @Test
     public void testPostBaseAtOrAboveRicRejected() throws Exception {
         QpackDecoder decoder = new QpackDecoder(Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
         insertSeries(decoder, 2);   // absolute 0..1
@@ -1127,6 +1164,60 @@ public class TestQpackDecoder {
                 emitted.isEmpty());
         Assert.assertTrue("Truncated prefix must leave the block unconsumed",
                 block.hasRemaining());
+    }
+
+
+    @Test
+    public void testOverlongStaticIndexEncodingIsValueTooLarge()
+            throws Exception {
+        QpackDecoder decoder = new QpackDecoder(
+                Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        putPrefix(block, 0, 0);
+        // Indexed Field Line, static table, index 63 (a valid entry) encoded
+        // with redundant continuation octets: the encoded-length limit is an
+        // implementation limit (RFC 9204 Section 7.4), not an invalid
+        // reference, so it must surface as the stream-scoped
+        // QpackValueTooLargeException rather than a plain QpackException.
+        block.put((byte) 0xFF);
+        for (int i = 0; i < 10; i++) {
+            block.put((byte) 0x80);
+        }
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an encoded-length limit failure");
+        } catch (QpackException e) {
+            Assert.assertTrue("An overlong encoding of a valid index must be "
+                    + "reported as a value-too-large implementation limit",
+                    e instanceof QpackIntegerEncodingLimitException);
+        }
+    }
+
+
+    @Test
+    public void testOverlongEncodedInsertCountIsValueTooLarge()
+            throws Exception {
+        QpackDecoder decoder = new QpackDecoder(
+                Qpack.DEFAULT_TABLE_SIZE, Qpack.DEFAULT_TABLE_SIZE);
+
+        ByteBuffer block = ByteBuffer.allocate(64);
+        block.put((byte) 0xFF);
+        for (int i = 0; i < 10; i++) {
+            block.put((byte) 0x80);
+        }
+        block.flip();
+
+        try {
+            collect(decoder, block);
+            Assert.fail("Expected an encoded-length limit failure");
+        } catch (QpackException e) {
+            Assert.assertTrue("An overlong Encoded Insert Count encoding must "
+                    + "be reported as a value-too-large implementation limit",
+                    e instanceof QpackIntegerEncodingLimitException);
+        }
     }
 
 

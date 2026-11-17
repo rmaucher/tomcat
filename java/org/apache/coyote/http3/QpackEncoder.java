@@ -131,7 +131,10 @@ public class QpackEncoder {
                 StringBuilder sb = new StringBuilder("QPACK encode headers (");
                 sb.append(headers.size()).append("): ");
                 for (int i = 0; i < headers.size(); i++) {
-                    sb.append('[').append(i).append("]").append(headers.getName(i).toString()).append("=").append(headers.getValue(i).toString()).append(" ");
+                    sb.append('[').append(i).append(']').append(
+                            Http3Log.printable(headers.getName(i).toString()))
+                            .append("=").append(Http3Log.printable(
+                                    headers.getValue(i).toString())).append(' ');
                 }
                 log.trace(sb.toString());
             }
@@ -176,7 +179,7 @@ public class QpackEncoder {
                 skip = true;
                 if (log.isDebugEnabled()) {
                     log.debug(sm.getString("qpackEncoder.invalidNameSkipped",
-                            name));
+                            Http3Log.printable(name)));
                 }
             } else if (firstPass) {
                 if (!pseudo) {
@@ -199,7 +202,8 @@ public class QpackEncoder {
                     // corrupting it or emitting an invalid field line.
                     if (log.isDebugEnabled()) {
                         log.debug(sm.getString(
-                                "qpackEncoder.invalidValueSkipped", name));
+                                "qpackEncoder.invalidValueSkipped",
+                                Http3Log.printable(name)));
                     }
                 } else {
                     // HTTP field values are byte strings (RFC 9110 Section
@@ -208,7 +212,7 @@ public class QpackEncoder {
                     // byte per char rather than re-encoding as UTF-8 (which
                     // would change the bytes and fail to round-trip through
                     // Qpack.decodeString()).
-                    byte[] nameBytes = toBytes(name);
+                    byte[] nameBytes = toFieldBytes(name);
                     byte[] valueBytes = toValueBytes(value);
 
                     StaticTableMatch match = lookupStaticTable(name, value);
@@ -224,10 +228,12 @@ public class QpackEncoder {
 
                     if (log.isTraceEnabled()) {
                         log.trace(sm.getString("qpackEncoder.encodeHeader",
-                                name, value));
+                                Http3Log.printable(name),
+                                Http3Log.printable(value)));
                     }
 
-                    if (match.exact() >= 0 && shouldIndex(name, value)) {
+                    if (match.exact() >= 0 &&
+                            shouldUseIndexedStaticRepresentation(name, value)) {
                         // Indexed Field Line (RFC 9204 Section 4.5.2)
                         encodeIndexed(target, match.exact(), true);
                     } else if (match.exact() < 0 && match.nameOnly() >= 0) {
@@ -332,14 +338,18 @@ public class QpackEncoder {
 
 
     /*
-     * HTTP/3 field values are byte strings (RFC 9110 Section 5.5). Tomcat's
-     * header values use ISO-8859-1 characters (one byte per char), matching
-     * HTTP/1.1 and HPACK; UTF-8 re-encoding here would change non-ASCII
-     * values and make an HTTP/3 round trip produce a different string from
-     * the request decode path.
+     * Converts a field name or field value string to its one-byte-per-char
+     * ISO-8859-1 wire form. HTTP/3 field names and values are byte strings
+     * (RFC 9110 Sections 5.1 and 5.5); Tomcat stores them as ISO-8859-1
+     * characters, matching HTTP/1.1 and HPACK, and UTF-8 re-encoding would
+     * change non-ASCII values and make an HTTP/3 round trip produce a
+     * different string from the request decode path. Names are validated as
+     * tokens by encode(); the shared field-vchar check accepts every valid
+     * token name. Values that encode() has already validated pass
+     * {@code validate=false} to avoid a second scan.
      */
-    private static byte[] toBytes(String s) {
-        if (!isEncodableValue(s)) {
+    private static byte[] toFieldBytes(String s, boolean validate) {
+        if (validate && !isEncodableValue(s)) {
             throw new IllegalArgumentException(
                     sm.getString("qpackEncoder.invalidValue"));
         }
@@ -351,17 +361,13 @@ public class QpackEncoder {
     }
 
 
-    /*
-     * Converts an already validated field value to its one-byte-per-char wire
-     * form. encode() has just run isEncodableValue() on the value, so this
-     * variant does not repeat the scan.
-     */
+    private static byte[] toFieldBytes(String s) {
+        return toFieldBytes(s, true);
+    }
+
+
     private static byte[] toValueBytes(String s) {
-        byte[] bytes = new byte[s.length()];
-        for (int i = 0; i < s.length(); i++) {
-            bytes[i] = (byte) s.charAt(i);
-        }
-        return bytes;
+        return toFieldBytes(s, false);
     }
 
 
@@ -395,8 +401,9 @@ public class QpackEncoder {
 
 
     /*
-     * Whether a header value can be represented by one wire byte per char
-     * and contains only characters permitted in an HTTP field value.
+     * Whether a field name or field value string can be represented by one
+     * wire byte per char and contains only characters permitted in an HTTP
+     * field value (a valid token name is also a field-vchar string).
      * RFC 9110 Section 5.5 defines field-value as *field-content, where
      * field-content is field-vchar [ 1*( SP / HTAB / field-vchar ) field-vchar ]:
      * a value therefore has no leading or trailing whitespace. Values outside
@@ -429,7 +436,22 @@ public class QpackEncoder {
     }
 
 
-    private boolean shouldIndex(String name, String value) {
+    /**
+     * Whether an exact static-table match may be emitted as an Indexed Field
+     * Line (RFC 9204 Section 4.5.2) rather than as a Literal Field Line with
+     * Name Reference (Section 4.5.4). This is only a choice between two
+     * representations of the static table; the encoder never inserts into a
+     * dynamic table. Values that are sensitive (authorization/set-cookie/
+     * cookie), connection framing metadata (content-length/date/etag) or
+     * likely to vary use the literal name-reference form.
+     *
+     * @param name  The (lower-cased) field name
+     * @param value The field value
+     *
+     * @return {@code true} if the exact static match may be indexed
+     */
+    private boolean shouldUseIndexedStaticRepresentation(String name,
+            String value) {
         if (value == null || value.isEmpty()) {
             return false;
         }

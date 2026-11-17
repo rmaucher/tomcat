@@ -32,7 +32,7 @@ package org.apache.coyote.http3;
  *     RFC 9204 Section 8.3 (QPACK)</li>
  * </ul>
  */
-enum Http3Error {
+public enum Http3Error {
     // @formatter:off
     // RFC 9114 Section 8.1 - HTTP/3 Error Codes
     H3_NO_ERROR                    (0x100),
@@ -73,13 +73,15 @@ enum Http3Error {
     /**
      * Returns whether this code is stream-scoped when emitted by the
      * processor layer (QUIC {@code RESET_STREAM}) rather than a connection
-     * error. Only {@link #H3_MESSAGE_ERROR} is classified here. Other
-     * stream-scoped resets ({@link #H3_REQUEST_INCOMPLETE},
-     * {@link #H3_FRAME_ERROR}, {@link #H3_QPACK_DECOMPRESSION_FAILED}) are
-     * emitted directly through {@code Http3StreamException} or
-     * {@code handleStreamError()} and bypass this method. The classification
-     * drives the base-{@link Http3Exception} dispatch in {@code service()} and
-     * {@code isTrailerFieldsReady()}.
+     * error. Only {@link #H3_MESSAGE_ERROR} is classified here. The other
+     * stream-scoped resets this implementation emits bypass this method:
+     * {@link #H3_REQUEST_INCOMPLETE}, {@link #H3_REQUEST_REJECTED},
+     * {@link #H3_REQUEST_CANCELLED}, {@link #H3_FRAME_ERROR} and
+     * {@link #H3_QPACK_DECOMPRESSION_FAILED} (for a truncated field section
+     * or an implementation-limit integer encoding) are emitted directly
+     * through {@code Http3StreamException} or {@code handleStreamError()}.
+     * The classification drives the base-{@link Http3Exception} dispatch in
+     * {@code service()} and {@code isTrailerFieldsReady()}.
      *
      * @return {@code true} if the processor layer emits this code only as a
      *         stream error

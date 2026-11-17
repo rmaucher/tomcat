@@ -173,6 +173,37 @@ final class Qpack {
 
 
     /**
+     * Decodes the two QUIC variable-length integers that make up an HTTP/3
+     * frame header (frame type and declared payload length, RFC 9114
+     * Section 7.1) into {@code out[0]} and {@code out[1]}. If either varint is
+     * incomplete, the buffer position is restored to the start of the header
+     * and {@code false} is returned so the caller can retain the bytes and
+     * re-parse after more data arrives.
+     *
+     * @param source The buffer to read from
+     * @param out    Two-element array receiving the type and length
+     *
+     * @return {@code true} if a complete header was decoded
+     */
+    static boolean decodeFrameHeader(ByteBuffer source, long[] out) {
+        int start = source.position();
+        long frameType = decodeQuicInteger(source);
+        if (frameType == -1) {
+            source.position(start);
+            return false;
+        }
+        long frameLength = decodeQuicInteger(source);
+        if (frameLength == -1) {
+            source.position(start);
+            return false;
+        }
+        out[0] = frameType;
+        out[1] = frameLength;
+        return true;
+    }
+
+
+    /**
      * Decodes a QUIC variable-length integer (RFC 9000 Section 16).
      * Used for HTTP/3 frame types and frame lengths (RFC 9114 Section 7.1)
      * and for SETTINGS identifiers and values (RFC 9114 Section 7.2.4).
@@ -308,22 +339,29 @@ final class Qpack {
                 return -1;
             }
             b = source.get() & 0xFF;
-            // The bound is tested before the addition. A group at a shift
-            // beyond 56 cannot represent any bit of a value at or below the
-            // 62-bit maximum, and one at shift 56 (or below) whose
-            // contribution would take the running sum past it is likewise
-            // out of range; adding first would in both cases wrap the sum
-            // into a negative long before any guard saw it, and consumers
-            // read a negative return as "incomplete" rather than as an
-            // error, so the offending bytes would be retained forever
-            // instead of failing the connection/stream.
-            if (shift >= 63 ||
-                    (long) (b & 0x7F) << shift > MAX_IRP_VALUE - value) {
+            // The bound is tested before the addition. An encoding with a
+            // group at shift 63 or beyond exceeds the octet limit of
+            // RFC 9204 Section 7.4 regardless of the value it represents;
+            // report it separately so consumers can scope it as an
+            // implementation limit rather than as an invalid reference. A
+            // group at shift 56 (or below) whose contribution would take
+            // the running sum past the 62-bit maximum is a value-domain
+            // overflow; adding it first would wrap the sum into a negative
+            // long before any guard saw it, and consumers read a negative
+            // return as "incomplete" rather than as an error, so the
+            // offending bytes would be retained forever instead of failing
+            // the connection/stream.
+            if (shift >= 63) {
+                source.position(sp);
+                throw new QpackIntegerEncodingLimitException(
+                        sm.getString("qpack.integerTooLarge"));
+            }
+            if ((long) (b & 0x7F) << shift > MAX_IRP_VALUE - value) {
                 source.position(sp);
                 // RFC 9204 Section 7.4: scope depends on the stream class,
                 // decided by the consumer - see QpackValueTooLargeException.
                 throw new QpackValueTooLargeException(
-                        sm.getString("qpack.integerTooLarge"));
+                        sm.getString("qpack.integerOverflow"));
             }
             value += (long) (b & 0x7F) << shift;
             shift += 7;
@@ -417,12 +455,14 @@ final class Qpack {
 
     /**
      * Decodes a raw (non-Huffman) string literal of the given length into
-     * the target, one char per byte as the Latin-1 widening the (possibly
-     * UTF-8) bytes require. The caller must ensure the buffer holds at
-     * least {@code length} remaining bytes. Shared by every raw-literal
-     * read site (string decoding and the prefix-metadata literals whose
-     * length is not a self-describing string prefix) so the loops cannot
-     * drift.
+     * the target, widening each wire byte to the corresponding
+     * ISO-8859-1/Latin-1 character. QPACK strings are byte strings: bytes that
+     * happen to form a UTF-8 sequence are deliberately not decoded as UTF-8,
+     * matching Tomcat's ISO-8859-1 HTTP field representation (HTTP/1.1 and
+     * HPACK do the same). The caller must ensure the buffer holds at least
+     * {@code length} remaining bytes. Shared by every raw-literal read site
+     * (string decoding and the prefix-metadata literals whose length is not a
+     * self-describing string prefix) so the loops cannot drift.
      *
      * @param source The buffer to read from
      * @param length The number of bytes to read
@@ -497,6 +537,13 @@ final class Qpack {
      * stream): a string longer than the bound can never complete from the
      * re-assembly buffer, so it must fail the connection rather than stall
      * the stream waiting for bytes that will never be accepted.
+     *
+     * The decoded character buffer can be larger than the encoded input:
+     * the shortest RFC 7541 Huffman code is five bits, so a Huffman literal
+     * can expand by up to 8/5. The field-section and dynamic-table limits are
+     * enforced on the decoded size by the caller after this method returns;
+     * the transient expansion is accounted for in the HTTP/3 connector
+     * documentation (see {@code maxFieldSectionSize} in http3.xml).
      *
      * @param source The buffer to read from
      * @param maxEncodedLength The maximum accepted encoded length

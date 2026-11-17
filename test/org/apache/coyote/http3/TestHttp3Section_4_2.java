@@ -204,6 +204,28 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
 
 
     @Test
+    public void testExpectContinueMixedCaseSendsInterimResponse()
+            throws Exception {
+        startHttp3Server();
+
+        // The expectation value is a case-insensitive token (RFC 9110
+        // Section 10.1.1), so a client spelling it "100-Continue" must get
+        // the same interim response.
+        ClientOutput output = runClient(rawCommandWith("--headers",
+                buildFieldSection(":method", "GET", ":scheme", "https",
+                        ":authority", "127.0.0.1:" + port, ":path",
+                        "/simple", "expect", "100-Continue")),
+                CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        Assert.assertEquals(Arrays.asList(100, 200),
+                response.getStatuses());
+        Assert.assertEquals("Hello over HTTP/3",
+                response.getBodyAsString());
+    }
+
+
+    @Test
     public void testExpectContinueTimingOnRead() throws Exception {
         Connector connector = startHttp3Server();
         Assert.assertTrue(connector.setProperty("continueResponseTiming",
@@ -245,6 +267,91 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
         Http3Response response = get("/trailers");
 
         validateStatus(response, 200);
+        Assert.assertEquals("test", response.getTrailer("x-test-trailer"));
+        Assert.assertEquals("body", response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testHostTrailerFiltered() throws Exception {
+        startHttp3Server(ctxt -> {
+            Tomcat.addServlet(ctxt, "hostTrailer", new HttpServlet() {
+
+                private static final long serialVersionUID = 1L;
+
+                @Override
+                protected void doGet(HttpServletRequest req,
+                        HttpServletResponse resp) throws IOException {
+                    resp.setContentType("text/plain");
+                    resp.setCharacterEncoding(
+                            StandardCharsets.ISO_8859_1.name());
+                    resp.setTrailerFields(() -> Map.of(
+                            "host", "evil.example",
+                            "x-test-trailer", "test"));
+                    resp.getWriter().print("body");
+                    resp.flushBuffer();
+                }
+            });
+            ctxt.addServletMapping("/hostTrailer", "hostTrailer");
+        });
+
+        // RFC 9110 Section 6.5.1: a sender MUST NOT generate a trailer field
+        // that is necessary for routing (e.g. Host). The connector's trailer
+        // filter must drop it even though the application supplied it, while
+        // retaining the valid trailer.
+        Http3Response response = get("/hostTrailer");
+
+        validateStatus(response, 200);
+        Assert.assertNull("Host must not be generated as a response trailer",
+                response.getTrailer("host"));
+        Assert.assertEquals("test", response.getTrailer("x-test-trailer"));
+        Assert.assertEquals("body", response.getBodyAsString());
+    }
+
+
+    @Test
+    public void testProhibitedAuthenticationAndConditionalTrailersFiltered()
+            throws Exception {
+        startHttp3Server(ctxt -> {
+            Tomcat.addServlet(ctxt, "prohibitedTrailer", new HttpServlet() {
+
+                private static final long serialVersionUID = 1L;
+
+                @Override
+                protected void doGet(HttpServletRequest req,
+                        HttpServletResponse resp) throws IOException {
+                    resp.setContentType("text/plain");
+                    resp.setCharacterEncoding(
+                            StandardCharsets.ISO_8859_1.name());
+                    resp.setTrailerFields(() -> Map.of(
+                            "set-cookie", "session=evil",
+                            "authorization", "Bearer secret",
+                            "if-match", "\"etag\"",
+                            "content-language", "en",
+                            "x-test-trailer", "test"));
+                    resp.getWriter().print("body");
+                    resp.flushBuffer();
+                }
+            });
+            ctxt.addServletMapping("/prohibitedTrailer", "prohibitedTrailer");
+        });
+
+        // RFC 9110 Section 6.5.1: authentication, request-modifier/
+        // conditional and payload-metadata fields must not be generated as
+        // trailers unless the field definition permits it. HTTP/3 must
+        // filter these even though the application supplied them, while
+        // retaining a valid trailer.
+        Http3Response response = get("/prohibitedTrailer");
+
+        validateStatus(response, 200);
+        Assert.assertNull("Set-Cookie must not be generated as a trailer",
+                response.getTrailer("set-cookie"));
+        Assert.assertNull("Authorization must not be generated as a trailer",
+                response.getTrailer("authorization"));
+        Assert.assertNull("If-Match must not be generated as a trailer",
+                response.getTrailer("if-match"));
+        Assert.assertNull("Content-Language must not be generated as a trailer",
+                response.getTrailer("content-language"));
         Assert.assertEquals("test", response.getTrailer("x-test-trailer"));
         Assert.assertEquals("body", response.getBodyAsString());
     }

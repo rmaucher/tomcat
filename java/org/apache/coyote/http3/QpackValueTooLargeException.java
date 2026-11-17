@@ -20,18 +20,25 @@ import java.io.Serial;
 
 
 /**
- * Signals that an encoded integer or string value was larger than this
+ * Signals that a value decoded from QPACK was larger than this
  * implementation is able to decode (RFC 9204 Section 7.4).
  * <p>
  * The limit covered here is an implementation limit on literal values and
- * on locally int-typed lengths (field-name/value string lengths, dynamic
- * table capacities and encoder instruction indexes); the stream-scoped
- * error below does not apply to invalid field-section table indexes or an
- * impossible Encoded Insert Count. Those are invalid references or values
- * that a conformant encoder could not produce, and RFC 9204 Sections 2.2.3,
- * 3.1 and 4.5.1.1 require a connection error of type
- * {@code QPACK_DECOMPRESSION_FAILED} instead. The decoder distinguishes the
- * two cases before this exception is raised for a request field section.
+ * locally int-typed lengths (field-name/value string lengths, dynamic table
+ * capacities and encoder instruction indexes), plus the Delta Base of a
+ * field-section prefix, which is decoded as an unbounded iRP. The
+ * stream-scoped error below does not apply to invalid field-section table
+ * indexes or an impossible Encoded Insert Count. Those are invalid
+ * references or values that a conformant encoder could not produce, and
+ * RFC 9204 Sections 2.2.3, 3.1 and 4.5.1.1 require a connection error of
+ * type {@code QPACK_DECOMPRESSION_FAILED} instead. The decoder distinguishes
+ * the two cases before this exception is raised for a request field section.
+ * <p>
+ * A redundant (overlong) encoding of a value is an encoded-length limit
+ * rather than a value limit; {@link QpackIntegerEncodingLimitException}, a
+ * subclass of this exception, distinguishes that case so it is scoped as a
+ * stream error even when the represented value is a valid table index or
+ * Encoded Insert Count.
  * <p>
  * RFC 9204 Section 7.4 scopes the failure by stream: met on a request
  * stream it MUST be treated as a <em>stream</em> error of type

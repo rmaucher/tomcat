@@ -243,7 +243,8 @@ public class TestRfc9218 extends Http3TestBase {
         // A very large concurrent-stream limit must not allow unbounded
         // buffering of pre-open PRIORITY_UPDATE signals.
         state.setMaxConcurrentStreams(1_000_000);
-        for (long id = 0; id < 2000; id++) {
+        int limit = Http3ConnectionManager.MAX_PENDING_PRIORITY_UPDATES;
+        for (long id = 0; id < limit + 1000; id++) {
             state.applyPriorityUpdate(id * 4, new Priority());
         }
 
@@ -255,7 +256,7 @@ public class TestRfc9218 extends Http3TestBase {
         java.util.Map<Long,Priority> pending =
                 (java.util.Map<Long,Priority>) field.get(state);
         Assert.assertEquals("The pending PRIORITY_UPDATE buffer must have "
-                + "an independent, fixed upper bound", 1024, pending.size());
+                + "an independent, fixed upper bound", limit, pending.size());
     }
 
 

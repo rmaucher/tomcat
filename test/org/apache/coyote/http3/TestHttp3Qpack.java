@@ -120,15 +120,16 @@ public class TestHttp3Qpack extends Http3TestBase {
         startHttp3Server();
 
         // The field section is truncated: the value string of the first
-        // field line is missing, so the field section cannot be decoded
-        // and the request is missing its required pseudo headers. That is
-        // a malformed HTTP message (stream error H3_MESSAGE_ERROR), not a
-        // QPACK error.
+        // field line is missing. The decoder failed to interpret an encoded
+        // field section, which RFC 9204 Section 6 defines as
+        // QPACK_DECOMPRESSION_FAILED. The incomplete field line is rewound
+        // without mutating shared decoder state, so the error is scoped to
+        // this request stream.
         ClientOutput output = runClient(rawCommandWith("--headers",
                 b64(0x00, 0x00, 0x60)),
                 CLIENT_TIMEOUT_SECONDS);
 
-        assertStreamError(output, H3_MESSAGE_ERROR);
+        assertStreamError(output, H3_QPACK_DECOMPRESSION_FAILED);
     }
 
 
@@ -165,6 +166,54 @@ public class TestHttp3Qpack extends Http3TestBase {
                         0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
                 "--timeout", "3"),
                 CLIENT_TIMEOUT_SECONDS);
+
+        assertStreamError(output, H3_QPACK_DECOMPRESSION_FAILED);
+    }
+
+
+    @Test
+    public void testOverlongStaticIndexEncodingResetsStreamOnly()
+            throws Exception {
+        startHttp3Server();
+
+        // An indexed field line with static table index 63 (a valid entry)
+        // encoded with redundant continuation octets exceeds the
+        // implementation's encoded-length limit. RFC 9204 Section 7.4 scopes
+        // that limit to the request stream, not the connection: the decoder
+        // aborts on the length before it can classify the represented value.
+        ByteBuffer block = ByteBuffer.allocate(32);
+        Qpack.encodeIrp(block, 0, 8, 0);
+        Qpack.encodeIrp(block, 0, 7, 0);
+        block.put((byte) 0xFF);       // 1 T=1, static index prefix 6 all ones
+        for (int i = 0; i < 10; i++) {
+            block.put((byte) 0x80);   // redundant continuation octets
+        }
+        block.flip();
+
+        ClientOutput output = runClient(rawCommandWith("--headers",
+                b64(block), "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+
+        assertStreamError(output, H3_QPACK_DECOMPRESSION_FAILED);
+    }
+
+
+    @Test
+    public void testOverlongEncodedInsertCountResetsStreamOnly()
+            throws Exception {
+        startHttp3Server();
+
+        // The Encoded Insert Count is an iRP(8); a value encoded with
+        // redundant continuation octets is likewise an encoded-length limit
+        // (RFC 9204 Section 7.4) and must only reset the request stream.
+        ByteBuffer block = ByteBuffer.allocate(32);
+        block.put((byte) 0xFF);       // Required Insert Count prefix all ones
+        for (int i = 0; i < 10; i++) {
+            block.put((byte) 0x80);   // redundant continuation octets
+        }
+        block.flip();
+
+        ClientOutput output = runClient(rawCommandWith("--headers",
+                b64(block), "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_QPACK_DECOMPRESSION_FAILED);
     }

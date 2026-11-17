@@ -89,22 +89,36 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * reads its QPACK decoder stream must not be able to grow per-
      * connection memory and per-flush work without bound.
      */
-    static final int MAX_PENDING_DECODER_INSTRUCTIONS = 10_000;
+    static final int MAX_PENDING_DECODER_INSTRUCTIONS = 65_536;
 
     /**
      * Maximum number of pre-open PRIORITY_UPDATE signals buffered per
      * connection. RFC 9218 Section 7 recommends (SHOULD) that servers buffer
-     * the most recently received signal for each not-yet-opened stream; this
-     * bound is deliberately independent of the configurable concurrent-stream
-     * limit so a large limit cannot turn the buffer into unbounded
-     * per-connection memory.
+     * the most recently received signal for each not-yet-opened stream. The
+     * effective bound (see ConnectionState.applyPriorityUpdate) is
+     * {@code min(MAX_PENDING_PRIORITY_UPDATES, max(16, maxConcurrentStreams))}:
+     * the 4096 ceiling keeps a large concurrent-stream limit from turning the
+     * buffer into unbounded per-connection memory, and the floor of 16 keeps
+     * a small concurrent-stream limit from making the buffer unusably small.
      */
-    static final int MAX_PENDING_PRIORITY_UPDATES = 1024;
+    static final int MAX_PENDING_PRIORITY_UPDATES = 4096;
+
+    /**
+     * Maximum number of QPACK instructions (encoder and decoder streams
+     * combined) that may be parsed on one connection, and maximum total
+     * bytes they may consume. The instructions are parsed inline on the QUIC
+     * poll thread; without a bound a peer could keep sending tiny valid
+     * instructions and occupy that thread for the connection's lifetime
+     * (RFC 9114 Section 10.5). Exceeding either budget fails the connection
+     * with H3_EXCESSIVE_LOAD.
+     */
+    static final int MAX_QPACK_INSTRUCTIONS = 262_144;
+    static final long MAX_QPACK_INSTRUCTION_BYTES = 128L * 1024 * 1024;
 
     /**
      * Maximum number of ignored control-stream frames per connection.
      */
-    static final int MAX_IGNORED_FRAMES = 4096;
+    static final int MAX_IGNORED_FRAMES = 16_384;
 
     /**
      * Maximum total declared payload of ignored control-stream frames, and
@@ -113,7 +127,18 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * elements can be used to waste processing capacity; these bounds keep
      * the work per connection finite.
      */
-    static final long MAX_IGNORED_BYTES = 32L * 1024 * 1024;
+    static final long MAX_IGNORED_BYTES = 64L * 1024 * 1024;
+
+    /**
+     * Maximum number of known control-stream frames per connection and
+     * maximum total declared payload of those frames. Known control frames
+     * are parsed inline on the QUIC poll thread; without a bound a peer could
+     * keep sending valid GOAWAY/MAX_PUSH_ID/PRIORITY_UPDATE frames for the
+     * connection's lifetime (RFC 9114 Section 10.5). Exceeding either budget
+     * fails the connection with H3_EXCESSIVE_LOAD.
+     */
+    static final int MAX_KNOWN_CONTROL_FRAMES = 65536;
+    static final long MAX_KNOWN_CONTROL_FRAME_BYTES = 32L * 1024 * 1024;
 
     /**
      * Connection-lifetime aggregate for ignored/padding frames on request
@@ -121,8 +146,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * but a peer can keep opening sequential request streams; this aggregate
      * keeps the total discard work on one connection finite.
      */
-    static final int MAX_CONNECTION_NON_BODY_FRAMES = 65536;
-    static final long MAX_CONNECTION_NON_BODY_BYTES = 128L * 1024 * 1024;
+    static final int MAX_CONNECTION_NON_BODY_FRAMES = 262_144;
+    static final long MAX_CONNECTION_NON_BODY_BYTES = 256L * 1024 * 1024;
 
     /**
      * Shared QPACK decoder for this connection.
@@ -326,7 +351,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             // server's QPACK decoder (RFC 9204 Section 4.2). A malformed
             // instruction is a connection error of type
             // H3_QPACK_ENCODER_STREAM_ERROR (RFC 9204 Section 6).
-            processQpackEncoderStream(streamId, data);
+            processQpackEncoderStream(state, streamId, data);
             // Inserts raise the decoder's insert count, which owes the peer
             // an Insert Count Increment instruction (RFC 9204 Section
             // 2.2.2.3). Mark the connection so the poll-thread flush sweep
@@ -339,7 +364,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             // server's QPACK encoder (RFC 9204 Section 4.2). A malformed
             // instruction is a connection error of type
             // H3_QPACK_DECODER_STREAM_ERROR (RFC 9204 Section 6).
-            processQpackDecoderStream(streamId, data);
+            processQpackDecoderStream(state, streamId, data);
         }
 
         // No native work here: this method only parses and updates the
@@ -668,9 +693,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             }
 
             int sp = data.position();
-            long frameType = Qpack.decodeQuicInteger(data);
-            long frameLength = frameType == -1 ? -1 : Qpack.decodeQuicInteger(data);
-            if (frameType == -1 || frameLength == -1) {
+            if (!Qpack.decodeFrameHeader(data, state.clientControlFrameHeader)) {
                 // Incomplete frame header: retain for the next read, unless
                 // the retained bytes already fill the stream read buffer.
                 // The buffer is the entire retention window, so a header
@@ -682,6 +705,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 }
                 break;
             }
+            long frameType = state.clientControlFrameHeader[0];
+            long frameLength = state.clientControlFrameHeader[1];
 
             // RFC 9114 Section 6.2.1: the first frame on the control
             // stream MUST be SETTINGS. The frame type alone decides, so
@@ -768,6 +793,29 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 continue;
             }
 
+            if ((frameType == Constants.H3_GOAWAY ||
+                    frameType == Constants.H3_MAX_PUSH_ID ||
+                    frameType == Constants.H3_CANCEL_PUSH) &&
+                    frameLength > 8) {
+                // GOAWAY, MAX_PUSH_ID and CANCEL_PUSH carry exactly one
+                // QUIC variable-length integer (RFC 9114 Sections 7.2.3,
+                // 7.2.6 and 7.2.7), whose encoding is at most 8 bytes. A
+                // longer declared payload is malformed regardless of the
+                // local read-buffer size and MUST be classified as
+                // H3_FRAME_ERROR (Section 7.1), not as the generic
+                // H3_EXCESSIVE_LOAD re-assembly limit below.
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString(
+                            "http3ConnectionManager.pushIdFrameMalformed",
+                            Long.valueOf(frameType), Long.valueOf(frameLength)));
+                }
+                throw new Http3Exception(
+                        sm.getString(
+                                "http3ConnectionManager.pushIdFrameMalformed",
+                                Long.valueOf(frameType), Long.valueOf(frameLength)),
+                        Http3Error.H3_FRAME_ERROR);
+            }
+
             if (frameLength > (long) data.capacity() - (data.position() - sp)) {
                 // A known frame whose payload cannot fit in the stream read
                 // buffer can never be re-assembled from the retained bytes
@@ -793,6 +841,23 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // retain partial bytes for the next read
                 data.position(sp);
                 break;
+            }
+
+            // The frame is complete and known. Charge it before parsing the
+            // payload so a peer cannot keep the poll thread busy with an
+            // unbounded stream of valid control frames (RFC 9114 Section
+            // 10.5).
+            if (state.noteKnownControlFrame(frameLength)) {
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString(
+                            "http3ConnectionManager.knownControlFrameBudget",
+                            Long.valueOf(frameType), Long.valueOf(frameLength)));
+                }
+                throw new Http3Exception(
+                        sm.getString(
+                                "http3ConnectionManager.knownControlFrameBudget",
+                                Long.valueOf(frameType), Long.valueOf(frameLength)),
+                        Http3Error.H3_EXCESSIVE_LOAD);
             }
 
             if (frameType == Constants.H3_SETTINGS) {
@@ -988,8 +1053,9 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * <li>An ID beyond the client-initiated bidirectional stream limit
      * only SHOULD be an H3_ID_ERROR, and correctly evaluating the limit
      * requires knowledge of the transport-level stream window. The ID is
-     * therefore not range-checked here; the pending-update buffer is
-     * bounded independently (see ConnectionState.applyPriorityUpdate).</li>
+     * therefore not range-checked here; the pending-update buffer applies the
+     * connection's concurrent-stream limit (floored at 16 and capped at
+     * MAX_PENDING_PRIORITY_UPDATES) in ConnectionState.applyPriorityUpdate.</li>
      * <li>The push-stream variant (0xF0701) MUST reference a promised push
      * stream. This implementation does not implement push and never sends
      * PUSH_PROMISE, so receipt is always a connection error of type
@@ -1073,8 +1139,9 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         } catch (IllegalArgumentException iae) {
             if (log.isTraceEnabled()) {
                 log.trace(sm.getString("http3ConnectionManager.priorityUpdateIgnoredValue",
-                        Long.valueOf(elementId), new String(fieldBytes,
-                                StandardCharsets.US_ASCII)), iae);
+                        Long.valueOf(elementId), Http3Log.printable(
+                                new String(fieldBytes,
+                                        StandardCharsets.ISO_8859_1))), iae);
             }
         }
 
@@ -1103,11 +1170,11 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * instructions from encoder to decoder. The stream type varint has
      * already been read by {@link #processClientUniStreamData}.
      */
-    private void processQpackEncoderStream(long streamId, ByteBuffer data)
-            throws Http3Exception {
+    private void processQpackEncoderStream(ConnectionState state,
+            long streamId, ByteBuffer data) throws Http3Exception {
         // Process QPACK encoder instructions on the shared decoder
         // (encoder stream -> decoder, per RFC 9204 Section 4.2)
-        processQpackInstructions(streamId, data,
+        processQpackInstructions(state, streamId, data,
                 sharedDecoder::processInstruction,
                 Http3Error.H3_QPACK_ENCODER_STREAM_ERROR);
     }
@@ -1119,11 +1186,11 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * instructions from decoder to encoder. The stream type varint has
      * already been read by {@link #processClientUniStreamData}.
      */
-    private void processQpackDecoderStream(long streamId, ByteBuffer data)
-            throws Http3Exception {
+    private void processQpackDecoderStream(ConnectionState state,
+            long streamId, ByteBuffer data) throws Http3Exception {
         // Process QPACK decoder instructions: Section Acknowledgment,
         // Stream Cancellation, Insert Count Increment (RFC 9204 Section 4.4)
-        processQpackInstructions(streamId, data,
+        processQpackInstructions(state, streamId, data,
                 this::processDecoderInstruction,
                 Http3Error.H3_QPACK_DECODER_STREAM_ERROR);
     }
@@ -1137,9 +1204,9 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * depends on the stream the instructions arrived on (RFC 9204
      * Section 6).
      */
-    private void processQpackInstructions(long streamId, ByteBuffer data,
-            QpackInstructionHandler handler, Http3Error streamError)
-            throws Http3Exception {
+    private void processQpackInstructions(ConnectionState state, long streamId,
+            ByteBuffer data, QpackInstructionHandler handler,
+            Http3Error streamError) throws Http3Exception {
         while (data.hasRemaining()) {
             int posBefore = data.position();
             try {
@@ -1159,14 +1226,30 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // instruction can never complete and must fail the
                 // connection instead of stalling the stream forever.
                 // (Instructions whose declared lengths are individually
-                // bounded - see QpackDecoder.encodedLiteralBudget() -
-                // always fit a default-sized buffer; this catches a
-                // reduced readBufferSize and any instruction form the
-                // handler rewinds without a length check.)
+                // bounded by QpackDecoder.encodedLiteralBudget() fit the
+                // default 16 KiB read buffer when qpackMaxTableCapacity has
+                // its default value (4096); a configured larger table
+                // capacity raises that budget above the default read buffer,
+                // so this check also covers a reduced readBufferSize and any
+                // instruction form the handler rewinds without a length
+                // check.)
                 if (data.limit() - data.position() >= data.capacity()) {
                     throw partialDataTooLarge(streamId);
                 }
                 break;
+            }
+            // Account the complete instruction against the per-connection
+            // inbound budget. The instructions are parsed inline on the QUIC
+            // poll thread, so the work per connection must stay finite
+            // (RFC 9114 Section 10.5); an unbounded stream of tiny valid
+            // instructions would otherwise occupy that thread indefinitely.
+            if (state.noteQpackInstruction(data.position() - posBefore)) {
+                throw new Http3Exception(
+                        sm.getString(
+                                "http3ConnectionManager.qpackInstructionBudget",
+                                Long.valueOf(streamId),
+                                Integer.valueOf(MAX_QPACK_INSTRUCTIONS)),
+                        Http3Error.H3_EXCESSIVE_LOAD);
             }
         }
     }
@@ -1620,13 +1703,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * stream.
      */
     private Http3Exception partialDataTooLarge(long streamId) {
-        String message = sm.getString(
-                "http3ConnectionManager.partialDataTooLarge",
-                Long.valueOf(streamId));
-        if (log.isDebugEnabled()) {
-            log.debug(message);
-        }
-        return new Http3Exception(message, Http3Error.H3_EXCESSIVE_LOAD);
+        return connectionError("http3ConnectionManager.partialDataTooLarge",
+                streamId);
     }
 
 
@@ -1636,9 +1714,19 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * shared by all of the connection's ignored data.
      */
     private Http3Exception excessiveIgnoredData(long streamId) {
-        String message = sm.getString(
-                "http3ConnectionManager.excessiveIgnoredData",
-                Long.valueOf(streamId));
+        return connectionError("http3ConnectionManager.excessiveIgnoredData",
+                streamId);
+    }
+
+
+    /*
+     * The connection error (H3_EXCESSIVE_LOAD) for a resource-limit violation
+     * on the given stream: a partial frame/instruction that can never complete
+     * from the read buffer, or an ignored-data budget exhaustion. Shared by
+     * the two named factories so their only difference is the message key.
+     */
+    private Http3Exception connectionError(String messageKey, long streamId) {
+        String message = sm.getString(messageKey, Long.valueOf(streamId));
         if (log.isDebugEnabled()) {
             log.debug(message);
         }
@@ -1679,7 +1767,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // threads (the response field section limit in Http3Processor).
         // -1 means the peer did not declare a limit; 0 is an explicit limit.
         private volatile long peerMaxFieldSectionSize = -1;
-        private int activeStreamCount = 0;
+        private long activeStreamCount = 0;
         // Volatile because it is updated on the QUIC poll thread (transport
         // stream limit reconciliation) after the state has been published
         // via the connection map, and may be read through the public
@@ -1701,21 +1789,24 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // the client's control/QPACK streams are not known in advance; they
         // are identified by the stream type read from the start of each
         // stream (RFC 9114 Section 6.2.1, RFC 9204 Section 4.2).
-        // Volatile because the QUIC poll thread both writes and reads them
-        // through the protocol code today (both in-tree endpoints call
-        // processClientUniStreamData() and checkClientUniStreamClosed()
-        // inline on the poll thread), but the protocol layer makes no
-        // assumption about that: an endpoint is free to dispatch this work
-        // to its own threads, and these fields carry no synchronization of
-        // their own. The volatile makes the cross-thread visibility
-        // structural rather than an incident of the current endpoint
-        // wiring (a missed write here would skip the
-        // H3_CLOSED_CRITICAL_STREAM connection error), and keeps the longs
-        // non-torn on 32-bit JVMs, as for the fields below.
+        // These fields are confined to the QUIC poll thread: the endpoint
+        // invokes processClientUniStreamData() and checkClientUniStreamClosed()
+        // inline on that thread, as required by the
+        // QuicConnectionManager.processClientUniStreamData() threading
+        // contract. The critical-stream check-then-set below and the
+        // per-connection control/QPACK budgets rely on that confinement; an
+        // endpoint must not dispatch this work to other threads. The fields
+        // are volatile so any reader outside the poll thread sees a coherent
+        // value and so the longs are non-torn on 32-bit JVMs, but volatility
+        // does not make the check-then-set atomic.
         private volatile long clientControlStreamId = -1;
         private volatile long clientQpackEncoderStreamId = -1;
         private volatile long clientQpackDecoderStreamId = -1;
         private boolean clientControlFirstFrameSeen = false;
+        // Scratch [type, length] for decoding a control-stream frame header.
+        // Confined to the QUIC poll thread, like the other control-stream
+        // fields above.
+        private final long[] clientControlFrameHeader = new long[2];
         // Remaining bytes of an unknown control-stream frame's payload that
         // are being skipped without being retained (RFC 9114 Section 9).
         // Written and read only by the QUIC poll thread, which runs
@@ -1731,11 +1822,20 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // processing capacity indefinitely (RFC 9114 Section 10.5).
         private int ignoredControlFrameCount;
         private long ignoredControlFrameBytes;
+        // Budget for known control-stream frames, which are also parsed inline
+        // on the poll thread. Unlike the ignored-frame budget this covers the
+        // frames this implementation actually handles.
+        private int knownControlFrameCount;
+        private long knownControlFrameBytes;
         private long discardedUniStreamBytes;
         // Connection-lifetime request-stream ignored/padding budget. Guarded
         // by the ConnectionState monitor.
         private int requestNonBodyFrameCount;
         private long requestNonBodyFrameBytes;
+        // Connection-lifetime inbound QPACK instruction budget (encoder and
+        // decoder streams combined). Guarded by the ConnectionState monitor.
+        private int qpackInstructionCount;
+        private long qpackInstructionBytes;
         // IDs of client-initiated unidirectional streams whose type was
         // unknown, so subsequent data on them is consumed without being
         // re-parsed as a stream type (RFC 9114 Section 9). Entries are
@@ -1929,9 +2029,10 @@ public class Http3ConnectionManager implements QuicConnectionManager {
          * The buffer is bounded by local implementation policy (RFC 9218
          * Section 7): only the most recent signal per element is kept and
          * the total number of buffered elements is limited to the smaller of
-         * {@link #MAX_PENDING_PRIORITY_UPDATES} (1024) and the connection's
-         * concurrent-stream limit (with a floor of 16), the oldest entries
-         * being evicted first. The independent 1024 ceiling prevents a large
+         * {@link #MAX_PENDING_PRIORITY_UPDATES} (4096) and the connection's
+         * concurrent-stream limit (with a floor of 16), the
+         * least-recently-used entries being evicted first (the map is
+         * access-ordered). The independent 4096 ceiling prevents a large
          * configured concurrent-stream limit from turning the buffer into
          * unbounded per-connection memory.
          *
@@ -2054,6 +2155,22 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
 
         /**
+         * Accounts one known control-stream frame and reports whether the
+         * per-connection known-control-frame budget has been exceeded.
+         *
+         * @param payloadLength The declared frame payload length
+         *
+         * @return {@code true} if the budget was exceeded
+         */
+        boolean noteKnownControlFrame(long payloadLength) {
+            knownControlFrameCount++;
+            knownControlFrameBytes += payloadLength;
+            return knownControlFrameCount > MAX_KNOWN_CONTROL_FRAMES ||
+                    knownControlFrameBytes > MAX_KNOWN_CONTROL_FRAME_BYTES;
+        }
+
+
+        /**
          * Accounts one ignored/padding frame on a request stream against the
          * connection-lifetime request padding budget.
          *
@@ -2067,6 +2184,28 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 requestNonBodyFrameBytes += payloadLength;
                 return requestNonBodyFrameCount > MAX_CONNECTION_NON_BODY_FRAMES ||
                         requestNonBodyFrameBytes > MAX_CONNECTION_NON_BODY_BYTES;
+            }
+        }
+
+
+        /**
+         * Accounts one complete inbound QPACK instruction (encoder or decoder
+         * stream) and reports whether the per-connection instruction budget
+         * has been exceeded. Both the number of instructions and the total
+         * number of instruction bytes are bounded, so a peer cannot keep the
+         * QUIC poll thread parsing instructions for the connection's
+         * lifetime (RFC 9114 Section 10.5).
+         *
+         * @param length The encoded length of the consumed instruction
+         *
+         * @return {@code true} if the budget was exceeded
+         */
+        public boolean noteQpackInstruction(int length) {
+            synchronized (this) {
+                qpackInstructionCount++;
+                qpackInstructionBytes += length;
+                return qpackInstructionCount > MAX_QPACK_INSTRUCTIONS ||
+                        qpackInstructionBytes > MAX_QPACK_INSTRUCTION_BYTES;
             }
         }
 

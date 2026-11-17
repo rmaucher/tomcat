@@ -66,7 +66,8 @@ public class QpackDecoder {
     private long currentTableSize = 0;
 
     /**
-     * Maximum table size (soft limit, can be reduced by encoder).
+     * Maximum table size (soft limit; the encoder may change it up to the
+     * hard limit with a Set Dynamic Table Capacity instruction).
      */
     private int maxTableSize;
 
@@ -233,7 +234,16 @@ public class QpackDecoder {
             throws QpackException {
         try {
             return Qpack.decodeIrp(buffer, n, firstByte);
+        } catch (QpackIntegerEncodingLimitException e) {
+            // An overlong encoding of an index is an implementation limit on
+            // the encoded length (RFC 9204 Section 7.4), not an invalid
+            // reference: the decoder never learns the represented value. Let
+            // it reach the processor as a stream-scoped decompression
+            // failure.
+            throw e;
         } catch (QpackValueTooLargeException e) {
+            // The encoded value is beyond the 62-bit iRP domain, so it is an
+            // invalid reference (RFC 9204 Sections 2.2.3 and 3.1).
             throw new QpackException(
                     sm.getString("qpackdecoder.indexTooLarge"), e);
         }
@@ -609,6 +619,11 @@ public class QpackDecoder {
      * the start of that field line; field lines decoded before it remain
      * consumed. Callers detect a truncated section by checking
      * {@code buffer.hasRemaining()} after the call.
+     * <p>
+     * {@link QpackBlockedException} handling: the buffer position is restored
+     * to the start of the field section before the exception is thrown, so a
+     * caller that waits for the required inserts and re-decodes can call this
+     * method again with the same buffer without rewinding it first.
      *
      * @param buffer The buffer containing the header block
      * @param emitter The callback invoked for each decoded header field
@@ -634,10 +649,11 @@ public class QpackDecoder {
      * decode either sees its own limits or waits for the monitor.
      *
      * <p>
-     * Incomplete input handling is the same as for
+     * Incomplete input and blocked-section handling is the same as for
      * {@link #decodeHeaderBlock(ByteBuffer, HeaderEmitter)}: an incomplete
      * prefix leaves the whole block unconsumed, an incomplete field line
-     * leaves that line unconsumed, and callers detect truncation with
+     * leaves that line unconsumed, a {@link QpackBlockedException} leaves the
+     * buffer at the block start, and callers detect truncation with
      * {@code buffer.hasRemaining()}.
      *
      * @param buffer          The buffer containing the header block
@@ -682,7 +698,15 @@ public class QpackDecoder {
         long encodedInsertCount;
         try {
             encodedInsertCount = Qpack.decodeIrp(buffer, 8);
+        } catch (QpackIntegerEncodingLimitException e) {
+            // An overlong encoding of the Encoded Insert Count is an
+            // implementation limit on the encoded length (RFC 9204
+            // Section 7.4), not an impossible count: the value it represents
+            // is never decoded. Leave it stream-scoped.
+            throw e;
         } catch (QpackValueTooLargeException e) {
+            // A value beyond the 62-bit iRP domain could not have been
+            // produced by a conformant encoder (RFC 9204 Section 4.5.1.1).
             throw new QpackException(
                     sm.getString("qpackdecoder.encodedInsertCountTooLarge"), e);
         }
@@ -749,8 +773,13 @@ public class QpackDecoder {
         try {
             // Per RFC 9204 Section 2.2.1, if the Required Insert Count
             // exceeds the number of entries inserted so far, the stream is
-            // blocked (this is not an error).
+            // blocked (this is not an error). Restore the buffer to the
+            // start of the field section before signalling: the prefix has
+            // already been consumed, and a caller that re-decodes the
+            // section after the inserts arrive must restart from the block
+            // start (the contract documented on decodeHeaderBlock()).
             if (requiredInsertCount > totalInserts) {
+                buffer.position(blockStart);
                 throw new QpackBlockedException(requiredInsertCount);
             }
 
@@ -878,7 +907,8 @@ public class QpackDecoder {
         String name = entry.name;
         String value = entry.value != null ? entry.value : "";
         if (log.isTraceEnabled()) {
-            log.trace("QPACK Indexed: name=" + name + " value=" + value);
+            log.trace("QPACK Indexed: name=" + Http3Log.printable(name) +
+                    " value=" + Http3Log.printable(value));
         }
         emit(name, value, emitter);
     }
@@ -887,7 +917,8 @@ public class QpackDecoder {
     private void emitNameRefEntry(long index, boolean isStatic, String value, HeaderEmitter emitter) throws QpackException, Http3Exception {
         String name = resolveIndexedEntry(index, isStatic).name;
         if (log.isTraceEnabled()) {
-            log.trace("QPACK NameRef: name=" + name + " value=" + value);
+            log.trace("QPACK NameRef: name=" + Http3Log.printable(name) +
+                    " value=" + Http3Log.printable(value));
         }
         emit(name, value, emitter);
     }
@@ -911,7 +942,8 @@ public class QpackDecoder {
         String name = entry.name;
         String value = entry.value != null ? entry.value : "";
         if (log.isTraceEnabled()) {
-            log.trace("QPACK PostBase Indexed: name=" + name + " value=" + value);
+            log.trace("QPACK PostBase Indexed: name=" + Http3Log.printable(name) +
+                    " value=" + Http3Log.printable(value));
         }
         emit(name, value, emitter);
     }
@@ -920,7 +952,8 @@ public class QpackDecoder {
     private void emitPostBaseNameRefEntry(long postBaseIndex, String value, HeaderEmitter emitter) throws QpackException, Http3Exception {
         String name = resolvePostBaseEntry(postBaseIndex).name;
         if (log.isTraceEnabled()) {
-            log.trace("QPACK PostBase NameRef: name=" + name + " value=" + value);
+            log.trace("QPACK PostBase NameRef: name=" + Http3Log.printable(name) +
+                    " value=" + Http3Log.printable(value));
         }
         emit(name, value, emitter);
     }
@@ -950,7 +983,9 @@ public class QpackDecoder {
                     Http3Error.H3_MESSAGE_ERROR);
         }
         if (log.isTraceEnabled()) {
-            log.trace("QPACK emit: name=" + name + " value=" + value + " count=" + headerCount + " size=" + headerSize);
+            log.trace("QPACK emit: name=" + Http3Log.printable(name) +
+                    " value=" + Http3Log.printable(value) + " count=" +
+                    headerCount + " size=" + headerSize);
         }
         emitter.emitHeader(name, value);
     }

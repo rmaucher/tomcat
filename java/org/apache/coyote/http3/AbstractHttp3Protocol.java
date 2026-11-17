@@ -16,7 +16,9 @@
  */
 package org.apache.coyote.http3;
 
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -33,6 +35,7 @@ import org.apache.coyote.UpgradeProtocol;
 import org.apache.coyote.UpgradeToken;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.buf.StringUtils;
 import org.apache.tomcat.util.http.parser.HttpParser;
 import org.apache.tomcat.util.net.SSLHostConfig;
 import org.apache.tomcat.util.net.SocketWrapperBase;
@@ -92,12 +95,16 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     public static final long MAX_QPACK_TABLE_CAPACITY = 4L * 1024 * 1024;
 
     /**
-     * Largest stream-count value a QUIC transport parameter can carry:
-     * a QUIC variable-length integer has at most 62 payload bits (RFC 9000
-     * Section 16). The HTTP/3 concurrency limit must stay within this
-     * range so it can be advertised consistently by the transport.
+     * Largest valid stream-count value for a QUIC {@code max_streams}
+     * transport parameter or {@code MAX_STREAMS} frame. Although a QUIC
+     * variable-length integer can carry 62 payload bits (RFC 9000 Section 16),
+     * RFC 9000 Sections 4.6 and 18.2 limit a stream count to 2^60: larger
+     * values would describe stream IDs that cannot fit the 62-bit stream-ID
+     * space and must be treated as a transport parameter or frame encoding
+     * error. The HTTP/3 concurrency limit must stay within this range so it
+     * can be advertised consistently by the transport.
      */
-    public static final long MAX_CONCURRENT_STREAMS = (1L << 62) - 1;
+    public static final long MAX_CONCURRENT_STREAMS = 1L << 60;
 
     /**
      * Largest blocked-stream timeout whose millisecond-to-nanosecond
@@ -162,6 +169,16 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
      * Whether to enable CONNECT protocol (RFC 9220).
      */
     private volatile boolean enableConnectProtocol = false;
+
+    /**
+     * The {@code :protocol} values this connector supports for extended
+     * CONNECT (RFC 9220 Section 3), as a comma-separated list. The
+     * connector itself implements no extended-CONNECT protocol, so the
+     * default (empty) answers every extended CONNECT with 501 Not
+     * Implemented. An application that handles a tunnel registers the
+     * value(s) it supports here.
+     */
+    private volatile Set<String> connectProtocols = Set.of();
 
     /**
      * Whether to advertise the experimental (unregistered) H2 compatible
@@ -246,6 +263,11 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
 
     // ------------------------------------------------ Protocol Configuration
 
+    /**
+     * Returns the maximum QPACK dynamic table capacity in bytes.
+     *
+     * @return The configured capacity
+     */
     public long getQpackMaxTableCapacity() {
         return qpackMaxTableCapacity;
     }
@@ -387,15 +409,19 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
      * will decode and advertise via
      * {@code SETTINGS_MAX_FIELD_SECTION_SIZE}.
      * <p>
-     * The effective value is clamped by the connection manager to
+     * This accessor returns the configured value. The effective value used for
+     * enforcement and advertisement is clamped by the connection manager to
      * {@link Constants#MAX_FIELD_SECTION_SIZE_FOR_FRAME_LIMIT} (4473915
      * bytes, the largest decoded field section that fits the 16 MiB per-frame
      * buffer) and by the QPACK decoder and SETTINGS encoder to the non-negative
      * int range. Values above those bounds are clamped for the decoder, the
      * advertisement and the inbound frame preflight; non-positive values are
-     * enforced and advertised as an explicit zero-byte limit.
+     * enforced and advertised as an explicit zero-byte limit. A JMX client
+     * therefore sees the configured value, which may differ from the effective
+     * value computed by those consumers.
      *
-     * @return the configured maximum field-section size
+     * @return the configured maximum field-section size, not the effective
+     *         clamped value
      */
     public long getMaxFieldSectionSize() {
         return maxFieldSectionSize;
@@ -443,6 +469,13 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     }
 
 
+    /**
+     * Returns the maximum number of concurrent request streams per connection.
+     * The effective limit may be lower when the QUIC transport advertises a
+     * smaller stream limit.
+     *
+     * @return The configured concurrent-stream limit
+     */
     @Override
     public long getMaxConcurrentStreams() {
         return maxConcurrentStreams;
@@ -452,9 +485,9 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     /**
      * Sets the maximum number of concurrent request streams per connection.
      * The value must be greater than zero and no greater than
-     * {@link #MAX_CONCURRENT_STREAMS} (the 62-bit QUIC varint limit); the
-     * effective limit is then clamped to the stream limit advertised by the
-     * QUIC transport.
+     * {@link #MAX_CONCURRENT_STREAMS} (the RFC 9000 2^60 stream-count limit);
+     * the effective limit is then clamped to the stream limit advertised by
+     * the QUIC transport.
      *
      * @param maxConcurrentStreams The maximum number of concurrent request
      *                              streams
@@ -478,16 +511,100 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     }
 
 
+    /**
+     * Returns whether Extended CONNECT (RFC 9220) is enabled. When enabled,
+     * {@code SETTINGS_ENABLE_CONNECT_PROTOCOL} is advertised with value 1 and
+     * requests carrying a {@code :protocol} pseudo-header are accepted,
+     * subject to the configured {@code connectProtocols} list.
+     *
+     * @return {@code true} if Extended CONNECT is enabled
+     */
     public boolean isEnableConnectProtocol() {
         return enableConnectProtocol;
     }
 
 
+    /**
+     * Sets whether Extended CONNECT (RFC 9220) is enabled.
+     *
+     * @param enableConnectProtocol {@code true} to advertise and accept
+     *                              Extended CONNECT
+     */
     public void setEnableConnectProtocol(boolean enableConnectProtocol) {
         this.enableConnectProtocol = enableConnectProtocol;
     }
 
 
+    /**
+     * Returns the supported extended-CONNECT {@code :protocol} values as a
+     * comma-separated list (RFC 9220 Section 3).
+     *
+     * @return The supported values, possibly empty
+     */
+    public String getConnectProtocols() {
+        return String.join(",", connectProtocols);
+    }
+
+
+    /**
+     * Sets the extended-CONNECT {@code :protocol} values that this connector
+     * supports (RFC 9220 Section 3). Values are comma-separated; whitespace
+     * around each value is ignored. The default is empty: the connector
+     * implements no extended-CONNECT protocol itself and responds to every
+     * extended CONNECT with 501 Not Implemented.
+     *
+     * @param connectProtocols The supported values, or {@code null}/empty to
+     *                         support none
+     */
+    public void setConnectProtocols(String connectProtocols) {
+        if (connectProtocols == null || connectProtocols.isBlank()) {
+            this.connectProtocols = Set.of();
+            return;
+        }
+        Set<String> values = new HashSet<>();
+        for (String value : connectProtocols.split(",")) {
+            value = value.trim();
+            if (!value.isEmpty()) {
+                values.add(value);
+            }
+        }
+        this.connectProtocols = Set.copyOf(values);
+    }
+
+
+    /**
+     * Returns whether the given extended-CONNECT {@code :protocol} value is
+     * registered as supported by this connector.
+     *
+     * @param connectProtocol The {@code :protocol} value
+     *
+     * @return {@code true} if the value is supported
+     */
+    public boolean isConnectProtocolSupported(String connectProtocol) {
+        if (connectProtocol == null) {
+            return false;
+        }
+        // RFC 9110 Section 7.8: recipients SHOULD use case-insensitive
+        // comparison when matching a protocol name to the supported
+        // protocols. RFC 9220 Section 3 inherits the RFC 8441 :protocol
+        // semantics. Keep the configured values as supplied (their preferred
+        // case is visible through JMX) and compare here instead.
+        for (String supported : connectProtocols) {
+            if (supported.equalsIgnoreCase(connectProtocol)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    /**
+     * Returns whether the experimental, unregistered
+     * {@code H2_COMPATIBLE_IDENTITY} setting (identifier {@code 0x22}) is
+     * advertised to peers. Peers that do not recognise the setting ignore it.
+     *
+     * @return {@code true} if the setting is advertised
+     */
     public boolean isH2CompatibleIdentity() {
         return h2CompatibleIdentity;
     }
@@ -517,11 +634,23 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     }
 
 
+    /**
+     * Sets whether the experimental, unregistered
+     * {@code H2_COMPATIBLE_IDENTITY} setting (identifier {@code 0x22}) is
+     * advertised to peers.
+     *
+     * @param h2CompatibleIdentity {@code true} to advertise the setting
+     */
     public void setH2CompatibleIdentity(boolean h2CompatibleIdentity) {
         this.h2CompatibleIdentity = h2CompatibleIdentity;
     }
 
 
+    /**
+     * Returns the QUIC connection idle timeout in milliseconds.
+     *
+     * @return The configured idle timeout
+     */
     @Override
     public long getIdleTimeoutMs() {
         return idleTimeoutMs;
@@ -575,22 +704,50 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
     private volatile HttpParser httpParser = new HttpParser(null, null);
 
 
+    /**
+     * Returns the characters that are additionally permitted in the request
+     * target (path), above those RFC 9110 Section 7.1 allows. Same semantics
+     * as the HTTP/1.1 and HTTP/2 connector property.
+     *
+     * @return The additional path characters, or {@code null} if none
+     */
     public String getRelaxedPathChars() {
         return relaxedPathChars;
     }
 
 
+    /**
+     * Sets the characters that are additionally permitted in the request
+     * target (path). Same semantics as the HTTP/1.1 and HTTP/2 connector
+     * property.
+     *
+     * @param relaxedPathChars The additional characters, or {@code null}
+     *                         for none
+     */
     public void setRelaxedPathChars(String relaxedPathChars) {
         this.relaxedPathChars = relaxedPathChars;
         this.httpParser = new HttpParser(relaxedPathChars, relaxedQueryChars);
     }
 
 
+    /**
+     * Returns the characters that are additionally permitted in the query
+     * string. Same semantics as the HTTP/1.1 and HTTP/2 connector property.
+     *
+     * @return The additional query characters, or {@code null} if none
+     */
     public String getRelaxedQueryChars() {
         return relaxedQueryChars;
     }
 
 
+    /**
+     * Sets the characters that are additionally permitted in the query
+     * string. Same semantics as the HTTP/1.1 and HTTP/2 connector property.
+     *
+     * @param relaxedQueryChars The additional characters, or {@code null}
+     *                          for none
+     */
     public void setRelaxedQueryChars(String relaxedQueryChars) {
         this.relaxedQueryChars = relaxedQueryChars;
         this.httpParser = new HttpParser(relaxedPathChars, relaxedQueryChars);
@@ -609,12 +766,16 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
 
 
     /**
-     * The set of trailer header names that are allowed to be processed.
+     * The set of incoming request trailer header names that are allowed to be
+     * exposed to the application.
      */
     private final Set<String> allowedTrailerHeaders = ConcurrentHashMap.newKeySet();
 
     /**
-     * Set the names of headers that are allowed to be sent via a trailer.
+     * Set the names of incoming request trailer headers that this connector
+     * exposes to the application. The list does not affect outgoing response
+     * trailers; those are filtered by the fixed rules in
+     * {@code HeaderUtil.isHeaderDisallowedInTrailers()}.
      *
      * @param commaSeparatedHeaders Comma separated list of header names
      */
@@ -624,15 +785,27 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
         Set<String> toRemove = new HashSet<>(allowedTrailerHeaders);
         if (commaSeparatedHeaders != null) {
             String[] headers = commaSeparatedHeaders.split(",");
+            boolean added = false;
             for (String header : headers) {
                 String trimmedHeader = header.trim().toLowerCase(Locale.ENGLISH);
+                if (trimmedHeader.isEmpty()) {
+                    // A blank token is not a header name. It must especially
+                    // not become an allowed empty field name, and a value that
+                    // contains only blank tokens means "allow none".
+                    continue;
+                }
+                added = true;
                 if (toRemove.contains(trimmedHeader)) {
                     toRemove.remove(trimmedHeader);
                 } else {
                     allowedTrailerHeaders.add(trimmedHeader);
                 }
             }
-            allowedTrailerHeaders.removeAll(toRemove);
+            if (!added) {
+                allowedTrailerHeaders.clear();
+            } else {
+                allowedTrailerHeaders.removeAll(toRemove);
+            }
         } else {
             allowedTrailerHeaders.clear();
         }
@@ -640,11 +813,26 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
 
 
     /**
-     * Check if a header name is in the set of allowed trailer headers.
+     * Get the list of allowed trailer headers as a comma-separated string.
+     *
+     * @return The allowed trailer headers as a comma-separated string
+     */
+    public String getAllowedTrailerHeaders() {
+        // Chances of a change during execution of this line are small enough
+        // that a sync is unnecessary.
+        List<String> copy = new ArrayList<>(allowedTrailerHeaders);
+        return StringUtils.join(copy);
+    }
+
+
+    /**
+     * Check if an incoming request trailer header name is in the set of
+     * allowed trailer headers.
      *
      * @param headerName The header name to check
      *
-     * @return {@code true} if the header is allowed as a trailer header
+     * @return {@code true} if the header is allowed as an incoming request
+     *         trailer header
      */
     public boolean isTrailerHeaderAllowed(String headerName) {
         return allowedTrailerHeaders.contains(headerName.trim().toLowerCase(Locale.ENGLISH));
@@ -1031,11 +1219,23 @@ public abstract class AbstractHttp3Protocol extends AbstractProtocol<QuicStream>
 
     // ------------------------------------------------ SSL Configuration
 
+    /**
+     * Returns whether TLS is enabled on the QUIC endpoint. HTTP/3 requires
+     * TLS, so a non-TLS configuration is rejected at bind time.
+     *
+     * @return {@code true} if TLS is enabled
+     */
     public boolean isSSLEnabled() {
         return getEndpoint().isSSLEnabled();
     }
 
 
+    /**
+     * Sets whether TLS is enabled on the QUIC endpoint. HTTP/3 requires TLS,
+     * so disabling it leaves the endpoint unable to bind.
+     *
+     * @param SSLEnabled {@code true} to enable TLS
+     */
     public void setSSLEnabled(boolean SSLEnabled) {
         getEndpoint().setSSLEnabled(SSLEnabled);
     }

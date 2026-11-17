@@ -48,7 +48,7 @@ final class Http3Settings {
      * from creating thousands of map entries before the unknown entries are
      * discarded.
      */
-    private static final int MAX_SETTINGS = 1024;
+    static final int MAX_SETTINGS = 4096;
 
     private final long maxFieldSectionSize;
 

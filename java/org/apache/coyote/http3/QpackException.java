@@ -64,12 +64,12 @@ public class QpackException extends Exception {
     private static final long serialVersionUID = 1L;
 
 
-    QpackException(String msg) {
+    public QpackException(String msg) {
         super(msg);
     }
 
 
-    QpackException(String msg, Throwable cause) {
+    public QpackException(String msg, Throwable cause) {
         super(msg, cause);
     }
 }

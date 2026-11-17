@@ -626,12 +626,41 @@ public class TestHttp3Limits extends Http3TestBase {
     public void testConnectionRequestPaddingBudget() {
         Http3ConnectionManager.ConnectionState state =
                 new Http3ConnectionManager.ConnectionState(null);
-        long limit = 128L * 1024 * 1024;
+        long limit = Http3ConnectionManager.MAX_CONNECTION_NON_BODY_BYTES;
         Assert.assertFalse("A frame exactly at the byte limit must be accepted",
                 state.noteRequestNonBodyFrame(limit));
         Assert.assertTrue("A later frame must exceed the connection lifetime "
                 + "request padding byte budget",
                 state.noteRequestNonBodyFrame(1));
+    }
+
+
+    @Test
+    public void testInboundQpackInstructionBudget() throws Exception {
+        Http3ConnectionManager manager =
+                new Http3ConnectionManager(newHttp3Protocol());
+        QuicConnection connection = newConnection(manager);
+        manager.connectionOpen(connection);
+
+        // A valid but unbounded stream of tiny encoder instructions (Set
+        // Dynamic Table Capacity 0) must not keep the QUIC poll thread busy
+        // for the connection's lifetime. One instruction beyond the
+        // per-connection budget must fail the connection with
+        // H3_EXCESSIVE_LOAD.
+        int limit = Http3ConnectionManager.MAX_QPACK_INSTRUCTIONS;
+        ByteBuffer data = ByteBuffer.allocate(limit + 2);
+        Qpack.encodeQuicInteger(data, Constants.H3_STREAM_TYPE_QPACK_ENCODER);
+        for (int i = 0; i <= limit; i++) {
+            data.put((byte) 0x20);
+        }
+        data.flip();
+        try {
+            manager.processClientUniStreamData(connection, 2, data);
+            Assert.fail("An inbound QPACK instruction stream above the "
+                    + "budget must fail the connection");
+        } catch (Http3Exception e) {
+            Assert.assertEquals(Http3Error.H3_EXCESSIVE_LOAD, e.getError());
+        }
     }
 
 
@@ -651,7 +680,8 @@ public class TestHttp3Limits extends Http3TestBase {
         Qpack.encodeQuicInteger(data, Constants.H3_SETTINGS);
         Qpack.encodeQuicInteger(data, 0);
         Qpack.encodeQuicInteger(data, 0x80);
-        Qpack.encodeQuicInteger(data, 33L * 1024 * 1024);
+        Qpack.encodeQuicInteger(data,
+                Http3ConnectionManager.MAX_IGNORED_BYTES + 1);
         data.flip();
         try {
             manager.processClientUniStreamData(connection, 2, data);
@@ -681,7 +711,10 @@ public class TestHttp3Limits extends Http3TestBase {
 
         boolean failed = false;
         try {
-            for (int i = 0; i < 33; i++) {
+            for (int i = 0;
+                    i <= Http3ConnectionManager.MAX_IGNORED_BYTES
+                            / (1024 * 1024);
+                    i++) {
                 ByteBuffer chunk = ByteBuffer.allocate(1024 * 1024);
                 chunk.position(chunk.limit());
                 chunk.flip();
@@ -739,13 +772,13 @@ public class TestHttp3Limits extends Http3TestBase {
             // Expected
         }
         try {
-            protocol.setMaxConcurrentStreams(1L << 62);
-            Assert.fail("A maxConcurrentStreams value above the QUIC varint "
-                    + "limit must be rejected");
+            protocol.setMaxConcurrentStreams((1L << 60) + 1);
+            Assert.fail("A maxConcurrentStreams value above the QUIC "
+                    + "stream-count limit must be rejected");
         } catch (IllegalArgumentException expected) {
             // Expected
         }
-        protocol.setMaxConcurrentStreams((1L << 62) - 1);
+        protocol.setMaxConcurrentStreams(1L << 60);
 
         try {
             protocol.setQpackMaxTableCapacity(-1);

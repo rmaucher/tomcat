@@ -232,6 +232,24 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
+    public void testNoAuthoritySchemeWithEmptyPathAccepted() throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowSchemeMismatch(true);
+
+        // RFC 9114 Section 4.3.1 requires a non-empty :path only for http
+        // and https URIs. An empty path is legitimate for a scheme without a
+        // hierarchical path component such as urn, and must not be rejected
+        // as a malformed message.
+        ClientOutput output = rawRequest(":method", "GET",
+                ":scheme", "urn", ":path", "");
+
+        Assert.assertNull("An empty :path must not be rejected for a "
+                + "non-HTTP scheme", output.getStreamError());
+    }
+
+
+    @Test
     public void testNoAuthoritySchemeWithoutAuthorityAccepted() throws Exception {
         startHttp3Server();
         ((AbstractHttp3Protocol) connector.getProtocolHandler())
@@ -657,6 +675,61 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
+    public void testConnectContentLengthDoesNotFrameTunnelData() throws Exception {
+        startHttp3Server();
+
+        // RFC 9110 Section 9.3.6: a CONNECT request has no content, so a
+        // Content-Length field must not bound or complete the DATA frames,
+        // which carry tunnel bytes (RFC 9114 Section 4.4). A common
+        // "Content-Length: 0" on a bodyless request must not turn the first
+        // tunnel DATA frame into a body overrun (H3_MESSAGE_ERROR).
+        String headers = buildFieldSection(":method", "CONNECT",
+                ":authority", "127.0.0.1:" + port,
+                "content-length", "0");
+        ClientOutput output = runClient(rawCommandWith("--headers", headers,
+                "--data", Base64.getEncoder().encodeToString(
+                        new byte[] { 1, 2, 3 }),
+                "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 501);
+        Assert.assertNull("Tunnel DATA must not be classified as a "
+                + "Content-Length overrun", output.getStreamError());
+    }
+
+
+    @Test
+    public void testConnectMalformedContentLengthRejected() throws Exception {
+        startHttp3Server();
+
+        // CONNECT ignores Content-Length for framing, but a non-numeric value
+        // is still an invalid HTTP field value (RFC 9110 Section 8.6) and
+        // must make the request malformed.
+        ClientOutput output = rawRequest(":method", "CONNECT",
+                ":authority", "127.0.0.1:" + port,
+                "content-length", "not-a-number");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
+    public void testConnectDuplicateContentLengthRejected() throws Exception {
+        startHttp3Server();
+
+        // RFC 9110 Section 8.6 forbids multiple Content-Length fields. The
+        // framing semantics are ignored for CONNECT, but the duplicate field
+        // still makes the HTTP message malformed.
+        ClientOutput output = rawRequest(":method", "CONNECT",
+                ":authority", "127.0.0.1:" + port,
+                "content-length", "0",
+                "content-length", "1");
+
+        assertStreamError(output, H3_MESSAGE_ERROR);
+    }
+
+
+    @Test
     public void testConnectTrailersRejected() throws Exception {
         startHttp3Server();
 
@@ -744,6 +817,27 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         ClientOutput output = rawRequest(":method", "CONNECT",
                 ":scheme", "https", ":authority", "127.0.0.1:" + port,
                 ":protocol", "websocket", ":path", "/simple");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 501);
+        Assert.assertNull(output.getStreamError());
+    }
+
+
+    @Test
+    public void testExtendedConnectUnknownProtocolYieldsNotImplemented()
+            throws Exception {
+        startHttp3Server();
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setEnableConnectProtocol(true);
+
+        // RFC 9220 Section 3: an extended CONNECT with a :protocol value the
+        // server does not support SHOULD be answered with 501 Not
+        // Implemented. The connector supports no :protocol by default, so the
+        // request must not be dispatched to the application.
+        ClientOutput output = rawRequest(":method", "CONNECT",
+                ":scheme", "https", ":authority", "127.0.0.1:" + port,
+                ":protocol", "unknown-protocol", ":path", "/simple");
 
         Http3Response response = output.getResponse();
         validateStatus(response, 501);
@@ -865,6 +959,21 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         startHttp3Server();
 
         ClientOutput output = rawGet("/simple", "te", "trailers");
+
+        Http3Response response = output.getResponse();
+        validateStatus(response, 200);
+        Assert.assertNull(output.getStreamError());
+    }
+
+
+    @Test
+    public void testTeHeaderWithMixedCaseTrailersAccepted() throws Exception {
+        startHttp3Server();
+
+        // HTTP field values that are tokens are matched case-insensitively
+        // (RFC 9110 Sections 5.5 and 10.1.4), so this is the same TE value
+        // as "trailers" and must be accepted.
+        ClientOutput output = rawGet("/simple", "te", "Trailers");
 
         Http3Response response = output.getResponse();
         validateStatus(response, 200);
@@ -1465,22 +1574,53 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
 
     @Test
-    public void testAllowedCookieTrailerJoinedIntoRequestHeaders()
+    public void testProhibitedRequestTrailersNotSurfaced() throws Exception {
+        startHttp3Server(this::addTrailerEchoServlet);
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowedTrailerHeaders(
+                        "authorization,set-cookie,if-match,content-language,"
+                                + "x-checksum");
+
+        // Even when an operator explicitly allows these names, RFC 9110
+        // Section 6.5.1 prohibits their use in trailers. The HTTP/3 trailer
+        // filter must drop them while retaining a valid allowed trailer.
+        Http3Response response = request("POST", "/trailerecho", null,
+                new String[] { "authorization", "secret", "set-cookie",
+                        "session=evil", "if-match", "\"etag\"",
+                        "content-language", "en", "x-checksum", "ok" });
+
+        validateStatus(response, 200);
+        String body = response.getBodyAsString();
+        Assert.assertTrue("Expected ready=true in:\n" + body,
+                body.contains("ready=true"));
+        Assert.assertFalse("Authorization must not be surfaced as a trailer: "
+                + body, body.contains("authorization="));
+        Assert.assertFalse("Set-Cookie must not be surfaced as a trailer: "
+                + body, body.contains("set-cookie="));
+        Assert.assertFalse("If-Match must not be surfaced as a trailer: "
+                + body, body.contains("if-match="));
+        Assert.assertFalse("Content-Language must not be surfaced as a trailer: "
+                + body, body.contains("content-language="));
+        Assert.assertTrue("Expected the valid trailer in:\n" + body,
+                body.contains("x-checksum=ok"));
+    }
+
+
+    @Test
+    public void testAllowedCookieTrailerIsKeptInTrailerFields()
             throws Exception {
         startHttp3Server(this::addCookieEchoServlet);
         ((AbstractHttp3Protocol) connector.getProtocolHandler())
                 .setAllowedTrailerHeaders("cookie");
 
-        // A trailer field named cookie is processed like any cookie field:
-        // the cookie case of emitHeader is not gated on trailer mode (as in
-        // HTTP/2's Stream.emitHeader), so the values are joined with "; ".
-        // HTTP/2 flushes the joined value into the regular request headers
-        // at the end of every field section, trailer sections included
-        // (Stream.receivedEndOfHeaders via Http2UpgradeHandler.headersEnd);
-        // the same must happen when the trailer section completes here.
+        // RFC 9110 Section 6.5.1 forbids merging a trailer field into a
+        // header section unless the field definition explicitly permits it.
+        // A cookie field in the trailer section must therefore be exposed as
+        // a trailer field, while a regular cookie field is still joined in
+        // the request headers as before.
         String initial = buildFieldSection(":method", "POST", ":scheme",
                 "https", ":authority", "127.0.0.1:" + port, ":path",
-                "/cookieecho", "content-length", "4");
+                "/cookieecho", "content-length", "4", "cookie", "header=0");
         String trailers = buildFieldSection("cookie", "a=1", "cookie",
                 "b=2");
         ClientOutput output = runClient(
@@ -1492,8 +1632,15 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
         validateStatus(output.getResponse(), 200);
         String body = output.getResponse().getBodyAsString();
-        Assert.assertTrue("Expected the joined trailer cookie in:\n" + body,
-                body.contains("cookie=a=1; b=2"));
+        Assert.assertTrue("The regular request cookie must not absorb the "
+                + "trailer cookie: " + body,
+                body.contains("header-cookie=header=0;ready="));
+        Assert.assertTrue("The trailer cookie field lines must be joined with "
+                + "the RFC 9114 Section 4.2.1 delimiter \"; \": " + body,
+                body.contains("trailer-cookie=a=1; b=2"));
+        Assert.assertFalse("Trailer cookie field lines must not be joined "
+                + "with a comma: " + body,
+                body.contains("trailer-cookie=a=1,b=2"));
     }
 
 
@@ -1541,8 +1688,11 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
         validateStatus(output.getResponse(), 200);
         Assert.assertNull(output.getStreamError());
-        Assert.assertTrue("Expected the allowed content-length trailer in:\n"
-                        + output.getResponse().getBodyAsString(),
+        // RFC 9110 Section 6.5.1 prohibits Content-Length in trailers even
+        // when the operator allow-lists the name: the field must be ignored,
+        // not exposed to the application.
+        Assert.assertFalse("An allow-listed prohibited trailer field must be "
+                + "ignored: " + output.getResponse().getBodyAsString(),
                 output.getResponse().getBodyAsString()
                         .contains("content-length=99"));
     }
@@ -1568,10 +1718,52 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
 
         validateStatus(output.getResponse(), 200);
         Assert.assertNull(output.getStreamError());
-        Assert.assertTrue("Expected the allowed content-length trailer in:\n"
-                        + output.getResponse().getBodyAsString(),
+        // RFC 9110 Section 6.5.1 prohibits Content-Length in trailers even
+        // when allow-listed: the field must be ignored.
+        Assert.assertFalse("An allow-listed prohibited trailer field must be "
+                + "ignored: " + output.getResponse().getBodyAsString(),
                 output.getResponse().getBodyAsString()
                         .contains("content-length=5"));
+    }
+
+
+    @Test
+    public void testAllowedProhibitedTrailerFieldsAreIgnored() throws Exception {
+        startHttp3Server(this::addTrailerEchoServlet);
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setAllowedTrailerHeaders("x-ok, host, te, content-encoding");
+
+        // RFC 9110 Section 6.5.1: fields needed for message framing, routing,
+        // request modifiers, authentication, response control data or payload
+        // processing must be ignored in a trailer section. The operator
+        // allow-list cannot override the prohibition; a non-prohibited field
+        // in the same section is still exposed.
+        String initial = buildFieldSection(":method", "POST", ":scheme",
+                "https", ":authority", "127.0.0.1:" + port, ":path",
+                "/trailerecho", "content-length", "5");
+        String trailers = buildFieldSection("x-ok", "yes",
+                "host", "evil.example:443",
+                "te", "trailers",
+                "content-encoding", "gzip");
+        ClientOutput output = runClient(
+                rawCommandWith("--headers", initial,
+                        "--data", Base64.getEncoder().encodeToString(
+                                "body!".getBytes(StandardCharsets.UTF_8)),
+                        "--trailers", trailers),
+                CLIENT_TIMEOUT_SECONDS);
+
+        validateStatus(output.getResponse(), 200);
+        Assert.assertNull(output.getStreamError());
+        String body = output.getResponse().getBodyAsString();
+        Assert.assertTrue("A permitted non-prohibited trailer field must "
+                + "still be exposed: " + body, body.contains("x-ok=yes"));
+        Assert.assertFalse("A prohibited trailer field must be ignored even "
+                + "when allow-listed: " + body, body.contains("host="));
+        Assert.assertFalse("A prohibited trailer field must be ignored even "
+                + "when allow-listed: " + body, body.contains("te="));
+        Assert.assertFalse("A prohibited trailer field must be ignored even "
+                + "when allow-listed: " + body,
+                body.contains("content-encoding="));
     }
 
 
@@ -1953,8 +2145,12 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
             req.getInputStream().readAllBytes();
             resp.setContentType("text/plain");
             resp.setCharacterEncoding("UTF-8");
-            resp.getWriter().write("cookie=" + req.getHeader("cookie") +
-                    ";ready=" + req.isTrailerFieldsReady());
+            StringBuilder body = new StringBuilder();
+            body.append("header-cookie=").append(req.getHeader("cookie"));
+            body.append(";ready=").append(req.isTrailerFieldsReady());
+            req.getTrailerFields().forEach((name, value) -> body.append(
+                    ";trailer-").append(name).append('=').append(value));
+            resp.getWriter().write(body.toString());
         }
     }
 

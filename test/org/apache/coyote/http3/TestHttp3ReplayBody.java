@@ -57,8 +57,11 @@ public class TestHttp3ReplayBody extends Http3TestBase {
         Assert.assertArrayEquals("Replayed body bytes", body, read);
         Assert.assertEquals("End of replayed body", -1,
                 input.doRead(handler));
-        Assert.assertTrue("Replayed body is at end of stream",
-                processor.isTrailerFieldsReady());
+        Assert.assertTrue("A consumed replayed body is reported as fully read",
+                processor.isRequestBodyFullyRead());
+        Assert.assertFalse("The transport stream was not ended by the replay, "
+                + "so trailer readiness must not claim a clean empty trailer "
+                + "map", processor.isTrailerFieldsReady());
     }
 
 
@@ -166,8 +169,103 @@ public class TestHttp3ReplayBody extends Http3TestBase {
                 input.doRead(handler));
         Assert.assertTrue("A consumed replayed body must be reported as fully "
                 + "read", processor.isRequestBodyFullyRead());
-        Assert.assertTrue("A consumed replayed body must report ready trailer "
-                + "fields", processor.isTrailerFieldsReady());
+        Assert.assertFalse("The replayed body must not claim a clean transport "
+                + "stream end", processor.isTrailerFieldsReady());
+    }
+
+
+    @Test
+    public void testReplayDoesNotClaimCleanStreamEndWithoutFin()
+            throws Exception {
+        // A saved-request body replay is a body replacement, not an end of
+        // the QUIC request stream. Without a transport FIN, the readiness
+        // probe must not report an empty trailer map for a stream that may
+        // still deliver a trailer section, and the abandoned original stream
+        // owes a QPACK Stream Cancellation (RFC 9204 Section 2.2.2.2).
+        Http3Processor processor =
+                new Http3Processor(newHttp3Protocol(), null);
+        processor.setStreamId(0);
+        byte[] body = "body!".getBytes(StandardCharsets.UTF_8);
+        ByteChunk chunk = new ByteChunk();
+        chunk.setBytes(body, 0, body.length);
+        processor.setRequestBody(chunk);
+
+        InputBuffer input = processor.getRequest().getInputBuffer();
+        TestBufferHandler handler = new TestBufferHandler();
+        Assert.assertEquals("First read length", body.length,
+                input.doRead(handler));
+        Assert.assertEquals("End of replayed body", -1,
+                input.doRead(handler));
+
+        Assert.assertFalse("A replay must not claim a clean trailer end before "
+                + "the transport stream ended",
+                processor.isTrailerFieldsReady());
+        Assert.assertTrue("The replayed body must still be reported as fully "
+                + "read", processor.isRequestBodyFullyRead());
+
+        Field cancellationSent = Http3Processor.class.getDeclaredField(
+                "streamCancellationSent");
+        cancellationSent.setAccessible(true);
+        Assert.assertTrue("Abandoning the replaced request stream must queue "
+                + "the QPACK Stream Cancellation",
+                cancellationSent.getBoolean(processor));
+    }
+
+
+    @Test
+    public void testReplayClearsProtocolFrameState() throws Exception {
+        // Protocol frame state left over from the replaced request must not
+        // be interpreted as belonging to the replayed body.
+        Http3Processor processor =
+                new Http3Processor(newHttp3Protocol(), null);
+        processor.setStreamId(0);
+
+        Object inBuf = processor.getRequest().getInputBuffer();
+        setField(inBuf, "pendingSkipRemaining", Long.valueOf(7));
+        setField(inBuf, "partialDataRemaining", Integer.valueOf(3));
+        setField(inBuf, "trailerPayload", ByteBuffer.allocate(4));
+        Field bufferField = Http3Processor.class.getDeclaredField(
+                "inputBuffer");
+        bufferField.setAccessible(true);
+        ByteBuffer inputBuffer = (ByteBuffer) bufferField.get(processor);
+        inputBuffer.clear();
+        inputBuffer.put(new byte[] { 1, 2, 3 });
+        inputBuffer.flip();
+        Field hasData = Http3Processor.class.getDeclaredField(
+                "inputBufferHasData");
+        hasData.setAccessible(true);
+        hasData.setBoolean(processor, true);
+
+        byte[] body = "body!".getBytes(StandardCharsets.UTF_8);
+        ByteChunk chunk = new ByteChunk();
+        chunk.setBytes(body, 0, body.length);
+        processor.setRequestBody(chunk);
+
+        Assert.assertEquals("A replay must discard a pending ignored-frame "
+                + "skip", 0L, getField(inBuf, "pendingSkipRemaining"));
+        Assert.assertEquals("A replay must discard a partial DATA frame", 0,
+                getField(inBuf, "partialDataRemaining"));
+        Assert.assertNull("A replay must discard a staged trailer section",
+                getField(inBuf, "trailerPayload"));
+        Assert.assertEquals("A replay must discard the replaced request's "
+                + "protocol input buffer bytes", 0,
+                inputBuffer.remaining());
+    }
+
+
+    private static void setField(Object target, String name, Object value)
+            throws Exception {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(target, value);
+    }
+
+
+    private static Object getField(Object target, String name)
+            throws Exception {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(target);
     }
 
 

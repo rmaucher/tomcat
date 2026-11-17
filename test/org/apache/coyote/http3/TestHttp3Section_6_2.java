@@ -198,7 +198,7 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
         // Unknown settings are ignored, so they do not need to be retained.
         // A SETTINGS frame carrying an excessive number of identifiers is a
         // resource-limit violation and is rejected with H3_EXCESSIVE_LOAD.
-        int count = 1025;
+        int count = Http3Settings.MAX_SETTINGS + 1;
         long[] settings = new long[count * 2];
         for (int i = 0; i < count; i++) {
             settings[2 * i] = 0x1000L + i;
@@ -405,6 +405,33 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_ERROR);
+    }
+
+
+    @Test
+    public void testClientPushIdFrameOversizedPayloadRejected()
+            throws Exception {
+        startHttp3Server();
+
+        // GOAWAY, MAX_PUSH_ID and CANCEL_PUSH each carry exactly one QUIC
+        // variable-length integer (RFC 9114 Sections 7.2.3, 7.2.6 and 7.2.7),
+        // so any payload longer than the maximum 8-byte varint is malformed
+        // and MUST be a connection error of type H3_FRAME_ERROR (Section
+        // 7.1). The classification must not depend on whether the declared
+        // length happens to fit the stream read buffer: a larger declared
+        // length is still a malformed frame, not a local resource limit.
+        for (int frameType : new int[] { 0x03, 0x07, 0x0D }) {
+            String control = buildFramesB64(
+                    buildSettingsFrameB64(1, 4096),
+                    buildDeclaredFrameB64(frameType, 20000, new byte[64]));
+            ClientOutput output = runClient(rawCommandWith(
+                    "--control", control,
+                    "--no-request", "--timeout",
+                    Long.toString(NO_RESPONSE_TIMEOUT_SECONDS)),
+                    CLIENT_TIMEOUT_SECONDS);
+
+            assertConnectionError(output, H3_FRAME_ERROR);
+        }
     }
 
 

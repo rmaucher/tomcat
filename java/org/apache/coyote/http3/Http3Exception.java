@@ -22,8 +22,10 @@ import java.io.Serial;
 /**
  * Signals an HTTP/3 protocol error with its associated error code (RFC 9114
  * Section 8.1). The exception is part of the public QPACK decoder emitter
- * contract ({@link QpackDecoder.HeaderEmitter}); constructors remain package
- * private because only the protocol implementation creates it.
+ * contract ({@link QpackDecoder.HeaderEmitter}); its constructors are public so
+ * an external emitter implementation can signal the declared checked
+ * exceptions. The concrete stream-scoped subclass remains an internal
+ * implementation detail.
  */
 public class Http3Exception extends Exception {
 
@@ -33,13 +35,13 @@ public class Http3Exception extends Exception {
     private final Http3Error error;
 
 
-    Http3Exception(String msg, Http3Error error) {
+    public Http3Exception(String msg, Http3Error error) {
         super(msg);
         this.error = error;
     }
 
 
-    Http3Exception(String msg, Http3Error error, Throwable cause) {
+    public Http3Exception(String msg, Http3Error error, Throwable cause) {
         super(msg, cause);
         this.error = error;
     }
