@@ -74,6 +74,8 @@ public class QuicPollSet {
     private static final int GROWTH_INCREMENT = 32;
 
     private static final long STRIDE = QuicPoll.stride();
+    private static final QuicPlatformSupport.Abi ABI =
+            QuicPlatformSupport.get().abi();
 
     /**
      * Arena holding the current native poll array. Replaced (and the
@@ -130,7 +132,7 @@ public class QuicPollSet {
         this.nativeArray = arrayArena.allocate(STRIDE * capacity);
         this.slots = new QuicPollItem[capacity];
         this.resultCountArena = Arena.ofShared();
-        this.resultCountSegment = resultCountArena.allocate(ValueLayout.JAVA_LONG);
+        this.resultCountSegment = resultCountArena.allocate(ABI.sizeT());
     }
 
 
@@ -342,7 +344,7 @@ public class QuicPollSet {
      * @return The result count
      */
     public long getResultCount() {
-        return resultCountSegment.get(ValueLayout.JAVA_LONG, 0);
+        return ABI.getSizeT(resultCountSegment, 0);
     }
 
 
@@ -350,7 +352,7 @@ public class QuicPollSet {
      * Resets the result count before the next poll.
      */
     public void resetResultCount() {
-        resultCountSegment.set(ValueLayout.JAVA_LONG, 0, 0L);
+        ABI.setSizeT(resultCountSegment, 0, 0L);
     }
 
 

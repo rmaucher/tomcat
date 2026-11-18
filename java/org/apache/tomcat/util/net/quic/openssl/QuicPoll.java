@@ -17,10 +17,7 @@
 package org.apache.tomcat.util.net.quic.openssl;
 
 import java.lang.foreign.Arena;
-import java.lang.foreign.MemoryLayout;
-import java.lang.foreign.MemoryLayout.PathElement;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 
 
 
@@ -51,19 +48,12 @@ import java.lang.foreign.ValueLayout;
  * } SSL_POLL_ITEM;               // total 32 bytes
  * </pre>
  * <p>
- * The layout and the {@code struct timeval} used by the poll loop assume the
- * 64-bit Linux LP64 ABI ({@code time_t}/{@code suseconds_t} and pointers are
- * 8 bytes). A 32-bit build is rejected at class initialisation rather than
- * silently passing a mismatched struct to {@code SSL_poll()}.
+ * The native layouts and the {@code struct timeval} used by the poll loop come
+ * from {@link QuicPlatformSupport.Abi}. The platform selector rejects an ABI
+ * that cannot represent them, rather than silently passing a mismatched struct
+ * to {@code SSL_poll()}.
  */
 public final class QuicPoll {
-
-    static {
-        if (ValueLayout.ADDRESS.byteSize() != Long.BYTES) {
-            throw new IllegalStateException(
-                    "OpenSSL QUIC requires a 64-bit (LP64) JVM/ABI");
-        }
-    }
 
     private QuicPoll() {
         // Utility class - constants, layout and the SSL_poll() driver only.
@@ -165,51 +155,15 @@ public final class QuicPoll {
                 isWriteStateClosed(writeState);
     }
 
-    // Struct layout definitions
-    // BIO_POLL_DESCRIPTOR: uint32_t type + 4-byte padding + union{void* value} = 16 bytes
-    // Use JAVA_INT as padding (4 bytes, 4-byte alignment) before ADDRESS (8-byte alignment)
-    static final MemoryLayout BIO_POLL_DESCRIPTOR_LAYOUT = MemoryLayout.structLayout(
-            ValueLayout.JAVA_INT.withName("type"),
-            ValueLayout.JAVA_INT.withName("padding"),
-            ValueLayout.ADDRESS.withName("value")
-    ).withName("bio_poll_descriptor");
+    private static final QuicPlatformSupport.Abi ABI =
+            QuicPlatformSupport.get().abi();
 
-    // SSL_POLL_ITEM: BIO_POLL_DESCRIPTOR desc + uint64_t events + uint64_t revents = 32 bytes
-    static final MemoryLayout SSL_POLL_ITEM_LAYOUT = MemoryLayout.structLayout(
-            BIO_POLL_DESCRIPTOR_LAYOUT.withName("desc"),
-            ValueLayout.JAVA_LONG.withName("events"),
-            ValueLayout.JAVA_LONG.withName("revents")
-    ).withName("ssl_poll_item");
+    static final long DESC_TYPE_OFFSET = ABI.descTypeOffset();
+    static final long DESC_VALUE_OFFSET = ABI.descValueOffset();
+    static final long EVENTS_OFFSET = ABI.eventsOffset();
+    static final long REVENTS_OFFSET = ABI.reventsOffset();
 
-    static final long SSL_POLL_ITEM_SIZE = SSL_POLL_ITEM_LAYOUT.byteSize();
-    static final long STRIDE = (SSL_POLL_ITEM_SIZE % ValueLayout.ADDRESS.byteSize() != 0) ?
-            ((SSL_POLL_ITEM_SIZE / ValueLayout.ADDRESS.byteSize() + 1) * ValueLayout.ADDRESS.byteSize()) :
-            SSL_POLL_ITEM_SIZE;
-
-    // Offsets within SSL_POLL_ITEM
-    static final long DESC_TYPE_OFFSET =
-            SSL_POLL_ITEM_LAYOUT.byteOffset(PathElement.groupElement("desc"), PathElement.groupElement("type"));
-    static final long DESC_VALUE_OFFSET =
-            SSL_POLL_ITEM_LAYOUT.byteOffset(PathElement.groupElement("desc"), PathElement.groupElement("value"));
-    static final long EVENTS_OFFSET =
-            SSL_POLL_ITEM_LAYOUT.byteOffset(PathElement.groupElement("events"));
-    static final long REVENTS_OFFSET =
-            SSL_POLL_ITEM_LAYOUT.byteOffset(PathElement.groupElement("revents"));
-
-    // struct timeval - the single definition shared by every timeval site:
-    // the SSL_poll() timeout built below and the SSL_get_event_timeout()
-    // scratch the poll loop reads. time_t and suseconds_t are both 8 bytes on
-    // the LP64 / _TIME_BITS=64 ABI that this Linux-only FFM endpoint targets.
-    // A 32-bit or _TIME_BITS=32 build would need 4-byte fields here. The
-    // offsets are derived from the layout so they stay consistent with the
-    // field widths chosen below.
-    static final MemoryLayout TIMEVAL_LAYOUT = MemoryLayout.structLayout(
-            ValueLayout.JAVA_LONG.withName("tv_sec"),
-            ValueLayout.JAVA_LONG.withName("tv_usec"));
-    static final long TV_SEC_OFFSET =
-            TIMEVAL_LAYOUT.byteOffset(PathElement.groupElement("tv_sec"));
-    static final long TV_USEC_OFFSET =
-            TIMEVAL_LAYOUT.byteOffset(PathElement.groupElement("tv_usec"));
+    static final long STRIDE = ABI.sslPollItemStride();
 
     /**
      * Invokes {@code SSL_poll()} on the given array of poll items.
@@ -240,11 +194,10 @@ public final class QuicPoll {
                 // Infinite timeout
                 timeoutPtr = MemorySegment.NULL;
             } else {
-                MemorySegment tv = localArena.allocate(TIMEVAL_LAYOUT);
+                MemorySegment tv = localArena.allocate(ABI.timeval());
                 long secs = timeoutMs / 1000;
                 long usecs = (timeoutMs % 1000) * 1000;
-                tv.set(ValueLayout.JAVA_LONG, TV_SEC_OFFSET, secs);
-                tv.set(ValueLayout.JAVA_LONG, TV_USEC_OFFSET, usecs);
+                ABI.writeTimeval(tv, secs, usecs);
                 timeoutPtr = tv;
             }
             return QuicBindings.SSL_poll(

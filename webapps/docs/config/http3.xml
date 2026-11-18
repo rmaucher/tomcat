@@ -67,6 +67,9 @@
   1.26.x series plus libngtcp2_crypto_ossl backed by the system OpenSSL
   3.5 or later
   (ngtcp2 uses a normal TLS server context rather than the OpenSSL QUIC API).
+  The OpenSSL QUIC transport's native socket/wake-up layer is currently
+  implemented for Linux LP64. On other platforms the connector reports itself
+  unavailable at bind time rather than binding with a mismatched native ABI.
   The connector
   fails at bind time when the selected transport is unusable. The sample
   <code>conf/server.xml</code> also configures a TLS connector on the TCP

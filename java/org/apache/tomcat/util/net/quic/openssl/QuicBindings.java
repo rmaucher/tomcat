@@ -23,7 +23,6 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.util.LinkedHashSet;
-import java.util.Locale;
 import java.util.Set;
 
 import org.apache.juli.logging.Log;
@@ -36,12 +35,11 @@ import org.apache.tomcat.util.res.StringManager;
  * FFM bindings for OpenSSL QUIC functions.
  * <p>
  * This class provides downcall handles for the QUIC-specific OpenSSL functions
- * needed by {@code QuicOpenSSLEndpoint}. The bindings currently target Linux
- * LP64 with a glibc or musl libc: other operating systems use different libc
- * ABIs, socket constants, sockaddr layouts and C {@code long} widths, so the
- * endpoint reports itself unavailable there rather than binding with the
- * wrong ABI. All bindings follow the same pattern
- * as the existing bindings in {@code openssl_h}.
+ * needed by {@code QuicOpenSSLEndpoint}. Operating-system-specific socket,
+ * wake-up, address and error access is owned by {@link QuicPlatformSupport};
+ * the endpoint is available only when both the platform implementation and
+ * these OpenSSL symbols are usable. All bindings follow the same pattern as
+ * the existing bindings in {@code openssl_h}.
  * <p>
  * The list below summarizes the main groups of functions bound here; the
  * individual fields are the authoritative list (OpenSSL manages QUIC I/O
@@ -71,13 +69,8 @@ import org.apache.tomcat.util.res.StringManager;
  * <li>{@code SSL_ctrl()}, {@code SSL_CTX_callback_ctrl()}
  *     (used for the SNI callback and chain certificate management, which are
  *     macros in OpenSSL 4.0)</li>
- * <li>C libc helpers for the datagram socket: {@code socket()}, {@code bind()},
- *     {@code getsockname()}, {@code setsockopt()}, {@code fcntl()},
- *     {@code strerror()}, {@code close()}, {@code poll()},
- *     {@code read()}, {@code write()}, {@code eventfd()} and
- *     {@code __errno_location()} (the {@code errno} thread-local accessor
- *     used around the socket helpers; {@code read()}/{@code write()}/
- *     {@code eventfd()} drive the poll loop's wake eventfd)</li>
+ * <li>C libc helpers are intentionally not bound here; all socket, wake-up,
+ *     address and error operations are owned by {@link QuicPlatformSupport}</li>
  * </ul>
  */
 public class QuicBindings {
@@ -105,12 +98,18 @@ public class QuicBindings {
     public static final boolean QUIC_AVAILABLE;
 
     /**
-     * Symbols whose lookup or downcall binding failed during static
-     * initialisation, populated by {@code createHandle()} and
-     * {@code createLibcHandle()}. Empty means every symbol this class binds
-     * is present in the linked library.
+     * OpenSSL symbols whose lookup or downcall binding failed during static
+     * initialisation, populated by {@code createHandle()}. Empty means every
+     * OpenSSL symbol this class binds is present in the linked library.
      */
-    private static final Set<String> MISSING_SYMBOLS = new LinkedHashSet<>();
+    private static final Set<String> MISSING_OPENSSL_SYMBOLS = new LinkedHashSet<>();
+
+    /**
+     * The ABI used for the OpenSSL downcall descriptors. On Linux LP64 this is
+     * the same C {@code long}/{@code size_t} width as the generated bindings.
+     */
+    private static final QuicPlatformSupport.Abi ABI =
+            QuicPlatformSupport.get().abi();
 
     // -------------------------------------------------- QUIC Server Method
 
@@ -379,7 +378,7 @@ public class QuicBindings {
     public static final MethodHandle SSL_stream_reset$handle =
             createHandle("SSL_stream_reset",
                     FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER,
-                            openssl_h.C_POINTER, ValueLayout.JAVA_LONG));
+                            openssl_h.C_POINTER, ABI.sizeT()));
 
     /**
      * {@code int SSL_stream_reset(SSL *ssl, const uint8_t *args, size_t args_len)}
@@ -459,7 +458,7 @@ public class QuicBindings {
     public static final MethodHandle SSL_read_ex$handle =
             createHandle("SSL_read_ex",
                     FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER,
-                            openssl_h.C_POINTER, ValueLayout.JAVA_LONG, openssl_h.C_POINTER));
+                            openssl_h.C_POINTER, ABI.sizeT(), openssl_h.C_POINTER));
 
     /**
      * {@code int SSL_read_ex(SSL *s, void *buf, size_t num, size_t *readbytes)}
@@ -485,7 +484,7 @@ public class QuicBindings {
     public static final MethodHandle SSL_write_ex$handle =
             createHandle("SSL_write_ex",
                     FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER,
-                            openssl_h.C_POINTER, ValueLayout.JAVA_LONG, openssl_h.C_POINTER));
+                            openssl_h.C_POINTER, ABI.sizeT(), openssl_h.C_POINTER));
 
     /**
      * {@code int SSL_write_ex(SSL *s, const void *buf, size_t num, size_t *written)}
@@ -515,7 +514,7 @@ public class QuicBindings {
     public static final MethodHandle SSL_write_ex2$handle =
             createHandle("SSL_write_ex2",
                     FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER,
-                            openssl_h.C_POINTER, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, openssl_h.C_POINTER));
+                            openssl_h.C_POINTER, ABI.sizeT(), ValueLayout.JAVA_LONG, openssl_h.C_POINTER));
 
     /**
      * {@code int SSL_write_ex2(SSL *s, const void *buf, size_t num, uint64_t
@@ -587,7 +586,7 @@ public class QuicBindings {
     public static final MethodHandle SSL_shutdown_ex$handle =
             createHandle("SSL_shutdown_ex",
                     FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER,
-                            ValueLayout.JAVA_LONG, openssl_h.C_POINTER, ValueLayout.JAVA_LONG));
+                            ValueLayout.JAVA_LONG, openssl_h.C_POINTER, ABI.sizeT()));
 
     /**
      * {@code int SSL_shutdown_ex(SSL *ssl, uint64_t flags, const
@@ -1012,365 +1011,6 @@ public class QuicBindings {
         }
     }
 
-    // -------------------------------------------------- Socket (libc)
-
-    /**
-     * {@code int socket(int domain, int type, int protocol)}
-     */
-    public static final MethodHandle socket$handle = createLibcHandle("socket",
-            FunctionDescriptor.of(openssl_h.C_INT,
-                    openssl_h.C_INT, openssl_h.C_INT, openssl_h.C_INT));
-
-    /**
-     * {@code int socket(int domain, int type, int protocol)}
-     *
-     * @param domain   The address family of the socket
-     * @param type     The socket type
-     * @param protocol The socket protocol
-     * @return The file descriptor of the new socket
-     */
-    public static int socket(int domain, int type, int protocol) {
-        try {
-            return (int) socket$handle.invokeExact(domain, type, protocol);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)}
-     * socklen_t is unsigned int (32-bit) on Linux.
-     */
-    public static final MethodHandle bind$handle = createLibcHandle("bind",
-            FunctionDescriptor.of(openssl_h.C_INT,
-                    openssl_h.C_INT, openssl_h.C_POINTER, openssl_h.C_INT));
-
-    /**
-     * {@code int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)}
-     *
-     * @param sockfd  The file descriptor of the socket to bind
-     * @param addr    The address to bind the socket to
-     * @param addrlen The size of the address structure
-     * @return Zero on success or {@code -1} on failure
-     */
-    public static int bind(int sockfd, MemorySegment addr, int addrlen) {
-        try {
-            return (int) bind$handle.invokeExact(sockfd, addr, addrlen);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)}
-     * Returns the socket's bound address and port; used to resolve the
-     * actually assigned port after an ephemeral (port 0) bind.
-     * socklen_t is unsigned int (32-bit) on Linux and is passed by pointer.
-     */
-    public static final MethodHandle getsockname$handle = createLibcHandle("getsockname",
-            FunctionDescriptor.of(openssl_h.C_INT,
-                    openssl_h.C_INT, openssl_h.C_POINTER, openssl_h.C_POINTER));
-
-    /**
-     * {@code int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)}
-     *
-     * @param sockfd  The file descriptor of the socket to query
-     * @param addr    Out structure receiving the socket address
-     * @param addrlen In/out parameter holding the size of the address structure
-     * @return Zero on success or {@code -1} on failure
-     */
-    public static int getsockname(int sockfd, MemorySegment addr, MemorySegment addrlen) {
-        try {
-            return (int) getsockname$handle.invokeExact(sockfd, addr, addrlen);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code int close(int fd)}
-     */
-    public static final MethodHandle close$handle = createLibcHandle("close",
-            FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_INT));
-
-    /**
-     * {@code int close(int fd)}
-     *
-     * @param fd The file descriptor to close
-     * @return Zero on success or {@code -1} on failure
-     */
-    public static int close(int fd) {
-        try {
-            return (int) close$handle.invokeExact(fd);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code int fcntl(int fd, int cmd, int arg)}
-     */
-    public static final MethodHandle fcntl$handle = createLibcHandle("fcntl",
-            FunctionDescriptor.of(openssl_h.C_INT,
-                    openssl_h.C_INT, openssl_h.C_INT, openssl_h.C_INT),
-            Linker.Option.firstVariadicArg(2));
-
-    /**
-     * {@code int fcntl(int fd, int cmd, int arg)}
-     *
-     * @param fd  The file descriptor to control
-     * @param cmd The control command
-     * @param arg The argument of the control command
-     * @return The result of the control command
-     */
-    public static int fcntl(int fd, int cmd, int arg) {
-        try {
-            return (int) fcntl$handle.invokeExact(fd, cmd, arg);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code char *strerror(int errnum)}. The POSIX signature is portable to
-     * glibc and musl, unlike the GNU-only {@code char *strerror_r} variant
-     * that was previously bound here.
-     */
-    public static final MethodHandle strerror$handle = createLibcHandle("strerror",
-            FunctionDescriptor.of(openssl_h.C_POINTER, openssl_h.C_INT));
-
-    /**
-     * Thread-safe description of an {@code errno} value. {@code strerror()}
-     * returns a pointer into a process-wide static buffer, so access is
-     * serialized and the Java string is copied before the lock is released.
-     * This avoids the glibc-only {@code char *strerror_r()} ABI and works on
-     * musl as well.
-     *
-     * @param errnum The {@code errno} value to describe
-     * @return The description of the error number
-     */
-    public static String strerror(int errnum) {
-        synchronized (STRERROR_LOCK) {
-            try {
-                MemorySegment res = (MemorySegment) strerror$handle.invokeExact(errnum);
-                if (res.equals(MemorySegment.NULL)) {
-                    return "Unknown error " + errnum;
-                }
-                return res.getString(0);
-            } catch (Throwable t) {
-                throw new AssertionError("should not reach here", t);
-            }
-        }
-    }
-
-    private static final Object STRERROR_LOCK = new Object();
-
-    /**
-     * {@code int errno} - accessed via __errno_location()
-     */
-    public static final MethodHandle errno_location$handle = createLibcHandle("__errno_location",
-            FunctionDescriptor.of(openssl_h.C_POINTER));
-
-    /**
-     * {@code int *__errno_location()}
-     *
-     * @return A pointer to the calling thread's {@code errno} variable
-     */
-    public static MemorySegment errno_location() {
-        try {
-            return (MemorySegment) errno_location$handle.invokeExact();
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * Reads the current thread's {@code errno}. The returned pointer of
-     * {@code __errno_location()} is bound through the
-     * {@code openssl_h.C_POINTER} target layout, so it is already readable;
-     * the reinterpret below is a bound-limiting defence (an int-sized view
-     * of the thread-local), not a prerequisite for the read.
-     *
-     * @return The errno value
-     */
-    public static int errno() {
-        return errno_location().reinterpret(Integer.BYTES).get(ValueLayout.JAVA_INT, 0);
-    }
-
-    /**
-     * {@code int poll(struct pollfd *fds, nfds_t nfds, int timeout)}
-     * Polls file descriptors for I/O events.
-     */
-    public static final MethodHandle poll$handle = createLibcHandle("poll",
-            FunctionDescriptor.of(openssl_h.C_INT,
-                    openssl_h.C_POINTER, openssl_h.C_LONG, openssl_h.C_INT));
-
-    /**
-     * {@code int poll(struct pollfd *fds, nfds_t nfds, int timeout)}
-     *
-     * @param fds     The array of file descriptors to wait on
-     * @param nfds    The number of entries in the array
-     * @param timeout The maximum wait in milliseconds, {@code -1} to wait indefinitely
-     * @return The number of ready file descriptors
-     */
-    public static int poll(MemorySegment fds, long nfds, int timeout) {
-        try {
-            return (int) poll$handle.invokeExact(fds, nfds, timeout);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code int eventfd(unsigned int initval, int flags)}
-     * Creates a wakeup event counter. The endpoint uses this so that
-     * threads other than the QUIC poll thread can interrupt the poll
-     * thread's blocking wait: {@code SSL_poll()} has no external wake
-     * hook, so the poll loop waits on the UDP socket and this counter
-     * together with {@code poll()} and drives {@code SSL_poll()} in
-     * non-blocking mode.
-     */
-    public static final MethodHandle eventfd$handle = createLibcHandle("eventfd",
-            FunctionDescriptor.of(openssl_h.C_INT,
-                    openssl_h.C_INT, openssl_h.C_INT));
-
-    /**
-     * {@code int eventfd(unsigned int initval, int flags)}
-     *
-     * @param initval The initial value of the event counter
-     * @param flags   Flags controlling the behaviour of the file descriptor
-     * @return The file descriptor of the new event object
-     */
-    public static int eventfd(int initval, int flags) {
-        try {
-            return (int) eventfd$handle.invokeExact(initval, flags);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code ssize_t write(int fd, const void *buf, size_t count)}
-     */
-    public static final MethodHandle write$handle = createLibcHandle("write",
-            FunctionDescriptor.of(openssl_h.C_LONG,
-                    openssl_h.C_INT, openssl_h.C_POINTER, openssl_h.C_LONG));
-
-    /**
-     * {@code ssize_t write(int fd, const void *buf, size_t count)}
-     *
-     * @param fd    The file descriptor to write to
-     * @param buf   The buffer containing the data to write
-     * @param count The number of bytes to write
-     * @return The number of bytes written
-     */
-    public static long write(int fd, MemorySegment buf, long count) {
-        try {
-            return (long) write$handle.invokeExact(fd, buf, count);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code ssize_t read(int fd, void *buf, size_t count)}
-     */
-    public static final MethodHandle read$handle = createLibcHandle("read",
-            FunctionDescriptor.of(openssl_h.C_LONG,
-                    openssl_h.C_INT, openssl_h.C_POINTER, openssl_h.C_LONG));
-
-    /**
-     * {@code ssize_t read(int fd, void *buf, size_t count)}
-     *
-     * @param fd    The file descriptor to read from
-     * @param buf   The buffer that receives the data
-     * @param count The maximum number of bytes to read
-     * @return The number of bytes read
-     */
-    public static long read(int fd, MemorySegment buf, long count) {
-        try {
-            return (long) read$handle.invokeExact(fd, buf, count);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
-     * {@code int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)}
-     */
-    public static final MethodHandle setsockopt$handle = createLibcHandle("setsockopt",
-            FunctionDescriptor.of(openssl_h.C_INT,
-                    openssl_h.C_INT, openssl_h.C_INT, openssl_h.C_INT,
-                    openssl_h.C_POINTER, openssl_h.C_INT));
-
-    /**
-     * {@code int setsockopt(int sockfd, int level, int optname, const void
-     * *optval, socklen_t optlen)}
-     *
-     * @param sockfd  The file descriptor of the socket to configure
-     * @param level   The socket option level
-     * @param optname The socket option name
-     * @param optval  The buffer holding the option value
-     * @param optlen  The size of the option value buffer
-     * @return Zero on success or {@code -1} on failure
-     */
-    public static int setsockopt(int sockfd, int level, int optname, MemorySegment optval,
-            int optlen) {
-        try {
-            return (int) setsockopt$handle.invokeExact(sockfd, level, optname, optval, optlen);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    // AF_INET constant
-    /** Address family: IPv4. */
-    public static final int AF_INET = 2;
-
-    // AF_INET6 constant
-    /** Address family: IPv6. */
-    public static final int AF_INET6 = 10;
-
-    // SOCK_DGRAM constant
-    /** Socket type: datagram (used for the QUIC UDP socket). */
-    public static final int SOCK_DGRAM = 2;
-    /** Socket type flag: non-blocking I/O (Linux {@code SOCK_NONBLOCK}). */
-    public static final int SOCK_NONBLOCK = 0x800;
-    /** Socket type flag: close-on-exec (Linux {@code SOCK_CLOEXEC}). */
-    public static final int SOCK_CLOEXEC = 0x80000;
-
-    // fcntl commands
-    /** {@code fcntl()} command: get the file status flags. */
-    public static final int F_GETFL = 3;
-    /** {@code fcntl()} command: set the file status flags. */
-    public static final int F_SETFL = 4;
-    /** File status flag: non-blocking I/O (octal 04000 on Linux). */
-    public static final int O_NONBLOCK = 04000;  // Octal 04000 = 2048 decimal
-
-    // Socket option levels
-    /** Socket option level: the socket API itself. */
-    public static final int SOL_SOCKET = 1;
-
-    // IPv6 option level / names (Linux values; IPV6_V6ONLY is 27 on
-    // BSD/Darwin/FreeBSD, a different numbering on Windows)
-    /** Socket option level: the IPv6 protocol. */
-    public static final int IPPROTO_IPV6 = 41;
-    /** IPv6 option: restrict the socket to IPv6 traffic only. */
-    public static final int IPV6_V6ONLY = 26;
-
-    // errno values (Linux ABI) used by the wildcard-bind fallback
-    /** errno: operation not permitted. */
-    public static final int EPERM = 1;
-    /** errno: address family not supported by protocol. */
-    public static final int EAFNOSUPPORT = 97;
-    /** errno: cannot assign requested address. */
-    public static final int EADDRNOTAVAIL = 99;
-    // Linux values (BSD uses 0x1012/0x1011): SO_RCVBUF=8, SO_SNDBUF=7
-    /** Socket option: receive buffer size. */
-    public static final int SO_RCVBUF = 8;
-    /** Socket option: send buffer size. */
-    public static final int SO_SNDBUF = 7;
-
     // -------------------------------------------------- SNI / certificate selection
 
     /**
@@ -1417,6 +1057,10 @@ public class QuicBindings {
      * (with {@code larg = 1}); pushes onto the current key entry's chain.
      */
     public static final int SSL_CTRL_CHAIN_CERT = 89;
+    /** {@code SSL_CTX_ctrl()} command: set the minimum protocol version. */
+    public static final int SSL_CTRL_SET_MIN_PROTO_VERSION = 123;
+    /** {@code SSL_CTX_ctrl()} command: set the maximum protocol version. */
+    public static final int SSL_CTRL_SET_MAX_PROTO_VERSION = 124;
 
     /**
      * {@code SSL_MODE} bit applied via {@code SSL_CTX_ctrl(SSL_CTRL_MODE)}.
@@ -1549,8 +1193,8 @@ public class QuicBindings {
      */
     public static final MethodHandle SSL_ctrl$handle =
             createHandle("SSL_ctrl",
-                    FunctionDescriptor.of(openssl_h.C_LONG, openssl_h.C_POINTER,
-                            openssl_h.C_INT, openssl_h.C_LONG, openssl_h.C_POINTER));
+                    FunctionDescriptor.of(ABI.cLong(), openssl_h.C_POINTER,
+                            openssl_h.C_INT, ABI.cLong(), openssl_h.C_POINTER));
 
     /**
      * {@code long SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg)}
@@ -1578,7 +1222,7 @@ public class QuicBindings {
      */
     public static final MethodHandle SSL_CTX_callback_ctrl$handle =
             createHandle("SSL_CTX_callback_ctrl",
-                    FunctionDescriptor.of(openssl_h.C_LONG, openssl_h.C_POINTER,
+                    FunctionDescriptor.of(ABI.cLong(), openssl_h.C_POINTER,
                             openssl_h.C_INT, openssl_h.C_POINTER));
 
     /**
@@ -1606,7 +1250,7 @@ public class QuicBindings {
     public static final MethodHandle SSL_poll$handle =
             createHandle("SSL_poll",
                     FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER,
-                            ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, openssl_h.C_POINTER,
+                            ABI.sizeT(), ABI.sizeT(), openssl_h.C_POINTER,
                             ValueLayout.JAVA_LONG, openssl_h.C_POINTER));
 
     /**
@@ -1666,6 +1310,100 @@ public class QuicBindings {
         }
     }
 
+    // -------------------------------------------------- ABI-sensitive OpenSSL helpers
+
+    /**
+     * {@code long SSL_CTX_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)}
+     */
+    public static final MethodHandle SSL_CTX_ctrl$handle =
+            createHandle("SSL_CTX_ctrl",
+                    FunctionDescriptor.of(ABI.cLong(), openssl_h.C_POINTER,
+                            openssl_h.C_INT, ABI.cLong(), openssl_h.C_POINTER));
+
+    /**
+     * {@code long SSL_CTX_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)}
+     *
+     * @param ctx  The SSL context
+     * @param cmd  The control command
+     * @param larg The long argument of the control command
+     * @param parg The pointer argument of the control command
+     * @return The result of the control command
+     */
+    public static long SSL_CTX_ctrl(MemorySegment ctx, int cmd, long larg,
+            MemorySegment parg) {
+        try {
+            return (long) SSL_CTX_ctrl$handle.invokeExact(ctx, cmd, larg, parg);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
+     * Sets the minimum protocol version via {@code SSL_CTX_ctrl()}.
+     *
+     * @param ctx     The SSL context
+     * @param version The minimum protocol version
+     * @return Positive on success
+     */
+    public static long SSL_CTX_set_min_proto_version(MemorySegment ctx, long version) {
+        return SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, version,
+                MemorySegment.NULL);
+    }
+
+    /**
+     * Sets the maximum protocol version via {@code SSL_CTX_ctrl()}.
+     *
+     * @param ctx     The SSL context
+     * @param version The maximum protocol version
+     * @return Positive on success
+     */
+    public static long SSL_CTX_set_max_proto_version(MemorySegment ctx, long version) {
+        return SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, version,
+                MemorySegment.NULL);
+    }
+
+    /**
+     * {@code unsigned long ERR_get_error(void)}
+     */
+    public static final MethodHandle ERR_get_error$handle =
+            createHandle("ERR_get_error", FunctionDescriptor.of(ABI.cLong()));
+
+    /**
+     * {@code unsigned long ERR_get_error(void)}
+     *
+     * @return The oldest queued OpenSSL error code, or zero
+     */
+    public static long ERR_get_error() {
+        try {
+            return (long) ERR_get_error$handle.invokeExact();
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
+     * {@code void ERR_error_string_n(unsigned long e, char *buf, size_t len)}
+     */
+    public static final MethodHandle ERR_error_string_n$handle =
+            createHandle("ERR_error_string_n",
+                    FunctionDescriptor.ofVoid(ABI.cLong(), openssl_h.C_POINTER,
+                            ABI.sizeT()));
+
+    /**
+     * {@code void ERR_error_string_n(unsigned long e, char *buf, size_t len)}
+     *
+     * @param code The OpenSSL error code
+     * @param buf  The buffer receiving the description
+     * @param len  The buffer length
+     */
+    public static void ERR_error_string_n(long code, MemorySegment buf, long len) {
+        try {
+            ERR_error_string_n$handle.invokeExact(code, buf, len);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
     // -------------------------------------------------- Helpers
 
     private static MethodHandle createHandle(String symbol, FunctionDescriptor desc) {
@@ -1677,56 +1415,33 @@ public class QuicBindings {
             // The bind attempt itself is the availability probe: record the
             // failure so QUIC_AVAILABLE turns false at the end of static
             // initialisation (see the field's javadoc).
-            MISSING_SYMBOLS.add(symbol);
-            return null;
-        }
-    }
-
-    /**
-     * Creates a downcall handle for a libc symbol.
-     */
-    private static MethodHandle createLibcHandle(String symbol, FunctionDescriptor desc,
-            Linker.Option... options) {
-        try {
-            // Resolve libc symbols through the native linker first. The
-            // openssl_h lookup is only a fallback: coupling the libc layer to
-            // the OpenSSL library lookup can be affected by the selected
-            // OpenSSL library or by a same-named symbol in it.
-            MemorySegment addr = Linker.nativeLinker().defaultLookup().find(symbol)
-                    .or(() -> openssl_h.SYMBOL_LOOKUP.find(symbol))
-                    .orElseThrow(() -> new UnsatisfiedLinkError("unresolved libc symbol: " + symbol));
-            return Linker.nativeLinker().downcallHandle(addr, desc, options);
-        } catch (Throwable e) {
-            // See createHandle(): the bind attempt is the availability probe.
-            MISSING_SYMBOLS.add(symbol);
+            MISSING_OPENSSL_SYMBOLS.add(symbol);
             return null;
         }
     }
 
     // Runs after every handle field above (static initialisers execute in
     // textual order): every symbol this class binds has now been probed by
-    // its own createHandle()/createLibcHandle() call, so the availability
-    // verdict is simply "nothing failed to bind". Consumers must not read
+    // its own createHandle() call, so the availability verdict is simply
+    // "nothing failed to bind". Consumers must not read
     // QUIC_AVAILABLE from a static context earlier in this class - there is
     // none, the handle initialisers deliberately bind unconditionally.
     static {
-        boolean platformSupported = isSupportedPlatform();
-        QUIC_AVAILABLE = MISSING_SYMBOLS.isEmpty() && platformSupported;
+        QuicPlatformSupport platform = QuicPlatformSupport.get();
+        boolean platformSupported = platform.isAvailable() &&
+                platform.abi().isSupported();
+        QUIC_AVAILABLE = MISSING_OPENSSL_SYMBOLS.isEmpty() && platformSupported;
         if (!platformSupported) {
-            log.warn(sm.getString("quicEndpoint.quicBindingsPlatformUnsupported",
-                    System.getProperty("os.name", "unknown"),
-                    String.valueOf(ValueLayout.ADDRESS.byteSize() * 8)));
+            String reason = platform.unavailableReason();
+            if (reason == null) {
+                reason = sm.getString("quicPlatform.unsupportedAbi",
+                        String.valueOf(ValueLayout.ADDRESS.byteSize() * 8));
+            }
+            log.warn(reason);
         }
-        if (!MISSING_SYMBOLS.isEmpty()) {
+        if (!MISSING_OPENSSL_SYMBOLS.isEmpty()) {
             log.warn(sm.getString("quicEndpoint.quicBindingsMissingSymbols",
-                    String.join(", ", MISSING_SYMBOLS)));
+                    String.join(", ", MISSING_OPENSSL_SYMBOLS)));
         }
-    }
-
-
-    private static boolean isSupportedPlatform() {
-        String osName = System.getProperty("os.name", "");
-        return osName.toLowerCase(Locale.ENGLISH).contains("linux") &&
-                ValueLayout.ADDRESS.byteSize() == Long.BYTES;
     }
 }

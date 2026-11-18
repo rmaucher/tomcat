@@ -90,6 +90,9 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      */
     private final ReentrantLock writeLock = new ReentrantLock();
 
+    private static final QuicPlatformSupport.Abi ABI =
+            QuicPlatformSupport.get().abi();
+
     /**
      * Latched write interest. The endpoint's poll-loop sweep uses it to
      * re-drive writes even when OpenSSL reports no W event because the native
@@ -544,13 +547,13 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             }
 
             MemorySegment nativeBuf = localArena.allocate(remaining);
-            MemorySegment lenPtr = localArena.allocate(ValueLayout.JAVA_LONG);
-            lenPtr.set(ValueLayout.JAVA_LONG, 0, 0L);
+            MemorySegment lenPtr = localArena.allocate(ABI.sizeT());
+            ABI.setSizeT(lenPtr, 0, 0L);
 
             int rc = QuicBindings.SSL_read_ex(ssl, nativeBuf, (long) remaining, lenPtr);
 
             if (rc == 1) {
-                long bytesRead = lenPtr.get(ValueLayout.JAVA_LONG, 0);
+                long bytesRead = ABI.getSizeT(lenPtr, 0);
                 int actualLen = (int) Math.min(bytesRead, remaining);
                 // Single native -> heap copy. ByteBuffer.put(ByteBuffer) resolves
                 // the native source address directly; a Java byte[] staging copy

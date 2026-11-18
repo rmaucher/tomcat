@@ -59,7 +59,7 @@ final class QuicDiagnostics {
                     // with ERR_get_error() logged the newest code once per
                     // queued entry, losing all earlier (often root-cause)
                     // errors.
-                    code = openssl_h.ERR_get_error();
+                    code = QuicBindings.ERR_get_error();
                 } catch (Throwable t) {
                     break;
                 }
@@ -68,7 +68,7 @@ final class QuicDiagnostics {
                 }
                 MemorySegment buf = localArena.allocate(256);
                 try {
-                    openssl_h.ERR_error_string_n(code, buf, 256);
+                    QuicBindings.ERR_error_string_n(code, buf, 256L);
                     sb.append(buf.getString(0)).append(' ');
                 } catch (Throwable t) {
                     sb.append("0x").append(Long.toHexString(code)).append(' ');

@@ -37,7 +37,6 @@ import org.apache.tomcat.util.net.openssl.panama.CertificateLoader;
 import org.apache.tomcat.util.net.quic.QuicProtocol;
 import org.apache.tomcat.util.openssl.openssl_h;
 import org.apache.tomcat.util.openssl.openssl_h_Compatibility;
-import org.apache.tomcat.util.openssl.openssl_h_Macros;
 import org.apache.tomcat.util.res.StringManager;
 
 /**
@@ -213,9 +212,9 @@ public class QuicCertificateManager {
         // for the OpenSSL QUIC method as well. A failure must abort rather
         // than silently allowing a wider protocol range (the shared manager
         // also serves the ngtcp2 TLS_server_method context).
-        long minVersionRc = openssl_h_Macros.SSL_CTX_set_min_proto_version(sslCtx,
+        long minVersionRc = QuicBindings.SSL_CTX_set_min_proto_version(sslCtx,
                 openssl_h.TLS1_3_VERSION());
-        long maxVersionRc = openssl_h_Macros.SSL_CTX_set_max_proto_version(sslCtx,
+        long maxVersionRc = QuicBindings.SSL_CTX_set_max_proto_version(sslCtx,
                 openssl_h.TLS1_3_VERSION());
         if (minVersionRc < 1 || maxVersionRc < 1) {
             throw new java.io.IOException(sm.getString(
@@ -243,7 +242,7 @@ public class QuicCertificateManager {
         // modes set, a partial acceptance simply returns the accepted count
         // and a would-block retry may re-present the remainder from a new
         // buffer.
-        long ctxModeRc = openssl_h.SSL_CTX_ctrl(sslCtx, QuicBindings.SSL_CTRL_MODE,
+        long ctxModeRc = QuicBindings.SSL_CTX_ctrl(sslCtx, QuicBindings.SSL_CTRL_MODE,
                 QuicBindings.SSL_MODE_ENABLE_PARTIAL_WRITE |
                         QuicBindings.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER,
                 MemorySegment.NULL);

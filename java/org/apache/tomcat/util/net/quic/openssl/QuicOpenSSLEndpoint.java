@@ -23,7 +23,6 @@ import java.lang.foreign.ValueLayout;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.Locale;
@@ -71,13 +70,16 @@ import org.apache.tomcat.util.threads.LimitLatch;
  * {@link QuicBindings} can bind against some OpenSSL 3.5 libraries, but 3.5
  * lacks several directional filters and stream values; the code degrades
  * where those values are unavailable and does not claim a full 3.5
- * compatibility guarantee.
+ * compatibility guarantee. The native socket, wake-up and ABI layer is
+ * currently implemented for Linux LP64; other platforms are reported
+ * unavailable by {@link QuicPlatformSupport} instead of binding with a
+ * mismatched ABI.
  * <p>
  * Follows the OpenSSL poll-server reference pattern:
  * <ul>
- * <li>Creates a UDP socket via native socket() syscall</li>
+ * <li>Creates and binds a UDP socket through {@link QuicPlatformSupport}</li>
  * <li>Creates an OpenSSL QUIC listener via SSL_new_listener()</li>
- * <li>Attaches the socket FD to the listener via SSL_set_fd()</li>
+ * <li>Attaches the platform socket handle to the listener via SSL_set_fd()</li>
  * <li>Openssl manages all I/O internally through its own datagram BIO</li>
  * <li>Uses SSL_poll() with BIO_POLL_DESCRIPTOR_TYPE_SSL for event discovery</li>
  * <li>Uses SSL_read_ex()/SSL_write_ex2() for stream I/O</li>
@@ -343,9 +345,15 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     private volatile boolean listenerIdleTimeoutApplied;
 
     /**
-     * The socket file descriptor (created by native socket() call).
+     * The selected platform implementation. Resolved once at class
+     * initialisation; never queried on the per-request path.
      */
-    private int socketFd = -1;
+    private static final QuicPlatformSupport PLATFORM = QuicPlatformSupport.get();
+
+    /**
+     * The native UDP socket handle.
+     */
+    private QuicPlatformSupport.SocketHandle socketHandle;
 
     /**
      * Poll set for SSL_poll.
@@ -446,7 +454,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
     /**
      * The poll thread's blocking wait primitive (UDP socket + mailbox kick
-     * eventfd). Created in {@code bind()} once the UDP socket exists,
+     * platform wake object). Created in {@code bind()} once the UDP socket
+     * exists,
      * released with the bind resources.
      */
     private volatile QuicWakeup quicWakeup;
@@ -840,15 +849,16 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     }
 
     /**
-     * Reports whether the linked OpenSSL provides QUIC support.
+     * Reports whether the selected platform and the linked OpenSSL provide
+     * QUIC support.
      *
-     * @return {@code true} if OpenSSL QUIC is available
+     * @return {@code true} if OpenSSL QUIC is available on this platform
      */
     public static boolean isQuicAvailable() {
-        // QuicPoll enforces the same LP64 check when it is initialised. Do the
-        // check here too so isAvailable()/bind() do not report a 32-bit JVM as
-        // usable only to fail later during poll-set construction.
-        return QUIC_AVAILABLE && ValueLayout.ADDRESS.byteSize() == Long.BYTES;
+        // The platform selector owns the OS/ABI availability gate and
+        // QuicBindings adds the OpenSSL symbol check. Both are folded into
+        // QUIC_AVAILABLE, so callers see one verdict.
+        return QUIC_AVAILABLE;
     }
 
 
@@ -869,6 +879,14 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     @Override
     public void bind() throws Exception {
         if (!isQuicAvailable()) {
+            if (!PLATFORM.isAvailable()) {
+                throw new IllegalStateException(PLATFORM.unavailableReason());
+            }
+            if (!PLATFORM.abi().isSupported()) {
+                throw new IllegalStateException(sm.getString(
+                        "quicPlatform.unsupportedAbi",
+                        String.valueOf(ValueLayout.ADDRESS.byteSize() * 8)));
+            }
             throw new IllegalStateException(sm.getString("quicEndpoint.quicNotAvailable"));
         }
         // A poll thread that survived stopInternal()'s bounded join still owns
@@ -976,10 +994,10 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             }
             listener = MemorySegment.NULL;
         }
-        // The listener never owns the FD (BIO_NOCLOSE), so close it here.
-        if (socketFd >= 0) {
-            QuicBindings.close(socketFd);
-            socketFd = -1;
+        // The listener never owns the socket (BIO_NOCLOSE), so close it here.
+        if (socketHandle != null && socketHandle.isValid()) {
+            PLATFORM.close(socketHandle);
+            socketHandle = null;
         }
         bindAddress = null;
         // Detach the mailbox waker so no further submission even reaches the
@@ -1367,8 +1385,9 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         configureListenerIdleTimeout();
         configureListenerPendingConnections();
 
-        // Attach socket FD to listener - OpenSSL creates internal datagram BIO
-        int rc = QuicBindings.SSL_set_fd(listener, socketFd);
+        // Attach the socket to the listener - OpenSSL creates the internal
+        // datagram BIO from the platform-provided native descriptor.
+        int rc = QuicBindings.SSL_set_fd(listener, PLATFORM.openSslFd(socketHandle));
         if (rc != 1) {
             throw new IOException(sm.getString("quicEndpoint.sslSetFdError", Integer.valueOf(rc)));
         }
@@ -1388,8 +1407,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         }
 
         if (log.isDebugEnabled()) {
-            log.debug("Created QUIC listener on FD " + socketFd + " (0x" +
-                    Long.toHexString(listener.address()) + ")");
+            log.debug("Created QUIC listener on " + PLATFORM.describe(socketHandle) +
+                    " (0x" + Long.toHexString(listener.address()) + ")");
         }
 
      // Set up listener poll item
@@ -1402,308 +1421,130 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
 
     /**
-     * Creates the UDP socket, binds it and configures it (the socket FD is
-     * kept in {@link #socketFd}; the attachment to the listener via
-     * SSL_set_fd() is done separately by {@link #createListener()}, and
-     * OpenSSL internally creates a datagram BIO for the socket FD).
-     * Supports both IPv4 and IPv6; with no connector address configured it
-     * binds the dual-stack wildcard ({@code ::} accepting IPv4 as well),
-     * mirroring the NIO endpoints' default, and falls back to the IPv4
-     * wildcard when the IPv6 family is unusable.
+     * Creates the UDP socket and binds it through the platform implementation.
+     * The socket handle is kept in {@link #socketHandle}; the attachment to the
+     * listener via {@code SSL_set_fd()} is done separately by
+     * {@link #createListener()}. Supports both IPv4 and IPv6; with no connector
+     * address configured it binds the dual-stack wildcard ({@code ::} accepting
+     * IPv4 as well), mirroring the NIO endpoints' default, and falls back to
+     * the IPv4 wildcard when the IPv6 family is unusable.
      */
     private void createUdpSocket() throws Exception {
         int port = getPortWithOffset();
         // Port -1 (Tomcat's ephemeral convention) or 0 means "assign any free
-        // port". Use port 0 so the OS assigns one, then resolve the actual
-        // port after bind() (mirrors NioEndpoint). Mapping to a well-known
-        // port here would make two port=-1 connectors share UDP via
+        // port". Use port 0 so the OS assigns one and let the platform resolve
+        // the actual port after bind() (mirrors NioEndpoint). Mapping to a
+        // well-known port here would make two port=-1 connectors share UDP via
         // SO_REUSEPORT (split-brain).
         if (port > 65535) {
             throw new IOException(sm.getString("quicEndpoint.portOutOfRange",
                     Integer.valueOf(port)));
         }
-        boolean ephemeralPort = port <= 0;
-        if (ephemeralPort) {
+        if (port <= 0) {
             port = 0;
         }
 
-        try (Arena localArena = Arena.ofConfined()) {
-            InetAddress configuredAddr = getAddress();
-            InetAddress bindAddr;
-            int sockFd;
-            if (configuredAddr != null) {
-                // Explicit address: family taken from the address, V6ONLY
-                // left at the system default (previous behaviour).
-                bindAddr = configuredAddr;
-                sockFd = bindUdpSocket(localArena, bindAddr, port, false);
-            } else {
-                // No configured address: mirror the NIO endpoints' default of
-                // the dual-stack wildcard (:: with IPV6_V6ONLY=0, which also
-                // accepts IPv4), falling back to the IPv4 wildcard when the
-                // IPv6 family is unusable in this environment or when the
-                // JVM prefers IPv4 (java.net.preferIPv4Stack, the same switch
-                // the NIO bind honours).
-                bindAddr = null;
-                sockFd = -1;
-                if (!Boolean.getBoolean("java.net.preferIPv4Stack")) {
-                    try {
-                        bindAddr = InetAddress.getByName("::");
-                        sockFd = bindUdpSocket(localArena, bindAddr, port, true);
-                    } catch (DualStackUnavailable e) {
-                        if (log.isDebugEnabled()) {
-                            log.debug("IPv6 wildcard bind unavailable, "
-                                    + "falling back to IPv4: " + e.getMessage());
-                        }
-                        sockFd = -1;
+        InetAddress configuredAddr = getAddress();
+        InetAddress bindAddr;
+        QuicPlatformSupport.SocketHandle boundSocket;
+        int actualPort;
+        if (configuredAddr != null) {
+            // Explicit address: family taken from the address, V6ONLY left at
+            // the system default (previous behaviour).
+            bindAddr = configuredAddr;
+            QuicPlatformSupport.BoundUdpSocket bound = bindUdpSocket(bindAddr, port, false);
+            boundSocket = bound.socket();
+            actualPort = bound.boundPort();
+        } else {
+            // No configured address: mirror the NIO endpoints' default of the
+            // dual-stack wildcard (:: with IPV6_V6ONLY=0, which also accepts
+            // IPv4), falling back to the IPv4 wildcard when the IPv6 family is
+            // unusable in this environment or when the JVM prefers IPv4
+            // (java.net.preferIPv4Stack, the same switch the NIO bind honours).
+            bindAddr = null;
+            boundSocket = null;
+            actualPort = port;
+            if (!Boolean.getBoolean("java.net.preferIPv4Stack")) {
+                try {
+                    InetAddress candidate = InetAddress.getByName("::");
+                    QuicPlatformSupport.BoundUdpSocket bound = bindUdpSocket(candidate, port, true);
+                    bindAddr = candidate;
+                    boundSocket = bound.socket();
+                    actualPort = bound.boundPort();
+                } catch (DualStackUnavailable e) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("IPv6 wildcard bind unavailable, falling back "
+                                + "to IPv4: " + e.getMessage());
                     }
                 }
-                if (sockFd < 0) {
-                    bindAddr = InetAddress.getByName("0.0.0.0");
-                    sockFd = bindUdpSocket(localArena, bindAddr, port, false);
-                }
             }
-            boolean isIPv6 = bindAddr instanceof java.net.Inet6Address;
-            int addrlen = isIPv6 ? 28 : 16;
-
-            // Publish the FD as soon as it is bound so any later setup
-            // failure (non-blocking, listener creation) releases it through
-            // releaseBindResources() instead of leaking it. Failures inside
-            // bindUdpSocket() are not published: that method releases its fd
-            // before throwing.
-            this.socketFd = sockFd;
-
-            // Set non-blocking
-            int flags = QuicBindings.fcntl(sockFd, QuicBindings.F_GETFL, 0);
-            int setFlResult = QuicBindings.fcntl(
-                    sockFd, QuicBindings.F_SETFL, flags | QuicBindings.O_NONBLOCK);
-            if (setFlResult != 0) {
-                throw new IOException(sm.getString("quicEndpoint.fcntlError"));
+            if (boundSocket == null) {
+                bindAddr = InetAddress.getByName("0.0.0.0");
+                QuicPlatformSupport.BoundUdpSocket bound = bindUdpSocket(bindAddr, port, false);
+                boundSocket = bound.socket();
+                actualPort = bound.boundPort();
             }
+        }
 
-            // Wake primitive for the poll loop: the poll thread waits on
-            // this socket together with an eventfd, and the mailbox kicks
-            // that eventfd whenever another thread queues a poll task
-            // (SSL_poll() itself cannot be woken from outside - see
-            // QuicWakeup).
-            quicWakeup = new QuicWakeup(sockFd);
-            mailbox.setWaker(quicWakeup::kick);
+        // Publish the socket as soon as it is bound so any later setup failure
+        // (wake-up creation, listener creation) releases it through
+        // releaseBindResources() instead of leaking it.
+        this.socketHandle = boundSocket;
 
-            // Resolve the actually-assigned port for an ephemeral (port 0)
-            // bind so bindAddress - and therefore getLocalAddress() /
-            // getLocalPort(), which dispatch to the endpoint's overridden
-            // bind address getter - reflects the real port. getPort() keeps
-            // returning the configured port.
-            int actualPort = port;
-            if (ephemeralPort) {
-                MemorySegment nameAddr = localArena.allocate(28);
-                MemorySegment nameLen = localArena.allocate(4);
-                nameLen.set(ValueLayout.JAVA_INT, 0, addrlen);
-                int rcName = QuicBindings.getsockname(
-                        sockFd, nameAddr, nameLen);
-                if (rcName == 0) {
-                    // Port is big-endian at offset 2 in both
-                    // sockaddr_in and sockaddr_in6.
-                    actualPort = ((nameAddr.get(ValueLayout.JAVA_BYTE, 2) & 0xFF) << 8)
-                            | (nameAddr.get(ValueLayout.JAVA_BYTE, 3) & 0xFF);
-                } else {
-                    int errno = QuicBindings.errno();
-                    throw new IOException(sm.getString("quicEndpoint.getsocknameError",
-                            QuicBindings.strerror(errno), Integer.valueOf(errno)));
-                }
-            }
-            bindAddress = new InetSocketAddress(bindAddr, actualPort);
+        // Wake primitive for the poll loop: the poll thread waits on this
+        // socket together with the platform wake object, and the mailbox kicks
+        // that object whenever another thread queues a poll task (SSL_poll()
+        // itself cannot be woken from outside - see QuicWakeup).
+        quicWakeup = new QuicWakeup(boundSocket);
+        mailbox.setWaker(quicWakeup::kick);
 
-            if (log.isDebugEnabled()) {
-                log.debug("Created UDP socket FD " + sockFd + " bound to " + bindAddress +
-                        (isIPv6 ? " (IPv6)" : " (IPv4)"));
-            }
+        bindAddress = new InetSocketAddress(bindAddr, actualPort);
+
+        if (log.isDebugEnabled()) {
+            log.debug("Created UDP socket " + PLATFORM.describe(boundSocket) +
+                    " bound to " + bindAddress +
+                    (bindAddr instanceof java.net.Inet6Address ? " (IPv6)" : " (IPv4)"));
         }
     }
 
 
     /**
-     * Creates a UDP socket, arms the endpoint's socket options on it and
-     * binds it to {@code bindAddr:port}. Every failure path closes the fd
-     * before throwing, so the fd belongs to the caller only once this
-     * method returns it.
+     * Binds a UDP socket through the selected platform implementation. The
+     * endpoint keeps the address-selection and IPv4 fallback policy; the
+     * platform owns the native socket setup.
      *
-     * @param localArena  Arena for the bind/option scratch
-     * @param bindAddr    The address to bind. Any IPv6 scope information
-     *                    (a link-local {@code fe80::…%iface} obtained via
-     *                    {@link java.net.Inet6Address#getNetworkInterface()})
-     *                    is NOT translated: the raw bind below writes the
-     *                    16 address bytes only and leaves
-     *                    {@code sin6_scope_id} zero, which {@code java.net}
-     *                    would fill from the scope. Binding an IPv6 wildcard
-     *                    or a global address is unaffected; an explicit
-     *                    link-local bind address is not honoured and the bind
-     *                    fails (surfaced as the bind error it is) rather than
-     *                    silently landing on the wrong interface.
-     * @param port        The port to bind (already offset-mapped; {@code 0}
-     *                    requests an ephemeral port)
-     * @param dualStack   {@code true} to clear IPV6_V6ONLY before the bind so
-     *                    an {@code ::} bind also accepts IPv4 (the NIO
-     *                    endpoints' default); the option is immutable after
-     *                    bind, so this has to be armed here
+     * @param bindAddr  The address to bind
+     * @param port      The port to bind; {@code 0} requests an ephemeral port
+     * @param dualStack {@code true} for the IPv6 wildcard candidate
      *
-     * @return The bound socket fd
+     * @return The bound socket and its actual port
      *
-     * @throws DualStackUnavailable  The attempt failed for a reason that
-     *         rules out only this address family (no IPv6 stack, IPv6
-     *         administratively disabled, dual-stack mode refused) - the
-     *         default-bind caller falls back to the IPv4 wildcard
-     * @throws IOException  A genuine failure: socket(), a bind failure that
-     *         is not family-related (port in use, no permission), or a
-     *         refused socket option on an otherwise usable socket
+     * @throws DualStackUnavailable The failure rules out only the address
+     *         family, so the caller may try the IPv4 wildcard
+     * @throws IOException A genuine bind failure
      */
-    private int bindUdpSocket(Arena localArena, InetAddress bindAddr, int port,
+    private QuicPlatformSupport.BoundUdpSocket bindUdpSocket(InetAddress bindAddr, int port,
             boolean dualStack) throws DualStackUnavailable, IOException {
-        boolean isIPv6 = bindAddr instanceof java.net.Inet6Address;
-        int af = isIPv6 ? QuicBindings.AF_INET6 : QuicBindings.AF_INET;
-        // Create the socket non-blocking and close-on-exec atomically, as the
-        // quiche and ngtcp2 transports do. The later fcntl remains as a
-        // defensive check, but the flags must be set before any child process
-        // can inherit the descriptor.
-        int sockFd = QuicBindings.socket(af,
-                QuicBindings.SOCK_DGRAM | QuicBindings.SOCK_NONBLOCK |
-                        QuicBindings.SOCK_CLOEXEC,
-                0);
-        if (sockFd < 0) {
-            int errno = QuicBindings.errno();
-            if (dualStack && errno == QuicBindings.EAFNOSUPPORT) {
-                // No IPv6 stack at all (e.g. ipv6.disable=1): the IPv4
-                // wildcard fallback covers this, it is not a bind failure.
-                throw new DualStackUnavailable("socket(AF_INET6): "
-                        + QuicBindings.strerror(errno));
-            }
-            throw new IOException(sm.getString("quicEndpoint.socketCreateNegativeFd",
-                    Integer.valueOf(sockFd)));
-        }
         try {
-            // Neither SO_REUSEADDR nor SO_REUSEPORT is set, deliberately.
-            // SO_REUSEPORT lets independent processes share a UDP unicast port
-            // but Linux then load-balances datagrams across those sockets by
-            // hash, so packets of one QUIC connection can be delivered to
-            // different listener processes (e.g. during a rolling restart),
-            // silently breaking connections. SO_REUSEADDR is omitted too: a
-            // single listener restarts cleanly without it (UDP has no
-            // TIME_WAIT state), yet on Linux it relaxes the UDP bind-conflict
-            // rule to last-binder-wins - a second local process that also sets
-            // the flag can bind this endpoint's address and port and then
-            // receive the unicast datagrams addressed to it, a same-host
-            // hijack. Staying on the default keeps the single-binder guarantee.
-
-            // Receive/send buffer sizes. A single UDP socket carries every
-            // connection of the endpoint, so bursts (an accept stampede, a
-            // large response batch) can overflow the default OS buffer and
-            // the resulting losses amplify into retransmits. Values come from
-            // the connector's socket.rxBufSize/socket.txBufSize properties
-            // (0 or unset keeps the OS default). Best effort: the kernel may
-            // silently clamp the value to net.core.rmem_max/wmem_max, which
-            // Linux does without an error.
-            int rxBufSize = socketProperties.getRxBufSize();
-            if (rxBufSize > 0) {
-                MemorySegment rxBufVal = localArena.allocate(4);
-                rxBufVal.set(ValueLayout.JAVA_INT, 0, rxBufSize);
-                setOption(sockFd, QuicBindings.SOL_SOCKET, QuicBindings.SO_RCVBUF,
-                        rxBufVal, "SO_RCVBUF");
+            return PLATFORM.bindUdpSocket(bindAddr, port, new QuicPlatformSupport.UdpSocketOptions(
+                    socketProperties.getRxBufSize(),
+                    socketProperties.getTxBufSize(), dualStack));
+        } catch (QuicPlatformSupport.QuicPlatformException e) {
+            if (dualStack && (e.isAddressFamilyUnavailable() ||
+                    e.isAddressNotAvailable() || e.isPermissionDenied())) {
+                throw new DualStackUnavailable(e.getMessage());
             }
-            int txBufSize = socketProperties.getTxBufSize();
-            if (txBufSize > 0) {
-                MemorySegment txBufVal = localArena.allocate(4);
-                txBufVal.set(ValueLayout.JAVA_INT, 0, txBufSize);
-                setOption(sockFd, QuicBindings.SOL_SOCKET, QuicBindings.SO_SNDBUF,
-                        txBufVal, "SO_SNDBUF");
-            }
-
-            if (isIPv6 && dualStack) {
-                // Clear V6ONLY before the bind: an :: bind then also accepts
-                // IPv4 (the NIO endpoints' dual-stack default). If the kernel
-                // refuses it, this socket cannot give the wildcard candidate
-                // its whole purpose - defer to the IPv4 wildcard instead.
-                MemorySegment zero = localArena.allocate(4);
-                zero.set(ValueLayout.JAVA_INT, 0, 0);
-                if (QuicBindings.setsockopt(sockFd, QuicBindings.IPPROTO_IPV6,
-                        QuicBindings.IPV6_V6ONLY, zero, 4) != 0) {
-                    throw new DualStackUnavailable("IPV6_V6ONLY: "
-                            + QuicBindings.strerror(QuicBindings.errno()));
-                }
-            }
-
-            MemorySegment sockaddr;
-            int addrlen;
-            if (isIPv6) {
-                // sockaddr_in6: sin6_family(2) + sin6_port(2) + sin6_flowinfo(4) + sin6_addr(16) + sin6_scope_id(4) = 28 bytes
-                sockaddr = localArena.allocate(28);
-                // sin6_family uses the platform-native byte order (JAVA_SHORT
-                // is native-endian), so the kernel reads the correct family
-                // on big- as well as little-endian targets.
-                sockaddr.set(ValueLayout.JAVA_SHORT, 0, (short) QuicBindings.AF_INET6);
-                // sin6_port is network byte order on every platform: write
-                // the bytes explicitly rather than via a short layout.
-                sockaddr.set(ValueLayout.JAVA_BYTE, 2, (byte) (port >> 8));  // sin6_port MSB
-                sockaddr.set(ValueLayout.JAVA_BYTE, 3, (byte) (port & 0xFF)); // sin6_port LSB
-                // sin6_flowinfo at offset 4: zero
-                byte[] addrBytes = bindAddr.getAddress();
-                if (addrBytes != null && addrBytes.length == 16) {
-                    for (int i = 0; i < 16; i++) {
-                        sockaddr.set(ValueLayout.JAVA_BYTE, 8 + i, addrBytes[i]);
-                    }
-                }
-                // sin6_scope_id at offset 24: left zero. The bindAddr scope
-                // is not consulted (see the bindUdpSocket javadoc), so a
-                // scoped link-local address cannot bind here; the bind fails
-                // visibly instead of silently picking an interface.
-                addrlen = 28;
-            } else {
-                // sockaddr_in: sin_family(2) + sin_port(2) + sin_addr(4) + sin_zero(8) = 16 bytes
-                sockaddr = localArena.allocate(16);
-                // sin_family: platform-native byte order (see above);
-                // sin_port: explicit network byte order (see above).
-                sockaddr.set(ValueLayout.JAVA_SHORT, 0, (short) QuicBindings.AF_INET);
-                sockaddr.set(ValueLayout.JAVA_BYTE, 2, (byte) (port >> 8));  // sin_port MSB
-                sockaddr.set(ValueLayout.JAVA_BYTE, 3, (byte) (port & 0xFF)); // sin_port LSB
-                byte[] addrBytes = bindAddr.getAddress();
-                if (addrBytes != null) {
-                    for (int i = 0; i < Math.min(4, addrBytes.length); i++) {
-                        sockaddr.set(ValueLayout.JAVA_BYTE, 4 + i, addrBytes[i]);
-                    }
-                }
-                addrlen = 16;
-            }
-
-            int rc = QuicBindings.bind(sockFd, sockaddr, addrlen);
-            if (rc != 0) {
-                int errno = QuicBindings.errno();
-                String errmsg = QuicBindings.strerror(errno);
-                if (dualStack && (errno == QuicBindings.EAFNOSUPPORT ||
-                        errno == QuicBindings.EADDRNOTAVAIL ||
-                        errno == QuicBindings.EPERM)) {
-                    // The IPv6 family itself cannot carry the bind (disabled
-                    // or refused): fall back to the IPv4 wildcard. A busy
-                    // port (EADDRINUSE) or a permission problem (EACCES) is
-                    // a real failure - it would sink the IPv4 attempt too.
-                    throw new DualStackUnavailable("bind(::): " + errmsg);
-                }
-                throw new IOException(sm.getString("quicEndpoint.socketBindErrnoError",
-                        errmsg, Integer.valueOf(errno)));
-            }
-            return sockFd;
-        } catch (Exception | Error e) {
-            // Nothing has seen this fd yet; releaseBindResources() cannot
-            // reach it and the caller never receives it.
-            QuicBindings.close(sockFd);
             throw e;
         }
     }
 
 
     /**
-     * Signals a bind candidate that failed for a reason which rules out
-     * only its address family, so the default (no configured address) bind
-     * can fall back from the dual-stack wildcard to the IPv4 wildcard. A
-     * genuine bind failure (busy port, no permission) is never reported
-     * this way: it propagates as the bind error it is.
+     * Signals a bind candidate that failed for a reason which rules out only
+     * its address family, so the default (no configured address) bind can fall
+     * back from the dual-stack wildcard to the IPv4 wildcard. A genuine bind
+     * failure (busy port, no permission) is never reported this way: it
+     * propagates as the bind error it is.
      */
     private static final class DualStackUnavailable extends Exception {
 
@@ -1711,15 +1552,6 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
         private DualStackUnavailable(String message) {
             super(message);
-        }
-    }
-
-
-    private void setOption(int fd, int level, int opt, MemorySegment val, String name)
-            throws IOException {
-        if (QuicBindings.setsockopt(fd, level, opt, val, (int) val.byteSize()) != 0) {
-            throw new IOException(sm.getString("quicEndpoint.socketOptionError",
-                    name, Integer.valueOf(QuicBindings.errno())));
         }
     }
 
@@ -1852,7 +1684,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         if (pollThread != null) {
             pollThread.interrupt();
             // A thread blocked in the native poll(2)/SSL_poll() call is not
-            // interrupted by Thread.interrupt(): kick the wake eventfd so the
+            // interrupted by Thread.interrupt(): kick the platform wake object
+            // so the
             // loop re-checks the stop flag on its next iteration instead of
             // after the wait timeout.
             QuicWakeup wakeup = quicWakeup;
@@ -2344,7 +2177,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         // graceful shutdown hook) would black-hole the in-flight connections
         // that awaitConnectionsClose() is about to wait for. The FD is closed
         // by unbind() (via releaseBindResources()) after the poll thread and
-        // the connections are gone; deliberately do not reset socketFd here so
+        // the connections are gone; deliberately do not reset socketHandle here so
         // that path can still find and close it.
         // The base closeServerSocketGraceful() stops an acceptor; QUIC has no
         // acceptor, so pause the endpoint here instead. handleIncomingConnection
@@ -2883,7 +2716,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      */
     private void pollLoop() {
         if (log.isDebugEnabled()) {
-            log.debug("QUIC poll loop starting, socketFd=" + socketFd);
+            log.debug("QUIC poll loop starting, socket=" +
+                    PLATFORM.describe(socketHandle));
         }
 
         // Scratch for the SSL_get_event_timeout() read (struct timeval + int),
@@ -2892,7 +2726,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         // definition in QuicPoll, so the two ABI assumptions (LP64
         // time_t/suseconds_t) can never drift apart.
         try (Arena timerArena = Arena.ofConfined()) {
-            MemorySegment timerTv = timerArena.allocate(QuicPoll.TIMEVAL_LAYOUT);
+            MemorySegment timerTv = timerArena.allocate(PLATFORM.abi().timeval());
             MemorySegment timerInf = timerArena.allocate(ValueLayout.JAVA_INT);
             // Absolute System.currentTimeMillis() of the engine-wide deadline the
             // reactor reported on the last tick, or 0 while unknown.
@@ -3272,8 +3106,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                 timerInf.get(ValueLayout.JAVA_INT, 0) != 0) {
             return current;
         }
-        long secs = timerTv.get(ValueLayout.JAVA_LONG, QuicPoll.TV_SEC_OFFSET);
-        long usecs = timerTv.get(ValueLayout.JAVA_LONG, QuicPoll.TV_USEC_OFFSET);
+        long secs = PLATFORM.abi().readTimevalSeconds(timerTv);
+        long usecs = PLATFORM.abi().readTimevalMicroseconds(timerTv);
         long deadline = nowMs + secs * 1000 + Math.max(0, usecs / 1000);
         return current == 0 || deadline < current ? deadline : current;
     }
@@ -3793,27 +3627,23 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     return;
                 }
                 int family = QuicBindings.BIO_ADDR_family(bioAddr);
-                if (family != QuicBindings.AF_INET && family != QuicBindings.AF_INET6) {
+                if (!PLATFORM.isIPv4Family(family) && !PLATFORM.isIPv6Family(family)) {
                     if (log.isDebugEnabled()) {
                         log.debug("SSL_get_peer_addr unsupported family=" + family);
                     }
                     return;
                 }
-                // BIO_ADDR_rawport() hands back sin_port/sin6_port as the host
-                // reads it from the socket struct: the two memory bytes are
-                // network order, so the 16-bit result is the port byte-swapped
-                // on a little-endian host and already the plain port value on a
-                // big-endian one - twiddle only in the first case.
+                // BIO_ADDR_rawport() returns the two network-order port bytes
+                // in the host's 16-bit value. The platform implementation owns
+                // the byte-order decode.
                 int rawPort = QuicBindings.BIO_ADDR_rawport(bioAddr);
-                int port = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN
-                        ? ((rawPort & 0xFF) << 8) | (rawPort >>> 8)
-                        : rawPort;
+                int port = PLATFORM.decodePeerPort(rawPort);
 
-                int addrLen = family == QuicBindings.AF_INET ? 4 : 16;
+                int addrLen = PLATFORM.isIPv4Family(family) ? 4 : 16;
                 MemorySegment rawAddr = arena.allocate(addrLen);
-                MemorySegment lenPtr = arena.allocate(ValueLayout.JAVA_LONG);
+                MemorySegment lenPtr = arena.allocate(PLATFORM.abi().sizeT());
                 int addrRc = QuicBindings.BIO_ADDR_rawaddress(bioAddr, rawAddr, lenPtr);
-                long copied = lenPtr.get(ValueLayout.JAVA_LONG, 0);
+                long copied = PLATFORM.abi().getSizeT(lenPtr, 0);
                 if (addrRc != 1 || copied != addrLen) {
                     if (log.isDebugEnabled()) {
                         log.debug("BIO_ADDR_rawaddress rc=" + addrRc + " len=" + copied);
@@ -5189,13 +5019,13 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
         try (Arena localArena = Arena.ofConfined()) {
             MemorySegment nativeBuf = localArena.allocate(space);
-            MemorySegment lenPtr = localArena.allocate(ValueLayout.JAVA_LONG);
-            lenPtr.set(ValueLayout.JAVA_LONG, 0, 0L);
+            MemorySegment lenPtr = localArena.allocate(PLATFORM.abi().sizeT());
+            PLATFORM.abi().setSizeT(lenPtr, 0, 0L);
 
             int rc = QuicBindings.SSL_read_ex(ssl, nativeBuf, (long) space, lenPtr);
 
             if (rc == 1) {
-                long bytesRead = lenPtr.get(ValueLayout.JAVA_LONG, 0);
+                long bytesRead = PLATFORM.abi().getSizeT(lenPtr, 0);
                 int actualLen = (int) Math.min(bytesRead, space);
                 readBuf.put(nativeBuf.asSlice(0, actualLen).asByteBuffer());
                 if (log.isTraceEnabled()) {
@@ -5538,8 +5368,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             dataSeg = arena.allocate(ValueLayout.JAVA_BYTE, len);
             dataSeg.asByteBuffer().put(data.duplicate());
         }
-        MemorySegment lenPtr = arena.allocate(ValueLayout.JAVA_LONG);
-        lenPtr.set(ValueLayout.JAVA_LONG, 0, 0L);
+        MemorySegment lenPtr = arena.allocate(PLATFORM.abi().sizeT());
+        PLATFORM.abi().setSizeT(lenPtr, 0, 0L);
         // SSL_write_ex2 is part of the probed symbol set: QUIC_AVAILABLE
         // rejects a library that lacks it before bind() succeeds, so every
         // endpoint that runs reaches this call with ex2 bound.
@@ -5547,7 +5377,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         if (rc != 1) {
             return -1;
         }
-        return (int) lenPtr.get(ValueLayout.JAVA_LONG, 0);
+        return (int) PLATFORM.abi().getSizeT(lenPtr, 0);
     }
 
 
