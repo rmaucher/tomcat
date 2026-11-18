@@ -215,6 +215,21 @@ public class QuicConnectionWrapper implements QuicConnection {
     private volatile boolean peerCertsResolved;
     private volatile String cachedSessionId;
 
+    /**
+     * Number of client bidirectional and unidirectional streams accepted
+     * during connection bootstrap. Retained so transport-limit reconciliation
+     * can be completed later when the ALPN result was not yet readable at
+     * accept time.
+     */
+    private volatile int initialBidiStreamsAccepted;
+    private volatile int initialUniStreamsAccepted;
+
+    /**
+     * Whether the transport stream limits have been reconciled for this
+     * connection. Set on the poll thread by the endpoint.
+     */
+    private volatile boolean streamLimitsReconciled;
+
 
     String getCachedCipherSuite() {
         return cachedCipherSuite;
@@ -253,6 +268,38 @@ public class QuicConnectionWrapper implements QuicConnection {
 
     void setCachedSessionId(String sessionId) {
         this.cachedSessionId = sessionId;
+    }
+
+
+    /**
+     * Stores the number of client streams accepted during bootstrap.
+     *
+     * @param bidiStreamsAccepted Bidirectional streams accepted during bootstrap
+     * @param uniStreamsAccepted  Unidirectional streams accepted during bootstrap
+     */
+    void setInitialStreamCounts(int bidiStreamsAccepted, int uniStreamsAccepted) {
+        this.initialBidiStreamsAccepted = bidiStreamsAccepted;
+        this.initialUniStreamsAccepted = uniStreamsAccepted;
+    }
+
+
+    int getInitialBidiStreamsAccepted() {
+        return initialBidiStreamsAccepted;
+    }
+
+
+    int getInitialUniStreamsAccepted() {
+        return initialUniStreamsAccepted;
+    }
+
+
+    boolean isStreamLimitsReconciled() {
+        return streamLimitsReconciled;
+    }
+
+
+    void setStreamLimitsReconciled(boolean reconciled) {
+        this.streamLimitsReconciled = reconciled;
     }
 
 

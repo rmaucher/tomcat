@@ -290,8 +290,9 @@ public class QuicPollSet {
 
     /**
      * Syncs revents from the native array back to each item after
-     * {@code SSL_poll()} returns. This must be called after a successful
-     * poll and before processing events.
+     * {@code SSL_poll()} returns. This must be called whenever the poll
+     * reported events and before processing them; per SSL_poll(3) the
+     * revents of every item are initialised on both success and failure.
      * <p>
      * The native array index maps 1:1 to the items, so revents are mapped
      * directly to the items without any re-derivation of order.

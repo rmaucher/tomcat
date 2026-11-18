@@ -16,14 +16,19 @@
  */
 package org.apache.coyote.http3;
 
+import java.io.File;
+import java.lang.reflect.Field;
 import java.net.DatagramSocket;
 
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
 import org.apache.catalina.LifecycleState;
 import org.apache.catalina.connector.Connector;
 import org.apache.catalina.startup.Tomcat;
+import org.apache.tomcat.util.net.SSLHostConfig;
+import org.apache.tomcat.util.net.SSLHostConfigCertificate;
 
 /**
  * Tests for the QUIC endpoint's bind failure path. A failed bind must not
@@ -97,5 +102,41 @@ public class TestQuicBindFailure extends Http3TestBase {
             // so there is nothing to join).
             getTomcatInstance().stop();
         }
+    }
+
+
+    @Test
+    public void testInvalidCipherSuitesFailBind() throws Exception {
+        assumeQuicEnvironmentAvailable();
+        Assume.assumeFalse("quiche uses a PEM test certificate here",
+                endpointIsQuiche());
+
+        Connector connector = newHttp3Connector(findFreeUdpPort(),
+                invalidCipherHostConfig());
+        getTomcatInstance().setConnector(connector);
+        getProgrammaticRootContext();
+        getTomcatInstance().start();
+        // A cipher policy OpenSSL cannot parse must fail the bind rather than
+        // silently leaving the default TLS 1.3 cipher list active.
+        Assert.assertEquals(LifecycleState.FAILED, connector.getState());
+    }
+
+
+    private static SSLHostConfig invalidCipherHostConfig() throws Exception {
+        SSLHostConfig hostConfig = new SSLHostConfig();
+        hostConfig.setSslProtocol("tls");
+        SSLHostConfigCertificate certificate = new SSLHostConfigCertificate(
+                hostConfig, SSLHostConfigCertificate.Type.UNDEFINED);
+        certificate.setCertificateKeystoreFile(
+                new File(KEYSTORE).getAbsolutePath());
+        certificate.setCertificateKeystorePassword(KEYSTORE_PASSWORD);
+        hostConfig.addCertificate(certificate);
+        // SSLHostConfig silently filters non-TLS-1.3 names in the public
+        // setter; bypass that filter to exercise the native cipher parser.
+        Field cipherSuitesField = SSLHostConfig.class.getDeclaredField(
+                "cipherSuites");
+        cipherSuitesField.setAccessible(true);
+        cipherSuitesField.set(hostConfig, "TLS_DOES_NOT_EXIST");
+        return hostConfig;
     }
 }

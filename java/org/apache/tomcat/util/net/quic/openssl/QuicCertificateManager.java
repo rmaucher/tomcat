@@ -341,7 +341,12 @@ public class QuicCertificateManager {
             MemorySegment suites = localArena.allocateFrom(config.cipherSuites);
             int rc = openssl_h.SSL_CTX_set_ciphersuites(sslCtx, suites);
             if (rc != 1) {
-                log.warn(sm.getString("quicEndpoint.cipherSuitesSetError",
+                // SSL_CTX_set_ciphersuites() leaves the previous (default)
+                // TLS 1.3 suite list in place on parse failure. Continuing
+                // would silently serve suites the operator did not configure,
+                // so fail the configuration like the ngtcp2 transport does.
+                throw new IllegalArgumentException(sm.getString(
+                        "quicEndpoint.cipherSuitesSetError",
                         config.cipherSuites, Integer.valueOf(rc)));
             }
         }
@@ -363,6 +368,11 @@ public class QuicCertificateManager {
      * @param reason    A short description of what triggered the reload
      */
     public synchronized void swapConfig(QuicCertConfig newConfig, String reason) {
+        // Validate and apply the new cipher policy before taking ownership of
+        // the snapshot. On failure the caller still owns newConfig and the
+        // previous snapshot stays active; applyCipherSuites() does not change
+        // the context's cipher list when parsing fails.
+        applyCipherSuites(newConfig);
         QuicCertConfig oldConfig = certConfig;
         certConfig = newConfig;
         if (oldConfig != null) {
@@ -373,7 +383,6 @@ public class QuicCertificateManager {
         // state; the context option must follow it for the connections
         // handshaked from now on.
         applyPskOnlyOptions();
-        applyCipherSuites(newConfig);
         if (log.isInfoEnabled()) {
             log.info(sm.getString("quicEndpoint.certificateReloaded",
                     nameSupplier.get(), reason));

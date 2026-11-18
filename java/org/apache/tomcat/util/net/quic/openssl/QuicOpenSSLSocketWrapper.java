@@ -90,9 +90,6 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      */
     private final ReentrantLock writeLock = new ReentrantLock();
 
-    private static final QuicPlatformSupport.Abi ABI =
-            QuicPlatformSupport.get().abi();
-
     /**
      * Latched write interest. The endpoint's poll-loop sweep uses it to
      * re-drive writes even when OpenSSL reports no W event because the native
@@ -540,58 +537,29 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             return QuicStreamWrapper.transferPutMode(preReadBuf, buffer);
         }
 
-        try (Arena localArena = Arena.ofConfined()) {
-            int remaining = buffer.remaining();
-            if (remaining == 0) {
-                return 0;
-            }
-
-            MemorySegment nativeBuf = localArena.allocate(remaining);
-            MemorySegment lenPtr = localArena.allocate(ABI.sizeT());
-            ABI.setSizeT(lenPtr, 0, 0L);
-
-            int rc = QuicBindings.SSL_read_ex(ssl, nativeBuf, (long) remaining, lenPtr);
-
-            if (rc == 1) {
-                long bytesRead = ABI.getSizeT(lenPtr, 0);
-                int actualLen = (int) Math.min(bytesRead, remaining);
-                // Single native -> heap copy. ByteBuffer.put(ByteBuffer) resolves
-                // the native source address directly; a Java byte[] staging copy
-                // is not needed.
-                buffer.put(nativeBuf.asSlice(0, actualLen).asByteBuffer());
-                return actualLen;
-            } else if (rc == 0) {
-                // Query SSL_get_error() before any other native call so a hard
-                // failure is not mistaken for a retryable would-block. Only
-                // WANT_READ/WANT_WRITE are retryable; the terminal stream states
-                // are handled below with their specific exceptions.
-                int sslError = QuicBindings.SSL_get_error(ssl, 0);
-                int state = QuicBindings.SSL_get_stream_read_state(ssl);
-                stream.setReadState(QuicStreamWrapper.mapNativeState(state));
-
-                if (state == QuicPoll.SSL_STREAM_STATE_FINISHED) {
-                    return -1;
-                }
-                if (state == QuicPoll.SSL_STREAM_STATE_RESET_LOCAL ||
-                        state == QuicPoll.SSL_STREAM_STATE_RESET_REMOTE ||
-                        state == QuicPoll.SSL_STREAM_STATE_CONN_CLOSED) {
-                    throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
-                }
-                if (sslError == QuicBindings.SSL_ERROR_ZERO_RETURN) {
-                    // Clean FIN with no buffered bytes (OpenSSL reports this
-                    // as SSL_ERROR_ZERO_RETURN rather than WANT_READ).
-                    return -1;
-                }
-                if (sslError != QuicBindings.SSL_ERROR_WANT_READ &&
-                        sslError != QuicBindings.SSL_ERROR_WANT_WRITE) {
-                    throw new IOException(sm.getString("socketWrapper.quicReadNativeError",
-                            Integer.valueOf(sslError), QuicDiagnostics.dumpErrorQueue()));
-                }
-                return 0;
-            } else {
-                throw new IOException(sm.getString("socketWrapper.quicReadFailed"));
-            }
+        int remaining = buffer.remaining();
+        if (remaining == 0) {
+            return 0;
         }
+
+        // Share the endpoint's native read/error kernel. It sets the stream's
+        // read state (including FINISHED for SSL_ERROR_ZERO_RETURN), throws
+        // IOException for hard native read failures and returns 0 only for a
+        // retryable would-block or a terminal stream state.
+        int read = QuicOpenSSLEndpoint.drainStreamInto(stream, ssl, buffer);
+        if (read > 0) {
+            return read;
+        }
+        QuicStream.ReadState readState = stream.getReadState();
+        if (readState == QuicStream.ReadState.FINISHED) {
+            return -1;
+        }
+        if (readState == QuicStream.ReadState.RESET_LOCAL ||
+                readState == QuicStream.ReadState.RESET_REMOTE ||
+                readState == QuicStream.ReadState.CONN_CLOSED) {
+            throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
+        }
+        return 0;
     }
 
 

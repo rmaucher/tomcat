@@ -65,8 +65,9 @@ public final class QuicPoll {
     // SSL_POLL_EVENT constants - values of the SSL_POLL_EVENT_* enum in
     // OpenSSL's ssl.h (not exposed by the generated openssl_h bindings)
     // Failure: SSL_poll() failed to poll the item. SSL_poll() sets it on the
-    // failing item, returns 0 and zeroes the revents of every item after it.
-    // The endpoint must evict such items.
+    // failing item and returns 0; items after the first failing item are not
+    // processed and therefore report no events (SSL_poll(3) still initialises
+    // all revents before returning). The endpoint must evict such items.
     public static final long SSL_POLL_EVENT_F = 1L << 0;       // Failure (item could not be polled)
     public static final long SSL_POLL_EVENT_EL = 1L << 1;      // Listener error
     public static final long SSL_POLL_EVENT_EC = 1L << 2;      // Connection close

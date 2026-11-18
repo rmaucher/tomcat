@@ -734,9 +734,9 @@ public class QuicBindings {
     // SSL_set_value_uint() only supports SSL_VALUE_QUIC_IDLE_TIMEOUT and
     // SSL_VALUE_EVENT_HANDLING_MODE, so the transport cannot be instructed to
     // advertise a configured concurrency limit.
-    /** Stream ID: bidirectional-stream credit advertised to the peer. */
+    /** Value ID: bidirectional-stream credit advertised to the peer. */
     public static final int SSL_VALUE_QUIC_STREAM_BIDI_REMOTE_AVAIL = 2;
-    /** Stream ID: unidirectional-stream credit advertised to the peer. */
+    /** Value ID: unidirectional-stream credit advertised to the peer. */
     public static final int SSL_VALUE_QUIC_STREAM_UNI_REMOTE_AVAIL = 4;
     /** QUIC idle timeout in milliseconds, connection-level (settable). */
     public static final int SSL_VALUE_QUIC_IDLE_TIMEOUT = 5;
@@ -745,7 +745,7 @@ public class QuicBindings {
      * (handshaking) queue. Listener-level, generic value class (settable).
      */
     public static final int SSL_VALUE_QUIC_MAX_PENDING_CONNS = 16;
-    /** Stream ID: event handling mode for the object (settable). */
+    /** Value ID: event handling mode for the object (settable). */
     public static final int SSL_VALUE_EVENT_HANDLING_MODE = 6;
     /**
      * Stream-level write buffer statistics (read-only): the size of the

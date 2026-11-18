@@ -454,3 +454,40 @@ example, it has no `writeInterestedWrappers` or retained `listenerPollItem`
 fields), matching an earlier tree rather than the review parent. The
 parent-versus-fixed A/B above isolates the unpushed changes and shows no
 measurable regression.
+
+## 10. Post-review quick performance check (2026-11-18)
+
+A quick check of the current OpenSSL QUIC tree used the same `8x25` load case
+(`./run_case.sh <tag> load 8 25 8 12`) after a `1x32` warm-up. The shared-host
+load average ranged from about 5.8 to 17.2 during the runs, so absolute rps and
+sub-10% differences are noisy; `us/req` and the relative ordering are the useful
+signals.
+
+| tree | shape | rps | us/req | poller % | errs |
+|---|---|---:|---:|---:|---:|
+| current (HEAD before ABI cache) | 8x25 | 92,234.6 | 10.7 | 98.91 | 0 |
+| current (ABI cache) | 8x25 | 91,617.3 | 10.8 | 99.16 | 0 |
+| parent `e0ab41a5ef` | 8x25 | 89,608.9-90,849.6 | 10.9-11.0 | 98.83-98.91 | 0 |
+| `5a60708ad4` (before platform abstraction) | 8x25 | 91,855.8-93,108.4 | 10.6-10.8 | 98.91-99.00 | 0 |
+| current (HEAD before ABI cache) | 32x32 | 71,142.9 | 13.9 | 98.74 | 0 |
+| current (ABI cache) | 32x32 | 74,552.0 | 13.2 | 98.49 | 0 |
+| parent `e0ab41a5ef` | 32x32 | 75,812.3 | 13.1 | 99.25 | 0 |
+
+The current `8x25` numbers match the Section 9 current-tree result
+(91,502.3 rps / 10.85 us/req) and the pre-platform tree within the host-noise
+band. No reproducible regression attributable to the review fixes was found:
+the parent and current measurements overlap, and the `32x32` spread follows the
+host load (the same current classes measured 71.1k at load ~8.5 and 74.6k at
+load ~10.6).
+
+The older benchmark-base jar measured 99.1k / 10.0 us/req for `8x25` and
+79.6k / 12.2 for `32x32` on the same host window, but it is a different source
+tree: its `tomcat-coyote-ffm.jar` contains 29 OpenSSL QUIC classes versus 44 in
+the current/platform tree. It is therefore not an A/B of the current branch,
+and the absolute difference is not evidence of a review regression.
+
+One hot-path cleanup was identified during the investigation:
+`QuicOpenSSLEndpoint` called the abstract `PLATFORM.abi()` accessor repeatedly
+for every native read/write size/layout access. Caching the immutable ABI
+record in a static field reduced the `32x32` poller cost in the back-to-back
+pair above (71.1k to 74.6k; `8x25` stayed within noise).

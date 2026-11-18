@@ -57,9 +57,6 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
     private static final int SOCK_DGRAM = 2;
     private static final int SOCK_NONBLOCK = 0x800;
     private static final int SOCK_CLOEXEC = 0x80000;
-    private static final int F_GETFL = 3;
-    private static final int F_SETFL = 4;
-    private static final int O_NONBLOCK = 04000;
     private static final int SOL_SOCKET = 1;
     private static final int SO_RCVBUF = 8;
     private static final int SO_SNDBUF = 7;
@@ -158,11 +155,6 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                     ValueLayout.ADDRESS));
     private static final MethodHandle close$handle = libc("close",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
-    private static final MethodHandle fcntl$handle = libc("fcntl",
-            FunctionDescriptor.of(ValueLayout.JAVA_INT,
-                    ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
-                    ValueLayout.JAVA_INT),
-            Linker.Option.firstVariadicArg(2));
     private static final MethodHandle poll$handle = libc("poll",
             FunctionDescriptor.of(ValueLayout.JAVA_INT,
                     ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
@@ -216,14 +208,13 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
     }
 
 
-    private static MethodHandle libc(String symbol, FunctionDescriptor descriptor,
-            Linker.Option... options) {
+    private static MethodHandle libc(String symbol, FunctionDescriptor descriptor) {
         try {
             MemorySegment address = Linker.nativeLinker().defaultLookup().find(symbol)
                     .or(() -> SymbolLookup.loaderLookup().find(symbol))
                     .orElseThrow(() -> new UnsatisfiedLinkError(
                             "unresolved libc symbol: " + symbol));
-            return Linker.nativeLinker().downcallHandle(address, descriptor, options);
+            return Linker.nativeLinker().downcallHandle(address, descriptor);
         } catch (Throwable t) {
             MISSING_SYMBOLS.add(symbol);
             return null;
@@ -270,6 +261,15 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
     }
 
 
+    /**
+     * Creates and binds a UDP socket.
+     * <p>
+     * An IPv6 scope identifier is not translated: only the 16 address bytes
+     * are written and {@code sin6_scope_id} is left zero. Binding an IPv6
+     * wildcard or a global address is unaffected; an explicit link-local
+     * address with a scope fails rather than silently binding the wrong
+     * interface.
+     */
     @Override
     BoundUdpSocket bindUdpSocket(InetAddress address, int port,
             UdpSocketOptions options) throws QuicPlatformException {
@@ -305,9 +305,13 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
             int rc = invokeInt(bind$handle, "bind", socketFd, sockaddr, addrlen);
             if (rc != 0) {
                 int error = errno();
+                // Only EAFNOSUPPORT means the address family itself is
+                // unavailable. EADDRNOTAVAIL/EPERM are classified by their
+                // own predicates below and are still recognized by the
+                // endpoint's dual-stack fallback policy.
                 throw failure("bind", rc, error,
                         options.dualStack() && ipv6 &&
-                                isDualStackBindError(error));
+                                isAddressFamilyError(error));
             }
 
             int actualPort = port;
@@ -371,7 +375,12 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                 option, valueSegment, 4);
         if (rc != 0) {
             int error = errno();
-            throw failure("setsockopt(" + name + ")", rc, error, familyFailure);
+            // The caller's familyFailure flag only says that a family-related
+            // error may be meaningful for this option. It must not turn an
+            // unrelated errno (EINVAL/ENOPROTOOPT/ENOBUFS/...) into an
+            // address-family failure.
+            throw failure("setsockopt(" + name + ")", rc, error,
+                    familyFailure && isAddressFamilyError(error));
         }
     }
 
@@ -389,11 +398,6 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
 
     private boolean isAddressFamilyError(int error) {
         return error == EAFNOSUPPORT;
-    }
-
-
-    private boolean isDualStackBindError(int error) {
-        return error == EAFNOSUPPORT || error == EADDRNOTAVAIL || error == EPERM;
     }
 
 
