@@ -95,6 +95,9 @@ public final class ForEach implements TagPlugin {
             LoopAttributeChecks.generateStepCheck(ctxt, stepName);
         }
 
+        if (hasVar) {
+            LoopAttributeChecks.generateTryStart(ctxt);
+        }
         ctxt.generateJavaSource("for (int " + index + " = " + beginName + "; " + index + " <= " + endName + ";");
         if (hasStep) {
             ctxt.generateJavaSource(" " + index + " += " + stepName + ") {");
@@ -111,6 +114,9 @@ public final class ForEach implements TagPlugin {
         }
         ctxt.generateBody();
         ctxt.generateJavaSource("}");
+        if (hasVar) {
+            LoopAttributeChecks.generateRemoveVar(ctxt);
+        }
     }
 
     /**
@@ -152,6 +158,9 @@ public final class ForEach implements TagPlugin {
             LoopAttributeChecks.generateStepCheck(ctxt, stepV);
         }
 
+        if (hasVar) {
+            LoopAttributeChecks.generateTryStart(ctxt);
+        }
         // An empty range must not execute the body or consume any items.
         if (hasBegin && hasEnd) {
             ctxt.generateJavaSource("if (" + beginV + " <= " + endV + ") {");
@@ -249,6 +258,9 @@ public final class ForEach implements TagPlugin {
         ctxt.generateJavaSource("}"); // Not Null
         if (hasBegin && hasEnd) {
             ctxt.generateJavaSource("}"); // Non-empty range
+        }
+        if (hasVar) {
+            LoopAttributeChecks.generateRemoveVar(ctxt);
         }
     }
 

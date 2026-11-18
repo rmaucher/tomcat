@@ -111,7 +111,11 @@ public class ForTokens implements TagPlugin {
             ctxt.generateJavaSource("int " + stepName + " = 1;");
         }
 
-        // the loop
+        // The loop. The variable has nested visibility so it is removed from the page scope when the loop ends, including
+        // when the body throws an exception, as with the standard tag handler.
+        if (hasVar) {
+            LoopAttributeChecks.generateTryStart(ctxt);
+        }
         ctxt.generateJavaSource(
                 "for(int " + index + " = " + beginName + "; " + index + " <= " + endName + "; " + index + "++){");
         ctxt.generateJavaSource("    String " + temp + " = " + stName + ".nextToken();");
@@ -124,6 +128,9 @@ public class ForTokens implements TagPlugin {
         ctxt.generateBody();
         ctxt.generateJavaSource("    }");
         ctxt.generateJavaSource("}");
+        if (hasVar) {
+            LoopAttributeChecks.generateRemoveVar(ctxt);
+        }
     }
 
 }
