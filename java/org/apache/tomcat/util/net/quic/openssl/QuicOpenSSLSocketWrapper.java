@@ -357,8 +357,12 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     @Override
     public boolean isReadyForRead() throws IOException {
         checkNotClosed();
-        socketBufferHandler.configureReadBufferForRead();
-        if (socketBufferHandler.getReadBuffer().remaining() > 0) {
+        SocketBufferHandler handler = socketBufferHandler;
+        if (handler == null) {
+            throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
+        }
+        handler.configureReadBufferForRead();
+        if (handler.getReadBuffer().remaining() > 0) {
             return true;
         }
         // Once the transport has observed FIN, no further bytes can arrive.
@@ -372,13 +376,17 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             ByteBuffer streamReadBuffer = quicStream.getReadBuffer();
             return streamReadBuffer != null && streamReadBuffer.position() > 0;
         }
-        return fillReadBuffer() > 0;
+        return fillReadBuffer(handler) > 0;
     }
 
 
     @Override
     public int read(boolean block, byte[] b, int off, int len) throws IOException {
         checkNotClosed();
+        SocketBufferHandler handler = socketBufferHandler;
+        if (handler == null) {
+            throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
+        }
         // SocketWrapperBase contract: a blocking read waits for data and
         // reports a timed-out wait as a SocketTimeoutException (the socket
         // transports all do); the would-block marker 0 stays reserved for
@@ -393,17 +401,17 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(blockingReadTimeoutMs())
                 : 0L;
         while (true) {
-            int nRead = populateReadBuffer(b, off, len);
+            int nRead = populateReadBuffer(handler, b, off, len);
             if (nRead > 0) {
                 return nRead;
             }
-            nRead = fillReadBuffer();
+            nRead = fillReadBuffer(handler);
             if (nRead != 0) {
                 // Data (>0) or EOF (-1); either way this is the result.
                 if (nRead > 0) {
-                    socketBufferHandler.configureReadBufferForRead();
+                    handler.configureReadBufferForRead();
                     nRead = Math.min(nRead, len);
-                    socketBufferHandler.getReadBuffer().get(b, off, nRead);
+                    handler.getReadBuffer().get(b, off, nRead);
                 }
                 return nRead;
             }
@@ -428,15 +436,19 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             return 0;
         }
         checkNotClosed();
+        SocketBufferHandler handler = socketBufferHandler;
+        if (handler == null) {
+            throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
+        }
         long deadline = block
                 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(blockingReadTimeoutMs())
                 : 0L;
         while (true) {
-            int nRead = populateReadBuffer(to);
+            int nRead = populateReadBuffer(handler, to);
             if (nRead > 0) {
                 return nRead;
             }
-            int limit = socketBufferHandler.getReadBufferSize();
+            int limit = handler.getReadBufferSize();
             if (to.remaining() >= limit) {
                 // Direct path: read straight from the QUIC stream into the
                 // caller's buffer, up to its full remaining space. Unlike the
@@ -448,10 +460,10 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     return nRead;
                 }
             } else {
-                nRead = fillReadBuffer();
+                nRead = fillReadBuffer(handler);
                 if (nRead != 0) {
                     if (nRead > 0) {
-                        nRead = populateReadBuffer(to);
+                        nRead = populateReadBuffer(handler, to);
                     }
                     return nRead;
                 }
@@ -474,9 +486,29 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      * @return The number of bytes read, or -1 for EOF
      * @throws IOException If an I/O error occurs
      */
-    private int fillReadBuffer() throws IOException {
-        socketBufferHandler.configureReadBufferForWrite();
-        return fillReadBufferDirect(socketBufferHandler.getReadBuffer());
+    private int fillReadBuffer(SocketBufferHandler handler) throws IOException {
+        handler.configureReadBufferForWrite();
+        return fillReadBufferDirect(handler.getReadBuffer());
+    }
+
+
+    private static int populateReadBuffer(SocketBufferHandler handler, byte[] b,
+            int off, int len) {
+        handler.configureReadBufferForRead();
+        ByteBuffer readBuffer = handler.getReadBuffer();
+        int remaining = readBuffer.remaining();
+        if (remaining > 0) {
+            remaining = Math.min(remaining, len);
+            readBuffer.get(b, off, remaining);
+        }
+        return remaining;
+    }
+
+
+    private static int populateReadBuffer(SocketBufferHandler handler,
+            ByteBuffer to) {
+        handler.configureReadBufferForRead();
+        return transfer(handler.getReadBuffer(), to);
     }
 
 
@@ -623,9 +655,9 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void writeBlocking(byte[] buf, int off, int len) throws IOException {
-        checkNotClosed();
         writeLock.lock();
         try {
+            checkNotClosed();
             super.writeBlocking(buf, off, len);
         } finally {
             writeLock.unlock();
@@ -635,9 +667,9 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void writeBlocking(ByteBuffer from) throws IOException {
-        checkNotClosed();
         writeLock.lock();
         try {
+            checkNotClosed();
             super.writeBlocking(from);
         } finally {
             writeLock.unlock();
@@ -647,9 +679,9 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void writeNonBlocking(byte[] buf, int off, int len) throws IOException {
-        checkNotClosed();
         writeLock.lock();
         try {
+            checkNotClosed();
             super.writeNonBlocking(buf, off, len);
         } finally {
             writeLock.unlock();
@@ -659,9 +691,9 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void writeNonBlocking(ByteBuffer from) throws IOException {
-        checkNotClosed();
         writeLock.lock();
         try {
+            checkNotClosed();
             super.writeNonBlocking(from);
         } finally {
             writeLock.unlock();
@@ -671,9 +703,9 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     protected void flushBlocking() throws IOException {
-        checkNotClosed();
         writeLock.lock();
         try {
+            checkNotClosed();
             super.flushBlocking();
         } finally {
             writeLock.unlock();
@@ -995,20 +1027,25 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     @Override
     public void registerWriteInterest() {
         // Reference: pe_resume_write adds W to want_events
-        if (writeInterest.compareAndSet(false, true)) {
-            endpoint.addWriteInterest(this);
-        }
+        // Set the latch and add the wrapper unconditionally. The set add is
+        // idempotent; doing it on every registration also repairs the case
+        // where a concurrent clear removed the wrapper after the latch was
+        // already set (for example when a close races this registration).
+        writeInterest.set(true);
+        endpoint.addWriteInterest(this);
         resumeInterest(QuicPoll.SSL_POLL_EVENT_W);
     }
 
 
     /**
      * Clears the latched write interest, releasing the endpoint's sweep entry.
+     * The removal is unconditional: a clear racing a registration may run
+     * before the registration's set add, and the sweep must be able to
+     * discard the resulting latch-false entry rather than retain it forever.
      */
     void clearWriteInterest() {
-        if (writeInterest.compareAndSet(true, false)) {
-            endpoint.removeWriteInterest(this);
-        }
+        writeInterest.set(false);
+        endpoint.removeWriteInterest(this);
     }
 
 

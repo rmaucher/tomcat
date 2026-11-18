@@ -313,6 +313,18 @@ public abstract class AbstractEndpoint<S, U> {
         return new HashSet<>(connections.values());
     }
 
+
+    /**
+     * Reports whether the endpoint still has connections that a graceful stop
+     * should wait for. Endpoints that keep their connection state outside the
+     * base-class map override this method.
+     *
+     * @return {@code true} if connections are still open
+     */
+    protected boolean hasOpenConnections() {
+        return !connections.isEmpty();
+    }
+
     /**
      * The SSL implementation used by this endpoint.
      */
@@ -2495,7 +2507,9 @@ public abstract class AbstractEndpoint<S, U> {
     public final void closeServerSocketGraceful() {
         if (bindState == BindState.BOUND_ON_START) {
             // Stop accepting new connections
-            acceptor.stopMillis(-1);
+            if (acceptor != null) {
+                acceptor.stopMillis(-1);
+            }
             // Release locks that may be preventing the acceptor from stopping
             releaseConnectionLatch();
             unlockAccept();
@@ -2523,7 +2537,7 @@ public abstract class AbstractEndpoint<S, U> {
      * @return The wait time, if any remaining when the method returned
      */
     public final long awaitConnectionsClose(long waitMillis) {
-        while (waitMillis > 0 && !connections.isEmpty()) {
+        while (waitMillis > 0 && hasOpenConnections()) {
             try {
                 Thread.sleep(50);
                 waitMillis -= 50;

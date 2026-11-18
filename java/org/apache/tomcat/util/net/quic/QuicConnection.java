@@ -99,13 +99,12 @@ public interface QuicConnection {
      * transport thread hop the teardown there and may block the caller until
      * the hop completes (the SSL/Panama implementation waits for the poll
      * loop up to its hop timeout and then marks the connection closed), so
-     * this method is not guaranteed to return immediately. Note that the
-     * reachability-based fallback that releases the native connection when
-     * the wrapper becomes unreachable without an explicit failure or close
-     * is not hopped to the transport thread (unlike stream wrappers, whose
-     * fallback frees are hopped to the poll thread); it is safe only because
-     * the transport's connection book-keeping keeps the wrapper reachable
-     * while the explicit teardown paths can still run against it.
+     * this method is not guaranteed to return immediately. The
+     * reachability-based fallback that releases a native connection when its
+     * wrapper becomes unreachable without an explicit failure or close is
+     * transport-specific: the OpenSSL transport queues the connection free to
+     * its poll thread (as it does for streams), while transports without a
+     * native poll thread may release the object directly.
      *
      * @param appErrorCode The application protocol error code carried in the
      *                     {@code CONNECTION_CLOSE} frame
@@ -133,8 +132,9 @@ public interface QuicConnection {
      * retrying forever.
      *
      * @param stream The stream to write to
-     * @param data   The data to write, in write mode; the position is
-     *               advanced by the number of accepted bytes
+     * @param data   The data to write, in read mode (from the current
+     *               position to the limit); the position is advanced by the
+     *               number of accepted bytes
      *
      * @return the number of bytes accepted by the stream
      */

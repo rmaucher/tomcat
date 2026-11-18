@@ -96,6 +96,12 @@ public class QuicCertConfig {
     public final boolean pskOnly;
 
     /**
+     * TLS 1.3 cipher suites to apply to the native SSL_CTX. Kept in the
+     * snapshot so a certificate reload can re-apply the configured suites.
+     */
+    public final String cipherSuites;
+
+    /**
      * Arena holding every native object in this snapshot.
      */
     public final Arena arena;
@@ -117,13 +123,15 @@ public class QuicCertConfig {
      * @param pskOnly               Whether the endpoint has pre-shared keys
      *                              configured and no host offers a
      *                              certificate
+     * @param cipherSuites          TLS 1.3 cipher suites for the native context
      * @param arena                 Arena owning the native objects of this
      *                              snapshot
      */
     public QuicCertConfig(String defaultHostName, List<CertificateEntry> defaultCerts,
             Map<String, List<CertificateEntry>> certsByHost,
             Map<String, OpenSSLPreSharedKeySelector> pskByHost,
-            OpenSSLPreSharedKeySelector defaultPskSelector, boolean pskOnly, Arena arena) {
+            OpenSSLPreSharedKeySelector defaultPskSelector, boolean pskOnly,
+            String cipherSuites, Arena arena) {
         // The snapshot is handed to the native SNI/PSK callbacks and read
         // while a later reload swaps in a new instance; copy and wrap the
         // collections so the documented immutability cannot be violated by a
@@ -131,14 +139,16 @@ public class QuicCertConfig {
         this.defaultHostName = defaultHostName;
         Map<String, List<CertificateEntry>> certsCopy = new HashMap<>();
         for (Map.Entry<String, List<CertificateEntry>> host : certsByHost.entrySet()) {
-            certsCopy.put(host.getKey(),
-                    Collections.unmodifiableList(host.getValue()));
+            certsCopy.put(host.getKey(), Collections.unmodifiableList(
+                    new ArrayList<>(host.getValue())));
         }
-        this.defaultCerts = Collections.unmodifiableList(defaultCerts);
+        this.defaultCerts = Collections.unmodifiableList(
+                new ArrayList<>(defaultCerts));
         this.certsByHost = Collections.unmodifiableMap(certsCopy);
         this.pskByHost = Collections.unmodifiableMap(new HashMap<>(pskByHost));
         this.defaultPskSelector = defaultPskSelector;
         this.pskOnly = pskOnly;
+        this.cipherSuites = cipherSuites;
         this.arena = arena;
     }
 
@@ -178,6 +188,12 @@ public class QuicCertConfig {
             Map<String, OpenSSLPreSharedKeySelector> pskByHost = new HashMap<>();
             for (SSLHostConfig hostConfig : hostConfigs) {
                 String hostName = hostConfig.getHostName().toLowerCase(Locale.ENGLISH);
+                if (hostConfig != defaultHostConfig &&
+                        !hostConfig.getCipherSuites().equals(
+                                defaultHostConfig.getCipherSuites())) {
+                    log.warn(sm.getString("quicEndpoint.perHostCipherSuitesUnsupported",
+                            hostConfig.getHostName()));
+                }
                 SSLHostConfig.CertificateVerification verification =
                         hostConfig.getCertificateVerification();
                 if (verification != SSLHostConfig.CertificateVerification.NONE) {
@@ -274,7 +290,8 @@ public class QuicCertConfig {
             boolean pskOnly = !pskByHost.isEmpty() && !certsByHost.values().stream()
                     .anyMatch(entries -> !entries.isEmpty());
             return new QuicCertConfig(defaultHostName, defaultCerts, certsByHost, pskByHost,
-                    defaultPskSelector, pskOnly, arena);
+                    defaultPskSelector, pskOnly,
+                    defaultHostConfig.getCipherSuites(), arena);
         } catch (Throwable t) {
             freeLoadedEntries(loaded);
             CertificateLoader.closeQuietly(arena);

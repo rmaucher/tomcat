@@ -385,3 +385,72 @@ retained.
 
 All three HTTP/3 test suites pass after the changes: 520 tests, 0 failures,
 with 2/20/6 skipped for OpenSSL/quiche/ngtcp2.
+
+## 11. Post-defect-fix ngtcp2 performance check (2026-11-17)
+
+A quick regression check covered the later ngtcp2 correctness fixes. The
+documented `8x25` load case (`connections=8`, `streams=25`, `procs=8`,
+3 s warm-up, 12 s window) was run after a `1x32` JVM-warming run. The
+benchmark base and server configuration were held fixed; only
+`tomcat-coyote.jar` and `tomcat-coyote-ffm.jar` were swapped. The host load
+average ranged from about 9 to 14, within the shared-host caveat in Section 2.
+
+| tree | rps (mean) | us/req |
+|---|---:|---:|
+| parent tree (`bb46787c41`, before the fixes) | 83,400 (3 runs) | 11.9 |
+| fixes before this performance correction | 70,262 (3 runs) | 14.0 |
+| corrected tree | 82,397 (3 runs) | 12.0 |
+| Section 10.2 after-optimization report | 82,891.9 | 11.95 |
+
+The initial fixes showed a reproducible ~15% regression. Bisecting the
+fix series with only the coyote jars swapped isolated two interacting
+changes on the request-stream completion path:
+
+- Closing a late readable edge for an already completed request directly on
+  the poll thread moved the remaining stream drain/close work there. The
+  poller is already saturated in this shape; the previous wrapper dispatch
+  performed that cleanup on executor workers, which kept per-request poller
+  cost lower.
+- Suppressing the terminal FIN edge for request streams removed the later
+  drain that returned connection flow-control credit for bytes sent after the
+  response. It also let the binding tombstone disappear earlier, so some
+  late edges were reclassified as new requests and allocated a fresh wrapper.
+
+The correction keeps a bounded tombstone of recently finalized client
+bidirectional stream IDs so late edges stay on the duplicate path without
+touching the HTTP/3 active-stream count. Request streams keep the terminal
+FIN edge (and the wrapper dispatch, which runs the cleanup on workers);
+client- and server-initiated unidirectional streams keep the earlier
+suppression, since their cleanup is handled directly. The corrected tree is
+within run-to-run noise of both the parent tree and the Section 10.2 report.
+
+The ngtcp2 HTTP/3 suite passes after the correction (586 tests, 0 failures,
+6 skipped).
+## 12. Post-defect-fix OpenSSL performance check (2026-11-18)
+
+A quick regression check covered the final OpenSSL QUIC fixes on top of the
+`efea20486f` review tree. The documented `8x25` load case (`connections=8`,
+`streams=25`, `procs=8`, 3 s warm-up, 12 s window) was run after a `1x32`
+JVM-warming run. The benchmark base was `/home/opencode/tomcat-http3`; only
+`tomcat-coyote.jar` and `tomcat-coyote-ffm.jar` were swapped, and the server
+was restarted between variants. Host load average ranged from about 10.9 to
+24.1, within the shared-host caveat in Section 2.
+
+| tree | runs (rps) | mean rps | us/req |
+|---|---:|---:|---:|
+| final fixed tree | 92,192.9 / 92,529.6 / 88,976.1 | 91,232.9 | 10.8 |
+| parent tree (`efea20486f`) | 90,545.7 / 92,936.4 / 92,474.3 | 91,985.5 | 10.7 |
+| Section 9 report (final fixed tree) | 91,502.3 | 91,502.3 | 10.85 |
+| older benchmark-base jar | 97,640.7 / 98,650.5 | 98,145.6 | 10.05 |
+
+The final tree is within the shared-host spread of the parent tree (about
+0.8% lower mean rps, 0.1 us/req higher) and matches the Section 9 report
+(about 0.8% higher rps, 1.4% lower us/req). No regression attributable to the
+defect fixes was measurable in this shape.
+
+The older benchmark-base jar is faster in this run but is not a comparison
+baseline for the current tree: its class files predate current code (for
+example, it has no `writeInterestedWrappers` or retained `listenerPollItem`
+fields), matching an earlier tree rather than the review parent. The
+parent-versus-fixed A/B above isolates the unpushed changes and shows no
+measurable regression.

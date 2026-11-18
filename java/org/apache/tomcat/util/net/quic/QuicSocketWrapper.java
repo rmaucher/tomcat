@@ -76,9 +76,10 @@ public abstract class QuicSocketWrapper extends SocketWrapperBase<QuicStream> {
      * park/unpark is used rather than wait/notify so a signal racing the park
      * cannot be lost (an unpark that arrives before the park is stored as a
      * permit and the wake check re-validates it against the sequence
-     * counter). At most one thread blocks per direction in practice (the
-     * stream's processing flag serialises handlers); a second concurrent
-     * waiter would simply fall back to waiting out the configured timeout.
+     * counter). Only one waiter per direction is supported in practice (the
+     * stream's processing flag serialises handlers); a second registration
+     * overwrites the waiter slot, so the replaced thread falls back to waiting
+     * out the configured timeout.
      */
     private final AtomicReference<Thread> readWaiter = new AtomicReference<>();
     private final AtomicReference<Thread> writeWaiter = new AtomicReference<>();
@@ -458,7 +459,7 @@ public abstract class QuicSocketWrapper extends SocketWrapperBase<QuicStream> {
      * @throws EOFException If the wrapper has been closed
      */
     protected void checkNotClosed() throws EOFException {
-        if (socketBufferHandler == null) {
+        if (closed.get() || socketBufferHandler == null) {
             throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
         }
     }

@@ -23,20 +23,29 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.util.LinkedHashSet;
+import java.util.Locale;
 import java.util.Set;
 
+import org.apache.juli.logging.Log;
+import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.openssl.openssl_h;
+import org.apache.tomcat.util.res.StringManager;
 
 
 /**
  * FFM bindings for OpenSSL QUIC functions.
  * <p>
  * This class provides downcall handles for the QUIC-specific OpenSSL functions
- * needed by {@code QuicOpenSSLEndpoint}. All bindings follow the same pattern
+ * needed by {@code QuicOpenSSLEndpoint}. The bindings currently target Linux
+ * LP64 with a glibc or musl libc: other operating systems use different libc
+ * ABIs, socket constants, sockaddr layouts and C {@code long} widths, so the
+ * endpoint reports itself unavailable there rather than binding with the
+ * wrong ABI. All bindings follow the same pattern
  * as the existing bindings in {@code openssl_h}.
  * <p>
- * Functions bound here (OpenSSL manages QUIC I/O internally, so only the
- * symbols actually called by the endpoint are bound):
+ * The list below summarizes the main groups of functions bound here; the
+ * individual fields are the authoritative list (OpenSSL manages QUIC I/O
+ * internally, so only the symbols actually called by the endpoint are bound):
  * <ul>
  * <li>{@code OSSL_QUIC_server_method()}</li>
  * <li>{@code SSL_new_listener()}, {@code SSL_listen()}, {@code SSL_accept_connection()}</li>
@@ -64,7 +73,7 @@ import org.apache.tomcat.util.openssl.openssl_h;
  *     macros in OpenSSL 4.0)</li>
  * <li>C libc helpers for the datagram socket: {@code socket()}, {@code bind()},
  *     {@code getsockname()}, {@code setsockopt()}, {@code fcntl()},
- *     {@code strerror_r()}, {@code close()}, {@code poll()},
+ *     {@code strerror()}, {@code close()}, {@code poll()},
  *     {@code read()}, {@code write()}, {@code eventfd()} and
  *     {@code __errno_location()} (the {@code errno} thread-local accessor
  *     used around the socket helpers; {@code read()}/{@code write()}/
@@ -72,6 +81,10 @@ import org.apache.tomcat.util.openssl.openssl_h;
  * </ul>
  */
 public class QuicBindings {
+
+    private static final Log log = LogFactory.getLog(QuicBindings.class);
+    private static final StringManager sm =
+            StringManager.getManager(QuicBindings.class);
 
     private QuicBindings() {
         // Utility class - should not be instantiated
@@ -134,7 +147,10 @@ public class QuicBindings {
      * {@code SSL *SSL_new_listener(SSL_CTX *ctx, uint64_t flags)}
      *
      * @param ctx   The SSL context configured for QUIC
-     * @param flags Reserved for future use; must be {@code 0}
+     * @param flags OpenSSL {@code SSL_LISTENER_FLAG_*} values. The endpoint
+     *              passes {@code 0}, which keeps OpenSSL's default address
+     *              validation enabled; {@code SSL_LISTENER_FLAG_NO_VALIDATE}
+     *              (OpenSSL 4.x) would disable it
      * @return The new listener object, or {@code NULL} on failure
      */
     public static MemorySegment SSL_new_listener(MemorySegment ctx, long flags) {
@@ -179,7 +195,10 @@ public class QuicBindings {
      * {@code SSL *SSL_accept_connection(SSL *listener, uint64_t flags)}
      *
      * @param listener The listener SSL object
-     * @param flags    Reserved for future use; must be {@code 0}
+     * @param flags    OpenSSL {@code SSL_ACCEPT_CONNECTION_*} values; the
+     *                 endpoint passes {@code 0}. OpenSSL 4.x defines
+     *                 {@code SSL_ACCEPT_CONNECTION_NO_BLOCK} for the non-blocking
+     *                 accept case
      * @return The SSL object for the incoming connection, or {@code NULL} if none is pending
      */
     public static MemorySegment SSL_accept_connection(MemorySegment listener, long flags) {
@@ -630,7 +649,7 @@ public class QuicBindings {
                             openssl_h.C_POINTER,
                             openssl_h.C_INT,
                             openssl_h.C_INT,
-                            openssl_h.C_LONG));
+                            ValueLayout.JAVA_LONG));
 
     /**
      * {@code int SSL_set_value_uint(SSL *s, uint32_t class_, uint32_t id, uint64_t v)}
@@ -675,17 +694,6 @@ public class QuicBindings {
     }
 
     /**
-     * {@code SSL_get_stream_write_buf_size(ssl, &value)}: the size of the
-     * stream's native write buffer.
-     *
-     * @param ssl The stream SSL object
-     * @return The buffer size, or {@code -1} if unavailable
-     */
-    public static long SSL_get_stream_write_buf_size(MemorySegment ssl) {
-        return SSL_get_stream_write_buf_stat(ssl, SSL_VALUE_STREAM_WRITE_BUF_SIZE);
-    }
-
-    /**
      * {@code SSL_get_stream_write_buf_used(ssl, &value)}: the number of
      * bytes in the stream's native write buffer that the peer has not yet
      * acknowledged.
@@ -695,17 +703,6 @@ public class QuicBindings {
      */
     public static long SSL_get_stream_write_buf_used(MemorySegment ssl) {
         return SSL_get_stream_write_buf_stat(ssl, SSL_VALUE_STREAM_WRITE_BUF_USED);
-    }
-
-    /**
-     * {@code SSL_get_stream_write_buf_avail(ssl, &value)}: the number of
-     * bytes the stream's native write buffer can accept without blocking.
-     *
-     * @param ssl The stream SSL object
-     * @return The available byte count, or {@code -1} if unavailable
-     */
-    public static long SSL_get_stream_write_buf_avail(MemorySegment ssl) {
-        return SSL_get_stream_write_buf_stat(ssl, SSL_VALUE_STREAM_WRITE_BUF_AVAIL);
     }
 
     // SSL_shutdown_ex flags
@@ -744,6 +741,11 @@ public class QuicBindings {
     public static final int SSL_VALUE_QUIC_STREAM_UNI_REMOTE_AVAIL = 4;
     /** QUIC idle timeout in milliseconds, connection-level (settable). */
     public static final int SSL_VALUE_QUIC_IDLE_TIMEOUT = 5;
+    /**
+     * Maximum number of connections the listener may hold in its pending
+     * (handshaking) queue. Listener-level, generic value class (settable).
+     */
+    public static final int SSL_VALUE_QUIC_MAX_PENDING_CONNS = 16;
     /** Stream ID: event handling mode for the object (settable). */
     public static final int SSL_VALUE_EVENT_HANDLING_MODE = 6;
     /**
@@ -1110,7 +1112,8 @@ public class QuicBindings {
      */
     public static final MethodHandle fcntl$handle = createLibcHandle("fcntl",
             FunctionDescriptor.of(openssl_h.C_INT,
-                    openssl_h.C_INT, openssl_h.C_INT, openssl_h.C_INT));
+                    openssl_h.C_INT, openssl_h.C_INT, openssl_h.C_INT),
+            Linker.Option.firstVariadicArg(2));
 
     /**
      * {@code int fcntl(int fd, int cmd, int arg)}
@@ -1129,38 +1132,38 @@ public class QuicBindings {
     }
 
     /**
-     * {@code char *strerror_r(int errnum, char *buf, size_t buflen)} - the
-     * glibc (GNU) variant, which the Linux/glibc ABI this endpoint binds
-     * exposes under that symbol name.
+     * {@code char *strerror(int errnum)}. The POSIX signature is portable to
+     * glibc and musl, unlike the GNU-only {@code char *strerror_r} variant
+     * that was previously bound here.
      */
-    public static final MethodHandle strerror_r$handle = createLibcHandle("strerror_r",
-            FunctionDescriptor.of(openssl_h.C_POINTER, openssl_h.C_INT,
-                    openssl_h.C_POINTER, openssl_h.C_LONG));
+    public static final MethodHandle strerror$handle = createLibcHandle("strerror",
+            FunctionDescriptor.of(openssl_h.C_POINTER, openssl_h.C_INT));
 
     /**
-     * Thread-safe description of an {@code errno} value. The plain
-     * {@code strerror()} returns a pointer into a process-wide static buffer,
-     * so two threads formatting an error at once (bind on the start thread, a
-     * socket-option failure on the stop path) can garble each other's
-     * message. glibc's {@code strerror_r()} returns a pointer to a message
-     * that is either the caller's buffer or a thread-local string, so
-     * concurrent callers never share storage; the caller's buffer is supplied
-     * here so the common short messages stay in caller memory.
+     * Thread-safe description of an {@code errno} value. {@code strerror()}
+     * returns a pointer into a process-wide static buffer, so access is
+     * serialized and the Java string is copied before the lock is released.
+     * This avoids the glibc-only {@code char *strerror_r()} ABI and works on
+     * musl as well.
      *
      * @param errnum The {@code errno} value to describe
      * @return The description of the error number
      */
     public static String strerror(int errnum) {
-        final int buflen = 256;
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment buf = arena.allocate(buflen);
-            MemorySegment res = (MemorySegment) strerror_r$handle.invokeExact(
-                    errnum, buf, (long) buflen);
-            return res.getString(0);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
+        synchronized (STRERROR_LOCK) {
+            try {
+                MemorySegment res = (MemorySegment) strerror$handle.invokeExact(errnum);
+                if (res.equals(MemorySegment.NULL)) {
+                    return "Unknown error " + errnum;
+                }
+                return res.getString(0);
+            } catch (Throwable t) {
+                throw new AssertionError("should not reach here", t);
+            }
         }
     }
+
+    private static final Object STRERROR_LOCK = new Object();
 
     /**
      * {@code int errno} - accessed via __errno_location()
@@ -1331,6 +1334,10 @@ public class QuicBindings {
     // SOCK_DGRAM constant
     /** Socket type: datagram (used for the QUIC UDP socket). */
     public static final int SOCK_DGRAM = 2;
+    /** Socket type flag: non-blocking I/O (Linux {@code SOCK_NONBLOCK}). */
+    public static final int SOCK_NONBLOCK = 0x800;
+    /** Socket type flag: close-on-exec (Linux {@code SOCK_CLOEXEC}). */
+    public static final int SOCK_CLOEXEC = 0x80000;
 
     // fcntl commands
     /** {@code fcntl()} command: get the file status flags. */
@@ -1343,10 +1350,6 @@ public class QuicBindings {
     // Socket option levels
     /** Socket option level: the socket API itself. */
     public static final int SOL_SOCKET = 1;
-
-    // Socket options
-    /** Socket option: allow binding an address in TIME_WAIT. */
-    public static final int SO_REUSEADDR = 2;
 
     // IPv6 option level / names (Linux values; IPV6_V6ONLY is 27 on
     // BSD/Darwin/FreeBSD, a different numbering on Windows)
@@ -1682,13 +1685,17 @@ public class QuicBindings {
     /**
      * Creates a downcall handle for a libc symbol.
      */
-    private static MethodHandle createLibcHandle(String symbol, FunctionDescriptor desc) {
+    private static MethodHandle createLibcHandle(String symbol, FunctionDescriptor desc,
+            Linker.Option... options) {
         try {
-            // Use openssl_h's symbol lookup which works for libc symbols too
-            // since they're all in the same process address space
-            MemorySegment addr = openssl_h.SYMBOL_LOOKUP.find(symbol)
+            // Resolve libc symbols through the native linker first. The
+            // openssl_h lookup is only a fallback: coupling the libc layer to
+            // the OpenSSL library lookup can be affected by the selected
+            // OpenSSL library or by a same-named symbol in it.
+            MemorySegment addr = Linker.nativeLinker().defaultLookup().find(symbol)
+                    .or(() -> openssl_h.SYMBOL_LOOKUP.find(symbol))
                     .orElseThrow(() -> new UnsatisfiedLinkError("unresolved libc symbol: " + symbol));
-            return Linker.nativeLinker().downcallHandle(addr, desc);
+            return Linker.nativeLinker().downcallHandle(addr, desc, options);
         } catch (Throwable e) {
             // See createHandle(): the bind attempt is the availability probe.
             MISSING_SYMBOLS.add(symbol);
@@ -1703,6 +1710,23 @@ public class QuicBindings {
     // QUIC_AVAILABLE from a static context earlier in this class - there is
     // none, the handle initialisers deliberately bind unconditionally.
     static {
-        QUIC_AVAILABLE = MISSING_SYMBOLS.isEmpty();
+        boolean platformSupported = isSupportedPlatform();
+        QUIC_AVAILABLE = MISSING_SYMBOLS.isEmpty() && platformSupported;
+        if (!platformSupported) {
+            log.warn(sm.getString("quicEndpoint.quicBindingsPlatformUnsupported",
+                    System.getProperty("os.name", "unknown"),
+                    String.valueOf(ValueLayout.ADDRESS.byteSize() * 8)));
+        }
+        if (!MISSING_SYMBOLS.isEmpty()) {
+            log.warn(sm.getString("quicEndpoint.quicBindingsMissingSymbols",
+                    String.join(", ", MISSING_SYMBOLS)));
+        }
+    }
+
+
+    private static boolean isSupportedPlatform() {
+        String osName = System.getProperty("os.name", "");
+        return osName.toLowerCase(Locale.ENGLISH).contains("linux") &&
+                ValueLayout.ADDRESS.byteSize() == Long.BYTES;
     }
 }

@@ -41,7 +41,7 @@ import org.apache.tomcat.util.openssl.openssl_h_Macros;
 import org.apache.tomcat.util.res.StringManager;
 
 /**
- * Owns the TLS side of a {@link QuicOpenSSLEndpoint}: the native QUIC
+ * Owns the TLS side of an OpenSSL QUIC endpoint: the native QUIC
  * {@code SSL_CTX}, the ALPN, SNI and TLS 1.3 pre-shared key callbacks
  * installed on it, the current {@link QuicCertConfig}
  * certificate snapshot the SNI callback applies per connection, and the
@@ -54,7 +54,9 @@ import org.apache.tomcat.util.res.StringManager;
  * {@link SSLHostConfig}) and it owns no thread of its own. The native
  * certificate context is created once during bind and released during
  * unbind; the certificate snapshot is swapped in on the endpoint's poll
- * thread so it is serialized with the SNI callback.
+ * thread so it is serialized with the SNI callback. The same manager is also
+ * used by the ngtcp2 transport adapter with a normal
+ * {@code TLS_server_method()} context.
  */
 public class QuicCertificateManager {
 
@@ -251,6 +253,7 @@ public class QuicCertificateManager {
         }
 
         applyPskOnlyOptions();
+        applyCipherSuites(certConfig);
 
         // Set up ALPN callback for "h3" protocol
         setupAlpnCallback();
@@ -323,6 +326,30 @@ public class QuicCertificateManager {
 
 
     /**
+     * Applies the TLS 1.3 cipher suites of the snapshot to the native
+     * SSL_CTX. The QUIC endpoint uses a single shared context; per-host
+     * cipher configurations that differ from the default host cannot be
+     * represented and are reported when the snapshot is built.
+     *
+     * @param config The certificate snapshot whose suite list to apply
+     */
+    private void applyCipherSuites(QuicCertConfig config) {
+        if (config == null || config.cipherSuites == null ||
+                sslCtx == null || sslCtx.equals(MemorySegment.NULL)) {
+            return;
+        }
+        try (Arena localArena = Arena.ofConfined()) {
+            MemorySegment suites = localArena.allocateFrom(config.cipherSuites);
+            int rc = openssl_h.SSL_CTX_set_ciphersuites(sslCtx, suites);
+            if (rc != 1) {
+                log.warn(sm.getString("quicEndpoint.cipherSuitesSetError",
+                        config.cipherSuites, Integer.valueOf(rc)));
+            }
+        }
+    }
+
+
+    /**
      * Swaps in the new certificate configuration and frees the native objects
      * of the previous one. Must only run on the poll thread (or when the poll
      * thread is not running) so it is serialized with the SNI callback.
@@ -347,6 +374,7 @@ public class QuicCertificateManager {
         // state; the context option must follow it for the connections
         // handshaked from now on.
         applyPskOnlyOptions();
+        applyCipherSuites(newConfig);
         if (log.isInfoEnabled()) {
             log.info(sm.getString("quicEndpoint.certificateReloaded",
                     nameSupplier.get(), reason));

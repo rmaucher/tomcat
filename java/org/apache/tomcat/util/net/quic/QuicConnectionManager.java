@@ -95,6 +95,32 @@ public interface QuicConnectionManager {
 
 
     /**
+     * Returns the protocol-specific connection error code to use when a
+     * critical client-initiated unidirectional stream terminates with data
+     * that the protocol parser retained as an incomplete frame/instruction,
+     * or {@code 0} when the stream ended at a valid boundary (or the protocol
+     * has no specific truncated-stream error).
+     * <p>
+     * The endpoint uses this before mapping a terminal critical stream to the
+     * generic "critical stream closed" error: RFC 9114 Section 7.1 requires a
+     * truncated final frame to be reported as {@code H3_FRAME_ERROR}, and
+     * RFC 9204 requires incomplete QPACK instructions to use the
+     * corresponding QPACK stream error.
+     *
+     * @param connection The QUIC connection
+     * @param streamId   The client unidirectional stream identifier
+     * @param partialRetained Whether the endpoint retained unconsumed bytes
+     *                        from the last protocol parse
+     *
+     * @return The protocol error code, or 0 for a clean frame boundary
+     */
+    default long getTruncatedClientUniStreamErrorCode(QuicConnection connection,
+            long streamId, boolean partialRetained) {
+        return 0;
+    }
+
+
+    /**
      * Returns the application protocol state for a connection.
      *
      * @param connection The QUIC connection for which the state is required

@@ -27,7 +27,7 @@ import org.apache.tomcat.util.res.StringManager;
 
 /**
  * OpenSSL endpoint specialization of the shared poll-task mailbox
- * ({@code org.apache.tomcat.util.net.quic.QuicNativeMailbox}), adding three
+ * ({@code org.apache.tomcat.util.net.quic.QuicNativeMailbox}), adding four
  * work queues that cross the endpoint's poll-thread confinement boundary
  * beside the base poll-task queue:
  * <ul>
@@ -174,6 +174,14 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
             if (stream.isFreed()) {
                 continue;
             }
+            if (stream.isProcessing()) {
+                // A handler still owns the stream: do not free its SSL
+                // regardless of force flags. The worker's
+                // finishStreamDispatch() queues the free once the handler has
+                // released the claim.
+                waiting.add(stream);
+                continue;
+            }
             try {
                 QuicConnectionWrapper conn = stream.getConnection();
                 boolean force = forceAll ||
@@ -211,6 +219,14 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
         confinementCheck.accept("drainPendingStreamFrees");
         QuicStreamWrapper deferredStream;
         while ((deferredStream = pendingStreamFrees.poll()) != null) {
+            if (!deferredStream.isFreed() && deferredStream.isProcessing()) {
+                // The stream was queued while a handler still owned it (for
+                // example a wrapper close from inside the handler). Keep it
+                // for the worker's completion path instead of freeing it
+                // underneath the handler.
+                pendingStreamDrains.add(deferredStream);
+                continue;
+            }
             try {
                 deferredStream.freeSslOnce();
             } catch (Throwable t) {

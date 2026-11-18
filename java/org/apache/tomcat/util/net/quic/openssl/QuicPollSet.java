@@ -52,8 +52,7 @@ import org.apache.tomcat.util.res.StringManager;
  * Copies into the native array are incremental: an item's struct is copied
  * by {@link #rebuild()} only when the item is new or its descriptor/events
  * changed since the previous rebuild (per-item dirty flag, see
- * {@link QuicPollItem#setWantEvents(long)} and
- * {@link QuicPollItem#setSsl(MemorySegment)}). Per SSL_poll(3) (OpenSSL
+ * {@link QuicPollItem#setWantEvents(long)}). Per SSL_poll(3) (OpenSSL
  * 3.5+), SSL_poll() initialises the revents of all items in the input array
  * upon returning, so no other per-iteration maintenance of the array is
  * required. After {@code SSL_poll()} returns, revents are read back from
@@ -144,42 +143,15 @@ public class QuicPollSet {
         long key = item.getSsl().address();
         QuicPollItem previous = items.putIfAbsent(key, item);
         if (previous != null) {
-            // Already present - update in place. The passed-in item is not
-            // used; drop its dirty flag via dispose().
-            // This path must not be taken for a live stream item: the
-            // want-events mask is managed cooperatively by the endpoint
-            // (dispatchStreamEvent strips R/W, the processor re-arms them), so
-            // overwriting it with a freshly-constructed mask loses the current
-            // interest, and disposing the caller's item can make its later
-            // setWantEvents() calls ineffective. No call
-            // site is expected to re-add a tracked address, but the add is
-            // still interpreted below (the previous item is updated in place),
-            // so a regression on this path would not fail loudly - the warning
-            // is the only signal that it happened.
+            // Re-adding a tracked address is not supported: the existing
+            // item's want-events mask is managed cooperatively by the
+            // endpoint (dispatchStreamEvent strips R/W, the processor re-arms
+            // them). Overwriting that mask with the fresh item's initial mask
+            // loses the current interest, and disposing the caller's item can
+            // make its later setWantEvents() calls ineffective. Report the
+            // regression and keep the existing item unchanged.
             log.warn(sm.getString("quicPollSet.duplicateAdd",
                     Long.toHexString(key)));
-            long newAddress = item.getSsl().address();
-            if (newAddress != key) {
-                // The set's lookup key must always match the descriptor's
-                // current SSL address. Move the existing item to the new key
-                // before updating its SSL pointer; if another item already
-                // owns that address, leave the old mapping intact rather than
-                // corrupting both entries.
-                boolean moved = items.remove(key, previous);
-                if (moved) {
-                    QuicPollItem collision = items.putIfAbsent(newAddress, previous);
-                    if (collision != null) {
-                        items.putIfAbsent(key, previous);
-                        log.error(sm.getString("quicPollSet.duplicateAddress",
-                                Long.toHexString(newAddress)));
-                        item.dispose();
-                        return;
-                    }
-                }
-            }
-            previous.setSsl(item.getSsl());
-            previous.setWantEvents(item.getWantEvents());
-            previous.setAppData(item.getAppData());
             item.dispose();
             return;
         }
@@ -250,6 +222,45 @@ public class QuicPollSet {
                     "Index " + index + " out of bounds for poll set size " + count);
         }
         return slots[index];
+    }
+
+
+    /**
+     * Moves an active item to the last slot. Used to move the listener behind
+     * all connection/stream items so a listener poll failure (SSL_POLL_EVENT_F)
+     * cannot zero the revents of items after it.
+     *
+     * @param item The item to move
+     */
+    public void moveToEnd(QuicPollItem item) {
+        if (item == null) {
+            return;
+        }
+        QuicPollItem current = items.get(item.getSsl().address());
+        if (current != item) {
+            if (current == null) {
+                // The item is not tracked; nothing to reorder.
+                return;
+            }
+            item = current;
+        }
+        int slot = item.getSlot();
+        if (slot < 0 || slot >= count || count == 0) {
+            return;
+        }
+        int last = count - 1;
+        if (slot == last) {
+            return;
+        }
+        QuicPollItem swapped = slots[last];
+        slots[slot] = swapped;
+        swapped.setSlot(slot);
+        slots[last] = item;
+        item.setSlot(last);
+        // Both descriptors moved in the native array; rebuild must rewrite
+        // both slots.
+        swapped.markDirty();
+        item.markDirty();
     }
 
 
@@ -344,8 +355,8 @@ public class QuicPollSet {
 
 
     /**
-     * Removes all items from the poll set and releases their native
-     * structs.
+     * Removes all items from the poll set, clearing their Java state and the
+     * lookup map.
      */
     public void clear() {
         for (int i = 0; i < count; i++) {

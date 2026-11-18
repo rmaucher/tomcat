@@ -276,6 +276,13 @@ public class QuicConnectionWrapper implements QuicConnection {
 
     @Override
     public void setProtocolDataPending(boolean pending) {
+        if (pending && (isClosed() || isFreed())) {
+            // A late worker/manager mark on a connection that has already
+            // been torn down cannot be flushed and would otherwise strand
+            // the endpoint-wide pending counter. A false transition is still
+            // allowed so an existing mark can be balanced.
+            return;
+        }
         QuicOpenSSLEndpoint ep = endpoint;
         if (ep != null) {
             ep.setConnectionProtocolDataPending(this, pending);
@@ -795,6 +802,28 @@ public class QuicConnectionWrapper implements QuicConnection {
 
 
     /**
+     * Removes a server-initiated unidirectional stream from the connection's
+     * bookkeeping when it is deregistered. The stream SSL is freed by the
+     * stream teardown, so keeping the wrapper here would retain it after close
+     * and let {@link #getServerUniStream(int)} return a freed stream.
+     *
+     * @param stream The stream wrapper to remove
+     */
+    void removeServerUniStream(QuicStreamWrapper stream) {
+        serverUniStreams.values().remove(stream);
+    }
+
+
+    /**
+     * Releases all server-unidirectional-stream bookkeeping, for example when
+     * the connection is being torn down.
+     */
+    void clearServerUniStreams() {
+        serverUniStreams.clear();
+    }
+
+
+    /**
      * Writes the remaining bytes of the given buffer to the provided stream in
      * a single native {@code SSL_write_ex(2)} call (through the endpoint's
      * shared write kernel), allocating the native buffers from a confined
@@ -829,6 +858,16 @@ public class QuicConnectionWrapper implements QuicConnection {
             return 0;
         }
         QuicStreamWrapper s = (QuicStreamWrapper) stream;
+        QuicConnectionWrapper conn = (QuicConnectionWrapper) s.getConnection();
+        if (s.isFreed() || (conn != null &&
+                (conn.isClosed() || conn.isFreed()))) {
+            // The stream or its connection has already been torn down. Do not
+            // touch the stream SSL; report all bytes as consumed so the
+            // protocol caller drops its pending state instead of retrying a
+            // write that can never reach the wire.
+            data.position(startPos + len);
+            return len;
+        }
         try (Arena localArena = Arena.ofConfined()) {
             int written = QuicOpenSSLEndpoint.writeStreamData(s.getSsl(), data, localArena);
             if (written >= 0) {
@@ -845,14 +884,27 @@ public class QuicConnectionWrapper implements QuicConnection {
             int writeState = QuicBindings.SSL_get_stream_write_state(s.getSsl());
             boolean wouldBlock = sslError == QuicBindings.SSL_ERROR_WANT_READ ||
                     sslError == QuicBindings.SSL_ERROR_WANT_WRITE;
-            boolean terminal = !wouldBlock ||
-                    QuicPoll.isTerminalWriteState(writeState);
-            if (terminal) {
-                // Consume the bytes so the caller drops its pending state
-                // instead of retrying forever; the connection-level error
-                // path surfaces the failure.
+            if (QuicPoll.isTerminalWriteState(writeState)) {
+                // The stream can never accept these bytes: consume them so
+                // the caller drops its pending state instead of retrying
+                // forever. The connection's terminal path is already running.
                 data.position(startPos + len);
                 return len;
+            }
+            if (!wouldBlock) {
+                // A hard error that left the write state non-terminal must
+                // not be reported as "all bytes accepted" (that silently
+                // loses protocol data). Leave the bytes pending so the caller
+                // stops this flush attempt, and fail the connection on the
+                // next poll-loop iteration, after this method has returned.
+                QuicOpenSSLEndpoint ep = endpoint;
+                if (ep != null) {
+                    ep.submitPollTask(
+                            () -> ep.failConnectionForStreamWriteError(this, sslError));
+                } else {
+                    data.position(startPos + len);
+                    return len;
+                }
             }
             data.position(startPos);
             return 0;
@@ -966,6 +1018,7 @@ public class QuicConnectionWrapper implements QuicConnection {
         }
         streams.clear();
         pendingStreams.clear();
+        serverUniStreams.clear();
     }
 
 

@@ -259,16 +259,6 @@ public final class QuicPoll {
 
 
     /**
-     * Returns the byte size of a single SSL_POLL_ITEM struct.
-     *
-     * @return The struct size in bytes
-     */
-    public static long itemSize() {
-        return SSL_POLL_ITEM_SIZE;
-    }
-
-
-    /**
      * Returns the aligned stride for an array of SSL_POLL_ITEM structs.
      *
      * @return The stride in bytes

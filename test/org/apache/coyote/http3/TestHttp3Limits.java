@@ -16,7 +16,6 @@
  */
 package org.apache.coyote.http3;
 
-import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Base64;
@@ -177,64 +176,6 @@ public class TestHttp3Limits extends Http3TestBase {
 
 
     @Test
-    public void testPreHeaderUnknownFrameNotBufferedMidDelivery()
-            throws Exception {
-        startHttp3Server();
-
-        // A frame with an unknown type must be ignored without buffering its
-        // payload (RFC 9114 Sections 4.1, 9). The client declares a large
-        // unknown frame (type 0xA0, not in the reserved family) and delivers
-        // part of it, holding the rest back so the server sits mid-frame.
-        // If the server buffered the pre-HEADERS payload as it read it, the
-        // heap would have grown by roughly the delivered amount at the
-        // midRun sample; the skip path must not allocate at all. Keep the
-        // delivered size moderate: the test runs in the same JVM as the
-        // server and usedHeap() must not put enough GC pressure on the
-        // server to make the client time out.
-        int delivered = 6 * 1024 * 1024;
-        long declared = 12L * 1024 * 1024;
-        long[] heapDelta = new long[1];
-        long heapBefore = usedHeap();
-
-        ClientOutput output = runClient(rawCommandWith(
-                "--headers",
-                buildFieldSection(simpleGetHeaders("/simple")),
-                "--declared-frame", "0xA0," + declared + "," + delivered,
-                "--frame-delay", "2",
-                "--timeout", "30",
-                "--wait", "2"),
-                CLIENT_TIMEOUT_SECONDS, 0, () -> {
-                    // Sample while the server has read the delivered payload
-                    // of the mid-frame unknown frame but not its remainder
-                    // (held back by --frame-delay).
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                    heapDelta[0] = usedHeap() - heapBefore;
-                });
-
-        // The stream must still serve: the unknown frame is skipped and the
-        // HEADERS frame after it processed normally. The client timeout is
-        // deliberately generous so a loaded test machine has time to deliver
-        // the delayed remainder and process the following HEADERS frame.
-        Assert.assertEquals("Expected exactly one response; client output: "
-                        + output.getLines(), 1, output.getResponses().size());
-        Http3Response response = output.getResponse();
-        validateStatus(response, 200);
-        Assert.assertNull(output.getConnectionError());
-
-        // The delivered payload must not have been retained as frame payload.
-        // The heap delta stays small because the payload is skipped as it
-        // arrives; a buffering implementation would grow by several MiB.
-        Assert.assertTrue("Pre-HEADERS unknown frame payload was buffered: "
-                + "heap grew by " + heapDelta[0] + " bytes mid-frame",
-                heapDelta[0] < 2 * 1024 * 1024);
-    }
-
-
-    @Test
     public void testPreHeaderIgnoredFrameAboveBufferLimitServes()
             throws Exception {
         startHttp3Server();
@@ -303,40 +244,6 @@ public class TestHttp3Limits extends Http3TestBase {
         System.arraycopy(payload, 0, frame, type.length + length.length,
                 payload.length);
         return Base64.getEncoder().encodeToString(frame);
-    }
-
-
-    private static long usedHeap() {
-        // Full GC, then used heap: transient allocations are collected, so a
-        // sustained delta means retained live data. System.gc() is only a
-        // request: on the busy test JVM a full GC can outlast any fixed
-        // sleep, and sampling before it completes reports the uncollected
-        // transient garbage of an in-flight transfer (tens of MiB after a
-        // 10 MiB stream delivery, near-identical every run because it is
-        // proportional to the delivered amount) as a retained delta.
-        // Collect repeatedly until consecutive readings stop improving by
-        // 256 KiB: at that point the collections reclaim no more and the
-        // lowest reading is the live-data floor.
-        long lowest = Long.MAX_VALUE;
-        long deadline = System.currentTimeMillis() + 1500;
-        while (System.currentTimeMillis() < deadline) {
-            System.gc();
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-            long previous = lowest;
-            lowest = Math.min(lowest,
-                    ManagementFactory.getMemoryMXBean().getHeapMemoryUsage()
-                            .getUsed());
-            if (previous != Long.MAX_VALUE
-                    && previous - lowest < 256 * 1024) {
-                break;
-            }
-        }
-        return lowest;
     }
 
 

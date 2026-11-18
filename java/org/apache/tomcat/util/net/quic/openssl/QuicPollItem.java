@@ -104,10 +104,10 @@ public class QuicPollItem {
     }
 
     /**
-     * Releases this item's resources when it leaves the poll set. The item no
-     * longer owns native memory (see {@link #writeTo(MemorySegment, long)});
-     * this is retained as the lifecycle hook called by the poll set's
-     * remove()/clear() paths and is safe to call more than once.
+     * Clears this item's lifecycle state when it leaves the poll set. The item
+     * owns no native memory (see {@link #writeTo(MemorySegment, long)}); this
+     * is the hook called by the poll set's remove()/clear() paths and is safe
+     * to call more than once.
      */
     public void dispose() {
         dirty = false;
@@ -128,18 +128,6 @@ public class QuicPollItem {
         array.set(ValueLayout.JAVA_LONG, offset + QuicPoll.EVENTS_OFFSET,
                 wantEvents);
         array.set(ValueLayout.JAVA_LONG, offset + QuicPoll.REVENTS_OFFSET, 0L);
-    }
-
-
-    /**
-     * Updates the SSL pointer in the native descriptor and marks the item
-     * dirty so the next {@link QuicPollSet#rebuild()} re-copies the struct.
-     *
-     * @param ssl The new SSL* pointer
-     */
-    public void setSsl(MemorySegment ssl) {
-        this.ssl = ssl;
-        this.dirty = true;
     }
 
 
@@ -266,16 +254,6 @@ public class QuicPollItem {
      */
     public Object getAppData() {
         return appData;
-    }
-
-
-    /**
-     * Sets the application data associated with this poll item.
-     *
-     * @param data The application data object
-     */
-    public void setAppData(Object data) {
-        this.appData = data;
     }
 
 

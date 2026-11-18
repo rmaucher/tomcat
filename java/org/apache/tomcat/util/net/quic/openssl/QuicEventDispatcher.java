@@ -18,7 +18,7 @@ package org.apache.tomcat.util.net.quic.openssl;
 
 /**
  * The event-priority decision of the QUIC poll loop, kept free of native and
- * endpoint state so it can be reasoned about (and unit tested) as a pure
+ * endpoint state so it can be reasoned about as a pure
  * function of the {@code SSL_poll()} revents mask.
  * <p>
  * {@code SSL_poll()} reports an OR of event flags per item. The endpoint

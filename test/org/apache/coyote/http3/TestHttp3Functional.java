@@ -272,6 +272,23 @@ public class TestHttp3Functional extends Http3TestBase {
 
 
     @Test
+    public void testUnidentifiedClientUniAndBidiResetAreNotTruncatedErrors() {
+        Http3ConnectionManager manager = new Http3ConnectionManager(newHttp3Protocol());
+        StubQuicConnection connection = new StubQuicConnection();
+        manager.connectionOpen(connection);
+
+        // No stream-type header has been received for either stream. RFC 9114
+        // Section 6.2 requires tolerating a unidirectional stream closed
+        // before its header, and a BIDI reset is a stream-level event. The
+        // truncated-stream helper must not turn either into a connection error.
+        Assert.assertEquals(0, manager.getTruncatedClientUniStreamErrorCode(
+                connection, 2L, true));
+        Assert.assertEquals(0, manager.getTruncatedClientUniStreamErrorCode(
+                connection, 0L, true));
+    }
+
+
+    @Test
     public void testStreamedBodyOverrunStreamReset() throws Exception {
         startHttp3Server();
 

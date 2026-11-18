@@ -45,7 +45,7 @@ public interface QuicProtocol {
      * <p>
      * Note: the QUIC transport advertises its own concurrency limit to the
      * peer in the {@code initial_max_streams_bidi} transport parameter. With
-     * the OpenSSL QUIC implementation (OpenSSL 3.5 / 4.0) that parameter is
+     * the OpenSSL QUIC implementation (OpenSSL 4.x) that parameter is
      * fixed and cannot be configured via the public API, so the endpoint
      * cannot advertise a value below the transport default. The endpoint
      * therefore uses the configured value for its own enforcement and warns

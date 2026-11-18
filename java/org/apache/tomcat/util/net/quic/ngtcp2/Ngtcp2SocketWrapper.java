@@ -50,12 +50,13 @@ import org.apache.tomcat.util.res.StringManager;
  * behaviour expected by {@code AbstractProtocol} and the generic QUIC view
  * declared by {@link QuicSocketWrapper}, which this class extends.
  * <p>
- * This is the ngtcp2 port of
- * {@code org.apache.tomcat.util.net.quic.openssl.QuicOpenSSLSocketWrapper}:
- * the same read/write buffering, wake-up and interest semantics, with the
- * native calls expressed through the ngtcp2 stream API on the parent
- * connection ({@code ngtcp2_conn_stream_recv/send/shutdown}) instead of the
- * OpenSSL per-stream {@code SSL} objects.
+ * This is modelled on
+ * {@code org.apache.tomcat.util.net.quic.quiche.QuicheSocketWrapper}, not the
+ * OpenSSL wrapper: it follows quiche's FIN-tail handling, queue-based
+ * terminal writes and {@code hasBufferedWrites} contract, with the native
+ * calls expressed through the ngtcp2 stream API on the parent connection
+ * ({@code ngtcp2_conn_stream_recv/send/shutdown}) instead of quiche's
+ * per-stream handle.
  */
 public class Ngtcp2SocketWrapper extends QuicSocketWrapper
         implements WriteBuffer.Sink {
@@ -1094,14 +1095,7 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
                 // and busy-spin without waiting.
                 return -1;
             }
-            if (written == Ngtcp2Bindings.NGTCP2_ERR_FLOW_CONTROL ||
-                    written == Ngtcp2Bindings.NGTCP2_ERR_DONE) {
-                return -1;
-            }
-            if (written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_RESET ||
-                    written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_STOPPED ||
-                    written == Ngtcp2Bindings.NGTCP2_ERR_INVALID_STREAM_STATE ||
-                    written == Ngtcp2Bindings.NGTCP2_ERR_FINAL_SIZE) {
+            if (Ngtcp2Bindings.isTerminalStreamWriteError(written)) {
                 return WRITE_TERMINAL;
             }
             if (Ngtcp2Bindings.ngtcp2_conn_is_closed(connPtr) ||

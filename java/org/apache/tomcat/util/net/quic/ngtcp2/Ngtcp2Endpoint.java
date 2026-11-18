@@ -54,12 +54,14 @@ import org.apache.tomcat.util.net.SSLHostConfigCertificate;
 import org.apache.tomcat.util.net.SocketEvent;
 import org.apache.tomcat.util.net.SocketProcessorBase;
 import org.apache.tomcat.util.net.SocketWrapperBase;
+import org.apache.tomcat.util.net.openssl.panama.OpenSSLContext;
 import org.apache.tomcat.util.net.quic.QuicConnectionManager;
 import org.apache.tomcat.util.net.quic.QuicEndpoint;
 import org.apache.tomcat.util.net.quic.QuicNativeMailbox;
 import org.apache.tomcat.util.net.quic.QuicProtocol;
 import org.apache.tomcat.util.net.quic.QuicSSLContext;
 import org.apache.tomcat.util.net.quic.QuicStream;
+import org.apache.tomcat.util.openssl.openssl_h;
 import org.apache.tomcat.util.res.StringManager;
 import org.apache.tomcat.util.threads.LimitLatch;
 
@@ -74,7 +76,7 @@ import org.apache.tomcat.util.threads.LimitLatch;
  * The endpoint owns the UDP socket and all packet I/O: ngtcp2 has no
  * listener engine, so the single poll thread demultiplexes every datagram by
  * destination connection ID, feeds it to the right {@code ngtcp2_conn}
- * ({@code ngtcp2_accept()} for unknown Initials, {@code ngtcp2_conn_recv()}
+ * ({@code ngtcp2_accept_custom()} for unknown Initials, {@code ngtcp2_conn_recv()}
  * otherwise), drives each connection's timers ({@code on_timeout}) and
  * transmits its output ({@code ngtcp2_conn_send()} until DONE, sent via
  * {@code sendmsg()} with the source address pinned from
@@ -158,13 +160,27 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
     private static final int DEFAULT_MAX_CONNECTIONS = 8192;
     private static final int PENDING_LIMIT_FLOOR = 1024;
 
+    /**
+     * Upper bound on the expensive capacity/pause rejection path (full native
+     * accept + TLS/crypto setup per Initial). Additional rejected Initials
+     * are dropped cheaply instead, so a flood cannot force unbounded
+     * per-datagram crypto work while the endpoint is saturated.
+     */
+    private static final int MAX_REJECTS_PER_SECOND = 16;
+
     /** Length of every server-minted connection ID (see class doc). */
     private static final int SERVER_CID_LEN = 16;
 
 
     /**
-     * Maximum datagrams delivered per poll-loop iteration, including the
-     * segments expanded from a GRO read (fairness bound).
+     * Receive-read budget per poll-loop iteration (fairness bound).
+     * <p>
+     * The budget is checked before each {@code recvmsg}/{@code recvmmsg}
+     * call and the segments expanded from a GRO-coalesced read are charged
+     * after that read is delivered whole. One read can therefore overshoot
+     * the budget by up to the kernel's GRO batch size ({@code
+     * UDP_MAX_SEGMENTS}, 128), but the overshoot is bounded by a single read
+     * and {@code exhaustedOut} still forces a timeout-0 retry.
      */
     private static final int RECV_BUDGET = 64;
 
@@ -385,7 +401,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      * read it from lifecycle and JMX threads), so it must be volatile: a
      * stale {@code null} seen by {@link #reloadCertificates} while the poll
      * loop is live would take the off-thread direct-install branch and free a
-     * config the poll thread is still using in {@code ngtcp2_accept}.
+     * config the poll thread is still using in {@code ngtcp2_accept_custom}.
      */
     private volatile Thread pollThread;
 
@@ -481,6 +497,9 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
     private volatile int maxConnections = DEFAULT_MAX_CONNECTIONS;
     private long lastMaxConnectionsLogMs = 0;
     private long lastPausedLogMs = 0;
+    /** Token window for {@link #MAX_REJECTS_PER_SECOND}; poll thread only. */
+    private long rejectWindowStartMs = 0;
+    private int rejectWindowCount = 0;
     private long lastNoDestinationLogMs = 0;
     private long lastProtocolDataFlushWarnMs = 0;
     private long lastAlpnNotServedLogMs = 0;
@@ -633,7 +652,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             // running endpoint to TLS. Build the native config off the poll
             // thread, then install it through the same staged poll-task swap
             // as certificate reloads: initialize() would free the old config
-            // while the poll thread could still be inside ngtcp2_accept()
+            // while the poll thread could still be inside ngtcp2_accept_custom()
             // with that pointer.
             Ngtcp2CertificateManager.Config prepared =
                     certManager.prepareConfig(sslHostConfig, findSslHostConfigs(),
@@ -1528,13 +1547,29 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      */
     private void queueConnectionClosesForShutdown() {
         long code = getGracefulShutdownErrorCode();
+        long deadline = System.currentTimeMillis() + GRACEFUL_SHUTDOWN_DRAIN_MS;
         for (Ngtcp2ConnectionWrapper conn : connections.values()) {
             try {
                 if (!conn.isClosed() && !conn.isFreed()) {
                     queueConnectionClose(conn, code, "endpoint shutdown");
                 }
+                // The poll loop has stopped, so an EAGAIN here has no retry
+                // sweep to rely on: the close packet would be dropped when
+                // the stop path frees the connection. Keep flushing (each
+                // pass drains the parked queue first) until the socket
+                // accepts it or the shared drain budget is used up.
                 if (!conn.isFreed()) {
-                    flushSend(conn);
+                    boolean retry = flushSend(conn);
+                    while (retry && !conn.pendingSends().isEmpty() &&
+                            System.currentTimeMillis() < deadline) {
+                        try {
+                            Thread.sleep(1);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                        retry = flushSend(conn);
+                    }
                 }
             } catch (Throwable t) {
                 if (log.isDebugEnabled()) {
@@ -1680,10 +1715,12 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
 
 
     /**
-     * Logs the certificate configuration for the given host and records the
-     * TLS information exposed via JMX. QUIC mandates TLS 1.3 (RFC 9001); the
-     * enabled cipher suites are the fixed TLS 1.3 set the native stack
-     * supports (see {@link #DEFAULT_CIPHER_SUITES}). Consumers that read the
+     * Applies the host's configured TLS 1.3 cipher suites to the native
+     * SSL_CTX, logs the certificate configuration for the given host and
+     * records the TLS information exposed via JMX. QUIC mandates TLS 1.3
+     * (RFC 9001); the enabled suites are read back from the context so an
+     * operator's cipher restriction (and the actual OpenSSL build's suite
+     * set) is reflected instead of a hard-coded list. Consumers that read the
      * certificate data through the certificate's SSLContext (the Manager
      * application, the certificate expiry checks) are served by a
      * {@link QuicSSLContext} reporting the Java-parsed chain. An
@@ -1692,7 +1729,37 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
     @Override
     protected void createSSLContext(SSLHostConfig sslHostConfig) throws IllegalArgumentException {
         sslHostConfig.setEnabledProtocols(new String[] { "TLSv1.3" });
-        sslHostConfig.setEnabledCiphers(DEFAULT_CIPHER_SUITES);
+        MemorySegment sslCtx = certManager.getConfig();
+        if (!sslCtx.equals(MemorySegment.NULL)) {
+            String cipherSuites = sslHostConfig.getCipherSuites();
+            if (cipherSuites != null && !cipherSuites.isEmpty()) {
+                try (Arena arena = Arena.ofConfined()) {
+                    int rc = openssl_h.SSL_CTX_set_ciphersuites(sslCtx,
+                            arena.allocateFrom(cipherSuites));
+                    if (rc <= 0) {
+                        throw new IllegalArgumentException(sm.getString(
+                                "ngtcp2Endpoint.cipherSuiteConfigError",
+                                cipherSuites));
+                    }
+                }
+            }
+            String[] ciphers = OpenSSLContext.getCiphers(sslCtx);
+            if (ciphers != null && ciphers.length > 0) {
+                // SSL_CTX_get_ciphers() lists the context's whole cipher
+                // list; QUIC only negotiates TLS 1.3, whose suite names start
+                // with TLS_. Report only those so JMX/Manager shows the
+                // suites that can actually be negotiated.
+                String[] tls13 = java.util.Arrays.stream(ciphers)
+                        .filter(c -> c.startsWith("TLS_"))
+                        .toArray(String[]::new);
+                sslHostConfig.setEnabledCiphers(tls13.length > 0 ? tls13 :
+                        DEFAULT_CIPHER_SUITES);
+            } else {
+                sslHostConfig.setEnabledCiphers(DEFAULT_CIPHER_SUITES);
+            }
+        } else {
+            sslHostConfig.setEnabledCiphers(DEFAULT_CIPHER_SUITES);
+        }
         for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates()) {
             org.apache.tomcat.util.net.SSLContext sslContext = certificate.getSslContext();
             if (sslContext == null || sslContext instanceof QuicSSLContext) {
@@ -2402,6 +2469,11 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         // and burns the poll thread in a tight timer sweep (measured up to
         // ~150k iterations/s on an 8000-connection idle fleet). The poll wait
         // is millisecond-granular anyway, so give such timers a 1 ms floor.
+        // A timer whose expiry call failed is left parked instead: it cannot
+        // make progress until new input arrives (which clears the flag).
+        if (conn.isTimerFailed() && t <= 1) {
+            t = Long.MAX_VALUE;
+        }
         conn.setTimerDeadline(t < 0 || t == Long.MAX_VALUE ? Long.MAX_VALUE :
                 System.currentTimeMillis() + Math.max(1, t));
         timerHeap.add(new TimerEntry(conn.getTimerDeadlineMs(),
@@ -2547,9 +2619,11 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             any = true;
             int seg = groReceive ? groSeg[0] : 0;
             // Charge GRO-expanded segments, not just syscalls, against the
-            // per-iteration fairness budget. Linux caps one GSO batch at
-            // UDP_MAX_SEGMENTS (128), but without this a single read can
-            // bypass the RECV_BUDGET datagram bound entirely.
+            // per-iteration fairness budget. A coalesced read is delivered
+            // whole, so this can overshoot RECV_BUDGET by up to one kernel
+            // GRO batch (UDP_MAX_SEGMENTS, 128); the overshoot is bounded by
+            // this single read and the next iteration starts with timeout 0
+            // when the budget was exhausted.
             int segments = (seg > 0 && n > seg) ?
                     (int) ((n + seg - 1) / seg) : 1;
             delivered += segments;
@@ -2757,6 +2831,11 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 // (RFC 9000 Section 5.2).
                 return;
             }
+            if ((curPkt.get(ValueLayout.JAVA_BYTE, 0) & 0x40) == 0) {
+                // RFC 9000 Section 17.2: the fixed bit MUST be 1. Reject it
+                // before allocating SSL/QUIC state.
+                return;
+            }
             if (pendingConns.size() >= pendingLimit()) {
                 // Bounded pending queue: drop; the client retries or times
                 // out (ngtcp2's equivalent of OpenSSL's pending queue).
@@ -2769,7 +2848,14 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                     (maxConnections >= 0 &&
                             connections.size() + pendingConns.size() >= maxConnections);
             if (reject) {
-                rejectIncoming(len);
+                if (allowRejectIncoming()) {
+                    rejectIncoming(len);
+                } else if (log.isDebugEnabled()) {
+                    log.debug("Dropping rejected Initial from " +
+                            Ngtcp2Bindings.readSockaddr(saFrom,
+                                    Ngtcp2Bindings.sockaddrLength(saFrom)) +
+                            ": capacity/pause rejection rate limit reached");
+                }
                 return;
             }
             // No Retry / address validation: the Initial is accepted
@@ -2958,7 +3044,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         MemorySegment connPtr = acceptWithMintedScid(local, peerLen, cfg);
         if (connPtr.equals(MemorySegment.NULL)) {
             if (log.isTraceEnabled()) {
-                log.trace("createConnection: ngtcp2_accept returned NULL (dcidLen=" +
+                log.trace("createConnection: ngtcp2_accept_custom returned NULL (dcidLen=" +
                         dcidLen + " peerLen=" + peerLen +
                         " cfg=0x" + Long.toHexString(cfg.address()) + ")");
             }
@@ -2995,7 +3081,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      * {@link #rejectIncoming(int)}: mints a random accept SCID into
      * {@code mintedScid}, fills {@code saBind} with the caller-chosen local
      * address, verifies both sockaddr pairs against the ngtcp2 contract and
-     * runs {@code ngtcp2_accept} with a NULL odcid. The minted SCID stays in
+     * runs {@code ngtcp2_accept_custom} with a NULL odcid. The minted SCID stays in
      * {@code mintedScid} for the caller to register (createConnection) or
      * discard (rejectIncoming); both callers run on the poll thread, so the
      * shared buffers need no extra synchronisation.
@@ -3016,7 +3102,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      * @param cfg     The TLS config to accept with
      *
      * @return The raw connection pointer, or {@link MemorySegment#NULL} if
-     *         ngtcp2_accept refused the packet
+     *         ngtcp2_accept_custom refused the packet
      */
     private MemorySegment acceptWithMintedScid(InetSocketAddress local,
             int peerLen, MemorySegment cfg) {
@@ -3033,15 +3119,33 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         int dcidLen = (int) hdrDcidLen.get(ValueLayout.JAVA_LONG, 0);
         int scidLen = (int) hdrScidLen.get(ValueLayout.JAVA_LONG, 0);
         int version = hdrVersion.get(ValueLayout.JAVA_INT, 0);
-        return Ngtcp2Bindings.ngtcp2_accept(mintedScid, SERVER_CID_LEN,
+        // Read the current protocol limits for every accept, not the values
+        // captured at bind: the HTTP/3 protocol setters are mutable (JMX),
+        // and acceptConnection() already reads the live maxConcurrentStreams
+        // for its application-level state. A runtime increase must raise the
+        // advertised transport limit for new connections. A decrease is not
+        // advertised below the bind-time value: the lower application limit
+        // is enforced by canAcceptStream(), and keeping the transport credit
+        // at least at its original level lets a new client open requests that
+        // the application may reject rather than blocking it below the
+        // configured transport capacity.
+        long maxStreams = serverMaxStreams;
+        long idleTimeoutMs = serverIdleTimeoutMs;
+        QuicProtocol protocol = getQuicProtocol();
+        if (protocol != null) {
+            maxStreams = Math.max(serverMaxStreams,
+                    protocol.getMaxConcurrentStreams());
+            idleTimeoutMs = protocol.getIdleTimeoutMs();
+        }
+        return Ngtcp2Bindings.ngtcp2_accept_custom(mintedScid, SERVER_CID_LEN,
                 hdrDcid, dcidLen, hdrScid, scidLen, version,
-                serverMaxStreams, serverIdleTimeoutMs,
+                maxStreams, idleTimeoutMs,
                 saBind, localLen, saFrom, peerLen, cfg);
     }
 
 
     /*
-     * Accept-and-reject path for capacity/pause: ngtcp2_accept, feed the
+     * Accept-and-reject path for capacity/pause: ngtcp2_accept_custom, feed the
      * triggering datagram, queue the rejection CONNECTION_CLOSE, transmit
      * it, free. The handshake cost was already paid by the peer; this is
      * the rejectIncomingConnection analogue, adapted to ngtcp2's
@@ -3069,6 +3173,24 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      * the emitted code intentional rather than an accident of ngtcp2's
      * internal fallback.
      */
+    /*
+     * Bounds the expensive capacity/pause rejection path to
+     * MAX_REJECTS_PER_SECOND. Poll thread only.
+     */
+    private boolean allowRejectIncoming() {
+        long now = System.currentTimeMillis();
+        if (now - rejectWindowStartMs >= 1000) {
+            rejectWindowStartMs = now;
+            rejectWindowCount = 0;
+        }
+        if (rejectWindowCount >= MAX_REJECTS_PER_SECOND) {
+            return false;
+        }
+        rejectWindowCount++;
+        return true;
+    }
+
+
     private void rejectIncoming(int len) {
         long now = System.currentTimeMillis();
         if (paused) {
@@ -3140,7 +3262,12 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         }
 
         long rc = recvIntoConn(conn.getConn(), len, toSeg, toLen);
-        if (rc < 0 && rc != Ngtcp2Bindings.NGTCP2_ERR_DONE) {
+        if (rc >= 0) {
+            // Successful input can recover a timer whose expiry previously
+            // failed; let refreshTimerDeadline() use the native deadline
+            // again.
+            conn.setTimerFailed(false);
+        } else if (rc != Ngtcp2Bindings.NGTCP2_ERR_DONE) {
             noteConnectionError(conn, rc, "recv");
         }
     }
@@ -3182,7 +3309,20 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             // timer set on a received CONNECTION_CLOSE (ngtcp2's contract is
             // "call on_timeout whenever timeout_as_millis reports zero"; the
             // call is cheap and a no-op when no timer has elapsed).
-            Ngtcp2Bindings.ngtcp2_conn_on_timeout(conn.getConn());
+            int timeoutRc = Ngtcp2Bindings.ngtcp2_conn_on_timeout(conn.getConn());
+            if (timeoutRc != 0) {
+                // A failed expiry must not be silently swallowed: run the
+                // normal local-error path (CONNECTION_CLOSE or teardown) and
+                // stop re-arming the broken timer at the 1 ms floor.
+                conn.setTimerFailed(true);
+                noteConnectionError(conn, timeoutRc, "timeout");
+                if (conn.isClosed() || conn.isFreed()) {
+                    if (!conn.isFreed()) {
+                        detectClose(conn);
+                    }
+                    return;
+                }
+            }
             if (conn.isProtocolDataPending()) {
                 flushProtocolData(conn);
             }
@@ -3195,6 +3335,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 // cannot be stranded on a quiet connection.
                 sweepRetryConns.add(conn);
             }
+            handleClosedServerUniStreams(conn);
             detectClose(conn);
         } catch (Throwable t) {
             ExceptionUtils.handleThrowable(t);
@@ -3222,12 +3363,28 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         }
         try {
             // See processConnection(): unconditional covers draining.
-            Ngtcp2Bindings.ngtcp2_conn_on_timeout(conn.getConn());
+            int timeoutRc = Ngtcp2Bindings.ngtcp2_conn_on_timeout(conn.getConn());
+            if (timeoutRc != 0) {
+                conn.setTimerFailed(true);
+                noteConnectionError(conn, timeoutRc, "timeout");
+                if (conn.isFreed()) {
+                    return;
+                }
+                if (conn.isClosed()) {
+                    discardPending(conn);
+                    return;
+                }
+            }
             flushSend(conn);
             if (conn.isFreed()) {
                 return;
             }
-            if (Ngtcp2Bindings.ngtcp2_conn_is_closed(conn.getConn())) {
+            // A locally generated close waits for sendLoop() to confirm the
+            // packet reached the socket before the connection is reclaimed
+            // (the same rule as detectClose()).
+            if (Ngtcp2Bindings.ngtcp2_conn_is_closed(conn.getConn()) &&
+                    !Ngtcp2Bindings.ngtcp2_conn_close_delivery_pending(
+                            conn.getConn())) {
                 discardPending(conn);
                 return;
             }
@@ -3440,8 +3597,12 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             if ((id & 0x02) != 0) {
                 if ((id & 0x01) == 0) {
                     readUnidirectionalStream(conn, id);
+                } else {
+                    // A write-only server stream normally never becomes
+                    // readable. If ngtcp2 still reports an edge, record it so
+                    // the close is handled instead of silently consuming it.
+                    conn.addClosedServerUniStream(id);
                 }
-                // Server-initiated uni streams are never readable; ignore.
             } else {
                 processAcceptedBidi(conn, id);
             }
@@ -3472,13 +3633,13 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         if (conn.isClosed() || conn.isFreed()) {
             return;
         }
-        int guard = 0;
-        boolean exhausted = false;
+        // Scan every live stream. A fixed per-sweep budget that restarted
+        // from the start of this (ConcurrentHashMap-ordered) map would
+        // permanently starve streams beyond the budget once a connection has
+        // more entries than the budget; the map holds only live streams
+        // (closed binding states are reclaimed), so a full scan is also
+        // bounded by the configured concurrent-stream limit.
         for (Ngtcp2StreamWrapper stream : conn.getStreams().values()) {
-            if (guard++ >= SWEEP_BUDGET) {
-                exhausted = true;
-                break;
-            }
             long id = stream.getStreamId();
             if ((id & 0x03) != 0 || stream.isFreed() || stream.isDeregistered()) {
                 continue;
@@ -3494,12 +3655,6 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 continue;
             }
             dispatchToExecutor(wrapper, stream, SocketEvent.OPEN_READ, true);
-        }
-        if (exhausted) {
-            // More streams were not examined (the map is larger than the
-            // budget); schedule another pass instead of waiting for an
-            // unrelated event to re-drive this connection.
-            sweepRetryConns.add(conn);
         }
     }
 
@@ -3777,10 +3932,45 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             if (!latched && !parked) {
                 continue;
             }
-            if (Ngtcp2Bindings.ngtcp2_conn_stream_capacity(conn.getConn(), id) <= 0) {
+            if (Ngtcp2Bindings.ngtcp2_conn_stream_native_capacity(conn.getConn(), id) <= 0) {
+                if (Ngtcp2Bindings.ngtcp2_conn_stream_write_terminal(conn.getConn(), id)) {
+                    // A peer STOP_SENDING/stream close makes the write side
+                    // permanently unusable without producing a positive
+                    // capacity. Waiting for capacity would park a blocking
+                    // writer until its timeout and never deliver the
+                    // terminal event to an async write listener.
+                    notifyWriteTerminal(conn, wrapper, stream);
+                }
                 continue;
             }
             notifyWriteReady(wrapper, stream);
+        }
+    }
+
+
+    /*
+     * Delivers a terminal write state to a parked blocking writer and/or an
+     * async write listener: wake the waiter and dispatch ERROR (the write can
+     * never complete) instead of waiting for capacity that will never come.
+     * The write-interest latch/rearm entry is released because no later write
+     * notification is meaningful for this stream.
+     */
+    private void notifyWriteTerminal(Ngtcp2ConnectionWrapper conn,
+            Ngtcp2SocketWrapper wrapper, Ngtcp2StreamWrapper stream) {
+        if (wrapper.hasWriteWaiter()) {
+            wrapper.signalWriteWaiter();
+        }
+        if (stream.clearWriteInterest()) {
+            conn.releaseWriteRearm(stream);
+        }
+        conn.removeWriteRearm(stream);
+        if (wrapper.isClosed() || stream.isFreed() || stream.isDeregistered()) {
+            return;
+        }
+        if (stream.compareAndSetProcessing(false, true)) {
+            dispatchToExecutor(wrapper, stream, SocketEvent.ERROR, true);
+        } else {
+            scheduleStreamDispatch(wrapper, stream, SocketEvent.ERROR, true);
         }
     }
 
@@ -3811,6 +4001,9 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         if (stream.isFreed()) {
             return;
         }
+        // Whether the last protocol parse retained an incomplete frame/
+        // instruction tail (position is nonzero after compact()).
+        boolean retainedPartial = false;
         for (int round = 0; round < UNI_DRAIN_MAX_ROUNDS; round++) {
             drainIntoStreamBuffer(conn, stream);
 
@@ -3842,6 +4035,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 // the limit first would retain the stale buffer tail.
                 buffer.compact();
                 buffer.limit(buffer.capacity());
+                retainedPartial = buffer.position() > 0;
                 // The protocol data the processing queued (QPACK decoder
                 // instructions) must reach the peer.
                 flushProtocolData(conn);
@@ -3867,8 +4061,19 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         if (terminal) {
             QuicConnectionManager.ConnectionState state = connManager.getState(conn);
             if (state != null && state.isCriticalClientUniStream(streamId)) {
-                failConnection(conn, state.getClosedCriticalStreamErrorCode(),
-                        "Critical client unidirectional stream closed");
+                long errorCode = state.getClosedCriticalStreamErrorCode();
+                long truncatedCode = connManager.getTruncatedClientUniStreamErrorCode(
+                        conn, streamId, retainedPartial);
+                if (truncatedCode != 0) {
+                    // RFC 9114 Section 7.1 / RFC 9204: a stream ending inside
+                    // a frame or QPACK instruction is a frame/QPACK stream
+                    // error, not the generic critical-stream-closed error.
+                    errorCode = truncatedCode;
+                }
+                failConnection(conn, errorCode,
+                        truncatedCode != 0
+                                ? "Truncated critical client unidirectional stream"
+                                : "Critical client unidirectional stream closed");
             } else if (state != null) {
                 state.clientUniStreamClosed(streamId);
             }
@@ -3914,8 +4119,10 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         }
 
         boolean known = conn.getStreams().containsKey(Long.valueOf(streamId));
-        boolean lateDuplicate = !known && Ngtcp2Bindings
-                .ngtcp2_conn_stream_discarded(conn.getConn(), streamId);
+        boolean lateDuplicate = !known &&
+                (conn.isDiscardedBidiStream(streamId) ||
+                        Ngtcp2Bindings.ngtcp2_conn_stream_discarded(
+                                conn.getConn(), streamId));
         if (!known && !lateDuplicate && !state.canAcceptStream(streamId)) {
             // Concurrent stream limit: reject this stream (RFC 9114
             // H3_REQUEST_REJECTED - retryable, before processing began). The
@@ -3929,6 +4136,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             // of the most recent rejection quiet defensively.
             if (streamId != conn.getLastRejectedStreamId()) {
                 conn.setLastRejectedStreamId(streamId);
+                conn.recordDiscardedBidiStream(streamId);
                 if (state.getLastSentGoawayId() < 0) {
                     sendStreamLimitNotification(connManager, state);
                 }
@@ -3964,9 +4172,10 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 id -> new Ngtcp2StreamWrapper(id.longValue(), conn,
                         ByteBuffer.allocate(STREAM_PRE_READ_BUFFER_SIZE)));
         if (lateDuplicate) {
-            // A readable edge for a stream whose handler already closed its
-            // wrapper. Mark it so the processor closes it as a duplicate
-            // instead of treating an empty stream as H3_REQUEST_INCOMPLETE.
+            // A readable edge for a stream whose request already completed.
+            // Mark it so the processor closes it as a duplicate instead of
+            // treating an empty stream as a new request; it must not consume
+            // an HTTP/3 active-stream slot either.
             stream.setLateDuplicate();
         }
         if (stream.isFreed() || stream.isDeregistered()) {
@@ -3986,7 +4195,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             stream.setSocketWrapper(wrapper);
         }
 
-        if (!known) {
+        if (!known && !lateDuplicate) {
             state.incrementActiveStreams();
             state.setLastProcessedStreamId(streamId);
         }
@@ -4057,10 +4266,6 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 // silently swallow the reset and the aborted body would read
                 // as a clean end of stream.
                 stream.setReadState(QuicStream.ReadState.RESET_REMOTE);
-                return;
-            }
-            if (rc == Ngtcp2Bindings.NGTCP2_ERR_STREAM_STOPPED) {
-                stream.setReadState(QuicStream.ReadState.RESET_LOCAL);
                 return;
             }
             if (rc == 0 && finFlag.get(ValueLayout.JAVA_BOOLEAN, 0)) {
@@ -4195,12 +4400,16 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 stream.setWriteBuffer(null);
                 return UniStreamWriteResult.DONE;
             }
-            if (written == Ngtcp2Bindings.NGTCP2_ERR_FLOW_CONTROL ||
-                    written == Ngtcp2Bindings.NGTCP2_ERR_DONE || written == 0 ||
-                    written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_ID_BLOCKED) {
-                // STREAM_ID_BLOCKED means the peer has not granted another
-                // server-initiated uni stream yet; it becomes writable again
-                // after MAX_STREAMS_UNI, so keep the data buffered.
+            if (written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_ID_BLOCKED) {
+                // The peer has not granted another server-initiated uni
+                // stream yet; it becomes writable again after MAX_STREAMS_UNI,
+                // so keep the data buffered.
+                return UniStreamWriteResult.RETRY;
+            }
+            if (written == 0 ||
+                    !Ngtcp2Bindings.isTerminalStreamWriteError(written)) {
+                // Temporary condition (flow control/empty budget): the
+                // stream may accept the data later.
                 return UniStreamWriteResult.RETRY;
             }
             log.warn(sm.getString("ngtcp2Endpoint.serverUniStreamWriteFailed",
@@ -4217,6 +4426,41 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             stream.setWriteBuffer(null);
             notifyServerUniStreamClosed(conn, stream);
             return UniStreamWriteResult.FAILED;
+        }
+    }
+
+
+    /*
+     * Reclaims the server-initiated unidirectional stream wrappers whose
+     * native state closed (peer STOP_SENDING/reset or local reset). The
+     * native stream_close callback only records the ID, because the callback
+     * runs inside ngtcp2 and must not call back into the library. This runs
+     * on the poll thread after the sweeps/flush: it drops the endpoint
+     * wrapper and binding state and notifies the protocol manager, which
+     * fails the connection for HTTP/3's critical control/QPACK streams.
+     */
+    private void handleClosedServerUniStreams(Ngtcp2ConnectionWrapper conn) {
+        Set<Long> closed = conn.getClosedServerUniStreamIds();
+        if (closed.isEmpty()) {
+            return;
+        }
+        Iterator<Long> iterator = closed.iterator();
+        while (iterator.hasNext()) {
+            long streamId = iterator.next().longValue();
+            iterator.remove();
+            Ngtcp2StreamWrapper stream = conn.getStreams().remove(Long.valueOf(streamId));
+            Ngtcp2Bindings.ngtcp2_conn_discard_stream(conn.getConn(), streamId);
+            if (stream == null) {
+                continue;
+            }
+            stream.setWriteBuffer(null);
+            conn.removeServerUniStream(stream);
+            stream.setDeregistered();
+            stream.setFreed();
+            notifyServerUniStreamClosed(conn, stream);
+            if (conn.isClosed() || conn.isFreed()) {
+                return;
+            }
         }
     }
 
@@ -4398,6 +4642,20 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      *                     length 0 when unknown
      */
     private boolean sendLoop(Ngtcp2ConnectionWrapper conn, MemorySegment connPtr,
+            MemorySegment fallbackTo, int fallbackToLen) {
+        boolean retry = sendLoop0(conn, connPtr, fallbackTo, fallbackToLen);
+        if (conn != null && !retry && conn.pendingSends().isEmpty()) {
+            // Everything this pass pulled from ngtcp2, including a locally
+            // generated CONNECTION_CLOSE parked by an earlier EAGAIN, has
+            // been accepted by the socket. Only now may close detection
+            // reclaim the connection (see ngtcp2_conn_close_delivery_pending).
+            Ngtcp2Bindings.ngtcp2_conn_mark_close_delivered(connPtr);
+        }
+        return retry;
+    }
+
+
+    private boolean sendLoop0(Ngtcp2ConnectionWrapper conn, MemorySegment connPtr,
             MemorySegment fallbackTo, int fallbackToLen) {
         // Output-length invariant (checked against ngtcp2 1.16,
         // lib.rs send()): ngtcp2 clamps every packet to
@@ -4801,17 +5059,17 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
      */
     private void noteConnectionError(Ngtcp2ConnectionWrapper conn, long rc, String where) {
         boolean hasError;
-        boolean isApp;
-        long code;
         String reasonText;
         try (Arena localArena = Arena.ofConfined()) {
             MemorySegment isAppSeg = localArena.allocate(ValueLayout.JAVA_BOOLEAN);
             MemorySegment codeSeg = localArena.allocate(ValueLayout.JAVA_LONG);
             MemorySegment reasonSeg = localArena.allocate(ValueLayout.ADDRESS);
             MemorySegment reasonLenSeg = localArena.allocate(ValueLayout.JAVA_LONG);
-            // The binding return value means "a local error is recorded",
-            // not "the error is an application error"; the latter is the
-            // is_app out-value and was previously ignored.
+            // The binding's local-error facade reports only internal ngtcp2
+            // errors: is_app is always false and code is the internal error
+            // code, not an application error code. The is_app out-value is
+            // still written to satisfy the binding API but deliberately
+            // ignored here; there is no application-error branch to take.
             hasError = Ngtcp2Bindings.ngtcp2_conn_local_error(conn.getConn(), isAppSeg,
                     codeSeg, reasonSeg, reasonLenSeg);
             if (!hasError) {
@@ -4823,14 +5081,30 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
                 }
                 return;
             }
-            isApp = isAppSeg.get(ValueLayout.JAVA_BOOLEAN, 0);
-            code = codeSeg.get(ValueLayout.JAVA_LONG, 0);
             reasonText = readReason(reasonSeg, reasonLenSeg);
         }
-        if (!isApp && (rc == Ngtcp2Bindings.NGTCP2_ERR_RETRY ||
-                rc == Ngtcp2Bindings.NGTCP2_ERR_DROP_CONN ||
+        if (rc == Ngtcp2Bindings.NGTCP2_ERR_RETRY) {
+            // The endpoint neither implements Retry/token validation nor
+            // advertises settings.token, so ngtcp2 asks for address
+            // validation when a reordered Initial arrives before the CRYPTO
+            // offset advances. Tearing the connection down here would lose a
+            // legitimate connection on reordering; instead drop the
+            // triggering datagram and keep the native state, which still
+            // holds the buffered reordered CRYPTO data and accepts the
+            // client's Initial retransmission on PTO. Without Retry the
+            // unauthenticated first flight remains bounded by the
+            // pending-handshake limit (see deliverDatagram).
+            if (log.isDebugEnabled()) {
+                log.debug("ngtcp2_conn_" + where + " requested Retry for 0x" +
+                        Long.toHexString(conn.getConnAddress()) +
+                        "; Retry/token is not implemented, dropping the datagram" +
+                        " and retaining the connection for retransmission");
+            }
+            return;
+        }
+        if (rc == Ngtcp2Bindings.NGTCP2_ERR_DROP_CONN ||
                 rc == Ngtcp2Bindings.NGTCP2_ERR_DRAINING ||
-                rc == Ngtcp2Bindings.NGTCP2_ERR_CLOSING)) {
+                rc == Ngtcp2Bindings.NGTCP2_ERR_CLOSING) {
             // A peer CONNECTION_CLOSE (read_pkt reports DRAINING), an idle
             // teardown, or a lifecycle transition is not a local failure: the
             // peer's code/reason (captured from ccerr, which is_closed() would
@@ -4849,9 +5123,8 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         // A CRYPTO failure is a local TLS error, not a QUIC transport code:
         // ngtcp2_err_infer_quic_transport_error_code() would return the
         // generic PROTOCOL_VIOLATION for it, hiding the real TLS detail.
-        long transportCode = isApp ? code :
-                (rc == Ngtcp2Bindings.NGTCP2_ERR_CRYPTO ? 0 :
-                        Ngtcp2Bindings.ngtcp2_infer_transport_error_code((int) rc));
+        long transportCode = rc == Ngtcp2Bindings.NGTCP2_ERR_CRYPTO ? 0 :
+                Ngtcp2Bindings.ngtcp2_infer_transport_error_code((int) rc);
         log.warn(sm.getString("ngtcp2Endpoint.localConnectionErrorDetail",
                 Long.toHexString(conn.getConnAddress()),
                 Long.valueOf(rc), Long.valueOf(transportCode),
@@ -4861,11 +5134,23 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         // should send a CONNECTION_CLOSE; otherwise the peer waits for its
         // timeout instead of seeing the error. The close is queued and the
         // normal close detection tears the connection down once it leaves.
-        if (!isApp && rc == Ngtcp2Bindings.NGTCP2_ERR_CRYPTO) {
-            teardownConnection(conn);
+        if (rc == Ngtcp2Bindings.NGTCP2_ERR_CRYPTO) {
+            // RFC 9001 Section 4.8: a TLS handshake failure is signalled with
+            // a transport CONNECTION_CLOSE carrying the TLS alert as
+            // 0x100 + alert. ngtcp2 records the alert from the crypto
+            // callback; without it the peer only sees silence until its own
+            // handshake timeout.
+            int tlsAlert = Ngtcp2Bindings.ngtcp2_conn_get_tls_alert(conn.getConn());
+            if (tlsAlert != 0) {
+                failConnectionTransport(conn, 0x100L + tlsAlert,
+                        reasonText != null ? reasonText :
+                                "TLS alert " + tlsAlert);
+            } else {
+                teardownConnection(conn);
+            }
             return;
         }
-        queueConnectionClose(conn, isApp, isApp ? code : transportCode, reasonText);
+        queueConnectionClose(conn, false, transportCode, reasonText);
     }
 
 
@@ -4890,8 +5175,16 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         // No on_timeout() here: processConnection() runs it unconditionally
         // immediately before this method in the same iteration (it also
         // covers the draining timer that is_timed_out() does not track).
-        boolean closed = Ngtcp2Bindings.ngtcp2_conn_is_closed(conn.getConn()) ||
-                conn.isClosed();
+        // ngtcp2 enters its CLOSING period as soon as
+        // write_connection_close() produced the packet, before the packet is
+        // accepted by the socket. Tearing the connection down here would drop
+        // a close packet parked on EAGAIN (and with it the whole pending
+        // queue), so wait for the send loop to confirm delivery.
+        boolean closeDeliveryPending =
+                Ngtcp2Bindings.ngtcp2_conn_close_delivery_pending(conn.getConn());
+        boolean closed = !closeDeliveryPending &&
+                (Ngtcp2Bindings.ngtcp2_conn_is_closed(conn.getConn()) ||
+                        conn.isClosed());
         if (!closed && conn.isClosing() && Ngtcp2Bindings.ngtcp2_conn_is_draining(conn.getConn())) {
             // The close frame has left; the connection enters its draining
             // quiet period. is_closed() will follow; keep it live until then
@@ -5034,6 +5327,11 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         // and a blocked read/write can wait until the stall timeout.
         Ngtcp2SocketWrapper wrapper = stream.getSocketWrapper();
         stream.setDeregistered();
+        if (stream.getStreamType() == Ngtcp2StreamWrapper.TYPE_BIDI) {
+            // Remember the finalized request ID so a retransmitted FIN edge
+            // is recognised as a late duplicate, not a new request.
+            conn.recordDiscardedBidiStream(stream.getStreamId());
+        }
         conn.getStreams().remove(Long.valueOf(stream.getStreamId()));
         if (wrapper != null) {
             wrapper.signalReadWaiter();
@@ -5228,7 +5526,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             // task. If the executor is shut down with shutdownNow(), the
             // task is discarded without running its finally block; the stop
             // path balances this count (see discardQueuedDispatches()).
-            conn.incrQueuedDispatch();
+            conn.incrQueuedDispatch(stream);
         }
         if (executor == null) {
             // No executor available (torn down by the shutdown, or a
@@ -5264,7 +5562,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
         try {
             Runnable queued = () -> {
                 if (conn != null) {
-                    conn.decrQueuedDispatch();
+                    conn.decrQueuedDispatch(stream);
                 }
                 dispatch.run();
             };
@@ -5279,7 +5577,7 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             stream.clearProcessing();
             wakeClaimWaiters(stream, conn);
             if (conn != null) {
-                conn.decrQueuedDispatch();
+                conn.decrQueuedDispatch(stream);
                 // Same deferred-free completion as the no-executor branch.
                 finishStreamDispatch(conn);
                 if (!conn.isClosing() && !conn.isClosed()) {

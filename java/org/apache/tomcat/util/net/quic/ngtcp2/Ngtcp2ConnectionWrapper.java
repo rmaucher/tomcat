@@ -124,6 +124,15 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
     private int timerSeq;
 
     /**
+     * Set when ngtcp2_conn_handle_expiry() reported an error for this
+     * connection. A failed expiry leaves the native timeout at zero, and
+     * re-arming that at the poll loop's 1 ms floor would spin until the peer
+     * closes or the idle timeout fires. Cleared by the next successfully
+     * received datagram, which is the event that can recover the timer.
+     */
+    private boolean timerFailed;
+
+    /**
      * ID of the most recently stream-limit-rejected client-initiated
      * bidirectional stream, or {@code -1}. Read and written only on the poll
      * thread (the readable sweep's rejection path); used to suppress the
@@ -162,6 +171,16 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
     private final AtomicInteger queuedDispatches = new AtomicInteger(0);
 
     /**
+     * Streams whose dispatch task is currently queued in the executor. The
+     * stop path uses this to clear the processing flag of a dispatch that
+     * shutdownNow() discarded without running (see
+     * {@link #discardQueuedDispatches()}); otherwise a parked claim waiter
+     * keeps the connection retained forever.
+     */
+    private final Set<Ngtcp2StreamWrapper> queuedDispatchStreams =
+            ConcurrentHashMap.newKeySet();
+
+    /**
      * Set when the poll thread wants to free this connection but must wait
      * for {@link #activeHandlers} to reach zero. The worker that decrements
      * the count to zero clears this flag and schedules the free on the poll
@@ -176,6 +195,38 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
      */
     private final ConcurrentHashMap<Integer, Ngtcp2StreamWrapper> serverUniStreams =
             new ConcurrentHashMap<>();
+
+    /**
+     * Server-initiated unidirectional streams closed/reset by ngtcp2 (e.g. a
+     * peer STOP_SENDING while the server writes). The native stream_close
+     * callback records the ID here; the poll-thread sweep removes the wrapper,
+     * discards the binding state and notifies the protocol manager (which
+     * fails the connection for the HTTP/3 critical streams). A write-only
+     * stream has no read side to produce a normal readable edge, so without
+     * this record the endpoint would never learn that its control/QPACK
+     * stream was stopped. Poll thread only.
+     */
+    private final Set<Long> closedServerUniStreamIds =
+            ConcurrentHashMap.newKeySet();
+
+    /**
+     * Recently finalized client bidirectional stream IDs. A completed
+     * request can still produce a late readable edge for a retransmitted FIN;
+     * without a tombstone the endpoint would mistake that edge for a new
+     * request and allocate a wrapper for an already-finished stream, which is
+     * both wasted work and HTTP/3 active-stream accounting churn. The set is
+     * bounded by {@link #MAX_DISCARDED_STREAM_IDS}; stream IDs are never
+     * reused, so evicting the oldest tombstones only loses late-edge
+     * recognition for very old streams. Poll thread only.
+     */
+    private final Set<Long> discardedBidiStreamIds =
+            ConcurrentHashMap.newKeySet();
+
+    /** Insertion order backing the bounded tombstones above. Poll thread only. */
+    private final ArrayDeque<Long> discardedBidiStreamOrder = new ArrayDeque<>();
+
+    /** Maximum number of finalized stream IDs remembered per connection. */
+    static final int MAX_DISCARDED_STREAM_IDS = 4096;
 
     /**
      * Streams whose {@code OPEN_READ} dispatch was dropped by the
@@ -789,6 +840,27 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
 
 
     /**
+     * Whether ngtcp2_conn_handle_expiry() last reported an error. Poll thread
+     * only.
+     *
+     * @return {@code true} if the timer expiry failed
+     */
+    boolean isTimerFailed() {
+        return timerFailed;
+    }
+
+
+    /**
+     * Records the outcome of ngtcp2_conn_handle_expiry(). Poll thread only.
+     *
+     * @param failed Whether the expiry returned an error
+     */
+    void setTimerFailed(boolean failed) {
+        timerFailed = failed;
+    }
+
+
+    /**
      * Records that an executor worker is about to run the HTTP handler for a
      * stream on this connection.
      */
@@ -820,31 +892,44 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
 
     /**
      * Records that a dispatch task carrying an active-handler reference was
-     * queued in the executor.
+     * queued in the executor for {@code stream}.
+     *
+     * @param stream The stream whose dispatch was queued
      */
-    void incrQueuedDispatch() {
+    void incrQueuedDispatch(Ngtcp2StreamWrapper stream) {
         queuedDispatches.incrementAndGet();
+        queuedDispatchStreams.add(stream);
     }
 
 
     /**
-     * Records that a queued dispatch task started running (or was rejected).
+     * Records that a queued dispatch task for {@code stream} started running
+     * (or was rejected).
+     *
+     * @param stream The stream whose dispatch left the queue
      */
-    void decrQueuedDispatch() {
+    void decrQueuedDispatch(Ngtcp2StreamWrapper stream) {
+        queuedDispatchStreams.remove(stream);
         queuedDispatches.decrementAndGet();
     }
 
 
     /**
      * Balances the active-handler references of dispatch tasks that the
-     * executor discarded during shutdownNow(). Called by the stop path after
-     * the executor has terminated.
+     * executor discarded during shutdownNow(), and clears the processing flag
+     * those tasks held. A parked claim waiter waits on that flag; leaving it
+     * set retains the connection forever even though no handler will ever run.
+     * Called by the stop path after the executor has terminated.
      */
     void discardQueuedDispatches() {
         int discarded = queuedDispatches.getAndSet(0);
         if (discarded > 0) {
             activeHandlers.addAndGet(-discarded);
         }
+        for (Ngtcp2StreamWrapper stream : queuedDispatchStreams) {
+            stream.clearProcessing();
+        }
+        queuedDispatchStreams.clear();
     }
 
 
@@ -905,6 +990,74 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
 
 
     /**
+     * Removes a server-initiated unidirectional stream wrapper from this
+     * connection's protocol index map.
+     *
+     * @param stream The stream wrapper to remove
+     */
+    void removeServerUniStream(Ngtcp2StreamWrapper stream) {
+        serverUniStreams.values().remove(stream);
+    }
+
+
+    /**
+     * Records the ID of a server-initiated unidirectional stream whose native
+     * state closed (peer STOP_SENDING/reset or local reset). Poll thread only.
+     *
+     * @param streamId The stream identifier
+     */
+    void addClosedServerUniStream(long streamId) {
+        closedServerUniStreamIds.add(Long.valueOf(streamId));
+    }
+
+
+    /**
+     * The server-initiated unidirectional streams awaiting cleanup after
+     * their native close. The returned set is live; only the poll thread may
+     * mutate it through {@link #addClosedServerUniStream(long)} and by
+     * removing handled entries from this view.
+     *
+     * @return The closed server uni stream IDs
+     */
+    Set<Long> getClosedServerUniStreamIds() {
+        return closedServerUniStreamIds;
+    }
+
+
+    /**
+     * Records that a client bidirectional stream was finalized by its
+     * handler (or rejected before a wrapper existed), so a later readable
+     * edge for the same stream ID is treated as a late duplicate instead of
+     * a new request. The record is bounded, oldest-first. Poll thread only.
+     *
+     * @param streamId The finalized stream identifier
+     */
+    void recordDiscardedBidiStream(long streamId) {
+        if (!discardedBidiStreamIds.add(Long.valueOf(streamId))) {
+            return;
+        }
+        discardedBidiStreamOrder.addLast(Long.valueOf(streamId));
+        while (discardedBidiStreamOrder.size() > MAX_DISCARDED_STREAM_IDS) {
+            discardedBidiStreamIds.remove(discardedBidiStreamOrder.pollFirst());
+        }
+    }
+
+
+    /**
+     * Whether a client bidirectional stream was already finalized.
+     * Poll thread only.
+     *
+     * @param streamId The stream identifier
+     *
+     * @return {@code true} if the stream finished and may only produce late
+     *         duplicate edges now
+     */
+    boolean isDiscardedBidiStream(long streamId) {
+        return discardedBidiStreamIds.contains(Long.valueOf(streamId));
+    }
+
+
+    /**
      * Writes the remaining bytes of the given buffer to the provided stream
      * in one native {@code ngtcp2_conn_stream_send()} call. Must be called
      * on the QUIC poll thread (ngtcp2 connections are not thread-safe).
@@ -921,9 +1074,10 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
      *               its limit; the position is advanced by the accepted count
      *
      * @return the number of bytes accepted by the stream - the whole buffer
-     *         also when the stream is in a terminal state that can never
-     *         accept the data (the bytes are dropped rather than retried
-     *         forever)
+     *         also when the stream is in a terminal write state (negative
+     *         capacity or a terminal stream error such as peer STOP_SENDING,
+     *         RESET_STREAM, a collected stream or a shut write side); those
+     *         bytes are dropped rather than retried forever
      */
     @Override
     public int writeToStream(QuicStream stream, ByteBuffer data) {
@@ -958,10 +1112,7 @@ public class Ngtcp2ConnectionWrapper implements QuicConnection {
         }
         long written = Ngtcp2Bindings.ngtcp2_conn_stream_send(conn, s.getStreamId(),
                 bytes, 0, bytes.length, false);
-        if (written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_STOPPED ||
-                written == Ngtcp2Bindings.NGTCP2_ERR_STREAM_RESET ||
-                written == Ngtcp2Bindings.NGTCP2_ERR_INVALID_STREAM_STATE ||
-                written == Ngtcp2Bindings.NGTCP2_ERR_FINAL_SIZE) {
+        if (Ngtcp2Bindings.isTerminalStreamWriteError(written)) {
             // Terminal send error: same drop-and-report semantics as the
             // terminal capacity path above.
             data.position(startPos + bytes.length);

@@ -137,15 +137,21 @@ final class QuicWakeup {
             throw new IOException(sm.getString("quicEndpoint.wakeupCreateError"));
         }
         this.wakeFd = fd;
-        this.pollfds = arena.allocate(POLLFD_LAYOUT, 2);
-        pollfds.set(ValueLayout.JAVA_INT, SLOT_SOCK * POLLFD_SIZE, socketFd);
-        pollfds.set(ValueLayout.JAVA_SHORT,
-                SLOT_SOCK * POLLFD_SIZE + EVENTS_OFFSET, POLLIN);
-        pollfds.set(ValueLayout.JAVA_INT, SLOT_WAKE * POLLFD_SIZE, wakeFd);
-        pollfds.set(ValueLayout.JAVA_SHORT,
-                SLOT_WAKE * POLLFD_SIZE + EVENTS_OFFSET, POLLIN);
-        this.counter = arena.allocate(ValueLayout.JAVA_LONG);
-        counter.set(ValueLayout.JAVA_LONG, 0, 1L);
+        try {
+            this.pollfds = arena.allocate(POLLFD_LAYOUT, 2);
+            pollfds.set(ValueLayout.JAVA_INT, SLOT_SOCK * POLLFD_SIZE, socketFd);
+            pollfds.set(ValueLayout.JAVA_SHORT,
+                    SLOT_SOCK * POLLFD_SIZE + EVENTS_OFFSET, POLLIN);
+            pollfds.set(ValueLayout.JAVA_INT, SLOT_WAKE * POLLFD_SIZE, wakeFd);
+            pollfds.set(ValueLayout.JAVA_SHORT,
+                    SLOT_WAKE * POLLFD_SIZE + EVENTS_OFFSET, POLLIN);
+            this.counter = arena.allocate(ValueLayout.JAVA_LONG);
+            counter.set(ValueLayout.JAVA_LONG, 0, 1L);
+        } catch (RuntimeException | Error t) {
+            QuicBindings.close(fd);
+            arena.close();
+            throw t;
+        }
     }
 
 
@@ -273,6 +279,9 @@ final class QuicWakeup {
      */
     void close() {
         synchronized (this) {
+            if (closed) {
+                return;
+            }
             closed = true;
             try {
                 QuicBindings.close(wakeFd);

@@ -125,9 +125,12 @@ public interface QuicStream {
 
     /**
      * Returns the data the transport has queued as pending to be written on
-     * this stream, in write mode, or a buffer with nothing to write when no
-     * data is pending. The buffer is owned by the transport; readers must
-     * not modify it besides consuming it with relative get operations.
+     * this stream, or a buffer with nothing to write when no data is pending.
+     * The pending bytes are {@code [position, limit)}; the transport may
+     * create or maintain the buffer in read mode or in a write-mode view with
+     * the same current position/limit. The buffer is owned by the transport;
+     * readers must not modify it besides consuming it with relative get
+     * operations.
      *
      * @return The pending write data, may be {@code null}
      */

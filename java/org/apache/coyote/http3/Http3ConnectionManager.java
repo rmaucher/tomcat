@@ -377,6 +377,56 @@ public class Http3ConnectionManager implements QuicConnectionManager {
     }
 
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * A critical client uni stream truncated at FIN maps to the frame or
+     * QPACK stream error required by RFC 9114 Section 7.1 / RFC 9204, not to
+     * the generic "critical stream closed" error used for a clean FIN at a
+     * frame boundary. A stream that is closed before its stream type header
+     * is received is not an error: RFC 9114 Section 6.2 requires the receiver
+     * to tolerate that case.
+     */
+    @Override
+    public long getTruncatedClientUniStreamErrorCode(QuicConnection connection,
+            long streamId, boolean partialRetained) {
+        ConnectionState state = connections.get(connection);
+        if (state == null) {
+            return 0;
+        }
+        if ((streamId & 3) != 2) {
+            // Client-initiated unidirectional stream IDs are 2 mod 4. This
+            // method must never classify a BIDI or server-initiated stream as
+            // a truncated client-uni stream.
+            return 0;
+        }
+        long streamType = state.getClientUniStreamType(streamId);
+        boolean partial = partialRetained ||
+                (streamType == Constants.H3_STREAM_TYPE_CONTROL &&
+                        state.controlFrameSkipRemaining > 0);
+        if (!partial) {
+            return 0;
+        }
+        if (streamType < 0) {
+            // The stream ended before its type varint was complete. RFC 9114
+            // Section 6.2 requires tolerating unidirectional streams that are
+            // closed or reset before their header is received, so an
+            // unidentified type is not a connection error.
+            return 0;
+        }
+        if (streamType == Constants.H3_STREAM_TYPE_CONTROL) {
+            return Http3Error.H3_FRAME_ERROR.getCode();
+        }
+        if (streamType == Constants.H3_STREAM_TYPE_QPACK_ENCODER) {
+            return Http3Error.H3_QPACK_ENCODER_STREAM_ERROR.getCode();
+        }
+        if (streamType == Constants.H3_STREAM_TYPE_QPACK_DECODER) {
+            return Http3Error.H3_QPACK_DECODER_STREAM_ERROR.getCode();
+        }
+        return 0;
+    }
+
+
     /*
      * At most one control stream and at most one QPACK encoder and decoder
      * stream are permitted per peer: a second stream of any of these types
