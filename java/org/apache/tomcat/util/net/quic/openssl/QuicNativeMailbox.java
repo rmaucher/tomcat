@@ -50,6 +50,11 @@ import org.apache.tomcat.util.res.StringManager;
  * (or on the stop thread once the poll loop has stopped); the confinement
  * check inherited from the base is applied to each so a future mis-threading
  * is caught under {@code -ea}.
+ * <p>
+ * This class owns all four queues. {@code QuicOpenSSLEndpoint} exposes
+ * one-line delegating wrappers for the drains so call sites document the
+ * required ordering (streams before connections); those wrappers add no state
+ * and must stay that way.
  */
 class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbox {
 
@@ -118,20 +123,6 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
         return !pendingStreamFrees.isEmpty() || !pendingStreamDrains.isEmpty()
                 || !cleanerStreamFrees.isEmpty()
                 || !cleanerConnectionFrees.isEmpty();
-    }
-
-
-    /**
-     * Defers freeing a stream's native SSL object to the next post-{@code
-     * SSL_poll()} drain, so a frame queued during the same iteration (for
-     * example a RESET_STREAM) reaches the network first. Keeping the wrapper
-     * in the queue also keeps it reachable so its Cleaner cannot free the
-     * native object early.
-     *
-     * @param stream The stream whose free is deferred
-     */
-    void queueStreamFree(QuicStreamWrapper stream) {
-        pendingStreamFrees.add(stream);
     }
 
 

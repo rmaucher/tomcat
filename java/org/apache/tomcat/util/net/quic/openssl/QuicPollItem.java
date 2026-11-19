@@ -271,9 +271,14 @@ public class QuicPollItem {
 
 
     /**
-     * Checks if any error events occurred.
+     * Checks the error events that form OpenSSL's {@code SSL_POLL_EVENT_E}
+     * macro: listener error, connection close, stream read error and stream
+     * write error. Connection-closed ({@code SSL_POLL_EVENT_ECD}) is reported
+     * separately by {@link #hasConnectionClose()} and poll failure
+     * ({@code SSL_POLL_EVENT_F}) by {@link #hasPollFailure()}; the mask here
+     * intentionally mirrors OpenSSL's macro. Used only for trace formatting.
      *
-     * @return {@code true} if an error event is set in revents
+     * @return {@code true} if an {@code SSL_POLL_EVENT_E} error event is set
      */
     public boolean hasError() {
         return (revents & QuicPoll.SSL_POLL_EVENT_E) != 0;

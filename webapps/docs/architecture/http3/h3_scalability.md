@@ -491,3 +491,36 @@ One hot-path cleanup was identified during the investigation:
 for every native read/write size/layout access. Caching the immutable ABI
 record in a static field reduced the `32x32` poller cost in the back-to-back
 pair above (71.1k to 74.6k; `8x25` stayed within noise).
+
+## 13. Unpushed-fix OpenSSL regression check (2026-11-19)
+
+A quick regression check covered the uncommitted review fixes on top of the
+`b8a200c6ed` parent (`Remove defects`). The documented `8x25` and `32x32`
+load cases (`connections x streams`, `procs=8`, 3 s warm-up, 12 s window)
+were run after a `1x32` JVM-warming run. The benchmark base was
+`/home/opencode/tomcat-http3`; only `tomcat-coyote.jar` and
+`tomcat-coyote-ffm.jar` were swapped, and the server was restarted between
+variants. The two `tomcat-coyote.jar` files are byte-identical between the
+trees; only `tomcat-coyote-ffm.jar` differs, so the A/B isolates the OpenSSL
+QUIC changes. Host load average ranged from about 11 to 16, within the
+shared-host caveat in Section 2.
+
+| tree | shape | runs (rps) | mean rps | us/req |
+|---|---|---:|---:|---:|
+| current fixed tree | 8x25 | 89,786.2 / 90,383.0 | 90,084.6 | 10.6 |
+| parent `b8a200c6ed` | 8x25 | 89,118.1 / 90,196.9 | 89,657.5 | 10.7 / 10.6 |
+| Section 9 current tree | 8x25 | — | 91,502.3 | 10.85 |
+| current fixed tree | 32x32 | 77,980.3 / 72,453.6 / 72,448.9 | 74,294.3 | 12.7 / 13.7 / 13.7 |
+| parent `b8a200c6ed` | 32x32 | 78,836.0 / 95,758.6 / 72,888.5 | 82,494.4 | 12.4 / 9.7 / 13.6 |
+| Section 10 current tree | 32x32 | — | 71,142.9–74,552.0 | 13.9 / 13.2 |
+
+The current `8x25` mean is 0.5% faster than the parent and 1.5% below the
+Section 9 current-tree report while using 0.2 us/req less, all inside the
+shared-host spread. The `32x32` parent and current ranges overlap: the
+parent's 95.8k / 9.7 run and the current 72.4k / 13.7 runs were taken at
+the same host load, and a clean parent rerun measured 72.9k / 13.6. No
+reproducible regression attributable to the unpushed fixes was found. The
+fixes touch teardown, error and liveness paths rather than steady-state
+request processing; the two added liveness checks are volatile reads on
+existing hot paths and were not measurable in this shape.
+

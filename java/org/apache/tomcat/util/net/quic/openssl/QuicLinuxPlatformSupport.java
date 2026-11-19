@@ -279,7 +279,7 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                 SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (socketFd < 0) {
             int error = errno();
-            throw failure("socket", socketFd, error,
+            throw failure("socket", error,
                     options.dualStack() && ipv6 && isAddressFamilyError(error));
         }
 
@@ -309,7 +309,7 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                 // unavailable. EADDRNOTAVAIL/EPERM are classified by their
                 // own predicates below and are still recognized by the
                 // endpoint's dual-stack fallback policy.
-                throw failure("bind", rc, error,
+                throw failure("bind", error,
                         options.dualStack() && ipv6 &&
                                 isAddressFamilyError(error));
             }
@@ -323,7 +323,7 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                         socketFd, nameAddr, nameLen);
                 if (nameRc != 0) {
                     int error = errno();
-                    throw failure("getsockname", nameRc, error, false);
+                    throw failure("getsockname", error, false);
                 }
                 actualPort = ((nameAddr.get(ValueLayout.JAVA_BYTE, 2) & 0xFF) << 8) |
                         (nameAddr.get(ValueLayout.JAVA_BYTE, 3) & 0xFF);
@@ -379,13 +379,13 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
             // error may be meaningful for this option. It must not turn an
             // unrelated errno (EINVAL/ENOPROTOOPT/ENOBUFS/...) into an
             // address-family failure.
-            throw failure("setsockopt(" + name + ")", rc, error,
+            throw failure("setsockopt(" + name + ")", error,
                     familyFailure && isAddressFamilyError(error));
         }
     }
 
 
-    private QuicPlatformException failure(String operation, int rc, int error,
+    private QuicPlatformException failure(String operation, int error,
             boolean addressFamilyUnavailable) {
         boolean interrupted = error == EINTR;
         boolean addressNotAvailable = error == EADDRNOTAVAIL;
@@ -459,7 +459,7 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
     }
 
 
-    private int errno() {
+    private static int errno() {
         try {
             MemorySegment pointer = (MemorySegment) errnoLocation$handle.invokeExact();
             return pointer.reinterpret(Integer.BYTES).get(ValueLayout.JAVA_INT, 0);
@@ -469,7 +469,7 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
     }
 
 
-    private String strerror(int error) {
+    private static String strerror(int error) {
         synchronized (STRERROR_LOCK) {
             try {
                 MemorySegment result = (MemorySegment) strerror$handle.invokeExact(error);
@@ -523,10 +523,10 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                 throw new AssertionError("should not reach here", t);
             }
             if (fd < 0) {
-                int error = errnoStatic();
+                int error = errno();
                 arena.close();
                 throw new QuicPlatformException("eventfd", error,
-                        strerrorStatic(error), false, false, false, false);
+                        strerror(error), false, false, false, false);
             }
             this.wakeFd = fd;
             try {
@@ -583,7 +583,7 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                     throw new AssertionError("should not reach here", t);
                 }
                 if (rc < 0) {
-                    int error = errnoStatic();
+                    int error = errno();
                     if (error == EINTR) {
                         if (!finite) {
                             continue;
@@ -628,6 +628,13 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                         counter, 8L);
             } catch (Throwable t) {
                 throw new AssertionError("should not reach here", t);
+            } finally {
+                // eventfd read() overwrites the counter buffer with the
+                // accumulated count. kick() writes that buffer as the next
+                // increment, so leaving the observed count in place makes
+                // batches of kicks multiply the kernel counter. Restore the
+                // constant one used by every kick.
+                counter.set(ValueLayout.JAVA_LONG, 0, 1L);
             }
         }
 
@@ -656,31 +663,6 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
         private short revents(int slot) {
             return pollfds.get(ValueLayout.JAVA_SHORT,
                     slot * POLLFD_SIZE + POLLFD_REVENTS_OFFSET);
-        }
-    }
-
-
-    private static int errnoStatic() {
-        try {
-            MemorySegment pointer = (MemorySegment) errnoLocation$handle.invokeExact();
-            return pointer.reinterpret(Integer.BYTES).get(ValueLayout.JAVA_INT, 0);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-
-    private static String strerrorStatic(int error) {
-        synchronized (STRERROR_LOCK) {
-            try {
-                MemorySegment result = (MemorySegment) strerror$handle.invokeExact(error);
-                if (result.equals(MemorySegment.NULL)) {
-                    return "Unknown error " + error;
-                }
-                return result.getString(0);
-            } catch (Throwable t) {
-                throw new AssertionError("should not reach here", t);
-            }
         }
     }
 

@@ -1422,7 +1422,15 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
 
                     if (read) {
                         for (int i = 0; i < length; i++) {
-                            int bytes = read(false, buffers[offset + i]);
+                            ByteBuffer buffer = buffers[offset + i];
+                            if (!buffer.hasRemaining()) {
+                                // A zero-length destination returns 0 without
+                                // touching the stream; that is not a
+                                // would-block signal. Skip it and continue
+                                // with the later buffers.
+                                continue;
+                            }
+                            int bytes = read(false, buffer);
                             if (bytes < 0) {
                                 // EOF: treating it as would-block (0) would
                                 // re-run the operation or report no progress
@@ -1434,6 +1442,8 @@ public class Ngtcp2SocketWrapper extends QuicSocketWrapper
                             if (bytes > 0) {
                                 nBytes += bytes;
                             } else {
+                                // Only a non-empty buffer that returns 0 is
+                                // would-block.
                                 break;
                             }
                         }

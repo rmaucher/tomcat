@@ -176,7 +176,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      */
     private QuicStreamWrapper liveStream() {
         QuicStreamWrapper stream = getSocket();
-        if (stream == null || stream.isFreed()) {
+        if (stream == null || stream.isFreed() || stream.isDeregistered()) {
             return null;
         }
         MemorySegment ssl = stream.getSsl();
@@ -273,7 +273,15 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             return;
         }
         try {
-            onPollThreadVoid(() -> QuicBindings.SSL_handle_events(conn.getSsl()));
+            onPollThreadVoid(() -> {
+                // The connection may have been torn down between this check
+                // and the poll-thread hop. Re-check its state on the poll
+                // thread before dereferencing the native SSL pointer.
+                if (conn.isClosed() || conn.isFreed()) {
+                    return;
+                }
+                QuicBindings.SSL_handle_events(conn.getSsl());
+            });
         } catch (IOException e) {
             // Ignore - the poll loop will surface any real errors
         }
@@ -365,16 +373,15 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         if (handler.getReadBuffer().remaining() > 0) {
             return true;
         }
-        // Once the transport has observed FIN, no further bytes can arrive.
-        // A stream pre-read buffer may still hold bytes the protocol has not
-        // consumed, so check it directly instead of issuing a native read:
-        // for a FINISHED stream that read can only return zero and costs a
+        // Once the transport has observed FIN, a subsequent read can report
+        // EOF immediately whether or not a pre-read buffer still holds bytes.
+        // Report ready in both cases without issuing a native read: for a
+        // FINISHED stream that read can only return zero and costs a
         // poll-thread hop. This probe runs on the per-response fast-FIN path.
         QuicStream stream = getQuicStream();
         if (stream instanceof QuicStreamWrapper quicStream &&
                 quicStream.getReadState() == QuicStream.ReadState.FINISHED) {
-            ByteBuffer streamReadBuffer = quicStream.getReadBuffer();
-            return streamReadBuffer != null && streamReadBuffer.position() > 0;
+            return true;
         }
         return fillReadBuffer(handler) > 0;
     }
@@ -912,7 +919,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      * @throws IOException If the stream is no longer safe to touch
      */
     private MemorySegment requireLiveSsl(QuicStreamWrapper stream) throws IOException {
-        if (stream == null || stream.isFreed()) {
+        if (stream == null || stream.isFreed() || stream.isDeregistered()) {
             throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
         }
         MemorySegment ssl = stream.getSsl();
@@ -1278,64 +1285,81 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
                     if (read) {
                         for (int i = 0; i < length; i++) {
-                            int bytes = read(false, buffers[offset + i]);
+                            ByteBuffer buffer = buffers[offset + i];
+                            if (!buffer.hasRemaining()) {
+                                // A zero-length destination returns 0 without
+                                // touching the stream; that is not a
+                                // would-block signal. Skip it and continue
+                                // with the later buffers.
+                                continue;
+                            }
+                            int bytes = read(false, buffer);
                             if (bytes < 0) {
                                 // EOF: treating it as would-block (0) would
                                 // re-run the operation or report no progress
                                 // forever instead of completing at end of
-                                // stream.
-                                completion.failed(new EOFException(
-                                        sm.getString("socketWrapper.quicStreamClosed")), this);
+                                // stream. If bytes were already transferred,
+                                // report them: they have been consumed and
+                                // cannot be read again.
+                                if (nBytes > 0) {
+                                    completion.completed(Long.valueOf(nBytes), this);
+                                } else {
+                                    completion.failed(new EOFException(
+                                            sm.getString("socketWrapper.quicStreamClosed")), this);
+                                }
                                 return;
                             }
                             if (bytes > 0) {
                                 nBytes += bytes;
                             } else {
+                                // Only a non-empty buffer that returns 0 is
+                                // would-block.
                                 break;
                             }
                         }
                     } else {
-                        // The vectored path calls doWrite() without taking
-                        // writeLock - shared upstream behaviour. Safety
-                        // rests on two preconditions, not one: the NIO2
-                        // machinery keeps at most one operation state per
-                        // wrapper in flight, so no second vectored writer
-                        // overlaps this loop; and
-                        // flushNonBlocking() - called from the worker-side
-                        // dispatch re-arm and sendfile - takes writeLock,
-                        // which this loop does not hold and which therefore
-                        // cannot exclude it, but reaches doWrite() only
-                        // through staged residue (socketBufferHandler write
-                        // buffer / nonBlockingWriteBuffer), which a
-                        // contract-conforming producer has already drained
-                        // before issuing a vectored write. Note when
-                        // touching either wrapper: doWrite() mutates per-
-                        // wrapper write state that every other writer holds
-                        // under writeLock - relaxing either precondition
-                        // would let this unsynchronised loop race that
-                        // state. The quiche twin (QuicheSocketWrapper's
-                        // QuicOperationState) states the same rule with the
-                        // same preconditions; keep the two in step.
-                        for (int i = 0; i < length; i++) {
-                            int start = buffers[offset + i].position();
-                            doWrite(false, buffers[offset + i]);
-                            nBytes += buffers[offset + i].position() - start;
-                            if (buffers[offset + i].hasRemaining()) {
-                                // Non-blocking would-block (flow control / full
-                                // send buffer): the remainder of this buffer is
-                                // still queued in front of the later buffers, so
-                                // stop here. Writing buffers[i+1] now would
-                                // append its bytes to the stream ahead of the
-                                // undelivered remainder and corrupt the byte
-                                // order. doWrite() has re-armed write interest;
-                                // the completion handler reports the partial
-                                // transfer and the caller resumes later.
-                                break;
+                        // The vectored loop mutates the same per-wrapper write
+                        // state as every other writer. Take writeLock for the
+                        // whole loop: the poll thread's opportunistic
+                        // flushNonBlocking() uses tryLock(), so it cannot block
+                        // here, and the NIO2 machinery keeps at most one
+                        // operation state per wrapper in flight. This matches
+                        // the quiche and ngtcp2 twins; keep the three in step.
+                        writeLock.lock();
+                        try {
+                            for (int i = 0; i < length; i++) {
+                                int start = buffers[offset + i].position();
+                                doWrite(false, buffers[offset + i]);
+                                nBytes += buffers[offset + i].position() - start;
+                                if (buffers[offset + i].hasRemaining()) {
+                                    // Non-blocking would-block (flow control /
+                                    // full send buffer): the remainder of this
+                                    // buffer is still queued in front of the
+                                    // later buffers, so stop here. Writing
+                                    // buffers[i+1] now would append its bytes
+                                    // to the stream ahead of the undelivered
+                                    // remainder and corrupt the byte order.
+                                    // doWrite() has re-armed write interest;
+                                    // the completion handler reports the
+                                    // partial transfer and the caller resumes
+                                    // later.
+                                    break;
+                                }
                             }
+                        } finally {
+                            writeLock.unlock();
                         }
                     }
                 } catch (IOException ioe) {
-                    completion.failed(ioe, this);
+                    // Bytes accepted by earlier buffers are already consumed
+                    // from the stream/socket and cannot be replayed. Report
+                    // that progress instead of discarding it; fail only when
+                    // no bytes were transferred.
+                    if (nBytes > 0) {
+                        completion.completed(Long.valueOf(nBytes), this);
+                    } else {
+                        completion.failed(ioe, this);
+                    }
                     return;
                 }
             }
@@ -1508,9 +1532,15 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                                         java.security.cert.X509Certificate leafCert =
                                                 (java.security.cert.X509Certificate) cf.generateCertificate(
                                                         new java.io.ByteArrayInputStream(leafDer));
-                                        boolean present = !certs.isEmpty() &&
-                                                java.util.Arrays.equals(leafCert.getEncoded(),
-                                                        certs.get(0).getEncoded());
+                                        byte[] leafEncoding = leafCert.getEncoded();
+                                        boolean present = false;
+                                        for (java.security.cert.X509Certificate cert : certs) {
+                                            if (java.util.Arrays.equals(leafEncoding,
+                                                    cert.getEncoded())) {
+                                                present = true;
+                                                break;
+                                            }
+                                        }
                                         if (!present) {
                                             certs.add(0, leafCert);
                                         }
@@ -1644,7 +1674,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             // client actually requested at the level that matters here is the
             // ALPN one (e.g. "h3") - return the negotiated ALPN identifier,
             // matching what the quiche transport's QuicheSocketWrapper does.
-            QuicConnectionWrapper conn = stream().getConnection();
+            QuicConnectionWrapper conn = connection();
             if (conn != null) {
                 return conn.getNegotiatedProtocol();
             }

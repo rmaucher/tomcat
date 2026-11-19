@@ -376,8 +376,11 @@ public class QuicCertificateManager {
         QuicCertConfig oldConfig = certConfig;
         certConfig = newConfig;
         if (oldConfig != null) {
-            oldConfig.free();
-            CertificateLoader.closeQuietly(oldConfig.arena);
+            try {
+                oldConfig.free();
+            } finally {
+                CertificateLoader.closeQuietly(oldConfig.arena);
+            }
         }
         // The snapshot swap can change the endpoint's pre-shared-key-only
         // state; the context option must follow it for the connections
@@ -412,8 +415,11 @@ public class QuicCertificateManager {
         QuicCertConfig configToFree = certConfig;
         certConfig = null;
         if (configToFree != null) {
-            configToFree.free();
-            CertificateLoader.closeQuietly(configToFree.arena);
+            try {
+                configToFree.free();
+            } finally {
+                CertificateLoader.closeQuietly(configToFree.arena);
+            }
         }
         if (alpnCallbackArena != null) {
             try {

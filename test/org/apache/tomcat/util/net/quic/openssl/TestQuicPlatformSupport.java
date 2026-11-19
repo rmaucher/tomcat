@@ -97,4 +97,33 @@ public class TestQuicPlatformSupport {
             platform.close(bound.socket());
         }
     }
+
+
+    @Test
+    public void testWakeupCoalescedKicks() throws Exception {
+        QuicPlatformSupport platform = QuicPlatformSupport.selectForTest("linux");
+        Assume.assumeTrue(platform.isAvailable());
+        QuicPlatformSupport.BoundUdpSocket bound = platform.bindUdpSocket(
+                InetAddress.getByName("127.0.0.1"), 0,
+                new QuicPlatformSupport.UdpSocketOptions(0, 0, false));
+        QuicPlatformSupport.Wakeup wakeup = platform.createWakeup(bound.socket());
+        try {
+            // Multiple kicks between consumes must keep the eventfd counter
+            // at a small constant. Reusing the read() result as the next
+            // kick value used to multiply the counter and eventually make
+            // kick() fail with EAGAIN.
+            for (int i = 0; i < 70; i++) {
+                wakeup.kick();
+                wakeup.kick();
+                int events = wakeup.await(1000);
+                Assert.assertTrue("batch " + i,
+                        (events & QuicPlatformSupport.Wakeup.EVENT_WAKE) != 0);
+                wakeup.consume();
+            }
+        } finally {
+            wakeup.close();
+            platform.close(bound.socket());
+            platform.close(bound.socket());
+        }
+    }
 }

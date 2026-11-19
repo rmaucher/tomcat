@@ -142,7 +142,8 @@ abstract class QuicPlatformSupport {
             Class<?> clazz = Class.forName(className);
             if (!QuicPlatformSupport.class.isAssignableFrom(clazz)) {
                 return new QuicPlatformUnavailable("", "", sm.getString(
-                        "quicPlatform.overrideClassInvalid", className));
+                        "quicPlatform.overrideClassInvalid", className,
+                        "class is not a QuicPlatformSupport subclass"));
             }
             QuicPlatformSupport candidate = (QuicPlatformSupport)
                     clazz.getDeclaredConstructor().newInstance();
@@ -341,12 +342,8 @@ abstract class QuicPlatformSupport {
         private final AtomicBoolean closed = new AtomicBoolean();
 
         SocketHandle(long value) {
-            this(value, value >= 0);
-        }
-
-        SocketHandle(long value, boolean valid) {
             this.value = value;
-            this.valid = valid;
+            this.valid = value >= 0;
         }
 
         long value() {

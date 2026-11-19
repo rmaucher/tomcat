@@ -84,4 +84,20 @@ final class QuicDiagnostics {
         }
         return sb.length() == 0 ? "<empty>" : sb.toString().trim();
     }
+
+
+    /**
+     * Empties the OpenSSL error queue without formatting it. Used on
+     * rate-limited failure paths where {@link #dumpErrorQueue()} is not called,
+     * so repeated failures cannot overwrite older root causes in the
+     * fixed-size per-thread ERR ring before the next diagnostic dump.
+     * Never throws.
+     */
+    static void clearErrorQueue() {
+        try {
+            openssl_h.ERR_clear_error();
+        } catch (Throwable t) {
+            // Ignore - diagnostics only
+        }
+    }
 }

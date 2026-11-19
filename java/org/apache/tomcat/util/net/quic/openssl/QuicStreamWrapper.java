@@ -634,6 +634,12 @@ public class QuicStreamWrapper implements QuicStream {
             // in-progress wait, it waits out at most that wait - bounded by
             // the loop's idle-rate timeout, or pollTimeoutMs while the
             // endpoint is busy (see QuicNativeMailbox.hasDeferredStreamFrees).
+            if (freed.get()) {
+                // The explicit free paths already released the native SSL;
+                // skip a no-op request that would otherwise accumulate in
+                // the deferred-free queue after the endpoint has stopped.
+                return;
+            }
             if (cleanerStreamFrees != null) {
                 cleanerStreamFrees.add(new DeferredStreamFree(ssl, freed));
             } else {

@@ -106,6 +106,15 @@ public class QuicCertConfig {
      */
     public final Arena arena;
 
+    /**
+     * Identity set of entries whose native material has already been
+     * released. {@link CertificateEntry} does not override {@code equals()},
+     * so a HashSet de-duplicates by identity (an entry object is shared
+     * between {@link #defaultCerts} and the {@link #certsByHost} values). It
+     * also makes {@link #free()} idempotent if an entry free throws.
+     */
+    private final Set<CertificateEntry> freedEntries = new HashSet<>();
+
 
     /**
      * Creates an immutable certificate snapshot.
@@ -309,22 +318,34 @@ public class QuicCertConfig {
      * {@link #certsByHost} values, so entries are de-duplicated to avoid a
      * double free.
      */
-    public void free() {
-        // CertificateEntry does not override equals(), so a HashSet de-duplicates
-        // by identity (the same entry object is shared between defaultCerts
-        // and certsByHost).
-        Set<CertificateEntry> seen = new HashSet<>();
+    public synchronized void free() {
         for (CertificateEntry entry : defaultCerts) {
-            if (seen.add(entry)) {
-                CertificateLoader.freeCertEntry(entry);
-            }
+            freeEntry(entry);
         }
         for (List<CertificateEntry> entries : certsByHost.values()) {
             for (CertificateEntry entry : entries) {
-                if (seen.add(entry)) {
-                    CertificateLoader.freeCertEntry(entry);
-                }
+                freeEntry(entry);
             }
+        }
+    }
+
+
+    /**
+     * Frees one entry unless it has already been released. The entry is
+     * marked before the native call so a throw cannot lead to a later second
+     * free of the same native object; a failure is logged and the remaining
+     * entries are still released.
+     *
+     * @param entry The entry to release
+     */
+    private void freeEntry(CertificateEntry entry) {
+        if (!freedEntries.add(entry)) {
+            return;
+        }
+        try {
+            CertificateLoader.freeCertEntry(entry);
+        } catch (Throwable t) {
+            log.warn(sm.getString("certificateLoader.freeError"), t);
         }
     }
 
@@ -332,13 +353,18 @@ public class QuicCertConfig {
     /**
      * Releases the native objects of the given entries (each entry appears
      * exactly once in the list built by {@link #buildCertConfig}, so no
-     * de-duplication is needed).
+     * de-duplication is needed). A failure frees the remaining entries rather
+     * than aborting the cleanup loop.
      *
      * @param entries The entries to release
      */
     private static void freeLoadedEntries(List<CertificateEntry> entries) {
         for (CertificateEntry entry : entries) {
-            CertificateLoader.freeCertEntry(entry);
+            try {
+                CertificateLoader.freeCertEntry(entry);
+            } catch (Throwable t) {
+                log.warn(sm.getString("certificateLoader.freeError"), t);
+            }
         }
     }
 

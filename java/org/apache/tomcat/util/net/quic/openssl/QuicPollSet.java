@@ -40,8 +40,10 @@ import org.apache.tomcat.util.res.StringManager;
  * Each member occupies a slot (index) in the array while it is in the set.
  * Active members always occupy slots {@code 0} to {@code count - 1}. On
  * removal, the member at the last used slot is swapped into the vacated
- * slot, so both add and remove are O(1) and {@code SSL_poll()} always
- * receives a contiguous array of the active members.
+ * slot, so remove is O(1) and {@code SSL_poll()} always receives a
+ * contiguous array of the active members. Add is amortized O(1): capacity
+ * doubles on growth and halves when the set falls to a quarter of its
+ * capacity, with the native array and slots array reallocated together.
  * <p>
  * The native array is kept on a dedicated {@link Arena} per generation:
  * when the set outgrows the current capacity a larger array is allocated on
@@ -71,7 +73,6 @@ public class QuicPollSet {
     private static final StringManager sm = StringManager.getManager(QuicPollSet.class);
 
     private static final int INITIAL_CAPACITY = 64;
-    private static final int GROWTH_INCREMENT = 32;
 
     private static final long STRIDE = QuicPoll.stride();
     private static final QuicPlatformSupport.Abi ABI =
@@ -98,6 +99,15 @@ public class QuicPollSet {
      * 0 to count-1.
      */
     private int count;
+
+    /**
+     * Set when the membership or order of the poll set changed since the last
+     * {@link #consumeChanged()} call. The poll loop uses this one-shot flag to
+     * force an engine tick and an {@code SSL_poll()} pass, because a slot
+     * added by a handler after the previous poll may already be readable and
+     * the normal tick-skip shortcut would not otherwise test it.
+     */
+    private boolean changed;
 
     /**
      * Map from SSL pointer address to QuicPollItem for O(1) lookup.
@@ -143,7 +153,7 @@ public class QuicPollSet {
      */
     public void add(QuicPollItem item) {
         long key = item.getSsl().address();
-        QuicPollItem previous = items.putIfAbsent(key, item);
+        QuicPollItem previous = items.get(key);
         if (previous != null) {
             // Re-adding a tracked address is not supported: the existing
             // item's want-events mask is managed cooperatively by the
@@ -154,16 +164,39 @@ public class QuicPollSet {
             // regression and keep the existing item unchanged.
             log.warn(sm.getString("quicPollSet.duplicateAdd",
                     Long.toHexString(key)));
-            item.dispose();
+            if (previous != item) {
+                item.dispose();
+            } else {
+                // The same item was re-added: preserve any want-events update
+                // made just before the call by forcing a native rewrite.
+                item.markDirty();
+                changed = true;
+            }
             return;
         }
         if (count == capacity) {
             grow();
         }
+        // Publish the item only after capacity growth succeeded, so an
+        // allocation failure cannot leave the map referencing an item that
+        // was never placed in the slots/native array.
+        previous = items.putIfAbsent(key, item);
+        if (previous != null) {
+            log.warn(sm.getString("quicPollSet.duplicateAdd",
+                    Long.toHexString(key)));
+            if (previous != item) {
+                item.dispose();
+            } else {
+                item.markDirty();
+                changed = true;
+            }
+            return;
+        }
         slots[count] = item;
         item.setSlot(count);
         count++;
         item.markDirty();
+        changed = true;
     }
 
 
@@ -191,6 +224,10 @@ public class QuicPollSet {
         }
         slots[count] = null;
         removed.dispose();
+        changed = true;
+        if (capacity > INITIAL_CAPACITY && count <= capacity / 4) {
+            shrink();
+        }
         return removed;
     }
 
@@ -263,6 +300,7 @@ public class QuicPollSet {
         // both slots.
         swapped.markDirty();
         item.markDirty();
+        changed = true;
     }
 
 
@@ -318,6 +356,19 @@ public class QuicPollSet {
     }
 
 
+    /**
+     * Returns and clears the one-shot “membership/order changed” flag. The
+     * poll loop calls this before deciding whether it may skip a tick and
+     * {@code SSL_poll()} iteration.
+     *
+     * @return {@code true} if the set changed since the previous call
+     */
+    public boolean consumeChanged() {
+        boolean result = changed;
+        changed = false;
+        return result;
+    }
+
 
     /**
      * Returns the native array segment for passing to {@code SSL_poll()}.
@@ -368,6 +419,7 @@ public class QuicPollSet {
         }
         count = 0;
         items.clear();
+        changed = true;
     }
 
 
@@ -395,17 +447,43 @@ public class QuicPollSet {
 
 
     /**
-     * Grows the native array. The new array starts zeroed, so every active
-     * item is marked dirty to force a re-copy on the next rebuild. The
-     * previous array's arena is closed once the new array is in place.
+     * Doubles the array capacity.
      */
     private void grow() {
-        int newCapacity = capacity + GROWTH_INCREMENT;
+        int newCapacity = capacity > Integer.MAX_VALUE / 2
+                ? Integer.MAX_VALUE : capacity * 2;
+        if (newCapacity > capacity) {
+            resize(newCapacity);
+        }
+    }
+
+
+    /**
+     * Halves the array capacity, not below the initial capacity.
+     */
+    private void shrink() {
+        int newCapacity = Math.max(INITIAL_CAPACITY, capacity / 2);
+        if (newCapacity < capacity) {
+            resize(newCapacity);
+        }
+    }
+
+
+    /**
+     * Replaces the native and Java arrays with new arrays of the given
+     * capacity. The new array starts zeroed, so every active item is marked
+     * dirty to force a re-copy on the next rebuild. The previous array's
+     * arena is closed once the new state is in place; a failed allocation
+     * leaves the old generation untouched.
+     */
+    private void resize(int newCapacity) {
         Arena oldArena = arrayArena;
         Arena newArena = Arena.ofShared();
         MemorySegment newArray;
+        QuicPollItem[] newSlots;
         try {
             newArray = newArena.allocate(STRIDE * newCapacity);
+            newSlots = new QuicPollItem[newCapacity];
         } catch (Throwable t) {
             // Do not leave the new arena open or replace the current array
             // when the allocation failed; keep the old generation intact.
@@ -419,12 +497,17 @@ public class QuicPollSet {
         arrayArena = newArena;
         nativeArray = newArray;
         capacity = newCapacity;
-        QuicPollItem[] newSlots = new QuicPollItem[capacity];
         System.arraycopy(slots, 0, newSlots, 0, count);
         slots = newSlots;
         for (int i = 0; i < count; i++) {
             slots[i].markDirty();
         }
-        oldArena.close();
+        try {
+            oldArena.close();
+        } catch (Throwable t) {
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("quicPollSet.closeArenaError", "old native array"), t);
+            }
+        }
     }
 }

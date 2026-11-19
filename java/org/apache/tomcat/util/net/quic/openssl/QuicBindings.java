@@ -35,11 +35,13 @@ import org.apache.tomcat.util.res.StringManager;
  * FFM bindings for OpenSSL QUIC functions.
  * <p>
  * This class provides downcall handles for the QUIC-specific OpenSSL functions
- * needed by {@code QuicOpenSSLEndpoint}. Operating-system-specific socket,
- * wake-up, address and error access is owned by {@link QuicPlatformSupport};
- * the endpoint is available only when both the platform implementation and
- * these OpenSSL symbols are usable. All bindings follow the same pattern as
- * the existing bindings in {@code openssl_h}.
+ * needed by {@code QuicOpenSSLEndpoint}. Operating-system-specific socket and
+ * wake-up access (including libc errno/strerror) is owned by
+ * {@link QuicPlatformSupport}; the OpenSSL error queue ({@code ERR_*}) and the
+ * {@code BIO_ADDR_*} peer-address accessors are bound here. The endpoint is
+ * available only when both the platform implementation and these OpenSSL
+ * symbols are usable. All bindings follow the same pattern as the existing
+ * bindings in {@code openssl_h}.
  * <p>
  * The list below summarizes the main groups of functions bound here; the
  * individual fields are the authoritative list (OpenSSL manages QUIC I/O
@@ -69,8 +71,10 @@ import org.apache.tomcat.util.res.StringManager;
  * <li>{@code SSL_ctrl()}, {@code SSL_CTX_callback_ctrl()}
  *     (used for the SNI callback and chain certificate management, which are
  *     macros in OpenSSL 4.0)</li>
- * <li>C libc helpers are intentionally not bound here; all socket, wake-up,
- *     address and error operations are owned by {@link QuicPlatformSupport}</li>
+ * <li>C libc helpers are intentionally not bound here; socket and wake-up
+ *     operations (including libc errno/strerror) are owned by
+ *     {@link QuicPlatformSupport}, while the OpenSSL error queue and
+ *     {@code BIO_ADDR_*} accessors are bound in this class</li>
  * </ul>
  */
 public class QuicBindings {
@@ -596,7 +600,10 @@ public class QuicBindings {
      * @param flags   The shutdown flags
      * @param args    Pointer to the shutdown arguments structure, or {@code NULL}
      * @param argsLen The size of the structure referenced by {@code args}
-     * @return One on success or zero on failure
+     * @return Zero while the shutdown is still in progress (rapid shutdown
+     *         generally returns zero even on success) and one once the
+     *         shutdown is complete; failures are reported through the error
+     *         queue, not by a negative return value
      */
     public static int SSL_shutdown_ex(MemorySegment ssl, long flags, MemorySegment args,
             long argsLen) {
@@ -734,8 +741,12 @@ public class QuicBindings {
     // SSL_set_value_uint() only supports SSL_VALUE_QUIC_IDLE_TIMEOUT and
     // SSL_VALUE_EVENT_HANDLING_MODE, so the transport cannot be instructed to
     // advertise a configured concurrency limit.
+    /** Value ID: bidirectional-stream creation credit available locally. */
+    public static final int SSL_VALUE_QUIC_STREAM_BIDI_LOCAL_AVAIL = 1;
     /** Value ID: bidirectional-stream credit advertised to the peer. */
     public static final int SSL_VALUE_QUIC_STREAM_BIDI_REMOTE_AVAIL = 2;
+    /** Value ID: unidirectional-stream creation credit available locally. */
+    public static final int SSL_VALUE_QUIC_STREAM_UNI_LOCAL_AVAIL = 3;
     /** Value ID: unidirectional-stream credit advertised to the peer. */
     public static final int SSL_VALUE_QUIC_STREAM_UNI_REMOTE_AVAIL = 4;
     /** QUIC idle timeout in milliseconds, connection-level (settable). */
@@ -782,9 +793,9 @@ public class QuicBindings {
 
     /**
      * {@code SSL_OP_ALLOW_NO_DHE_KEX} (SSL_OP_BIT(10) in openssl/ssl.h). Not
-     * yet in the jextract-generated openssl_h; it is listed in
-     * res/openssl/openssl-tomcat.conf so the next binding regeneration moves
-     * it there and this copy can go away.
+     * yet in the jextract-generated openssl_h, and not currently listed in
+     * res/openssl/openssl-tomcat.conf, so this local copy remains until the
+     * regeneration configuration includes the symbol.
      */
     public static final long SSL_OP_ALLOW_NO_DHE_KEX = 1L << 10;
 
