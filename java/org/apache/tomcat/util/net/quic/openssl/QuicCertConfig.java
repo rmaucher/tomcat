@@ -50,6 +50,12 @@ import org.apache.tomcat.util.res.StringManager;
  * endpoint shutdown). The endpoint's SNI callback applies the certificates of
  * the host matching the negotiated server name to each incoming connection
  * from the current snapshot.
+ * <p>
+ * A host that configures both certificates and pre-shared keys is rejected if
+ * none of its certificates can be loaded, so its authentication mode cannot
+ * silently change to pre-shared-key-only. Client certificate verification,
+ * OCSP stapling and CRL/revocation data are not part of this snapshot; see
+ * {@link QuicCertificateManager} for the supported TLS surface.
  */
 public class QuicCertConfig {
 
@@ -169,9 +175,12 @@ public class QuicCertConfig {
      * {@link QuicCertConfig}.
      * <p>
      * Individual certificate failures are logged and skipped. A host without
-     * certificates is accepted when it is pre-shared-key-only. The method
-     * returns {@code null} (and logs the error) when the default host has
-     * neither a loadable certificate nor pre-shared keys.
+     * certificates is accepted when it is pre-shared-key-only. A host that
+     * configures both certificates and pre-shared keys but whose certificates
+     * all fail to load is rejected (the build fails), because serving it would
+     * silently change its authentication mode to pre-shared-key-only. The
+     * method returns {@code null} (and logs the error) when the default host
+     * has neither a loadable certificate nor pre-shared keys.
      *
      * @param defaultHostConfig The configuration of the default host, whose
      *                          certificates and pre-shared keys are used when
@@ -201,6 +210,39 @@ public class QuicCertConfig {
                         !hostConfig.getCipherSuites().equals(
                                 defaultHostConfig.getCipherSuites())) {
                     log.warn(sm.getString("quicEndpoint.perHostCipherSuitesUnsupported",
+                            hostConfig.getHostName()));
+                }
+                String groups = hostConfig.getGroups();
+                if (groups != null && !groups.trim().isEmpty()) {
+                    // The native context never calls SSL_CTX_set1_groups_list(),
+                    // so a key-exchange group restriction would otherwise be
+                    // silently replaced by OpenSSL's default group list.
+                    log.warn(sm.getString("quicEndpoint.groupsUnsupported",
+                            hostConfig.getHostName(), groups));
+                }
+                Set<String> protocols = hostConfig.getProtocols();
+                if (protocols != null && !protocols.isEmpty() &&
+                        !protocols.contains("TLSv1.3")) {
+                    // QUIC mandates TLS 1.3 (RFC 9001); a protocol set that
+                    // excludes it cannot be honoured by this transport.
+                    log.warn(sm.getString("quicEndpoint.protocolsUnsupported",
+                            hostConfig.getHostName(), protocols.toString()));
+                }
+                String ciphers = hostConfig.getCiphers();
+                if (ciphers != null && !ciphers.trim().isEmpty()) {
+                    // TLS 1.3 selects cipher suites through cipherSuites, not
+                    // the TLS 1.2 ciphers list, and the QUIC context uses only
+                    // TLS 1.3.
+                    log.warn(sm.getString("quicEndpoint.tls12CiphersUnsupported",
+                            hostConfig.getHostName(), ciphers));
+                }
+                if (hostConfig.getOcspEnabled() ||
+                        hostConfig.getRevocationEnabled() ||
+                        hostConfig.getCertificateRevocationListFile() != null) {
+                    // The OpenSSL QUIC transport does not load OCSP responses
+                    // or CRLs, so these settings would otherwise be silently
+                    // ignored by an operator expecting revocation checking.
+                    log.warn(sm.getString("quicEndpoint.ocspCrlUnsupported",
                             hostConfig.getHostName()));
                 }
                 SSLHostConfig.CertificateVerification verification =
@@ -246,7 +288,23 @@ public class QuicCertConfig {
 
                 List<CertificateEntry> displaced;
                 if (entries.isEmpty()) {
-                    if (pskSelector != null && hostConfig.isPreSharedKeyOnly()) {
+                    if (pskSelector != null && !hostConfig.isPreSharedKeyOnly()) {
+                        // The host is configured with certificates and
+                        // pre-shared keys, but none of its certificates could
+                        // be loaded. Keeping the pre-shared key selector would
+                        // silently switch the host from certificate
+                        // authentication to pre-shared-key-only authentication,
+                        // although the operator did not configure a
+                        // pre-shared-key-only host. Fail the build (and
+                        // therefore the bind or keep the previous reload
+                        // snapshot) instead of accepting that downgrade.
+                        log.error(sm.getString(
+                                "certificateLoader.mixedAuthCertificateLoadFailed",
+                                hostConfig.getHostName()));
+                        freeLoadedEntries(loaded);
+                        CertificateLoader.closeQuietly(arena);
+                        return null;
+                    } else if (pskSelector != null) {
                         // Host intentionally has no certificate: connections
                         // are authenticated with its pre-shared keys. Map it
                         // to an empty list so the SNI callback applies no
@@ -278,7 +336,18 @@ public class QuicCertConfig {
                     // failure from freeing them a second time.
                     for (CertificateEntry entry : displaced) {
                         loaded.remove(entry);
-                        CertificateLoader.freeCertEntry(entry);
+                        try {
+                            CertificateLoader.freeCertEntry(entry);
+                        } catch (Throwable t) {
+                            // Match freeEntry()/freeLoadedEntries(): a failure
+                            // releasing one displaced entry must not abort the
+                            // loop and leave the remaining displaced entries
+                            // unreleased. The failed entry has already been
+                            // removed from the failure-path list (retrying a
+                            // partially freed certificate is unsafe), so log it
+                            // rather than leaking silently.
+                            log.warn(sm.getString("certificateLoader.freeError"), t);
+                        }
                     }
                 }
             }

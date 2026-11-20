@@ -32,10 +32,13 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.juli.logging.Log;
+import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.net.quic.QuicConnection;
 import org.apache.tomcat.util.net.quic.QuicConnectionManager;
 import org.apache.tomcat.util.net.quic.QuicStream;
 import org.apache.tomcat.util.openssl.openssl_h;
+import org.apache.tomcat.util.res.StringManager;
 
 /**
  * Wraps a QUIC connection (an {@code SSL *} representing a QUIC-level
@@ -47,6 +50,10 @@ import org.apache.tomcat.util.openssl.openssl_h;
  * and has a {@link QuicPollItem} for event-driven connection lifecycle events.
  */
 public class QuicConnectionWrapper implements QuicConnection {
+
+    private static final Log log = LogFactory.getLog(QuicConnectionWrapper.class);
+    private static final StringManager sm =
+            StringManager.getManager(QuicOpenSSLEndpoint.class);
 
     private static final Cleaner cleaner = Cleaner.create();
 
@@ -142,6 +149,17 @@ public class QuicConnectionWrapper implements QuicConnection {
     private final AtomicBoolean freed = new AtomicBoolean(false);
 
     /**
+     * Set when freeing any stream SSL of this connection failed. The
+     * connection SSL must then never be freed, because OpenSSL requires every
+     * stream SSL to be released first and a failed free may have left a
+     * native stream object alive even though its Java wrapper is marked
+     * {@code freed}. This is deliberately sticky: retrying a failed
+     * {@code SSL_free} is unsafe (it may already have partially run), so the
+     * connection is retained/leaked rather than freed under a live stream.
+     */
+    private final AtomicBoolean streamFreeFailed = new AtomicBoolean(false);
+
+    /**
      * Number of executor worker threads currently executing the HTTP handler
      * for a stream on this connection. While greater than zero, the native
      * connection SSL object (and the stream SSLs it owns) must NOT be freed,
@@ -152,20 +170,16 @@ public class QuicConnectionWrapper implements QuicConnection {
     private final AtomicInteger activeHandlers = new AtomicInteger(0);
 
     /**
-     * Active-handler references held by tasks that are queued in the executor
-     * but have not started yet. shutdownNow() discards such tasks without
-     * running their finally block; the stop path uses this count to balance
-     * those references instead of leaving the connection retained forever.
+     * Dispatch tasks queued in the executor that have not started yet. Each
+     * record carries an atomic claim shared by the task and the stop path:
+     * the task claims it before running, and the stop path claims it only to
+     * balance tasks that never started. A task that has already started keeps
+     * its active-handler reference and runs normally; it is never balanced by
+     * the stop path. This works for executors whose shutdownNow() does not
+     * cancel already-submitted tasks (for example VirtualThreadExecutor) as
+     * well as for a ThreadPoolExecutor whose termination timed out.
      */
-    private final AtomicInteger queuedDispatches = new AtomicInteger(0);
-
-    /**
-     * Streams whose dispatch task is queued in the executor and has not
-     * started yet. Used by the stop path to release the processing claim of
-     * tasks discarded by shutdownNow(); a stuck claim would prevent the
-     * stream SSL from being freed.
-     */
-    private final ConcurrentLinkedQueue<QuicStreamWrapper> queuedDispatchStreams =
+    private final ConcurrentLinkedQueue<QueuedDispatch> queuedDispatchStreams =
             new ConcurrentLinkedQueue<>();
 
     /**
@@ -378,7 +392,8 @@ public class QuicConnectionWrapper implements QuicConnection {
 
         // Pass the shared freed flag (not 'this') to the State so the Cleaner
         // does not keep this wrapper strongly reachable.
-        State state = new State(ssl, this.freed, cleanerConnectionFrees);
+        State state = new State(ssl, this.freed, this.streamFreeFailed,
+                cleanerConnectionFrees);
         cleaner.register(this, state);
     }
 
@@ -520,7 +535,8 @@ public class QuicConnectionWrapper implements QuicConnection {
      * @param ssl The SSL object to read the server name from
      *
      * @return the SNI host name, in lower case, or {@code null} if the client
-     *         sent no SNI
+     *         sent no SNI (or a name containing control/line-separator
+     *         characters, which is rejected to keep it out of log output)
      */
     public static String readSniHostNameNative(MemorySegment ssl) {
         MemorySegment namePtr = QuicBindings.SSL_get_servername(
@@ -530,7 +546,21 @@ public class QuicConnectionWrapper implements QuicConnection {
         }
         // Host names are case-insensitive and the endpoint's SSL host config
         // look-ups are keyed by lower-cased names. Normalise at the source.
-        return namePtr.getString(0).toLowerCase(Locale.ENGLISH);
+        String name = namePtr.getString(0).toLowerCase(Locale.ENGLISH);
+        // OpenSSL only rejects an empty name or embedded NUL; other control
+        // bytes are accepted. The name is logged by the certificate manager
+        // and the HTTP/3 processor, so a client could otherwise inject CR/LF
+        // into the log. Fail closed to "no SNI": a name containing control or
+        // line-separator characters is not a valid host name anyway.
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (Character.isISOControl(c) || Character.getType(c) ==
+                    Character.LINE_SEPARATOR || Character.getType(c) ==
+                    Character.PARAGRAPH_SEPARATOR) {
+                return null;
+            }
+        }
+        return name;
     }
 
 
@@ -570,8 +600,9 @@ public class QuicConnectionWrapper implements QuicConnection {
      * <p>
      * The native teardown must run on the QUIC poll thread. When called
      * from a worker thread the teardown is hopped there; if the hop cannot
-     * be completed in time the connection is marked closed and torn down
-     * by the normal teardown paths.
+     * be completed in time the connection is marked closed and a best-effort
+     * poll-thread teardown is scheduled. If the mailbox is already closed,
+     * the stop cleanup owns the remaining native state.
      *
      * @param appErrorCode The application protocol error code for the
      *                     CONNECTION_CLOSE frame
@@ -590,7 +621,13 @@ public class QuicConnectionWrapper implements QuicConnection {
                 return null;
             });
         } catch (Throwable t) {
+            // The hop timed out or was rejected. Mark the connection closed so
+            // no new work starts on it, then arrange a best-effort poll-thread
+            // teardown: the timed-out hop itself will hit the endpoint's
+            // isClosed() guard when it eventually runs, which would otherwise
+            // leave the native state alive until stop.
             setClosed();
+            endpoint.scheduleHopFailureTeardown(this, appErrorCode, reason);
         }
     }
 
@@ -699,6 +736,34 @@ public class QuicConnectionWrapper implements QuicConnection {
     }
 
     /**
+     * Records that freeing a stream SSL of this connection failed.
+     */
+    void markStreamFreeFailed() {
+        streamFreeFailed.set(true);
+    }
+
+    /**
+     * Returns whether any stream SSL free has failed. Once true, this
+     * connection SSL must not be freed.
+     *
+     * @return {@code true} if a stream free failed
+     */
+    boolean hasStreamFreeFailure() {
+        return streamFreeFailed.get();
+    }
+
+    /**
+     * Returns the shared stream-free-failure flag. Used by the stream Cleaner
+     * state so a deferred free failure can mark the connection without
+     * retaining the wrapper.
+     *
+     * @return The shared failure flag
+     */
+    AtomicBoolean getStreamFreeFailedFlag() {
+        return streamFreeFailed;
+    }
+
+    /**
      * Claims the single connection teardown. The first caller gets
      * {@code true}; every later caller gets {@code false} and must not repeat
      * the native teardown/free steps. This mirrors the quiche/ngtcp2
@@ -711,15 +776,62 @@ public class QuicConnectionWrapper implements QuicConnection {
         return !teardownStarted.getAndSet(true);
     }
 
+
     /**
-     * Frees the native SSL object exactly once, atomically. Both explicit
-     * cleanup and the Cleaner call this, so the {@link AtomicBoolean}
-     * guarantees {@code SSL_free} runs at most once even if they race.
+     * Whether the single connection teardown has already been claimed by an
+     * earlier caller (for example a protocol callback that failed the
+     * connection inline). A setup-abort path must not schedule the terminal
+     * stream events a second time in that case.
+     *
+     * @return {@code true} if teardown has already been claimed
      */
-    public void freeSslOnce() {
-        if (!freed.getAndSet(true)) {
-            openssl_h.SSL_free(ssl);
+    boolean isTeardownStarted() {
+        return teardownStarted.get();
+    }
+
+    /**
+     * Frees the native SSL object exactly once, atomically. Explicit cleanup
+     * paths call this; the Cleaner's {@link DeferredConnectionFree} uses the
+     * same shared {@link AtomicBoolean} and {@code SSL_free} guard instead of
+     * calling this method, so the native free still runs at most once even if
+     * they race.
+     *
+     * @return {@code true} only if this call performed the native
+     *         {@code SSL_free}; {@code false} if the SSL was already freed or
+     *         the free was skipped because a stream SSL free failed. Callers
+     *         must keep the connection retained (and its deferred socket open)
+     *         unless the result is {@code true} or {@link #isFreed()} is
+     *         already {@code true}.
+     */
+    public boolean freeSslOnce() {
+        return freeSslOnce(ssl, freed, streamFreeFailed);
+    }
+
+
+    /**
+     * Shared single-free guard used by the explicit free path and the
+     * Cleaner's {@link DeferredConnectionFree}, so both copies cannot drift on
+     * the stream-free-failure check or the freed CAS.
+     *
+     * @param ssl              The connection SSL
+     * @param freed            Shared freed flag
+     * @param streamFreeFailed Shared sticky stream-free-failure flag
+     *
+     * @return {@code true} only if this call performed {@code SSL_free}
+     */
+    static boolean freeSslOnce(MemorySegment ssl, AtomicBoolean freed,
+            AtomicBoolean streamFreeFailed) {
+        if (streamFreeFailed.get()) {
+            // At least one stream SSL free failed; freeing the connection now
+            // could violate SSL_new_stream(3). Leave the connection allocated
+            // (leaked) rather than risking a free under a live stream.
+            return false;
         }
+        if (freed.getAndSet(true)) {
+            return false;
+        }
+        openssl_h.SSL_free(ssl);
+        return true;
     }
 
     /**
@@ -744,41 +856,45 @@ public class QuicConnectionWrapper implements QuicConnection {
      * queued in the executor.
      *
      * @param stream The stream whose processing flag the task owns
-     */
-    void incrQueuedDispatch(QuicStreamWrapper stream) {
-        queuedDispatches.incrementAndGet();
-        queuedDispatchStreams.add(stream);
-    }
-
-    /**
-     * Records that a queued dispatch task started running (or was rejected).
      *
-     * @param stream The stream whose processing flag the task owned
+     * @return The claim record shared with the task and the stop path
      */
-    void decrQueuedDispatch(QuicStreamWrapper stream) {
-        queuedDispatches.decrementAndGet();
-        queuedDispatchStreams.remove(stream);
+    QueuedDispatch incrQueuedDispatch(QuicStreamWrapper stream) {
+        QueuedDispatch queued = new QueuedDispatch(stream);
+        queuedDispatchStreams.add(queued);
+        return queued;
     }
 
     /**
-     * Balances the active-handler references of dispatch tasks that the
-     * executor discarded during shutdownNow() and returns the streams whose
-     * processing claims those tasks still hold. Called by the stop path after
-     * the executor has terminated; the caller clears the claims so the streams
-     * can be freed.
+     * Removes a queued dispatch record when its task starts (or when the
+     * executor rejects it).
+     *
+     * @param queued The queued dispatch record
+     */
+    void decrQueuedDispatch(QueuedDispatch queued) {
+        queuedDispatchStreams.remove(queued);
+    }
+
+    /**
+     * Balances the active-handler references of dispatch tasks that never
+     * started and returns the streams whose processing claims those tasks
+     * still hold. A task that won its claim and started is left alone: it owns
+     * its active-handler reference and will release it when it finishes, even
+     * if this method runs concurrently with its start.
      *
      * @return The streams whose dispatch tasks were discarded unrun
      */
     List<QuicStreamWrapper> discardQueuedDispatches() {
-        int discarded = queuedDispatches.getAndSet(0);
-        if (discarded > 0) {
-            activeHandlers.addAndGet(-discarded);
-        }
-        List<QuicStreamWrapper> streams =
-                new ArrayList<>(discarded > 0 ? discarded : 0);
-        QuicStreamWrapper stream;
-        while ((stream = queuedDispatchStreams.poll()) != null) {
-            streams.add(stream);
+        List<QuicStreamWrapper> streams = new ArrayList<>();
+        QueuedDispatch queued;
+        while ((queued = queuedDispatchStreams.poll()) != null) {
+            if (queued.tryClaim()) {
+                // The task did not start. Balance the active-handler reference
+                // that was added when the task was queued and let the caller
+                // release the processing claim.
+                streams.add(queued.getStream());
+                activeHandlers.decrementAndGet();
+            }
         }
         return streams;
     }
@@ -1042,30 +1158,47 @@ public class QuicConnectionWrapper implements QuicConnection {
      * QUIC poll thread.
      */
     public void closeAllStreams() {
+        boolean failed = hasStreamFreeFailure();
         for (QuicStreamWrapper stream : streams.values()) {
-            QuicPollItem item = stream.getPollItem();
-            if (item != null) {
-                if (endpoint != null &&
-                        endpoint.getPollSet().get(stream.getSslAddress()) == item) {
-                    endpoint.getPollSet().remove(stream.getSslAddress());
-                } else {
-                    // Never promoted into the poll set (the server control
-                    // stream had not been created before teardown)
-                    item.dispose();
-                }
-            }
+            // Mark the stream non-live first so a failure below cannot leave a
+            // poll item dispatching handler code against a half-torn stream.
             stream.setDeregistered();
-            // The single teardown primitive; its javadoc explains why the
-            // claim is an atomic CAS. Losing the claim defers the free to the
-            // worker's finishStreamDispatch() (see this method's javadoc),
-            // and that is the whole story for this iteration - there is
-            // nothing left in the loop body to branch on, so the result is
-            // deliberately ignored.
-            stream.freeSslIfIdle();
+            try {
+                QuicPollItem item = stream.getPollItem();
+                if (item != null) {
+                    QuicPollSet pollSet = endpoint == null ? null : endpoint.getPollSet();
+                    if (pollSet != null &&
+                            pollSet.get(stream.getSslAddress()) == item) {
+                        pollSet.remove(stream.getSslAddress());
+                    } else {
+                        // Never promoted into the poll set (the server control
+                        // stream had not been created before teardown) or the
+                        // poll set is already gone.
+                        item.dispose();
+                    }
+                }
+                // The single teardown primitive; its javadoc explains why the
+                // claim is an atomic CAS. Losing the claim defers the free to
+                // the worker's finishStreamDispatch() (see this method's
+                // javadoc). A failed free marks the connection sticky; the
+                // map is kept below so connection-free paths can retain it.
+                if (!stream.freeSslIfIdle()) {
+                    if (hasStreamFreeFailure()) {
+                        failed = true;
+                    }
+                }
+            } catch (Throwable t) {
+                failed = true;
+                markStreamFreeFailed();
+                log.warn(sm.getString("quicEndpoint.streamTeardownError",
+                        Long.toHexString(stream.getSslAddress())), t);
+            }
         }
-        streams.clear();
-        pendingStreams.clear();
-        serverUniStreams.clear();
+        if (!failed && !hasStreamFreeFailure()) {
+            streams.clear();
+            pendingStreams.clear();
+            serverUniStreams.clear();
+        }
     }
 
 
@@ -1074,6 +1207,36 @@ public class QuicConnectionWrapper implements QuicConnection {
         return "QuicConnection[ssl=0x" + Long.toHexString(ssl.address()) +
                 ",streams=" + streams.size() +
                 ",protocol=" + negotiatedProtocol + "]";
+    }
+
+
+    /**
+     * One queued dispatch task's claim state. The task and the stop path race
+     * on {@link AtomicBoolean#compareAndSet(boolean, boolean)}: exactly one of
+     * them wins. The loser must not touch the stream claim or the
+     * active-handler reference because the winner owns that accounting.
+     */
+    static final class QueuedDispatch {
+
+        private final QuicStreamWrapper stream;
+        private final AtomicBoolean claimed = new AtomicBoolean();
+
+        QueuedDispatch(QuicStreamWrapper stream) {
+            this.stream = stream;
+        }
+
+        QuicStreamWrapper getStream() {
+            return stream;
+        }
+
+        /**
+         * Attempts to claim this dispatch for either starting or discarding.
+         *
+         * @return {@code true} if this caller won the claim
+         */
+        boolean tryClaim() {
+            return claimed.compareAndSet(false, true);
+        }
     }
 
 
@@ -1096,19 +1259,21 @@ public class QuicConnectionWrapper implements QuicConnection {
 
         private final MemorySegment ssl;
         private final AtomicBoolean freed;
+        private final AtomicBoolean streamFreeFailed;
 
-        DeferredConnectionFree(MemorySegment ssl, AtomicBoolean freed) {
+        DeferredConnectionFree(MemorySegment ssl, AtomicBoolean freed,
+                AtomicBoolean streamFreeFailed) {
             this.ssl = ssl;
             this.freed = freed;
+            this.streamFreeFailed = streamFreeFailed;
         }
 
         void run() {
-            // CAS with every other free path (teardownConnection,
-            // freeConnectionOrDefer, stopInternal): free the native SSL
-            // exactly once.
-            if (!freed.getAndSet(true)) {
-                openssl_h.SSL_free(ssl);
-            }
+            // Shared single-free guard: skips when a stream SSL free failed
+            // (stream-before-connection ordering) and CASes with every other
+            // free path (teardownConnection, freeConnectionOrDefer,
+            // stopInternal).
+            freeSslOnce(ssl, freed, streamFreeFailed);
         }
     }
 
@@ -1121,6 +1286,9 @@ public class QuicConnectionWrapper implements QuicConnection {
         // Shared freed flag (NOT the wrapper) so this State does not keep the
         // QuicConnectionWrapper strongly reachable from the static Cleaner.
         private final AtomicBoolean freed;
+        // Shared stream-free-failure flag (NOT the wrapper) so the Cleaner
+        // does not free the connection after a failed stream free.
+        private final AtomicBoolean streamFreeFailed;
         // The endpoint's poll-thread queue for deferred connection frees (NOT
         // the endpoint) so the free decision is serialized with the teardown
         // sequences and stays inside the poll thread's native-access
@@ -1129,10 +1297,12 @@ public class QuicConnectionWrapper implements QuicConnection {
                 cleanerConnectionFrees;
 
         State(MemorySegment ssl, AtomicBoolean freed,
+                AtomicBoolean streamFreeFailed,
                 ConcurrentLinkedQueue<DeferredConnectionFree>
                         cleanerConnectionFrees) {
             this.ssl = ssl;
             this.freed = freed;
+            this.streamFreeFailed = streamFreeFailed;
             this.cleanerConnectionFrees = cleanerConnectionFrees;
         }
 
@@ -1140,7 +1310,10 @@ public class QuicConnectionWrapper implements QuicConnection {
         public void run() {
             // Never call SSL_free on the GC thread: hand the request to the
             // poll thread, where it is serialized with the teardown
-            // sequences, mirroring QuicStreamWrapper.State.run().
+            // sequences, mirroring QuicStreamWrapper.State.run(). The queue
+            // is only null for a wrapper constructed without an endpoint;
+            // that fallback leaves the native SSL allocated and logs instead
+            // of violating OpenSSL's single-threaded QUIC object contract.
             //
             // No wake-descriptor kick here on purpose: a kick would need the
             // State to hold the endpoint (or its wakeup), defeating the
@@ -1155,11 +1328,21 @@ public class QuicConnectionWrapper implements QuicConnection {
                 // deferred-free queue after the endpoint has stopped.
                 return;
             }
+            if (streamFreeFailed.get()) {
+                // A stream SSL free failed; the connection must be retained/
+                // leaked rather than freed under a possibly-live stream.
+                return;
+            }
             if (cleanerConnectionFrees != null) {
                 cleanerConnectionFrees.add(
-                        new DeferredConnectionFree(ssl, freed));
+                        new DeferredConnectionFree(ssl, freed, streamFreeFailed));
             } else {
-                new DeferredConnectionFree(ssl, freed).run();
+                // Never call SSL_free on the Cleaner thread: leave the
+                // native connection allocated rather than touching OpenSSL
+                // outside the poll-thread confinement. This fallback is
+                // defensive only (endpoint connections always carry an
+                // endpoint queue), so log it instead of leaking silently.
+                log.warn(sm.getString("quicEndpoint.cleanerFreeSkipped"));
             }
         }
     }

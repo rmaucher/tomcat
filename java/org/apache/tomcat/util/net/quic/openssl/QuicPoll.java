@@ -171,7 +171,7 @@ public final class QuicPoll {
      *
      * @param nativeArray The native array of SSL_POLL_ITEM structs
      * @param count       The number of items
-     * @param timeoutMs   Timeout in milliseconds (0 = non-blocking, -1 = infinite)
+     * @param timeoutMs   Timeout in milliseconds (0 = non-blocking, any negative value = infinite)
      * @param flags       {@code SSL_POLL_*} flags, 0 or
      *                    {@link #SSL_POLL_FLAG_NO_HANDLE_EVENTS}
      * @param resultCount Output parameter for number of items with events
@@ -186,28 +186,45 @@ public final class QuicPoll {
      */
     public static int poll(MemorySegment nativeArray, int count, long timeoutMs,
             long flags, MemorySegment resultCount) {
-        // Build timeval on a confined arena; the native call copies the value
-        // before we return. try-with-resources also closes the arena if the
-        // allocation for the timeval fails.
-        try (Arena localArena = Arena.ofConfined()) {
-            MemorySegment timeoutPtr;
-            if (timeoutMs < 0) {
-                // Infinite timeout
-                timeoutPtr = MemorySegment.NULL;
-            } else {
-                MemorySegment tv = localArena.allocate(ABI.timeval());
-                long secs = timeoutMs / 1000;
-                long usecs = (timeoutMs % 1000) * 1000;
-                ABI.writeTimeval(tv, secs, usecs);
-                timeoutPtr = tv;
-            }
-            return QuicBindings.SSL_poll(
-                    nativeArray,
-                    (long) count,
-                    STRIDE,
-                    timeoutPtr,
-                    flags,
-                    resultCount);
+        MemorySegment timeoutPtr;
+        if (timeoutMs < 0) {
+            // Infinite timeout
+            timeoutPtr = MemorySegment.NULL;
+        } else {
+            // The poll loop calls this once per iteration; keep the confined
+            // arena and timeval on the calling thread instead of allocating
+            // them on every tick. SSL_poll() copies the timeval before it
+            // returns, so reuse is safe.
+            PollScratch scratch = POLL_SCRATCH.get();
+            long secs = timeoutMs / 1000;
+            long usecs = (timeoutMs % 1000) * 1000;
+            ABI.writeTimeval(scratch.timeval, secs, usecs);
+            timeoutPtr = scratch.timeval;
+        }
+        return QuicBindings.SSL_poll(
+                nativeArray,
+                (long) count,
+                STRIDE,
+                timeoutPtr,
+                flags,
+                resultCount);
+    }
+
+    /**
+     * Per-thread reusable native scratch for the timeval argument of
+     * {@code SSL_poll()}. Confined to the thread that created it, which for
+     * this endpoint is the poll thread.
+     */
+    private static final ThreadLocal<PollScratch> POLL_SCRATCH =
+            ThreadLocal.withInitial(PollScratch::new);
+
+    private static final class PollScratch {
+        private final Arena arena;
+        private final MemorySegment timeval;
+
+        private PollScratch() {
+            arena = Arena.ofConfined();
+            timeval = arena.allocate(ABI.timeval());
         }
     }
 

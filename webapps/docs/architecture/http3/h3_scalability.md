@@ -524,3 +524,48 @@ fixes touch teardown, error and liveness paths rather than steady-state
 request processing; the two added liveness checks are volatile reads on
 existing hot paths and were not measurable in this shape.
 
+## 14. Unpushed-fix OpenSSL regression check (2026-11-20)
+
+A quick check covered the later OpenSSL QUIC fixes on top of `a986be69ca`.
+The benchmark base was `/home/opencode/tomcat-http3`; only
+`tomcat-coyote.jar` and `tomcat-coyote-ffm.jar` were swapped, and the
+server was restarted between variants. `tomcat-coyote.jar` was
+byte-identical between the trees, so the A/B isolates the OpenSSL changes.
+The documented `8x25` and `32x32` load cases (`connections x streams`,
+`procs=8`, 3 s warm-up, 12 s window) were run after a `1x32` JVM-warming
+run. Host load average ranged from about 8 to 22, within the shared-host
+caveat in Section 2.
+
+| tree | shape | runs (rps) | mean rps | us/req |
+|---|---|---:|---:|---:|
+| current before optimization | 8x25 | 87,145.4 / 90,258.6 | 88,702.0 | 11.0 / 10.6 |
+| parent `a986be69ca` | 8x25 | 89,592.2 / 90,642.6 | 90,117.4 | 10.7 / 10.5 |
+| current after optimization | 8x25 | 89,248.5 / 90,085.4 / 90,671.8 | 90,001.9 | 10.6 / 10.6 / 10.5 |
+| Section 13 current tree | 8x25 | — | 90,084.6 | 10.6 |
+| current before optimization | 32x32 | 95,141.1 / 70,995.6 | 83,068.4 | 10.4 / 13.9 |
+| parent `a986be69ca` | 32x32 | 78,083.4 / 73,302.5 | 75,692.9 | 12.7 / 13.5 |
+| current after optimization | 32x32 | 84,572.6 / 78,082.4 | 81,327.5 | 11.7 / 12.7 |
+| Section 13 current tree | 32x32 | — | 74,294.3 | 12.7 |
+
+The first current run was about 1.6% below the parent and the Section 13
+report on `8x25`, so the difference was investigated before being
+accepted as noise. The cause was the D-06 error-queue fix: it called
+`QuicDiagnostics.clearErrorQueue()` immediately before every
+`SSL_accept_connection()`/`SSL_accept_stream()`. In the steady `8x25`
+shape each request-stream event runs a UNI accept pass (normally no
+stream) and a BIDI accept pass (one accepted stream), so the fix added
+two native `ERR_clear_error()` downcalls per request. That was enough to
+cost about 0.2 us/req against a 10.6 us/req request path.
+
+The correction clears any residual error-queue entries once per
+event-bearing poll iteration, before the item scan, instead of per
+accept call. Handled non-fatal failures continue to clear their own
+entries, so the D-06 intent is preserved: an accept still sees only
+errors raised in the current iteration, while steady-state stream
+acceptance no longer pays a native clear per stream. The optimized tree
+returns to the parent/report level (90.0k rps / 10.6 us/req on `8x25`);
+`32x32` also remains within the host-noise spread. The full HTTP/3
+OpenSSL suite passes (588 tests, 0 failures, 2 skipped). Raw shards are
+`/home/opencode/h3bench/out.perf-cur-*`, `out.perf-par-*` and
+`out.perf-opt-*`.
+

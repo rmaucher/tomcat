@@ -138,11 +138,44 @@ public class QuicPollSet {
     public QuicPollSet() {
         this.capacity = INITIAL_CAPACITY;
         this.count = 0;
-        this.arrayArena = Arena.ofShared();
-        this.nativeArray = arrayArena.allocate(STRIDE * capacity);
-        this.slots = new QuicPollItem[capacity];
-        this.resultCountArena = Arena.ofShared();
-        this.resultCountSegment = resultCountArena.allocate(ABI.sizeT());
+        Arena arrayArenaLocal = Arena.ofShared();
+        Arena resultCountArenaLocal = null;
+        MemorySegment nativeArrayLocal = null;
+        MemorySegment resultCountSegmentLocal = null;
+        try {
+            nativeArrayLocal = arrayArenaLocal.allocate(STRIDE * capacity);
+            slots = new QuicPollItem[capacity];
+            resultCountArenaLocal = Arena.ofShared();
+            resultCountSegmentLocal = resultCountArenaLocal.allocate(ABI.sizeT());
+        } catch (RuntimeException | Error e) {
+            // An allocation failure after the shared arenas were created must
+            // not leak the native memory they own. Close every arena that was
+            // successfully created before rethrowing.
+            closeQuietly(resultCountArenaLocal);
+            closeQuietly(arrayArenaLocal);
+            throw e;
+        }
+        this.arrayArena = arrayArenaLocal;
+        this.nativeArray = nativeArrayLocal;
+        this.resultCountArena = resultCountArenaLocal;
+        this.resultCountSegment = resultCountSegmentLocal;
+    }
+
+
+    /**
+     * Closes an arena while constructing or resizing, ignoring a close
+     * failure: the original allocation error is the one that must propagate.
+     *
+     * @param arena The arena to close (may be {@code null})
+     */
+    private static void closeQuietly(Arena arena) {
+        if (arena != null) {
+            try {
+                arena.close();
+            } catch (Throwable t) {
+                // Ignore - the allocation failure is the reportable error
+            }
+        }
     }
 
 
@@ -155,23 +188,7 @@ public class QuicPollSet {
         long key = item.getSsl().address();
         QuicPollItem previous = items.get(key);
         if (previous != null) {
-            // Re-adding a tracked address is not supported: the existing
-            // item's want-events mask is managed cooperatively by the
-            // endpoint (dispatchStreamEvent strips R/W, the processor re-arms
-            // them). Overwriting that mask with the fresh item's initial mask
-            // loses the current interest, and disposing the caller's item can
-            // make its later setWantEvents() calls ineffective. Report the
-            // regression and keep the existing item unchanged.
-            log.warn(sm.getString("quicPollSet.duplicateAdd",
-                    Long.toHexString(key)));
-            if (previous != item) {
-                item.dispose();
-            } else {
-                // The same item was re-added: preserve any want-events update
-                // made just before the call by forcing a native rewrite.
-                item.markDirty();
-                changed = true;
-            }
+            handleDuplicateAdd(item, previous);
             return;
         }
         if (count == capacity) {
@@ -182,14 +199,7 @@ public class QuicPollSet {
         // was never placed in the slots/native array.
         previous = items.putIfAbsent(key, item);
         if (previous != null) {
-            log.warn(sm.getString("quicPollSet.duplicateAdd",
-                    Long.toHexString(key)));
-            if (previous != item) {
-                item.dispose();
-            } else {
-                item.markDirty();
-                changed = true;
-            }
+            handleDuplicateAdd(item, previous);
             return;
         }
         slots[count] = item;
@@ -197,6 +207,32 @@ public class QuicPollSet {
         count++;
         item.markDirty();
         changed = true;
+    }
+
+
+    /**
+     * Handles an address that is already tracked in the set. Re-adding a
+     * tracked address is not supported: the existing item's want-events mask
+     * is managed cooperatively by the endpoint (dispatchStreamEvent strips
+     * R/W, the processor re-arms them). Overwriting that mask with the fresh
+     * item's initial mask loses the current interest, and disposing the
+     * caller's item can make its later setWantEvents() calls ineffective.
+     * Report the regression and keep the existing item unchanged; re-adding
+     * the same item itself still forces a native rewrite so a want-events
+     * update made just before the call is preserved.
+     *
+     * @param item     The item being added
+     * @param previous The item already tracked for the same SSL address
+     */
+    private void handleDuplicateAdd(QuicPollItem item, QuicPollItem previous) {
+        log.warn(sm.getString("quicPollSet.duplicateAdd",
+                Long.toHexString(item.getSsl().address())));
+        if (previous != item) {
+            item.dispose();
+        } else {
+            item.markDirty();
+            changed = true;
+        }
     }
 
 

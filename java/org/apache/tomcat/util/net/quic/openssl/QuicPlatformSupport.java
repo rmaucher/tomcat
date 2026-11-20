@@ -40,7 +40,10 @@ import org.apache.tomcat.util.res.StringManager;
  * The OpenSSL QUIC endpoint is currently implemented only for Linux LP64. The
  * selector returns a {@link QuicPlatformUnavailable} implementation for every
  * other OS or ABI; the endpoint then reports why it is unavailable instead of
- * binding with a mismatched native ABI.
+ * binding with a mismatched native ABI. An explicit operator override that is
+ * not recognized (or an override class that cannot be loaded) also selects an
+ * unavailable implementation: the selector fails closed instead of silently
+ * falling back to automatic selection.
  * <p>
  * This class is package-private and is not a supported public API. The
  * package-private {@link #selectForTest(String)} hook exists for tests; the
@@ -82,17 +85,7 @@ abstract class QuicPlatformSupport {
             return selectClass(className.trim());
         }
 
-        String osName = System.getProperty("os.name", "").toLowerCase(Locale.ENGLISH);
-        if (osName.startsWith("linux")) {
-            try {
-                return initialize(new QuicLinuxPlatformSupport());
-            } catch (Throwable t) {
-                return new QuicPlatformUnavailable(osName, System.getProperty("os.arch", ""),
-                        t.toString());
-            }
-        }
-        return new QuicPlatformUnavailable(osName, System.getProperty("os.arch", ""),
-                sm.getString("quicPlatform.unsupportedOs", osName));
+        return selectAuto();
     }
 
 
@@ -103,12 +96,7 @@ abstract class QuicPlatformSupport {
                     sm.getString("quicPlatform.disabled"));
         }
         if ("linux".equalsIgnoreCase(value)) {
-            try {
-                return initialize(new QuicLinuxPlatformSupport());
-            } catch (Throwable t) {
-                return new QuicPlatformUnavailable("linux", System.getProperty("os.arch", ""),
-                        t.toString());
-            }
+            return selectLinux();
         }
         // macOS/BSD/Windows implementations are future work. Keep the names
         // recognized so tests and diagnostics can force the unavailable path.
@@ -117,23 +105,34 @@ abstract class QuicPlatformSupport {
             return new QuicPlatformUnavailable(value, System.getProperty("os.arch", ""),
                     sm.getString("quicPlatform.unsupportedOs", value));
         }
-        log.warn(sm.getString("quicPlatform.overrideInvalid", value));
-        return selectAuto();
+        // An invalid explicit override is a configuration error. Falling back
+        // to automatic selection could silently enable QUIC when the operator
+        // intended to disable or test it, so fail closed instead.
+        String reason = sm.getString("quicPlatform.overrideInvalid",
+                value);
+        log.warn(reason);
+        return new QuicPlatformUnavailable(value,
+                System.getProperty("os.arch", ""), reason);
     }
 
 
     private static QuicPlatformSupport selectAuto() {
         String osName = System.getProperty("os.name", "").toLowerCase(Locale.ENGLISH);
         if (osName.startsWith("linux")) {
-            try {
-                return initialize(new QuicLinuxPlatformSupport());
-            } catch (Throwable t) {
-                return new QuicPlatformUnavailable(osName, System.getProperty("os.arch", ""),
-                        t.toString());
-            }
+            return selectLinux();
         }
         return new QuicPlatformUnavailable(osName, System.getProperty("os.arch", ""),
                 sm.getString("quicPlatform.unsupportedOs", osName));
+    }
+
+
+    private static QuicPlatformSupport selectLinux() {
+        try {
+            return initialize(new QuicLinuxPlatformSupport());
+        } catch (Throwable t) {
+            return new QuicPlatformUnavailable("linux",
+                    System.getProperty("os.arch", ""), t.toString());
+        }
     }
 
 
@@ -324,15 +323,6 @@ abstract class QuicPlatformSupport {
 
 
     /**
-     * Address families used by the socket layer.
-     */
-    enum AddressFamily {
-        INET,
-        INET6
-    }
-
-
-    /**
      * Opaque native socket handle.
      */
     static final class SocketHandle {
@@ -356,11 +346,6 @@ abstract class QuicPlatformSupport {
 
         boolean markClosed() {
             return closed.compareAndSet(false, true);
-        }
-
-        @Override
-        public String toString() {
-            return Long.toString(value);
         }
     }
 
@@ -395,43 +380,18 @@ abstract class QuicPlatformSupport {
 
         private static final long serialVersionUID = 1L;
 
-        private final String operation;
-        private final int nativeCode;
-        private final String nativeMessage;
-        private final boolean interrupted;
         private final boolean addressFamilyUnavailable;
         private final boolean addressNotAvailable;
         private final boolean permissionDenied;
 
         QuicPlatformException(String operation, int nativeCode,
-                String nativeMessage, boolean interrupted,
-                boolean addressFamilyUnavailable, boolean addressNotAvailable,
-                boolean permissionDenied) {
+                String nativeMessage, boolean addressFamilyUnavailable,
+                boolean addressNotAvailable, boolean permissionDenied) {
             super(operation + " failed: " + nativeMessage +
                     " (error=[" + nativeCode + "])");
-            this.operation = operation;
-            this.nativeCode = nativeCode;
-            this.nativeMessage = nativeMessage;
-            this.interrupted = interrupted;
             this.addressFamilyUnavailable = addressFamilyUnavailable;
             this.addressNotAvailable = addressNotAvailable;
             this.permissionDenied = permissionDenied;
-        }
-
-        String operation() {
-            return operation;
-        }
-
-        int nativeCode() {
-            return nativeCode;
-        }
-
-        String nativeMessage() {
-            return nativeMessage;
-        }
-
-        boolean isInterrupted() {
-            return interrupted;
         }
 
         boolean isAddressFamilyUnavailable() {

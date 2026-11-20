@@ -22,8 +22,10 @@ import java.lang.foreign.ValueLayout;
 
 /**
  * Per-item state wrapper for one entry in the endpoint's {@code SSL_poll()}
- * set: the native {@code SSL_POLL_ITEM} struct and the want/revents
- * bookkeeping for a single listener, connection or stream.
+ * set. It represents one listener, connection or stream and holds that
+ * item's want/revents bookkeeping; its {@code writeTo()} method materialises
+ * the corresponding {@code SSL_POLL_ITEM} struct into the poll set's shared
+ * native array (the item does not own a native struct itself).
  * <p>
  * The protocol constants, the native struct layout math and the
  * {@code SSL_poll()} driver are the binding-level building blocks and live in
@@ -65,13 +67,12 @@ public class QuicPollItem {
     private volatile boolean dirty;
 
     /**
-     * Events we want to monitor. Read and written only on the endpoint's
-     * poll thread: workers reach it through a submitted poll task (see
-     * {@code QuicOpenSSLSocketWrapper.resumeInterest()}), so the read-
-     * modify-write in setWantEvents() needs no synchronisation and the
-     * field is deliberately not volatile - a cross-thread read is not
-     * guaranteed to observe the latest mask and is acceptable only for
-     * diagnostics.
+     * Events we want to monitor. Read and written only on the endpoint's poll
+     * thread: workers reach it through a submitted poll task (see
+     * {@code QuicOpenSSLSocketWrapper.resumeInterest()}), so the
+     * read-modify-write in setWantEvents() needs no synchronisation and the
+     * field is deliberately not volatile. All call sites are poll-thread
+     * confined; there is no cross-thread read of this field.
      */
     private long wantEvents;
 

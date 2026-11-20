@@ -44,14 +44,16 @@ import org.apache.tomcat.util.res.StringManager;
  * bindings in {@code openssl_h}.
  * <p>
  * The list below summarizes the main groups of functions bound here; the
- * individual fields are the authoritative list (OpenSSL manages QUIC I/O
- * internally, so only the symbols actually called by the endpoint are bound):
+ * individual fields are the authoritative list. OpenSSL manages QUIC I/O
+ * internally, so the list is limited to the endpoint's native surface plus a
+ * few compatibility definitions retained for callers/tests; every bound
+ * symbol is also required by the {@code QUIC_AVAILABLE} probe:
  * <ul>
  * <li>{@code OSSL_QUIC_server_method()}</li>
  * <li>{@code SSL_new_listener()}, {@code SSL_listen()}, {@code SSL_accept_connection()}</li>
  * <li>{@code SSL_new_stream()}, {@code SSL_accept_stream()}</li>
- * <li>{@code SSL_read_ex()}, {@code SSL_write_ex()}, {@code SSL_write_ex2()},
- *     {@code SSL_get_error()}</li>
+ * <li>{@code SSL_read_ex()}, {@code SSL_write_ex2()} (the endpoint's write
+ *     path), {@code SSL_get_error()}</li>
  * <li>{@code SSL_poll()}, {@code SSL_handle_events()},
  *     {@code SSL_get_event_timeout()} (the poll loop's wait cap),
  *     {@code SSL_shutdown_ex()}</li>
@@ -67,6 +69,7 @@ import org.apache.tomcat.util.res.StringManager;
  *     {@code SSL_get_peer_addr()} (with the {@code BIO_ADDR_family()} /
  *     {@code BIO_ADDR_rawaddress()} / {@code BIO_ADDR_rawport()} accessors)</li>
  * <li>{@code SSL_get_servername()}, {@code SSL_get0_alpn_selected()},
+ *     {@code SSL_is_init_finished()}, {@code SSL_CTX_set_num_tickets()},
  *     {@code SSL_use_certificate()}, {@code SSL_use_PrivateKey()}</li>
  * <li>{@code SSL_ctrl()}, {@code SSL_CTX_callback_ctrl()}
  *     (used for the SNI callback and chain certificate management, which are
@@ -483,32 +486,6 @@ public class QuicBindings {
     }
 
     /**
-     * {@code int SSL_write_ex(SSL *s, const void *buf, size_t num, size_t *written)}
-     */
-    public static final MethodHandle SSL_write_ex$handle =
-            createHandle("SSL_write_ex",
-                    FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER,
-                            openssl_h.C_POINTER, ABI.sizeT(), openssl_h.C_POINTER));
-
-    /**
-     * {@code int SSL_write_ex(SSL *s, const void *buf, size_t num, size_t *written)}
-     *
-     * @param s       The stream SSL object
-     * @param buf     The buffer containing the data to write
-     * @param num     The number of bytes to write
-     * @param written Out parameter receiving the number of bytes written
-     * @return One on success or zero on failure
-     */
-    public static int SSL_write_ex(MemorySegment s, MemorySegment buf, long num,
-            MemorySegment written) {
-        try {
-            return (int) SSL_write_ex$handle.invokeExact(s, buf, num, written);
-        } catch (Throwable t) {
-            throw new AssertionError("should not reach here", t);
-        }
-    }
-
-    /**
      * {@code int SSL_write_ex2(SSL *s, const void *buf, size_t num, uint64_t flags, size_t *written)}
      * Extended write with flags support. This endpoint writes with {@code flags = 0}
      * and concludes via the separate {@code SSL_stream_conclude()} step (see
@@ -733,16 +710,15 @@ public class QuicBindings {
     public static final int SSL_VALUE_CLASS_FEATURE_REQUEST = 1;
 
     // SSL value IDs
-    // The *_AVAIL stream values are read-only in OpenSSL 3.5/4.0: they must
-    // be queried with SSL_get_value_uint() and SSL_VALUE_CLASS_GENERIC (the
-    // BIDI/UNI _REMOTE_AVAIL pair is the stream-count flow-control credit
-    // left to the peer, i.e. the initial_max_streams_bidi/uni the local
-    // endpoint advertised, less the streams the peer has already opened).
-    // SSL_set_value_uint() only supports SSL_VALUE_QUIC_IDLE_TIMEOUT and
-    // SSL_VALUE_EVENT_HANDLING_MODE, so the transport cannot be instructed to
-    // advertise a configured concurrency limit.
-    /** Value ID: bidirectional-stream creation credit available locally. */
-    public static final int SSL_VALUE_QUIC_STREAM_BIDI_LOCAL_AVAIL = 1;
+    // The *_AVAIL stream values are read-only: they must be queried with
+    // SSL_get_value_uint() and SSL_VALUE_CLASS_GENERIC (the BIDI/UNI
+    // _REMOTE_AVAIL pair is the stream-count flow-control credit left to the
+    // peer, i.e. the initial_max_streams_bidi/uni the local endpoint
+    // advertised, less the streams the peer has already opened).
+    // SSL_set_value_uint() supports the idle timeout, event-handling mode,
+    // max-pending-connections and several window/ACK values, but it has no
+    // case for the *_AVAIL stream credit IDs, so the transport cannot be
+    // instructed to advertise a configured concurrency limit.
     /** Value ID: bidirectional-stream credit advertised to the peer. */
     public static final int SSL_VALUE_QUIC_STREAM_BIDI_REMOTE_AVAIL = 2;
     /** Value ID: unidirectional-stream creation credit available locally. */
@@ -1050,8 +1026,6 @@ public class QuicBindings {
     public static final int SSL_CTRL_MODE = 33;
     /** {@code SSL_CTX_ctrl()} command: set the SNI callback. */
     public static final int SSL_CTRL_SET_TLSEXT_SERVERNAME_CB = 53;
-    /** {@code SSL_CTX_ctrl()} command: set the SNI callback argument. */
-    public static final int SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG = 54;
     /**
      * {@code SSL_set0_chain}/{@code SSL_clear_chain_certs} macro command.
      * With {@code larg = 0} and {@code parg = NULL} it frees the chain of
@@ -1094,6 +1068,30 @@ public class QuicBindings {
      * the original one.
      */
     public static final int SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = 0x00000002;
+
+    /**
+     * {@code int SSL_is_init_finished(const SSL *s)}
+     * Returns one once the handshake has completed, zero while it is still in
+     * progress. The QUIC bootstrap uses it to distinguish "ALPN not available
+     * yet" from "handshake complete without an ALPN extension".
+     */
+    public static final MethodHandle SSL_is_init_finished$handle =
+            createHandle("SSL_is_init_finished",
+                    FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER));
+
+    /**
+     * {@code int SSL_is_init_finished(const SSL *s)}
+     *
+     * @param s The SSL object
+     * @return One if the handshake has completed, zero otherwise
+     */
+    public static int SSL_is_init_finished(MemorySegment s) {
+        try {
+            return (int) SSL_is_init_finished$handle.invokeExact(s);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
 
     /**
      * {@code const char *SSL_get_servername(const SSL *s, int type)}
@@ -1374,6 +1372,31 @@ public class QuicBindings {
     }
 
     /**
+     * {@code int SSL_CTX_set_num_tickets(SSL_CTX *ctx, size_t num_tickets)}
+     * Sets how many TLS 1.3 session tickets the context issues after a full
+     * handshake.
+     */
+    public static final MethodHandle SSL_CTX_set_num_tickets$handle =
+            createHandle("SSL_CTX_set_num_tickets",
+                    FunctionDescriptor.of(openssl_h.C_INT, openssl_h.C_POINTER,
+                            ABI.sizeT()));
+
+    /**
+     * {@code int SSL_CTX_set_num_tickets(SSL_CTX *ctx, size_t num_tickets)}
+     *
+     * @param ctx        The SSL context
+     * @param numTickets Number of tickets to issue (zero disables tickets)
+     * @return One on success or zero on failure
+     */
+    public static int SSL_CTX_set_num_tickets(MemorySegment ctx, long numTickets) {
+        try {
+            return (int) SSL_CTX_set_num_tickets$handle.invokeExact(ctx, numTickets);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
      * {@code unsigned long ERR_get_error(void)}
      */
     public static final MethodHandle ERR_get_error$handle =
@@ -1387,6 +1410,26 @@ public class QuicBindings {
     public static long ERR_get_error() {
         try {
             return (long) ERR_get_error$handle.invokeExact();
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
+     * {@code unsigned long ERR_peek_error(void)}
+     */
+    public static final MethodHandle ERR_peek_error$handle =
+            createHandle("ERR_peek_error", FunctionDescriptor.of(ABI.cLong()));
+
+    /**
+     * {@code unsigned long ERR_peek_error(void)}
+     *
+     * @return The oldest queued OpenSSL error code without removing it, or
+     *         zero when the queue is empty
+     */
+    public static long ERR_peek_error() {
+        try {
+            return (long) ERR_peek_error$handle.invokeExact();
         } catch (Throwable t) {
             throw new AssertionError("should not reach here", t);
         }

@@ -25,6 +25,7 @@ import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -280,7 +281,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                 if (conn.isClosed() || conn.isFreed()) {
                     return;
                 }
-                QuicBindings.SSL_handle_events(conn.getSsl());
+                endpoint.handleEvents(conn.getSsl(), "stream pump");
             });
         } catch (IOException e) {
             // Ignore - the poll loop will surface any real errors
@@ -588,11 +589,20 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         if (stream == null) {
             return;
         }
-        if (!concludeStream(stream)) {
-            throw new IOException(sm.getString("socketWrapper.quicConcludeFailed",
-                    QuicDiagnostics.dumpErrorQueue()));
+        // Serialize the conclusion with every write/staging operation. The
+        // FIN must not land between two partial SSL_write_ex2() hops, and a
+        // write hop must not run after the terminal FINISHED state. A
+        // conclusion triggered from within a write path re-enters the lock.
+        writeLock.lock();
+        try {
+            if (!concludeStream(stream)) {
+                throw new IOException(sm.getString("socketWrapper.quicConcludeFailed",
+                        QuicDiagnostics.dumpErrorQueue()));
+            }
+            stream.setConcluded();
+        } finally {
+            writeLock.unlock();
         }
-        stream.setConcluded();
     }
 
 
@@ -626,8 +636,17 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         if (stream == null) {
             return false;
         }
-        Boolean done = onPollThread(() -> endpoint.resetStream(stream, errorCode));
-        return done != null && done;
+        // The reset discards the stream at the point the caller observes,
+        // including any partially staged write data; it must not race a
+        // concurrent write. A reset triggered from within a write re-enters
+        // the lock.
+        writeLock.lock();
+        try {
+            Boolean done = onPollThread(() -> endpoint.resetStream(stream, errorCode));
+            return done != null && done;
+        } finally {
+            writeLock.unlock();
+        }
     }
 
 
@@ -1110,12 +1129,12 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
 
     /**
-     * Sendfile data for QUIC streams. Since QUIC doesn't support kernel-level
-     * zero-copy sendfile, it is emulated by reading from the file and writing
-     * the bytes to the QUIC stream via {@code doWrite()}. The bytes are
-     * written raw - no HTTP/3 DATA-frame framing happens here - so this path
-     * is defensive only: the HTTP/3 connector disables sendfile and frames
-     * response bodies as DATA frames in the processor.
+     * Sendfile data holder for QUIC streams. QUIC has no kernel-level
+     * zero-copy sendfile, and this transport does not implement a read+write
+     * emulation: {@link #processSendfile(SendfileDataBase)} fails closed with
+     * {@link SendfileState#ERROR} because writing raw bytes here would bypass
+     * the HTTP/3 DATA-frame framing performed by the processor. The HTTP/3
+     * connector disables sendfile for that reason.
      */
     private static class QuicSendfileData extends SendfileDataBase {
 
@@ -1186,6 +1205,13 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                 if (log.isDebugEnabled()) {
                     log.debug(sm.getString("socketWrapper.quicCloseInterrupted"), t);
                 }
+            } else if (isShutdownRejection(t)) {
+                // The endpoint poll thread has already stopped and the mailbox
+                // rejects new hops. The stop path owns the stream cleanup;
+                // this is expected shutdown noise, not a close failure.
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("socketWrapper.quicCloseRejected"), t);
+                }
             } else {
                 // A close failure leaves native state behind; surface it
                 // unconditionally rather than hiding it behind a debug guard.
@@ -1213,6 +1239,25 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     private static boolean isInterrupted(Throwable t) {
         for (Throwable c = t; c != null; c = c.getCause()) {
             if (c instanceof InterruptedException) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    /**
+     * Whether the failure surface wraps a {@link RejectedExecutionException},
+     * i.e. the endpoint poll thread/mailbox has already stopped and the close
+     * hop was intentionally refused during shutdown.
+     *
+     * @param t The failure to inspect
+     *
+     * @return {@code true} if a rejection appears in the cause chain
+     */
+    private static boolean isShutdownRejection(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof RejectedExecutionException) {
                 return true;
             }
         }
@@ -1272,7 +1317,8 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         @Override
         public void run() {
             long nBytes = 0;
-            if (getError() == null) {
+            IOException error = getError();
+            if (error == null) {
                 try {
                     synchronized (this) {
                         if (!completionDone) {
@@ -1361,9 +1407,42 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                         completion.failed(ioe, this);
                     }
                     return;
+                } catch (RuntimeException | Error e) {
+                    // read()/doWrite() can throw unchecked exceptions too (for
+                    // example RejectedExecutionException/IllegalStateException
+                    // when the poll thread or mailbox is gone during shutdown).
+                    // The NIO2 completion must still be resolved, otherwise the
+                    // application's pending async operation hangs forever.
+                    ExceptionUtils.handleThrowable(e);
+                    if (nBytes > 0) {
+                        completion.completed(Long.valueOf(nBytes), this);
+                    } else {
+                        completion.failed(e, this);
+                    }
+                    return;
+                }
+            } else {
+                // An error recorded by the wrapper (closed stream, failed poll
+                // hop, ...) must fail the operation. Falling through to
+                // completed(0) would make the completion check re-run this
+                // state and recurse until a StackOverflowError.
+                completion.failed(error, this);
+                return;
+            }
+            if (nBytes > 0 || !buffersArrayHasRemaining(buffers, offset, length)) {
+                completion.completed(Long.valueOf(nBytes), this);
+            } else {
+                // Would-block with no progress: leave the operation pending,
+                // like NioEndpoint, and register interest so the poll loop
+                // wakes the operation once the stream can make progress.
+                // Completing with 0 here would make COMPLETE_READ/WRITE
+                // return CONTINUE and re-run this state recursively.
+                if (read) {
+                    registerReadInterest();
+                } else {
+                    registerWriteInterest();
                 }
             }
-            completion.completed(Long.valueOf(nBytes), this);
         }
     }
 

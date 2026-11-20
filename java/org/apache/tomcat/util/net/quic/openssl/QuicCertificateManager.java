@@ -53,9 +53,16 @@ import org.apache.tomcat.util.res.StringManager;
  * {@link SSLHostConfig}) and it owns no thread of its own. The native
  * certificate context is created once during bind and released during
  * unbind; the certificate snapshot is swapped in on the endpoint's poll
- * thread so it is serialized with the SNI callback. The same manager is also
- * used by the ngtcp2 transport adapter with a normal
+ * thread so it is serialized with the SNI callback, or on the calling thread
+ * when no poll loop is running (stopped/unbound lifecycle). The same manager
+ * is also used by the ngtcp2 transport adapter with a normal
  * {@code TLS_server_method()} context.
+ * <p>
+ * Server certificates and TLS 1.3 pre-shared keys are supported. Client
+ * certificate verification is not implemented (optional verification is
+ * warned about; required verification fails the build). OCSP stapling and
+ * CRL/revocation configuration are not loaded; configuring them produces a
+ * warning because the settings would otherwise be silently ignored.
  */
 public class QuicCertificateManager {
 
@@ -113,6 +120,12 @@ public class QuicCertificateManager {
     private boolean pskOptionWarned;
 
     /**
+     * Set once the PSK-only (no-DHE) forward-secrecy tradeoff was reported, so
+     * a certificate reload or context re-initialisation does not repeat it.
+     */
+    private boolean pskOnlyNoDheWarned;
+
+    /**
      * Last time the missing-certificate warning was emitted for an SNI host,
      * so a client repeatedly requesting a configured-but-unloadable host
      * cannot flood the log at handshake rate.
@@ -164,15 +177,25 @@ public class QuicCertificateManager {
      * Installs the initial certificate snapshot and creates the native
      * {@code SSL_CTX} with its ALPN and SNI callbacks. Called once from the
      * endpoint's {@code initialiseSsl()} before the per-host TLS information
-     * is populated.
+     * is populated. A second call while the context is still initialized is
+     * rejected (it would otherwise overwrite and leak the live context and its
+     * callback arenas); call {@link #release()} first for a restart.
      *
      * @param initialConfig The certificate snapshot built by the endpoint
      *                      before this call
      *
+     * @throws IllegalStateException If the manager is already initialized
      * @throws Exception If the context or a callback could not be created
      */
     public synchronized void initialize(QuicCertConfig initialConfig)
             throws Exception {
+        if (sslCtx != null && !sslCtx.equals(MemorySegment.NULL)) {
+            // Re-initializing would overwrite (and leak) the live SSL_CTX and
+            // its callback arenas while the listener/connections still use the
+            // old generation. Release first for a restart.
+            throw new IllegalStateException(sm.getString(
+                    "quicEndpoint.certificateManagerAlreadyInitialized"));
+        }
         certConfig = initialConfig;
         createNativeSslContext();
     }
@@ -221,6 +244,21 @@ public class QuicCertificateManager {
                     "quicEndpoint.tlsVersionSetError",
                     Long.valueOf(minVersionRc), Long.valueOf(maxVersionRc)));
         }
+
+        // Session resumption is deliberately disabled. All SNI hosts share
+        // this one SSL_CTX, and OpenSSL does not associate a TLS 1.3 session
+        // with the SNI of the ClientHello that established it: a ticket from
+        // one host could be resumed under another, bypassing that host's
+        // pre-shared-key policy. Ticket keys also survive swapConfig(), so a
+        // PSK removal would not revoke tickets already held by clients.
+        // Without per-host session/ticket isolation there is no safe
+        // resumption policy for virtual hosts, so issue no tickets at all.
+        if (QuicBindings.SSL_CTX_set_num_tickets(sslCtx, 0) != 1) {
+            throw new java.io.IOException(
+                    sm.getString("quicEndpoint.sessionTicketPolicyError"));
+        }
+        openssl_h_Compatibility.SSL_CTX_set_options(sslCtx,
+                openssl_h.SSL_OP_NO_TICKET());
 
         // Enable partial and moving-buffer writes on the TLS context. The
         // standard TLS stack (used by the ngtcp2 transport's
@@ -288,9 +326,11 @@ public class QuicCertificateManager {
      * key exchange mode for that, which OpenSSL only lets the server select
      * when SSL_OP_ALLOW_NO_DHE_KEX is set. Without the option (a mixed
      * certificate + pre-shared key endpoint) a resolved identity still
-     * produces a pre-shared key handshake, but in the DHE mode with the
-     * certificate as additional authenticator - the forward-secure shape
-     * preferred for hosts that have a certificate.
+     * produces a pre-shared key handshake, but in the DHE mode. When the
+     * serving host also has a certificate, that certificate is an additional
+     * authenticator (the forward-secure shape preferred for hosts that have a
+     * certificate); a mixed endpoint whose serving host has no certificate
+     * gets a DHE PSK handshake without a certificate.
      * <p>
      * The option is applied to the context, so it governs connections created
      * from now on; already handshaken connections keep the options they
@@ -307,6 +347,10 @@ public class QuicCertificateManager {
         QuicCertConfig config = certConfig;
         boolean wantOption = config != null && config.pskOnly;
         if (wantOption) {
+            if (!pskOnlyNoDheWarned) {
+                pskOnlyNoDheWarned = true;
+                log.warn(sm.getString("quicEndpoint.pskOnlyNoForwardSecrecy"));
+            }
             openssl_h_Compatibility.SSL_CTX_set_options(sslCtx,
                     QuicBindings.SSL_OP_ALLOW_NO_DHE_KEX);
         } else {
@@ -316,10 +360,15 @@ public class QuicCertificateManager {
         boolean optionSet =
                 (openssl_h_Compatibility.SSL_CTX_get_options(sslCtx)
                         & QuicBindings.SSL_OP_ALLOW_NO_DHE_KEX) != 0;
-        if (optionSet != wantOption && !pskOptionWarned) {
-            pskOptionWarned = true;
-            log.warn(sm.getString("quicEndpoint.pskOnlyOptionRejected",
-                    Boolean.valueOf(wantOption)));
+        if (optionSet != wantOption) {
+            // Handled non-fatal native failure: drain the error queue entry so
+            // it cannot be mistaken for a later accept failure.
+            QuicDiagnostics.clearErrorQueue();
+            if (!pskOptionWarned) {
+                pskOptionWarned = true;
+                log.warn(sm.getString("quicEndpoint.pskOnlyOptionRejected",
+                        Boolean.valueOf(wantOption)));
+            }
         }
     }
 
@@ -345,9 +394,11 @@ public class QuicCertificateManager {
                 // TLS 1.3 suite list in place on parse failure. Continuing
                 // would silently serve suites the operator did not configure,
                 // so fail the configuration like the ngtcp2 transport does.
-                throw new IllegalArgumentException(sm.getString(
+                String message = sm.getString(
                         "quicEndpoint.cipherSuitesSetError",
-                        config.cipherSuites, Integer.valueOf(rc)));
+                        config.cipherSuites, Integer.valueOf(rc));
+                QuicDiagnostics.clearErrorQueue();
+                throw new IllegalArgumentException(message);
             }
         }
     }
@@ -717,7 +768,22 @@ public class QuicCertificateManager {
      */
     private List<CertificateLoader.CertificateEntry> resolveCertEntries(
             MemorySegment ssl, QuicCertConfig config) {
-        String hostKey = resolveServingHostKey(ssl, config);
+        return resolveCertEntries(config, resolveServingHostKey(ssl, config));
+    }
+
+
+    /**
+     * Resolves the certificate entries for an already resolved serving host
+     * key, so callers that need both the entries and the host's PSK selector
+     * (the find-session callback) read the native SNI value only once.
+     *
+     * @param config  The current configuration snapshot
+     * @param hostKey The lower-cased serving host key
+     *
+     * @return The entries of the serving host
+     */
+    private List<CertificateLoader.CertificateEntry> resolveCertEntries(
+            QuicCertConfig config, String hostKey) {
         List<CertificateLoader.CertificateEntry> entries =
                 config.certsByHost.get(hostKey);
         if (entries != null) {
@@ -732,10 +798,12 @@ public class QuicCertificateManager {
         }
         // The name matched a specifically configured host whose certificates
         // failed to load (a pre-shared key-only host is mapped to an empty
-        // list and handled above, so it never reaches this branch).
-        // Presenting the default host's certificate would silently serve a
-        // name-mismatched identity; apply nothing so the handshake fails
-        // visibly for this host.
+        // list and handled above, so it never reaches this branch). The
+        // configuration builder rejects a host that also has pre-shared keys,
+        // so no PSK selector can make this handshake succeed. Presenting the
+        // default host's certificate would silently serve a name-mismatched
+        // identity; apply nothing so the handshake fails visibly for this
+        // host.
         long now = System.currentTimeMillis();
         if (now - lastSniMissingLogMs >= SNI_MISSING_LOG_INTERVAL_MS) {
             lastSniMissingLogMs = now;
@@ -928,9 +996,11 @@ public class QuicCertificateManager {
         if (config == null) {
             return null;
         }
-        applyCertEntries(ssl, resolveCertEntries(ssl, config));
-        // Same serving-host resolution as the SNI certificate callback.
+        // Resolve the serving host once and use it for both the certificate
+        // entries and the PSK selector instead of reading the native SNI
+        // value twice per PSK handshake.
         String hostKey = resolveServingHostKey(ssl, config);
+        applyCertEntries(ssl, resolveCertEntries(config, hostKey));
         OpenSSLPreSharedKeySelector selector =
                 config.pskByHost.get(hostKey);
         if (selector == null && hostKey.equals(config.defaultHostName)) {

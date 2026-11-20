@@ -269,18 +269,28 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
      * wildcard or a global address is unaffected; an explicit link-local
      * address with a scope fails rather than silently binding the wrong
      * interface.
+     * <p>
+     * {@code IPV6_V6ONLY} is set explicitly: 0 for the dual-stack wildcard
+     * candidate, 1 for every other IPv6 bind, so an explicit IPv6 address
+     * cannot inherit a system default that also accepts IPv4-mapped
+     * connections.
      */
     @Override
     BoundUdpSocket bindUdpSocket(InetAddress address, int port,
             UdpSocketOptions options) throws QuicPlatformException {
         boolean ipv6 = address instanceof Inet6Address;
         int af = ipv6 ? AF_INET6 : AF_INET;
-        int socketFd = invokeInt(socket$handle, "socket", af,
-                SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        int socketFd;
+        int socketError;
+        do {
+            socketFd = invokeInt(socket$handle, "socket", af,
+                    SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            socketError = socketFd < 0 ? errno() : 0;
+        } while (socketFd < 0 && socketError == EINTR);
         if (socketFd < 0) {
-            int error = errno();
-            throw failure("socket", error,
-                    options.dualStack() && ipv6 && isAddressFamilyError(error));
+            throw failure("socket", socketError,
+                    options.dualStack() && ipv6 &&
+                            isAddressFamilyError(socketError));
         }
 
         try (Arena arena = Arena.ofConfined()) {
@@ -294,24 +304,34 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                 setIntOption(arena, socketFd, SOL_SOCKET, SO_SNDBUF,
                         txBufSize, "SO_SNDBUF", false);
             }
-            if (ipv6 && options.dualStack()) {
+            if (ipv6) {
+                // The IPv6 wildcard default explicitly chooses dual-stack.
+                // Every other IPv6 bind (including an explicit wildcard
+                // address) is IPv6-only: leaving IPV6_V6ONLY at the system
+                // default would let it accept IPv4-mapped connections on
+                // systems whose default is 0.
                 setIntOption(arena, socketFd, IPPROTO_IPV6, IPV6_V6ONLY,
-                        0, "IPV6_V6ONLY", true);
+                        options.dualStack() ? 0 : 1, "IPV6_V6ONLY", true);
             }
 
             MemorySegment sockaddr = ipv6 ? buildSockaddrIn6(arena, address, port) :
                     buildSockaddrIn4(arena, address, port);
             int addrlen = ipv6 ? 28 : 16;
-            int rc = invokeInt(bind$handle, "bind", socketFd, sockaddr, addrlen);
+            int rc;
+            int bindError;
+            do {
+                rc = invokeInt(bind$handle, "bind", socketFd, sockaddr,
+                        addrlen);
+                bindError = rc != 0 ? errno() : 0;
+            } while (rc != 0 && bindError == EINTR);
             if (rc != 0) {
-                int error = errno();
                 // Only EAFNOSUPPORT means the address family itself is
                 // unavailable. EADDRNOTAVAIL/EPERM are classified by their
                 // own predicates below and are still recognized by the
                 // endpoint's dual-stack fallback policy.
-                throw failure("bind", error,
+                throw failure("bind", bindError,
                         options.dualStack() && ipv6 &&
-                                isAddressFamilyError(error));
+                                isAddressFamilyError(bindError));
             }
 
             int actualPort = port;
@@ -319,11 +339,15 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                 MemorySegment nameAddr = arena.allocate(ipv6 ? 28 : 16);
                 MemorySegment nameLen = arena.allocate(ValueLayout.JAVA_INT);
                 nameLen.set(ValueLayout.JAVA_INT, 0, addrlen);
-                int nameRc = invokeInt(getsockname$handle, "getsockname",
-                        socketFd, nameAddr, nameLen);
+                int nameRc;
+                int nameError;
+                do {
+                    nameRc = invokeInt(getsockname$handle, "getsockname",
+                            socketFd, nameAddr, nameLen);
+                    nameError = nameRc != 0 ? errno() : 0;
+                } while (nameRc != 0 && nameError == EINTR);
                 if (nameRc != 0) {
-                    int error = errno();
-                    throw failure("getsockname", error, false);
+                    throw failure("getsockname", nameError, false);
                 }
                 actualPort = ((nameAddr.get(ValueLayout.JAVA_BYTE, 2) & 0xFF) << 8) |
                         (nameAddr.get(ValueLayout.JAVA_BYTE, 3) & 0xFF);
@@ -371,10 +395,14 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
             throws QuicPlatformException {
         MemorySegment valueSegment = arena.allocate(ValueLayout.JAVA_INT);
         valueSegment.set(ValueLayout.JAVA_INT, 0, value);
-        int rc = invokeInt(setsockopt$handle, "setsockopt", socketFd, level,
-                option, valueSegment, 4);
+        int rc;
+        int error;
+        do {
+            rc = invokeInt(setsockopt$handle, "setsockopt", socketFd, level,
+                    option, valueSegment, 4);
+            error = rc != 0 ? errno() : 0;
+        } while (rc != 0 && error == EINTR);
         if (rc != 0) {
-            int error = errno();
             // The caller's familyFailure flag only says that a family-related
             // error may be meaningful for this option. It must not turn an
             // unrelated errno (EINVAL/ENOPROTOOPT/ENOBUFS/...) into an
@@ -387,11 +415,10 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
 
     private QuicPlatformException failure(String operation, int error,
             boolean addressFamilyUnavailable) {
-        boolean interrupted = error == EINTR;
         boolean addressNotAvailable = error == EADDRNOTAVAIL;
         boolean permissionDenied = error == EPERM;
         return new QuicPlatformException(operation, error, strerror(error),
-                interrupted, addressFamilyUnavailable, addressNotAvailable,
+                addressFamilyUnavailable, addressNotAvailable,
                 permissionDenied);
     }
 
@@ -416,13 +443,13 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
     int openSslFd(SocketHandle socket) throws QuicPlatformException {
         if (socket == null || !socket.isValid()) {
             throw new QuicPlatformException("openSslFd", 0,
-                    "invalid socket handle", false, false, false, false);
+                    "invalid socket handle", false, false, false);
         }
         long value = socket.value();
         if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
             throw new QuicPlatformException("openSslFd", 0,
                     "socket handle does not fit in an int: " + value,
-                    false, false, false, false);
+                    false, false, false);
         }
         return (int) value;
     }
@@ -526,7 +553,7 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                 int error = errno();
                 arena.close();
                 throw new QuicPlatformException("eventfd", error,
-                        strerror(error), false, false, false, false);
+                        strerror(error), false, false, false);
             }
             this.wakeFd = fd;
             try {

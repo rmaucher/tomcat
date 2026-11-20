@@ -22,8 +22,11 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.apache.juli.logging.Log;
+import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.net.quic.QuicStream;
 import org.apache.tomcat.util.openssl.openssl_h;
+import org.apache.tomcat.util.res.StringManager;
 
 /**
  * Wraps a QUIC stream (an {@code SSL *} representing a bidirectional or
@@ -34,6 +37,9 @@ import org.apache.tomcat.util.openssl.openssl_h;
  */
 public class QuicStreamWrapper implements QuicStream {
 
+    private static final Log log = LogFactory.getLog(QuicStreamWrapper.class);
+    private static final StringManager sm =
+            StringManager.getManager(QuicOpenSSLEndpoint.class);
     private static final Cleaner cleaner = Cleaner.create();
 
     /**
@@ -224,7 +230,9 @@ public class QuicStreamWrapper implements QuicStream {
         // the stream.
         QuicOpenSSLEndpoint endpoint =
                 (connection != null) ? connection.getEndpoint() : null;
-        State state = new State(ssl, this.freed,
+        AtomicBoolean connectionStreamFreeFailed =
+                (connection != null) ? connection.getStreamFreeFailedFlag() : null;
+        State state = new State(ssl, this.freed, connectionStreamFreeFailed,
                 (endpoint != null) ? endpoint.getCleanerStreamFrees() : null);
         cleaner.register(this, state);
     }
@@ -470,18 +478,47 @@ public class QuicStreamWrapper implements QuicStream {
     }
 
     /**
-     * Frees the native stream SSL object exactly once, atomically. Both
-     * explicit cleanup (closeStream/closeStreamByHandler) and the Cleaner call
-     * the same check-and-free, so {@code SSL_free} runs at most once even if
-     * they race. A stream SSL holds a reference on the owning connection, so
-     * it must be freed before the connection SSL (per SSL_new_stream(3));
-     * {@code SSL_free} on the connection does not free its streams.
+     * Frees the native stream SSL object exactly once, atomically. Explicit
+     * cleanup paths (closeStream/closeStreamByHandler) call this; the
+     * Cleaner's {@link DeferredStreamFree} uses the same shared
+     * {@link AtomicBoolean} and {@code SSL_free} guard instead of calling this
+     * method, so {@code SSL_free} still runs at most once even if they race. A
+     * stream SSL holds a reference on the owning connection, so it must be
+     * freed before the connection SSL (per SSL_new_stream(3)); {@code SSL_free}
+     * on the connection does not free its streams.
      */
     public void freeSslOnce() {
+        freeSslOnce(ssl, freed,
+                connection == null ? null : connection.getStreamFreeFailedFlag());
+    }
+
+
+    /**
+     * Shared single-free guard used by the explicit free path and the
+     * Cleaner's {@link DeferredStreamFree}, so both copies cannot drift on the
+     * freed CAS or the connection stream-free-failure flag.
+     *
+     * @param ssl                       The stream SSL
+     * @param freed                     Shared freed flag
+     * @param connectionStreamFreeFailed Shared connection failure flag, or
+     *                                  {@code null} when there is no connection
+     */
+    static void freeSslOnce(MemorySegment ssl, AtomicBoolean freed,
+            AtomicBoolean connectionStreamFreeFailed) {
         if (freed.getAndSet(true)) {
             return;
         }
-        openssl_h.SSL_free(ssl);
+        try {
+            openssl_h.SSL_free(ssl);
+        } catch (Throwable t) {
+            if (connectionStreamFreeFailed != null) {
+                // A failed SSL_free may have left the native stream object
+                // alive. Keep the connection SSL retained/leaked rather than
+                // freeing it while a stream may still reference it.
+                connectionStreamFreeFailed.set(true);
+            }
+            throw t;
+        }
     }
 
     /**
@@ -503,7 +540,10 @@ public class QuicStreamWrapper implements QuicStream {
      *
      * @return {@code true} if this call claimed the flag and freed the stream
      *         SSL; {@code false} if an executor worker still owns the stream,
-     *         in which case the caller must defer the free to that worker
+     *         or if the owning connection already carries a sticky stream-free
+     *         failure (in which case the caller must retain the connection).
+     *         A free failure raised by this call is thrown, not reported as
+     *         {@code false}.
      */
     public boolean freeSslIfIdle() {
         if (!compareAndSetProcessing(false, true)) {
@@ -514,7 +554,7 @@ public class QuicStreamWrapper implements QuicStream {
         } finally {
             clearProcessing();
         }
-        return true;
+        return connection == null || !connection.hasStreamFreeFailure();
     }
 
     /**
@@ -573,24 +613,25 @@ public class QuicStreamWrapper implements QuicStream {
 
         private final MemorySegment ssl;
         private final AtomicBoolean freed;
+        private final AtomicBoolean connectionStreamFreeFailed;
 
-        DeferredStreamFree(MemorySegment ssl, AtomicBoolean freed) {
+        DeferredStreamFree(MemorySegment ssl, AtomicBoolean freed,
+                AtomicBoolean connectionStreamFreeFailed) {
             this.ssl = ssl;
             this.freed = freed;
+            this.connectionStreamFreeFailed = connectionStreamFreeFailed;
         }
 
         void run() {
-            // CAS with every other free path (closeStream, closeAllStreams,
-            // finishStreamDispatch, stopInternal), and the free must NOT be
-            // skipped when the owning connection is closing: per
-            // SSL_new_stream(3) every stream SSL (which holds a reference on
-            // the connection) must be freed before the connection SSL, and
-            // closeAllStreams() deliberately skips streams whose handler is
-            // still running - so a closing connection can still be waiting on
-            // this free.
-            if (!freed.getAndSet(true)) {
-                openssl_h.SSL_free(ssl);
-            }
+            // Shared single-free guard: CASes with every other free path
+            // (closeStream, closeAllStreams, finishStreamDispatch,
+            // stopInternal), and the free is NOT skipped when the owning
+            // connection is closing: per SSL_new_stream(3) every stream SSL
+            // (which holds a reference on the connection) must be freed
+            // before the connection SSL, and closeAllStreams() deliberately
+            // skips streams whose handler is still running - so a closing
+            // connection can still be waiting on this free.
+            freeSslOnce(ssl, freed, connectionStreamFreeFailed);
         }
     }
 
@@ -603,15 +644,20 @@ public class QuicStreamWrapper implements QuicStream {
         // Shared freed flag (NOT the wrapper) so this State does not keep the
         // QuicStreamWrapper strongly reachable from the static Cleaner.
         private final AtomicBoolean freed;
+        // Shared connection stream-free-failure flag (NOT the wrapper or
+        // connection) so a deferred free failure can retain the connection.
+        private final AtomicBoolean connectionStreamFreeFailed;
         // The endpoint's poll-thread queue for deferred stream frees (NOT the
         // endpoint) so the free decision is serialized with connection
         // teardown. May be null if no endpoint was available.
         private final ConcurrentLinkedQueue<DeferredStreamFree> cleanerStreamFrees;
 
         State(MemorySegment ssl, AtomicBoolean freed,
+                AtomicBoolean connectionStreamFreeFailed,
                 ConcurrentLinkedQueue<DeferredStreamFree> cleanerStreamFrees) {
             this.ssl = ssl;
             this.freed = freed;
+            this.connectionStreamFreeFailed = connectionStreamFreeFailed;
             this.cleanerStreamFrees = cleanerStreamFrees;
         }
 
@@ -620,10 +666,10 @@ public class QuicStreamWrapper implements QuicStream {
             // Never call SSL_free on the GC thread: hand the request to the
             // poll thread, where it is serialized with the connection
             // teardown sequence. The queue is only null for a wrapper
-            // constructed without a connection/endpoint - such a wrapper has
-            // no poll thread and no teardown sequence to race, so freeing
-            // directly (still guarded by the shared freed CAS) is the only
-            // alternative to leaking the stream SSL. The endpoint never
+            // constructed without a connection/endpoint; such a wrapper has
+            // no poll thread to defer to, so leave the native stream SSL
+            // allocated (and log it) rather than violating OpenSSL's
+            // single-threaded QUIC object contract. The endpoint never
             // constructs a wrapper without wiring the connection first, so
             // the fallback is defensive, not a live path.
             //
@@ -641,9 +687,16 @@ public class QuicStreamWrapper implements QuicStream {
                 return;
             }
             if (cleanerStreamFrees != null) {
-                cleanerStreamFrees.add(new DeferredStreamFree(ssl, freed));
+                cleanerStreamFrees.add(new DeferredStreamFree(ssl, freed,
+                        connectionStreamFreeFailed));
             } else {
-                new DeferredStreamFree(ssl, freed).run();
+                // Never call SSL_free on the Cleaner thread: leaving the
+                // native stream allocated is safer than touching OpenSSL
+                // outside the poll-thread confinement. This fallback is
+                // defensive only (endpoint streams always carry a connection
+                // with an endpoint queue), so log it instead of leaking
+                // silently.
+                log.warn(sm.getString("quicEndpoint.cleanerFreeSkipped"));
             }
         }
     }

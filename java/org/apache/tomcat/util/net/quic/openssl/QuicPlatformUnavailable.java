@@ -65,7 +65,7 @@ final class QuicPlatformUnavailable extends QuicPlatformSupport {
     BoundUdpSocket bindUdpSocket(InetAddress address, int port,
             UdpSocketOptions options) throws QuicPlatformException {
         throw new QuicPlatformException("bindUdpSocket", 0, reason, false,
-                false, false, false);
+                false, false);
     }
 
     @Override
@@ -76,7 +76,7 @@ final class QuicPlatformUnavailable extends QuicPlatformSupport {
     @Override
     int openSslFd(SocketHandle socket) throws QuicPlatformException {
         throw new QuicPlatformException("openSslFd", 0, reason, false,
-                false, false, false);
+                false, false);
     }
 
     @Override
@@ -102,6 +102,6 @@ final class QuicPlatformUnavailable extends QuicPlatformSupport {
     @Override
     Wakeup createWakeup(SocketHandle socket) throws QuicPlatformException {
         throw new QuicPlatformException("createWakeup", 0, reason, false,
-                false, false, false);
+                false, false);
     }
 }

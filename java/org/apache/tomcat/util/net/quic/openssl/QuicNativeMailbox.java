@@ -46,10 +46,12 @@ import org.apache.tomcat.util.res.StringManager;
  * QUIC objects are single-threaded by default and the poll thread drives
  * the shared engine).</li>
  * </ul>
- * The extra drains perform native work and must run on the poll thread
- * (or on the stop thread once the poll loop has stopped); the confinement
- * check inherited from the base is applied to each so a future mis-threading
- * is caught under {@code -ea}.
+ * The extra drains perform native work and must run on the poll thread, or -
+ * once the poll loop has stopped - on a single thread at a time accepted by
+ * the endpoint's native-access policy (the stop thread, or the last handler's
+ * worker during retained-connection reclaim); the confinement check inherited
+ * from the base is applied to each so a future mis-threading is caught under
+ * {@code -ea}.
  * <p>
  * This class owns all four queues. {@code QuicOpenSSLEndpoint} exposes
  * one-line delegating wrappers for the drains so call sites document the
@@ -147,14 +149,17 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
     /**
      * Re-checks the streams queued by {@link #queueStreamDrain()} and moves a
      * drained stream to the ordinary deferred-free queue. Must run on the
-     * poll thread.
+     * poll thread, or on a single permitted thread once the poll loop has
+     * stopped (see the class-level threading rule).
      *
      * @param forceFreeConn If non-{@code null}, streams belonging to this
-     *                      connection are freed immediately regardless of
-     *                      their write buffer state (the connection is being
-     *                      torn down)
-     * @param forceAll      {@code true} to free every queued stream
-     *                      immediately (endpoint stop)
+     *                      connection are freed regardless of their write
+     *                      buffer state (the connection is being torn down).
+     *                      A stream still owned by a handler is always kept
+     *                      until that handler releases it, whatever the force
+     *                      flag.
+     * @param forceAll      {@code true} to free every queued stream except
+     *                      those still owned by a handler (endpoint stop)
      */
     void drainPendingStreamDrains(QuicConnectionWrapper forceFreeConn,
             boolean forceAll) {
