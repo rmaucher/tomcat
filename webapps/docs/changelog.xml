@@ -352,6 +352,14 @@
         connection flow control window reserved for a sendfile response if the
         stream is reset before the response is complete.  (markt)
       </fix>
+      <fix>
+        When an HTTP/1.x request is received with an invalid request line, the
+        client protocol version is unknown. Default to HTTP/1.1 for the error
+        response. (markt)
+      </fix>
+      <fix>
+        Refactor the strict SNI check for consistency. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Jasper">
@@ -408,6 +416,11 @@
         Remove the loop variable after the ForEach and ForTokens tag plugins.
         Pull request <pr>1158</pr> provided by Arturo Bernal. (markt)
       </fix>
+      <fix>
+        Align evaluation of expressions with section 1.6 of the expression
+        language specification when <code>expr-a</code> is a literal
+        <code>null</code>. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Cluster">
@@ -419,6 +432,14 @@
         configuration and security considerations. Based on pull request
         <pr>1134</pr> by sainadh777. (markt)
       </docs>
+      <fix>
+        Improve reporting of faulty members when sending of cluster messages
+        fails. (markt)
+      </fix>
+      <fix>
+        Increase visibility of TLS errors when receiving cluster messages.
+        (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="WebSocket">
@@ -474,6 +495,11 @@
         Tribes, including failure detection, security and troubleshooting
         guidance. Based on pull request <pr>153</pr> by sainadh777. (markt)
       </docs>
+      <fix>
+        When using TLS-PSK with TLS 1.3 ensure that a node does not accept a
+        connection from a peer that presents a certificate rather than the PSK.
+        (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="jdbc-pool">
