@@ -1164,6 +1164,9 @@ public class QuicConnectionWrapper implements QuicConnection {
             // poll item dispatching handler code against a half-torn stream.
             stream.setDeregistered();
             try {
+                if (endpoint != null) {
+                    endpoint.untrackStreamPollItem(stream);
+                }
                 QuicPollItem item = stream.getPollItem();
                 if (item != null) {
                     QuicPollSet pollSet = endpoint == null ? null : endpoint.getPollSet();

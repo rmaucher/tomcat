@@ -82,6 +82,22 @@ public class QuicPollItem {
     private long revents;
 
     /**
+     * Whether this item is part of the current poll subset. Confined to the
+     * poll thread and managed by {@link QuicPollSet#beginPoll()} /
+     * {@link QuicPollSet#addPollItem(QuicPollItem)}.
+     */
+    private boolean pollActive;
+
+    /**
+     * Number of poll passes for which this stream item should remain in the
+     * subset after its last event. A newly registered or connection-touched
+     * stream can produce buffered read data on the next pass even though the
+     * parent connection is no longer reported ready; the linger bounds that
+     * follow-up without keeping quiescent streams polled forever.
+     */
+    private int pollLinger;
+
+    /**
      * Application data associated with this poll item.
      */
     private Object appData;
@@ -191,6 +207,46 @@ public class QuicPollItem {
      */
     void clearDirty() {
         this.dirty = false;
+    }
+
+
+    /**
+     * Reports whether this item belongs to the current poll subset.
+     *
+     * @return {@code true} if the item is in the current poll subset
+     */
+    boolean isPollActive() {
+        return pollActive;
+    }
+
+
+    /**
+     * Sets whether this item belongs to the current poll subset.
+     *
+     * @param pollActive The new poll subset state
+     */
+    void setPollActive(boolean pollActive) {
+        this.pollActive = pollActive;
+    }
+
+
+    /**
+     * Returns the remaining linger passes for this stream item.
+     *
+     * @return The linger count; zero for non-lingering items
+     */
+    int getPollLinger() {
+        return pollLinger;
+    }
+
+
+    /**
+     * Sets the remaining linger passes for this stream item.
+     *
+     * @param pollLinger The linger count
+     */
+    void setPollLinger(int pollLinger) {
+        this.pollLinger = pollLinger;
     }
 
 

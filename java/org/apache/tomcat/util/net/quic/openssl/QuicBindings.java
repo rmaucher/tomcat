@@ -1253,6 +1253,53 @@ public class QuicBindings {
     // -------------------------------------------------- Poll
 
     /**
+     * {@code size_t SSL_get_quic_ready_channels(SSL *listener, SSL **channels,
+     *                                           size_t max_channels)}
+     * <p>
+     * This is an optional OpenSSL 4.x extension. It is bound without being
+     * included in {@link #QUIC_AVAILABLE}'s required-symbol set so that an
+     * OpenSSL build without the extension still runs the endpoint on its
+     * previous all-items poll path.
+     */
+    public static final MethodHandle SSL_get_quic_ready_channels$handle =
+            createOptionalHandle("SSL_get_quic_ready_channels",
+                    FunctionDescriptor.of(ABI.sizeT(), openssl_h.C_POINTER,
+                            openssl_h.C_POINTER, ABI.sizeT()));
+
+    /**
+     * Returns whether the optional ready-channel API is available.
+     *
+     * @return {@code true} if {@code SSL_get_quic_ready_channels()} is bound
+     */
+    public static boolean hasQuicReadyChannelsApi() {
+        return SSL_get_quic_ready_channels$handle != null;
+    }
+
+    /**
+     * {@code size_t SSL_get_quic_ready_channels(SSL *listener, SSL **channels,
+     *                                           size_t max_channels)}
+     *
+     * @param listener     The QUIC listener SSL object
+     * @param channels     The array receiving ready connection SSL pointers,
+     *                     or {@code NULL} to query the queued count
+     * @param maxChannels  The array capacity, or zero to query the count
+     * @return The number of channels written, or the queued count when
+     *         querying; zero when the API is unavailable or on error
+     */
+    public static long SSL_get_quic_ready_channels(MemorySegment listener,
+            MemorySegment channels, long maxChannels) {
+        MethodHandle handle = SSL_get_quic_ready_channels$handle;
+        if (handle == null) {
+            return 0;
+        }
+        try {
+            return (long) handle.invokeExact(listener, channels, maxChannels);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
      * {@code int SSL_poll(SSL_POLL_ITEM *items, size_t num_items, size_t stride,
      *                     const struct timeval *timeout, uint64_t flags, size_t *result_count)}
      */
@@ -1470,6 +1517,30 @@ public class QuicBindings {
             // failure so QUIC_AVAILABLE turns false at the end of static
             // initialisation (see the field's javadoc).
             MISSING_OPENSSL_SYMBOLS.add(symbol);
+            return null;
+        }
+    }
+
+    /**
+     * Binds an optional OpenSSL symbol. A missing symbol does not fail
+     * {@link #QUIC_AVAILABLE}; callers must check the returned handle before
+     * use and degrade to their compatibility path.
+     *
+     * @param symbol The symbol name
+     * @param desc   The downcall descriptor
+     * @return The method handle, or {@code null} if the symbol is unavailable
+     */
+    private static MethodHandle createOptionalHandle(String symbol,
+            FunctionDescriptor desc) {
+        try {
+            MemorySegment addr = openssl_h.SYMBOL_LOOKUP.find(symbol)
+                    .orElseThrow(() -> new UnsatisfiedLinkError("unresolved QUIC symbol: " + symbol));
+            return Linker.nativeLinker().downcallHandle(addr, desc);
+        } catch (Throwable e) {
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("quicBindings.optionalSymbolMissing",
+                        symbol), e);
+            }
             return null;
         }
     }

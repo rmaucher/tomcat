@@ -446,6 +446,25 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             new ConcurrentHashMap<>();
 
     /**
+     * Poll items for registered streams. Stream items stay in the poll subset
+     * for their whole registered lifetime; idle connections, by contrast, are
+     * only added for the iterations in which the ready-channel API reports
+     * them. Concurrent because stream registration/deregistration follows the
+     * same poll-thread confinement as the poll set, but teardown and worker
+     * paths can also reach the removal hook.
+     */
+    private final Set<QuicPollItem> streamPollItems =
+            ConcurrentHashMap.newKeySet();
+
+    /**
+     * Stream items kept in the poll subset for a bounded number of follow-up
+     * passes after a registration or a ready-connection touch. See
+     * {@link #STREAM_POLL_LINGER_PASSES}.
+     */
+    private final Set<QuicPollItem> lingeringStreamItems =
+            ConcurrentHashMap.newKeySet();
+
+    /**
      * Stream wrappers whose application-side write interest is latched (see
      * {@link QuicOpenSSLSocketWrapper#registerWriteInterest()}). OpenSSL's
      * {@code SSL_POLL_EVENT_W} condition requires free space in the stream's
@@ -760,6 +779,46 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * Whether QUIC is available in the linked OpenSSL.
      */
     private static final boolean QUIC_AVAILABLE = QuicBindings.QUIC_AVAILABLE;
+
+    /**
+     * Whether the optional ready-channel poll API is available in the linked
+     * OpenSSL. When absent, the endpoint keeps the legacy all-items poll path.
+     */
+    private static final boolean READY_CHANNELS_AVAILABLE =
+            QuicBindings.hasQuicReadyChannelsApi();
+
+    /**
+     * Number of ready connection SSL pointers read per native call. A larger
+     * ready set is drained over a bounded number of calls so one iteration
+     * cannot monopolise the poll thread.
+     */
+    private static final int READY_CHANNEL_BATCH = 1024;
+
+    /**
+     * Maximum ready-channel drain calls per poll iteration. Any channels left
+     * queued are picked up on a later wake. The batch and loop bound together
+     * let one iteration drain a full default-sized fleet without unbounded
+     * native calls.
+     */
+    private static final int READY_CHANNEL_DRAIN_LOOPS = 16;
+
+    /**
+     * Follow-up poll passes for a newly registered or connection-touched
+     * stream item. Buffered stream data can remain readable one pass after the
+     * parent connection's ready entry was drained, before the next network
+     * wake would return the connection again.
+     */
+    private static final int STREAM_POLL_LINGER_PASSES = 4;
+
+    /**
+     * Stream events which refresh the linger. W is excluded: it is a
+     * level-triggered "buffer has space" condition on a write stream and would
+     * otherwise keep quiescent server unidirectional streams polled forever.
+     */
+    private static final long STREAM_LINGER_EVENTS =
+            QuicPoll.SSL_POLL_EVENT_R |
+            QuicPoll.SSL_POLL_EVENT_ER |
+            QuicPoll.SSL_POLL_EVENT_EW;
 
     /**
      * Events requested for connection poll items. The endpoint never creates
@@ -1235,6 +1294,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                     // item added in createListener(), and any that a partial
                     // bind left behind) before releasing the array arenas.
                     pollSet.clear();
+                    streamPollItems.clear();
+                    lingeringStreamItems.clear();
                     pollSet.close();
                 } catch (Throwable t) {
                     if (log.isDebugEnabled()) {
@@ -2305,6 +2366,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             // would make the next poll loop call SSL_poll() on freed pointers.
             if (pollSet != null && listenerPollItem != null) {
                 pollSet.clear();
+                streamPollItems.clear();
+                lingeringStreamItems.clear();
                 pollSet.add(listenerPollItem);
             }
 
@@ -2891,9 +2954,9 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
     /**
      * Runs all queued poll tasks on the poll thread. Called at the top of
-     * every poll loop iteration, BEFORE {@code pollSet.rebuild()} and
-     * {@code SSL_poll()}, so tasks that mutate the poll set or free native
-     * objects take effect before the next {@code SSL_poll()} sees them.
+     * every poll loop iteration, BEFORE the poll subset is built and
+     * {@code SSL_poll()} runs, so tasks that mutate the poll set or free
+     * native objects take effect before the next {@code SSL_poll()} sees them.
      *
      * @return {@code true} if at least one task ran
      */
@@ -3341,6 +3404,193 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
 
     /**
+     * Removes a stream's poll item from the persistent stream poll subset.
+     * Called from every path that removes a stream from the poll set,
+     * including connection teardown.
+     *
+     * @param stream The stream being untracked
+     */
+    void untrackStreamPollItem(QuicStreamWrapper stream) {
+        QuicPollItem item = stream.getPollItem();
+        if (item != null) {
+            streamPollItems.remove(item);
+            lingeringStreamItems.remove(item);
+            item.setPollLinger(0);
+        }
+    }
+
+
+    /**
+     * Adds the registered stream items belonging to a ready connection to the
+     * current poll subset. A stream is only added when its poll item is still
+     * registered in the set; un-promoted streams (for example streams waiting
+     * for the server control stream) are not polled yet.
+     *
+     * @param conn The ready connection
+     */
+    private void addConnectionStreamPollItems(QuicConnectionWrapper conn) {
+        for (QuicStreamWrapper stream : conn.getStreams().values()) {
+            QuicPollItem item = stream.getPollItem();
+            if (item != null && streamPollItems.contains(item)
+                    && pollSet.get(item.getSsl().address()) == item) {
+                pollSet.addPollItem(item);
+                lingerStreamPollItem(item);
+            }
+        }
+    }
+
+
+    /**
+     * Marks a stream item for a bounded number of follow-up poll passes.
+     *
+     * @param item The stream poll item
+     */
+    private void lingerStreamPollItem(QuicPollItem item) {
+        if (item == null || !streamPollItems.contains(item)) {
+            return;
+        }
+        if (item.getPollLinger() < STREAM_POLL_LINGER_PASSES) {
+            item.setPollLinger(STREAM_POLL_LINGER_PASSES);
+        }
+        lingeringStreamItems.add(item);
+    }
+
+
+    /**
+     * Adds the poll items of all bidirectional request streams which have a
+     * socket wrapper. These streams can carry application read/write interest
+     * independent of new network activity on the parent connection, so they
+     * remain polled for their registered lifetime. Idle connections have no
+     * such wrappers, keeping the idle fleet subset small.
+     */
+    private void addSocketWrapperStreamPollItems() {
+        for (QuicOpenSSLSocketWrapper wrapper : streamWrappers.values()) {
+            QuicStreamWrapper stream = wrapper.getSocket();
+            if (stream == null) {
+                continue;
+            }
+            QuicPollItem item = stream.getPollItem();
+            if (item != null && streamPollItems.contains(item)
+                    && pollSet.get(item.getSsl().address()) == item) {
+                pollSet.addPollItem(item);
+            }
+        }
+    }
+
+
+    /**
+     * Adds stream items which are in their bounded linger window after a
+     * registration or a ready-connection touch.
+     */
+    private void addLingeringStreamPollItems() {
+        for (QuicPollItem item : lingeringStreamItems) {
+            if (item.getPollLinger() > 0 && streamPollItems.contains(item)
+                    && pollSet.get(item.getSsl().address()) == item) {
+                pollSet.addPollItem(item);
+            }
+        }
+    }
+
+
+    /**
+     * Drains ready accepted connections from OpenSSL and adds their connection
+     * and stream poll items to the current poll subset. This is the work-gated
+     * replacement for including every established connection and all of its
+     * streams in every {@code SSL_poll()} call.
+     *
+     * @param readyChannels Native array receiving the connection SSL pointers
+     * @param capacity      The array capacity
+     */
+    private void addReadyConnectionPollItems(MemorySegment readyChannels,
+            int capacity) {
+        long addressSize = ValueLayout.ADDRESS.byteSize();
+        int loops = 0;
+        long n;
+
+        do {
+            n = QuicBindings.SSL_get_quic_ready_channels(listener,
+                    readyChannels, capacity);
+            for (int i = 0; i < n; i++) {
+                MemorySegment ssl = readyChannels.get(ValueLayout.ADDRESS,
+                        i * addressSize);
+                if (ssl.equals(MemorySegment.NULL)) {
+                    continue;
+                }
+                QuicConnectionWrapper conn = connections.get(ssl.address());
+                if (conn == null || conn.isClosed() || conn.isFreed()) {
+                    continue;
+                }
+                QuicPollItem item = conn.getPollItem();
+                if (item != null &&
+                        pollSet.get(item.getSsl().address()) == item) {
+                    pollSet.addPollItem(item);
+                    addConnectionStreamPollItems(conn);
+                }
+            }
+        } while (n == capacity && ++loops < READY_CHANNEL_DRAIN_LOOPS);
+    }
+
+
+    /**
+     * Ages the linger window of stream items polled in this iteration. An
+     * item which produced a read/error event resets the window; otherwise it
+     * decrements, and an item reaching zero leaves the linger set. Write-only
+     * W events do not reset the window because they are level-triggered on
+     * quiescent write streams.
+     */
+    private void ageLingeringStreamPollItems() {
+        for (int i = 0; i < pollSet.getPollCount(); i++) {
+            QuicPollItem item = pollSet.pollItemAt(i);
+            if (!streamPollItems.contains(item)) {
+                lingeringStreamItems.remove(item);
+                item.setPollLinger(0);
+                continue;
+            }
+            int linger = item.getPollLinger();
+            if (linger <= 0) {
+                continue;
+            }
+            if ((item.getRevents() & STREAM_LINGER_EVENTS) != 0) {
+                linger = STREAM_POLL_LINGER_PASSES;
+            } else {
+                linger--;
+            }
+            if (linger <= 0) {
+                lingeringStreamItems.remove(item);
+                item.setPollLinger(0);
+            } else {
+                item.setPollLinger(linger);
+                lingeringStreamItems.add(item);
+            }
+        }
+    }
+
+
+    /**
+     * Builds the compact poll subset for the current iteration.
+     * <p>
+     * With the ready-channel API the subset is the listener plus only the
+     * connections OpenSSL reports as ready (and their registered streams).
+     * With the compatibility path (older OpenSSL) every member of the poll
+     * set is included, preserving the previous behaviour.
+     *
+     * @param readyChannels Native scratch array for ready connection pointers
+     * @param readyCapacity The scratch array capacity
+     */
+    private void buildPollSubset(MemorySegment readyChannels, int readyCapacity) {
+        pollSet.beginPoll();
+        pollSet.addPollItem(listenerPollItem);
+        if (READY_CHANNELS_AVAILABLE) {
+            addSocketWrapperStreamPollItems();
+            addLingeringStreamPollItems();
+            addReadyConnectionPollItems(readyChannels, readyCapacity);
+        } else {
+            pollSet.addAllPollItems();
+        }
+    }
+
+
+    /**
      * Main poll loop following the OpenSSL poll-server reference pattern,
      * adapted so the blocking wait is interruptible from other threads, and
      * so the QUIC engine is ticked once per iteration that needs a tick
@@ -3405,6 +3655,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
         try (Arena timerArena = Arena.ofConfined()) {
             MemorySegment timerTv = timerArena.allocate(ABI.timeval());
             MemorySegment timerInf = timerArena.allocate(ValueLayout.JAVA_INT);
+            MemorySegment readyChannels = timerArena.allocate(
+                    ValueLayout.ADDRESS, READY_CHANNEL_BATCH);
             // Absolute System.currentTimeMillis() of the engine-wide deadline the
             // reactor reported on the last tick, or 0 while unknown.
             long quicDeadlineAbsMs = 0;
@@ -3551,17 +3803,19 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                         nextDueTickFreeAtMs = nowMs + dueTickFloorMs;
                     }
 
-                    pollSet.rebuild();
+                    buildPollSubset(readyChannels, READY_CHANNEL_BATCH);
+                    pollSet.writePollItems();
                     pollSet.resetResultCount();
 
                       // SSL_poll() in non-blocking mode (timeout zero), with
-                      // SSL_POLL_FLAG_NO_HANDLE_EVENTS: readiness of each item is
-                      // tested and reported against the state the tick above just
-                      // produced, without OpenSSL ticking the engine again per
-                      // item.
+                      // SSL_POLL_FLAG_NO_HANDLE_EVENTS: readiness of the current
+                      // poll subset is tested and reported against the state the
+                      // tick above just produced, without OpenSSL ticking the
+                      // engine again per item. With the ready-channel API the
+                      // subset is O(work) instead of the whole idle fleet.
                     int sslPollResult = QuicPoll.poll(
                                 pollSet.getNativeArray(),
-                                pollSet.size(),
+                                pollSet.getPollCount(),
                                 0,
                                 QuicPoll.SSL_POLL_FLAG_NO_HANDLE_EVENTS,
                                 pollSet.getResultCountSegment()
@@ -3614,7 +3868,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                       // item - an item it failed to poll reports F and is counted
                       // (FAIL_ITEM increments the result count), so nothing is
                       // pending and every revents is zero. The revents sync and
-                      // the item scan are both O(poll set); skipping them here
+                      // the item scan are both O(poll subset); skipping them here
                       // keeps a ticked iteration over an otherwise idle fleet
                       // (the keep-alive-only case) at zero Java-side scan work.
                       // The scan runs only when the native readout actually
@@ -3626,7 +3880,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                         // never be cleared silently - doing so both hides the
                         // failure and starves all subsequent items. It is
                         // handled per-item below.
-                        pollSet.syncRevents();
+                        pollSet.syncPollRevents();
                         // The OpenSSL error queue is per thread and handled
                         // non-fatal failures elsewhere in this endpoint clear
                         // their own entries. Drain any residual entries once
@@ -3638,8 +3892,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
 
                         // Process items with events. Follow OpenSSL reference
                         // priority: ERROR -> IN -> OUT.
-                        for (int slot = 0; slot < pollSet.size(); slot++) {
-                            QuicPollItem item = pollSet.itemAt(slot);
+                        for (int slot = 0; slot < pollSet.getPollCount(); slot++) {
+                            QuicPollItem item = pollSet.pollItemAt(slot);
                             // A handler that ran earlier in this same iteration
                             // may have removed the item from the poll set (and
                             // freed the SSL it refers to). Skip items that are
@@ -3671,6 +3925,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
                                     revents, processedAnything);
                         }
                     }
+
+                    ageLingeringStreamPollItems();
 
                     // Re-drive latched write interest level-wise: OpenSSL's
                     // W event is not reported while the native send buffer is
@@ -4085,6 +4341,9 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
     private void forceRemovePollItem(QuicPollItem item) {
         if (item == null || pollSet == null) {
             return;
+        }
+        if (item.getAppData() instanceof QuicStreamWrapper stream) {
+            untrackStreamPollItem(stream);
         }
         long address = item.getSsl().address();
         if (pollSet.get(address) == item) {
@@ -7614,6 +7873,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             stream.setPollItem(streamItem);
             conn.getStreams().put(streamId, stream);
             pollSet.add(streamItem);
+            streamPollItems.add(streamItem);
+            lingerStreamPollItem(streamItem);
             return stream;
         } catch (RuntimeException | Error e) {
             if (stream == null) {
@@ -7689,6 +7950,8 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
             streamItem.setWantEvents(events);
         }
         pollSet.add(streamItem);
+        streamPollItems.add(streamItem);
+        lingerStreamPollItem(streamItem);
         if (!bidi) {
             if (log.isDebugEnabled()) {
                 log.debug("Adding UNI stream " + stream.getStreamId() + " to poll set");
@@ -9014,6 +9277,7 @@ public class QuicOpenSSLEndpoint extends QuicEndpoint<Long> {
      * @return {@code true} if the stream was tracked on its connection
      */
     boolean deregisterStream(QuicStreamWrapper stream) {
+        untrackStreamPollItem(stream);
         QuicConnectionWrapper conn = stream.getConnection();
         boolean wasTracked = false;
         if (conn != null) {

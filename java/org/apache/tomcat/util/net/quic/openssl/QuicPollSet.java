@@ -122,6 +122,18 @@ public class QuicPollSet {
     private QuicPollItem[] slots;
 
     /**
+     * Items selected for the current poll pass. This is a compact subset of
+     * the set and is rewritten into the beginning of the native array before
+     * each {@code SSL_poll()} call. Poll-thread confined.
+     */
+    private QuicPollItem[] pollItems;
+
+    /**
+     * Number of items selected for the current poll pass.
+     */
+    private int pollCount;
+
+    /**
      * Arena for the result_count value passed to SSL_poll.
      */
     private final Arena resultCountArena;
@@ -145,6 +157,7 @@ public class QuicPollSet {
         try {
             nativeArrayLocal = arrayArenaLocal.allocate(STRIDE * capacity);
             slots = new QuicPollItem[capacity];
+            pollItems = new QuicPollItem[capacity];
             resultCountArenaLocal = Arena.ofShared();
             resultCountSegmentLocal = resultCountArenaLocal.allocate(ABI.sizeT());
         } catch (RuntimeException | Error e) {
@@ -341,6 +354,108 @@ public class QuicPollSet {
 
 
     /**
+     * Starts a new poll-subset pass. Clears the previous subset's membership
+     * flags; the caller then selects items with {@link #addPollItem} and
+     * writes the subset with {@link #writePollItems()}.
+     */
+    public void beginPoll() {
+        for (int i = 0; i < pollCount; i++) {
+            pollItems[i].setPollActive(false);
+        }
+        pollCount = 0;
+    }
+
+
+    /**
+     * Adds an item to the current poll subset. Duplicate additions are
+     * ignored. The item must be a member of this set.
+     *
+     * @param item The item to poll
+     */
+    public void addPollItem(QuicPollItem item) {
+        if (item == null || item.isPollActive()) {
+            return;
+        }
+        if (pollCount == pollItems.length) {
+            // The set can grow during an iteration; preserve the subset that
+            // was already selected.
+            QuicPollItem[] newPollItems =
+                    new QuicPollItem[Math.max(pollItems.length * 2, pollCount + 1)];
+            System.arraycopy(pollItems, 0, newPollItems, 0, pollCount);
+            pollItems = newPollItems;
+        }
+        pollItems[pollCount] = item;
+        pollCount++;
+        item.setPollActive(true);
+    }
+
+
+    /**
+     * Adds every member of the set to the current poll subset. Used by the
+     * compatibility path when the ready-channel API is unavailable.
+     */
+    public void addAllPollItems() {
+        for (int i = 0; i < count; i++) {
+            addPollItem(slots[i]);
+        }
+    }
+
+
+    /**
+     * Returns the number of items in the current poll subset.
+     *
+     * @return The poll subset size
+     */
+    public int getPollCount() {
+        return pollCount;
+    }
+
+
+    /**
+     * Returns an item in the current poll subset.
+     *
+     * @param index The poll-subset index
+     * @return The item
+     */
+    public QuicPollItem pollItemAt(int index) {
+        if (index < 0 || index >= pollCount) {
+            throw new IndexOutOfBoundsException(
+                    "Index " + index + " out of bounds for poll subset size " + pollCount);
+        }
+        return pollItems[index];
+    }
+
+
+    /**
+     * Copies the current poll subset's structs into the beginning of the
+     * native array. Every selected item is written because its slot in the
+     * native array no longer matches its membership slot.
+     */
+    public void writePollItems() {
+        for (int i = 0; i < pollCount; i++) {
+            QuicPollItem item = pollItems[i];
+            item.resetRevents();
+            item.writeTo(nativeArray, (long) i * STRIDE);
+            item.clearDirty();
+        }
+    }
+
+
+    /**
+     * Syncs revents for the current poll subset from the beginning of the
+     * native array after {@code SSL_poll()} returns.
+     */
+    public void syncPollRevents() {
+        long reventsOffset = QuicPoll.getReventsOffset();
+        for (int i = 0; i < pollCount; i++) {
+            long revents = nativeArray.get(ValueLayout.JAVA_LONG,
+                    (long) i * STRIDE + reventsOffset);
+            pollItems[i].setRevents(revents);
+        }
+    }
+
+
+    /**
      * Copies the structs of new or changed items into the native array.
      * Must be called on the poll thread before every SSL_poll() call.
      * <p>
@@ -449,6 +564,10 @@ public class QuicPollSet {
      * lookup map.
      */
     public void clear() {
+        for (int i = 0; i < pollCount; i++) {
+            pollItems[i].setPollActive(false);
+        }
+        pollCount = 0;
         for (int i = 0; i < count; i++) {
             slots[i].dispose();
             slots[i] = null;
@@ -517,9 +636,14 @@ public class QuicPollSet {
         Arena newArena = Arena.ofShared();
         MemorySegment newArray;
         QuicPollItem[] newSlots;
+        QuicPollItem[] newPollItems;
+        int allocItems = Math.max(newCapacity, pollCount);
         try {
-            newArray = newArena.allocate(STRIDE * newCapacity);
+            newArray = newArena.allocate(STRIDE * allocItems);
             newSlots = new QuicPollItem[newCapacity];
+            // A shrink during event handling can happen while the current
+            // poll subset still references more items than the new capacity.
+            newPollItems = new QuicPollItem[allocItems];
         } catch (Throwable t) {
             // Do not leave the new arena open or replace the current array
             // when the allocation failed; keep the old generation intact.
@@ -534,7 +658,9 @@ public class QuicPollSet {
         nativeArray = newArray;
         capacity = newCapacity;
         System.arraycopy(slots, 0, newSlots, 0, count);
+        System.arraycopy(pollItems, 0, newPollItems, 0, pollCount);
         slots = newSlots;
+        pollItems = newPollItems;
         for (int i = 0; i < count; i++) {
             slots[i].markDirty();
         }
