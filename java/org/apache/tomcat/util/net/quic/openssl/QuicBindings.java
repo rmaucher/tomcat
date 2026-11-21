@@ -27,6 +27,7 @@ import java.util.Set;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.openssl.openssl_h;
 import org.apache.tomcat.util.res.StringManager;
 
@@ -46,8 +47,10 @@ import org.apache.tomcat.util.res.StringManager;
  * The list below summarizes the main groups of functions bound here; the
  * individual fields are the authoritative list. OpenSSL manages QUIC I/O
  * internally, so the list is limited to the endpoint's native surface plus a
- * few compatibility definitions retained for callers/tests; every bound
- * symbol is also required by the {@code QUIC_AVAILABLE} probe:
+ * few compatibility definitions retained for callers/tests. The required
+ * symbols are probed by the {@code QUIC_AVAILABLE} check; optional extension
+ * symbols (currently {@code SSL_get_quic_ready_channels()}) are bound through
+ * {@code createOptionalHandle()} and deliberately do not gate availability:
  * <ul>
  * <li>{@code OSSL_QUIC_server_method()}</li>
  * <li>{@code SSL_new_listener()}, {@code SSL_listen()}, {@code SSL_accept_connection()}</li>
@@ -96,18 +99,22 @@ public class QuicBindings {
      * Checks if QUIC support is available in the linked OpenSSL library.
      * The answer is computed (at the end of this class's static
      * initialisation, below) from the symbol failures recorded while the
-     * downcall handles were being created: every symbol this class resolves
-     * is probed by the very call that binds it, so the availability check
-     * and the bound-symbol set can never drift apart. A partially-complete
-     * library is rejected at startup instead of leaving individual handles
-     * null and degrading specific features silently.
+     * downcall handles were being created: every required symbol this class
+     * resolves is probed by the very call that binds it, so the availability
+     * check and the required-symbol set can never drift apart. Optional
+     * extension symbols bound by {@code createOptionalHandle()} are excluded
+     * from this verdict and must be checked individually. A partially-complete
+     * library is rejected at startup instead of leaving individual required
+     * handles null and degrading specific features silently.
      */
     public static final boolean QUIC_AVAILABLE;
 
     /**
-     * OpenSSL symbols whose lookup or downcall binding failed during static
-     * initialisation, populated by {@code createHandle()}. Empty means every
-     * OpenSSL symbol this class binds is present in the linked library.
+     * Required OpenSSL symbols whose lookup or downcall binding failed during
+     * static initialisation, populated by {@code createHandle()}. Empty means
+     * every required OpenSSL symbol this class binds is present in the linked
+     * library. Optional symbols bound by {@code createOptionalHandle()} are not
+     * recorded here.
      */
     private static final Set<String> MISSING_OPENSSL_SYMBOLS = new LinkedHashSet<>();
 
@@ -578,9 +585,9 @@ public class QuicBindings {
      * @param args    Pointer to the shutdown arguments structure, or {@code NULL}
      * @param argsLen The size of the structure referenced by {@code args}
      * @return Zero while the shutdown is still in progress (rapid shutdown
-     *         generally returns zero even on success) and one once the
-     *         shutdown is complete; failures are reported through the error
-     *         queue, not by a negative return value
+     *         generally returns zero even on success), one once the shutdown is
+     *         complete, and a negative value on failure; failure details are
+     *         also available through the error queue
      */
     public static int SSL_shutdown_ex(MemorySegment ssl, long flags, MemorySegment args,
             long argsLen) {
@@ -694,6 +701,11 @@ public class QuicBindings {
      * for the peer to acknowledge the close.
      */
     public static final long SSL_SHUTDOWN_FLAG_RAPID = 1L << 0;
+    /**
+     * {@code SSL_shutdown_ex()} flag: skip waiting for stream send buffers to
+     * drain before entering connection close.
+     */
+    public static final long SSL_SHUTDOWN_FLAG_NO_STREAM_FLUSH = 1L << 1;
     /**
      * {@code SSL_shutdown_ex()} flag: do not block; return instead of
      * waiting for the close to complete.
@@ -1018,6 +1030,12 @@ public class QuicBindings {
     /** SNI callback result: no acknowledgement of the server name. */
     public static final int SSL_TLSEXT_ERR_NOACK = 3;
 
+    /**
+     * TLS alert description used when configured certificate material cannot
+     * be applied to a connection. Value per OpenSSL 4.0 tls1.h.
+     */
+    public static final int SSL_AD_INTERNAL_ERROR = 80;
+
     // SSL_CTRL command codes for SSL_CTX_ctrl()/SSL_ctrl(). Values per
     // OpenSSL 4.0 ssl.h. In OpenSSL 4.0 the
     // SSL_CTX_set_tlsext_servername_callback()/SSL_CTX_add1_chain_cert()/
@@ -1253,6 +1271,53 @@ public class QuicBindings {
     // -------------------------------------------------- Poll
 
     /**
+     * {@code size_t SSL_get_quic_ready_channels(SSL *listener, SSL **channels,
+     *                                           size_t max_channels)}
+     * <p>
+     * This is an optional OpenSSL 4.x extension. It is bound without being
+     * included in {@link #QUIC_AVAILABLE}'s required-symbol set so that an
+     * OpenSSL build without the extension still runs the endpoint on its
+     * previous all-items poll path.
+     */
+    public static final MethodHandle SSL_get_quic_ready_channels$handle =
+            createOptionalHandle("SSL_get_quic_ready_channels",
+                    FunctionDescriptor.of(ABI.sizeT(), openssl_h.C_POINTER,
+                            openssl_h.C_POINTER, ABI.sizeT()));
+
+    /**
+     * Returns whether the optional ready-channel API is available.
+     *
+     * @return {@code true} if {@code SSL_get_quic_ready_channels()} is bound
+     */
+    public static boolean hasQuicReadyChannelsApi() {
+        return SSL_get_quic_ready_channels$handle != null;
+    }
+
+    /**
+     * {@code size_t SSL_get_quic_ready_channels(SSL *listener, SSL **channels,
+     *                                           size_t max_channels)}
+     *
+     * @param listener     The QUIC listener SSL object
+     * @param channels     The array receiving ready connection SSL pointers,
+     *                     or {@code NULL} to query the queued count
+     * @param maxChannels  The array capacity, or zero to query the count
+     * @return The number of channels written, or the queued count when
+     *         querying; zero when the API is unavailable or on error
+     */
+    public static long SSL_get_quic_ready_channels(MemorySegment listener,
+            MemorySegment channels, long maxChannels) {
+        MethodHandle handle = SSL_get_quic_ready_channels$handle;
+        if (handle == null) {
+            return 0;
+        }
+        try {
+            return (long) handle.invokeExact(listener, channels, maxChannels);
+        } catch (Throwable t) {
+            throw new AssertionError("should not reach here", t);
+        }
+    }
+
+    /**
      * {@code int SSL_poll(SSL_POLL_ITEM *items, size_t num_items, size_t stride,
      *                     const struct timeval *timeout, uint64_t flags, size_t *result_count)}
      */
@@ -1466,10 +1531,38 @@ public class QuicBindings {
                     .orElseThrow(() -> new UnsatisfiedLinkError("unresolved QUIC symbol: " + symbol));
             return Linker.nativeLinker().downcallHandle(addr, desc);
         } catch (Throwable e) {
+            // Fatal VM errors (for example OOM) must not be misreported as a
+            // missing OpenSSL symbol.
+            ExceptionUtils.handleThrowable(e);
             // The bind attempt itself is the availability probe: record the
             // failure so QUIC_AVAILABLE turns false at the end of static
             // initialisation (see the field's javadoc).
             MISSING_OPENSSL_SYMBOLS.add(symbol);
+            return null;
+        }
+    }
+
+    /**
+     * Binds an optional OpenSSL symbol. A missing symbol does not fail
+     * {@link #QUIC_AVAILABLE}; callers must check the returned handle before
+     * use and degrade to their compatibility path.
+     *
+     * @param symbol The symbol name
+     * @param desc   The downcall descriptor
+     * @return The method handle, or {@code null} if the symbol is unavailable
+     */
+    private static MethodHandle createOptionalHandle(String symbol,
+            FunctionDescriptor desc) {
+        try {
+            MemorySegment addr = openssl_h.SYMBOL_LOOKUP.find(symbol)
+                    .orElseThrow(() -> new UnsatisfiedLinkError("unresolved QUIC symbol: " + symbol));
+            return Linker.nativeLinker().downcallHandle(addr, desc);
+        } catch (Throwable e) {
+            ExceptionUtils.handleThrowable(e);
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("quicBindings.optionalSymbolMissing",
+                        symbol), e);
+            }
             return null;
         }
     }

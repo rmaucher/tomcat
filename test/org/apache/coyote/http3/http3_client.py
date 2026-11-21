@@ -112,7 +112,20 @@ from aioquic.h3.connection import stream_is_unidirectional
 from aioquic.quic.configuration import QuicConfiguration
 import pylsqpack
 
-DEFAULT_TIMEOUT = 10.0
+# The full test suite runs many classes in parallel on the same machine, so a
+# single request can be delayed well beyond the QUIC exchange time. Keep the
+# default observation window generous; tests that need to force a short-lived
+# client (for example --abandon) pass an explicit smaller --timeout.
+DEFAULT_TIMEOUT = 20.0
+
+# Grace period after the client considers the request streams settled, used to
+# collect a trailing CONNECTION_CLOSE/GOAWAY or final stream data that is still
+# being retransmitted while the host is busy. A completed response needs only
+# a short grace; error/no-response paths keep a longer window so a late
+# CONNECTION_CLOSE is not missed.
+COMPLETED_GRACE = 0.5
+ERROR_GRACE = 1.5
+MAX_WAIT_GRACE = 2.0
 
 # HTTP/3 frame types (RFC 9114 Section 7.2, Table 2)
 H3_DATA = 0x00
@@ -749,8 +762,10 @@ async def raw_connection(args):
                 # The connection is gone; nothing left to reset.
                 pass
 
-        # Wait for the responses and for the connection to settle.
-        deadline = args.timeout + (args.wait if args.wait else 0.5)
+        # Wait for the responses and for the connection to settle. Without an
+        # explicit --wait, allow the longer error observation window in the
+        # overall deadline as well.
+        deadline = args.timeout + (args.wait if args.wait else ERROR_GRACE)
         start = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start < deadline:
             streams_done = bool(request_stream_ids) and all(
@@ -760,12 +775,22 @@ async def raw_connection(args):
             done = (client.connection_error is not None or
                     client.closed_cleanly or streams_done)
             if done:
-                # Allow a short grace period for more data to arrive. Keep it
-                # well above the QUIC packet exchange time under load so
-                # trailing stream data / the CONNECTION_CLOSE are not missed
-                # when the host is busy (test suites share the machine with
-                # the server under test).
-                await asyncio.sleep(0.5)
+                # Allow a grace period for more data to arrive. A completed
+                # response or a stream reset already carries its terminal
+                # information, so only the short grace is needed. A request
+                # that has ended with neither a response nor a stream error
+                # (an expected connection error, or a control-stream-only
+                # probe) keeps the longer window so a late CONNECTION_CLOSE/
+                # GOAWAY is not missed. An explicit --wait extends the grace
+                # up to the bounded maximum.
+                grace = COMPLETED_GRACE
+                response_seen = bool(request_stream_ids) and any(
+                    stream_id in client._data for stream_id in request_stream_ids)
+                if not response_seen and not client.stream_errors:
+                    grace = ERROR_GRACE
+                if args.wait:
+                    grace = max(grace, min(args.wait, MAX_WAIT_GRACE))
+                await asyncio.sleep(grace)
                 break
             await asyncio.sleep(0.05)
 

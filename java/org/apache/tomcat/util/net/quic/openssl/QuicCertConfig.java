@@ -28,6 +28,7 @@ import java.util.Set;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.net.SSLHostConfig;
 import org.apache.tomcat.util.net.SSLHostConfigCertificate;
 import org.apache.tomcat.util.net.SSLHostConfigPreSharedKey;
@@ -37,12 +38,14 @@ import org.apache.tomcat.util.net.openssl.panama.CertificateLoader.CertificateEn
 import org.apache.tomcat.util.res.StringManager;
 
 /**
- * Immutable snapshot of all certificates and pre-shared keys configured
- * on an endpoint, keyed by lower case host name, plus the default host's
- * material. The arena owns the DER staging allocations of the snapshot and
- * is closed when the snapshot is discarded on reload or shutdown; the
+ * Structurally immutable snapshot of all certificates and pre-shared keys
+ * configured on an endpoint, keyed by lower case host name, plus the default
+ * host's material. The arena owns the DER staging allocations of the snapshot
+ * and is closed when the snapshot is discarded on reload or shutdown; the
  * OpenSSL-heap certificate objects are not arena-owned and are released
- * only by {@link #free()}.
+ * only by {@link #free()}. The collection structure is immutable, but the
+ * {@link CertificateEntry#chain} array is a mutable Java-side view (see its
+ * documentation).
  * <p>
  * The snapshot is built once by {@link #buildCertConfig(SSLHostConfig,
  * SSLHostConfig[])} on top of {@link CertificateLoader#loadCertEntry} and is
@@ -229,10 +232,14 @@ public class QuicCertConfig {
                             hostConfig.getHostName(), protocols.toString()));
                 }
                 String ciphers = hostConfig.getCiphers();
-                if (ciphers != null && !ciphers.trim().isEmpty()) {
+                if (ciphers != null && !ciphers.trim().isEmpty() &&
+                        !SSLHostConfig.DEFAULT_TLS_CIPHERS_12.equals(ciphers)) {
                     // TLS 1.3 selects cipher suites through cipherSuites, not
                     // the TLS 1.2 ciphers list, and the QUIC context uses only
-                    // TLS 1.3.
+                    // TLS 1.3. getCiphers() returns the default TLS 1.2 list
+                    // when nothing was configured; warning about that default
+                    // would incorrectly tell every operator they configured a
+                    // TLS 1.2 setting.
                     log.warn(sm.getString("quicEndpoint.tls12CiphersUnsupported",
                             hostConfig.getHostName(), ciphers));
                 }
@@ -346,6 +353,7 @@ public class QuicCertConfig {
                             // removed from the failure-path list (retrying a
                             // partially freed certificate is unsafe), so log it
                             // rather than leaking silently.
+                            ExceptionUtils.handleThrowable(t);
                             log.warn(sm.getString("certificateLoader.freeError"), t);
                         }
                     }
@@ -371,6 +379,7 @@ public class QuicCertConfig {
                     defaultPskSelector, pskOnly,
                     defaultHostConfig.getCipherSuites(), arena);
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             freeLoadedEntries(loaded);
             CertificateLoader.closeQuietly(arena);
             log.error(sm.getString("certificateLoader.certificateBuildError"), t);
@@ -414,6 +423,7 @@ public class QuicCertConfig {
         try {
             CertificateLoader.freeCertEntry(entry);
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             log.warn(sm.getString("certificateLoader.freeError"), t);
         }
     }
@@ -432,6 +442,7 @@ public class QuicCertConfig {
             try {
                 CertificateLoader.freeCertEntry(entry);
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 log.warn(sm.getString("certificateLoader.freeError"), t);
             }
         }

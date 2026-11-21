@@ -46,7 +46,7 @@ public class TestQuicPause extends Http3TestBase {
         // receives a response (the connection is torn down before any
         // stream is served) and the client gives up with an error.
         ClientOutput output = runClient(clientCommand("get", "127.0.0.1",
-                Integer.toString(port), "/simple", "--timeout", "5"),
+                Integer.toString(port), "/simple", "--timeout", "3"),
                 CLIENT_TIMEOUT_SECONDS, 1);
 
         Assert.assertEquals("Expected no response from a paused endpoint: "

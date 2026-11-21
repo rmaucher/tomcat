@@ -33,6 +33,7 @@ import java.util.Set;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.res.StringManager;
 
 
@@ -216,6 +217,7 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                             "unresolved libc symbol: " + symbol));
             return Linker.nativeLinker().downcallHandle(address, descriptor);
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             MISSING_SYMBOLS.add(symbol);
             return null;
         }
@@ -503,9 +505,17 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
                 if (result.equals(MemorySegment.NULL)) {
                     return "Unknown error " + error;
                 }
-                return result.getString(0);
+                // The downcall return layout is a bare ValueLayout.ADDRESS, so
+                // the returned segment has size 0. Bound it before reading the
+                // NUL-terminated message; strerror() strings are short but the
+                // bound prevents an unbounded native scan if the C string is
+                // malformed.
+                return result.reinterpret(1024).getString(0);
             } catch (Throwable t) {
-                throw new AssertionError("should not reach here", t);
+                // strerror() must never turn a classified platform failure
+                // into an assertion (the endpoint's dual-stack fallback relies
+                // on QuicPlatformException).
+                return "Unknown error " + error;
             }
         }
     }
@@ -589,17 +599,38 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
 
         @Override
         public int await(long timeoutMs) {
-            long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
+            boolean finite = timeoutMs >= 0;
+            // A very large finite timeout must not overflow the nanosecond
+            // deadline (and turn into an immediate return or a negative
+            // remaining time). Saturate instead: the caller is asking for a
+            // wait far beyond any practical poll interval.
+            long deadline = 0;
+            if (finite) {
+                long timeoutNanos;
+                try {
+                    timeoutNanos = Math.multiplyExact(timeoutMs, 1_000_000L);
+                } catch (ArithmeticException e) {
+                    timeoutNanos = Long.MAX_VALUE;
+                }
+                try {
+                    deadline = Math.addExact(System.nanoTime(), timeoutNanos);
+                } catch (ArithmeticException e) {
+                    deadline = Long.MAX_VALUE;
+                }
+            }
             while (true) {
                 long remainingMs = 0;
-                boolean finite = timeoutMs >= 0;
                 if (finite) {
-                    remainingMs = (deadline - System.nanoTime() + 999_999) /
-                            1_000_000;
-                    if (remainingMs > Integer.MAX_VALUE) {
+                    if (deadline == Long.MAX_VALUE) {
                         remainingMs = Integer.MAX_VALUE;
-                    } else if (remainingMs < 0) {
-                        return 0;
+                    } else {
+                        remainingMs = (deadline - System.nanoTime() + 999_999) /
+                                1_000_000;
+                        if (remainingMs > Integer.MAX_VALUE) {
+                            remainingMs = Integer.MAX_VALUE;
+                        } else if (remainingMs < 0) {
+                            return 0;
+                        }
                     }
                 }
                 int rc;

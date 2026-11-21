@@ -66,7 +66,7 @@ public class TestAsyncTimeout extends Http3TestBase {
                 + body, body.contains("PASS"));
 
         Assert.assertTrue("Async thread did not end in time",
-                latch.await(10, TimeUnit.SECONDS));
+                latch.await(20, TimeUnit.SECONDS));
     }
 
 

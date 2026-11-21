@@ -689,7 +689,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         ClientOutput output = runClient(rawCommandWith("--headers", headers,
                 "--data", Base64.getEncoder().encodeToString(
                         new byte[] { 1, 2, 3 }),
-                "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "15"), CLIENT_TIMEOUT_SECONDS);
 
         Http3Response response = output.getResponse();
         validateStatus(response, 501);
@@ -742,7 +742,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                 ":authority", "127.0.0.1:" + port);
         String trailers = buildFieldSection("x-test", "value");
         ClientOutput output = runClient(rawCommandWith("--headers", headers,
-                "--trailers", trailers, "--timeout", "5"),
+                "--trailers", trailers, "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         // The connector may answer the CONNECT (currently 501) before it
@@ -1039,9 +1039,21 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         // (including "-0", which Long.parseLong treats as zero) is not part
         // of the grammar and makes the request malformed (RFC 9114
         // Section 4.1.2).
-        for (String value : new String[] { "+0", "-0", "+5", "-5" }) {
-            ClientOutput output = rawGet("/simple", "content-length", value);
-            assertStreamError(output, H3_MESSAGE_ERROR);
+        String[] values = new String[] { "+0", "-0", "+5", "-5" };
+        java.util.concurrent.ExecutorService executor =
+                java.util.concurrent.Executors.newFixedThreadPool(values.length);
+        try {
+            java.util.List<java.util.concurrent.Future<ClientOutput>> results =
+                    new java.util.ArrayList<>(values.length);
+            for (String value : values) {
+                results.add(executor.submit(
+                        () -> rawGet("/simple", "content-length", value)));
+            }
+            for (java.util.concurrent.Future<ClientOutput> result : results) {
+                assertStreamError(result.get(), H3_MESSAGE_ERROR);
+            }
+        } finally {
+            executor.shutdownNow();
         }
     }
 
@@ -1079,7 +1091,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                         ":authority", "127.0.0.1:" + port, ":path", "/echo",
                         "content-length", "70000"),
                 "--data", Base64.getEncoder().encodeToString(body),
-                "--timeout", "5"),
+                "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_MESSAGE_ERROR);
@@ -1106,7 +1118,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                         "/shortbody", "content-length", "10"),
                 "--data", Base64.getEncoder().encodeToString(
                         "12345".getBytes(StandardCharsets.US_ASCII)),
-                "--fin-after", "0.5", "--timeout", "3"),
+                "--fin-after", "0.5", "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_MESSAGE_ERROR);
@@ -1212,7 +1224,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         // layer, not by the application.
         ClientOutput output = runClient(rawCommandWith("--headers",
                 buildFieldSection(simpleGetHeaders("/trailerready")),
-                "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "15"), CLIENT_TIMEOUT_SECONDS);
 
         Http3Response response = output.getResponse();
         validateStatus(response, 200);
@@ -1242,8 +1254,8 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                 "--data", Base64.getEncoder().encodeToString(
                         "0123456789".getBytes(StandardCharsets.US_ASCII)),
                 "--fin-after", "0.5",
-                "--timeout", "5",
-                "--wait", "3"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "15",
+                "--wait", "1"), CLIENT_TIMEOUT_SECONDS);
 
         validateStatus(output.getResponse(), 200);
         Assert.assertEquals("Expected stream error H3_MESSAGE_ERROR after the "
@@ -1292,7 +1304,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         ClientOutput output = runClient(rawCommandWith("--headers",
                 buildFieldSection(simpleGetHeaders("/trailerready")),
                 "--trailers", buildFieldSection("x-test", "value"),
-                "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "15"), CLIENT_TIMEOUT_SECONDS);
 
         Http3Response response = output.getResponse();
         validateStatus(response, 200);
@@ -1345,7 +1357,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                 rawCommandWith("--headers", initial,
                         "--data", Base64.getEncoder().encodeToString(body),
                         "--trailers", trailers,
-                        "--timeout", "5"),
+                        "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_MESSAGE_ERROR);
@@ -1376,7 +1388,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                                 Base64.getDecoder().decode(trailers)),
                         "--frame-after-data", buildFrameB64(0x00, extra),
                         "--no-fin",
-                        "--timeout", "5"),
+                        "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         Assert.assertEquals("Expected connection error H3_FRAME_UNEXPECTED, "
@@ -1408,7 +1420,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                         "--frame-after-data", buildFrameB64(0x01,
                                 Base64.getDecoder().decode(second)),
                         "--no-fin",
-                        "--timeout", "5"),
+                        "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         Assert.assertEquals("Expected connection error H3_FRAME_UNEXPECTED, "
@@ -1444,7 +1456,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                         "--frame-after-data", buildFrameB64(0x01,
                                 Base64.getDecoder().decode(second)),
                         "--no-fin",
-                        "--timeout", "5"),
+                        "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         Assert.assertEquals("Expected connection error H3_FRAME_UNEXPECTED, "
@@ -1473,7 +1485,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                 "--data", Base64.getEncoder().encodeToString(
                         "body!".getBytes(StandardCharsets.UTF_8)),
                 "--trailers", trailers, "--trailers-delay", "0.5",
-                "--timeout", "10"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "20"), CLIENT_TIMEOUT_SECONDS);
 
         Http3Response response = output.getResponse();
         validateStatus(response, 200);
@@ -1509,7 +1521,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                                 Base64.getDecoder().decode(trailers)),
                         "--frame-after-data",
                         Base64.getEncoder().encodeToString(truncated),
-                        "--timeout", "5"),
+                        "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         Assert.assertEquals("Expected connection error H3_FRAME_ERROR, got "
@@ -1853,7 +1865,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                         "--data", Base64.getEncoder().encodeToString(
                                 "body!".getBytes(StandardCharsets.UTF_8)),
                         "--trailers", b64(trailers),
-                        "--wait", "2"),
+                        "--wait", "1"),
                 CLIENT_TIMEOUT_SECONDS);
         long elapsed = System.currentTimeMillis() - start;
 
@@ -1908,8 +1920,8 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
                         "--data", Base64.getEncoder().encodeToString(
                                 bodyBytes),
                         "--trailers", b64(trailers),
-                        "--timeout", "10",
-                        "--wait", "2"),
+                        "--timeout", "20",
+                        "--wait", "1"),
                 CLIENT_TIMEOUT_SECONDS);
         long elapsed = System.currentTimeMillis() - start;
 

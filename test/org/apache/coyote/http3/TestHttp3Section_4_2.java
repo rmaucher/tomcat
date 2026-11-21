@@ -166,7 +166,7 @@ public class TestHttp3Section_4_2 extends Http3TestBase {
                 buildFieldSection(":method", "GET", ":scheme", "https",
                         ":authority", "127.0.0.1:" + port, ":path",
                         "/earlyHints"),
-                "--max-stream-data", "26", "--timeout", "5"),
+                "--max-stream-data", "26", "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         Http3Response response = output.getResponse();

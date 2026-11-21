@@ -16,6 +16,11 @@
  */
 package org.apache.tomcat.util.net.quic;
 
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
+
 import org.apache.tomcat.util.net.AbstractEndpoint;
 
 /**
@@ -75,5 +80,53 @@ public abstract class QuicEndpoint<U> extends AbstractEndpoint<QuicStream, U> {
      */
     public QuicProtocol getQuicProtocol() {
         return quicProtocol;
+    }
+
+
+    /**
+     * Converts an IPv4-mapped IPv6 address ({@code ::ffff/96}, RFC 9000
+     * Section 2.2 / RFC 4291 Section 2.5.5.2) to the plain IPv4 address it
+     * carries. A dual-stack wildcard bind delivers IPv4 datagrams with
+     * v4-mapped sockaddrs; the java.net transports report the IPv4 form of
+     * such peers, so the display paths (getRemoteAddr()/getLocalAddr(),
+     * access logs, valves) unmap through this helper. Native sockaddr
+     * consumers must keep the original value: the family has to match the
+     * bound socket for sendmsg/recvmsg purposes.
+     *
+     * @param a The address to unmap, may be {@code null}
+     *
+     * @return the IPv4 address a v4-mapped IPv6 address carries, otherwise
+     *         {@code a} unchanged
+     */
+    public static InetSocketAddress unmapIpv4Mapped(InetSocketAddress a) {
+        if (a == null) {
+            return null;
+        }
+        InetAddress addr = a.getAddress();
+        if (!(addr instanceof Inet6Address)) {
+            return a;
+        }
+        byte[] b = addr.getAddress();
+        if (b.length != 16) {
+            return a;
+        }
+        // v4-mapped: ten leading zero bytes, then 0xffff, then the address.
+        // (:: itself and ::1 fail the 0xffff test and stay untouched.)
+        for (int i = 0; i < 10; i++) {
+            if (b[i] != 0) {
+                return a;
+            }
+        }
+        if ((b[10] & 0xFF) != 0xFF || (b[11] & 0xFF) != 0xFF) {
+            return a;
+        }
+        try {
+            return new InetSocketAddress(
+                    InetAddress.getByAddress(new byte[] { b[12], b[13], b[14], b[15] }),
+                    a.getPort());
+        } catch (UnknownHostException e) {
+            // A four-byte address is always valid for InetAddress.getByAddress().
+            return a;
+        }
     }
 }

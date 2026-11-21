@@ -84,7 +84,7 @@ public class TestAsyncError extends Http3TestBase {
                 "--headers", buildFieldSection(simpleGetHeaders(
                         "/async-write-error")),
                 "--wait", "2",
-                "--timeout", "10"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "20"), CLIENT_TIMEOUT_SECONDS);
 
         Assert.assertEquals("A failed non-blocking write must reset the "
                         + "stream with H3_INTERNAL_ERROR, got "

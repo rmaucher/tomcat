@@ -83,7 +83,7 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
         // Section 6.2.1 requires the receiver to treat closure of either
         // control stream as a MUST-level connection error.
         ClientOutput output = runClient(rawCommandWith("--fin-control",
-                "--no-request", "--timeout", "3"),
+                "--no-request", "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_CLOSED_CRITICAL_STREAM);
@@ -99,7 +99,7 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
         // of either control stream as a connection error of type
         // H3_CLOSED_CRITICAL_STREAM.
         ClientOutput output = runClient(rawCommandWith("--reset-control", "1",
-                "--no-request", "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                "--no-request", "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_CLOSED_CRITICAL_STREAM);
     }
@@ -114,7 +114,7 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
         // type H3_STREAM_CREATION_ERROR (0x103).
         ClientOutput output = runClient(rawCommandWith(
                 "--uni", "1,,1",
-                "--no-request", "--timeout", "3"),
+                "--no-request", "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_STREAM_CREATION_ERROR);

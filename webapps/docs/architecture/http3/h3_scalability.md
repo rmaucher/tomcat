@@ -569,3 +569,79 @@ OpenSSL suite passes (588 tests, 0 failures, 2 skipped). Raw shards are
 `/home/opencode/h3bench/out.perf-cur-*`, `out.perf-par-*` and
 `out.perf-opt-*`.
 
+## 15. Unpushed-change OpenSSL regression check (2026-11-21)
+
+A quick check covered the unpushed tree at `d7e29013dd` (the final
+defect fixes plus the test-timing changes). The documented `8x25` load
+case (`connections=8`, `streams=25`, `procs=8`, 3 s warm-up, 12 s
+window) was run after a `1x32` JVM-warming run. The benchmark base was
+`/home/opencode/tomcat-http3`; only `tomcat-coyote.jar` and
+`tomcat-coyote-ffm.jar` were swapped, and the server was restarted
+between variants. Host load average ranged from about 9 to 19, within
+the shared-host caveat in Section 2.
+
+| tree | runs | mean rps | us/req |
+|---|---:|---:|---:|
+| current `d7e29013dd` | 80,624.1-87,317.4 | 83,891.2 | 11.1 |
+| parent `2bf850a793` (before the final fixes) | 81,513.3 / 83,183.3 / 83,240.1 | 82,645.6 | 11.2 |
+| Section 14 optimized current tree | — | 90,001.9 | 10.6 |
+
+The final fixes are about 1.5% faster than their parent on the same
+host, so the last defect-fix series is not the source of the gap. The
+current tree is about 6.8% below the Section 14 report in rps and 4.7%
+above it in `us/req`. Bisecting the unpushed history with built jars
+and only the coyote/ffm jars swapped isolated the cause.
+
+| tree / commit | runs (rps) | mean rps | us/req |
+|---|---:|---:|---:|
+| `b8bbb345a5` | 92,875.6 / 94,876.2 / 93,371.8 / 91,112.4 / 91,130.2 | 92,673.2 | 10.1 |
+| `4515c02089` (parent of the regression) | 91,519.0 / 93,615.6 | 92,567.3 | 10.2 |
+| `6e4de9f388` (cancel timed-out poll hops and isolate buffers) | 81,643.9 / 80,577.5 | 81,110.7 | 11.4 |
+| current `d7e29013dd` | see above | 83,891.2 | 11.1 |
+
+Commit `6e4de9f388` (an earlier unpushed correctness fix, before the
+defect-fix series) introduced the regression. It changed the worker
+read/write hops from passing the caller buffer to the poll thread to
+copying it into a task-owned buffer first:
+
+* `QuicOpenSSLSocketWrapper.fillReadBufferDirect()` now allocates a
+  scratch `ByteBuffer` per worker read and copies the bytes into the
+  caller buffer.
+* `QuicOpenSSLSocketWrapper.writeChunk()` now allocates a `byte[]` per
+  worker write, copies the caller bytes into it, and wraps that copy
+  for the native hop.
+
+The copies are required to keep a timed-out hop from touching a
+caller-owned buffer, but they add allocation and copy work to every
+worker read and write hop. The JVM CPU cost at the same request rate
+rose from about 500% of one core (`b8bbb`/`4515c0`) to about 620% on
+`6e4de9` and the current tree, while poller CPU stayed around 92-94%.
+The regression is therefore server-side Java work, not a change in
+native QUIC cost. The current tree's remaining gap to the Section 14
+report is consistent with this single commit: the report predates it.
+
+A dirty poll-item write experiment (copying only changed structs into
+the compact subset) and a slot-based replacement for the poll-item
+membership guard were measured during the investigation; neither
+recovered the lost throughput, because the buffer snapshots dominate
+the `8x25` request path. Both were reverted rather than committed.
+
+The correct mitigation is to keep the timed-out-hop isolation while
+avoiding a fresh allocation/copy on every hop, for example a pooled
+task-owned buffer with explicit ownership transfer on completion or
+cancellation, or a start/cancel handshake that lets a hop use the
+caller buffer when the caller promises not to reuse it. That requires a
+separate ownership design change.
+
+The buffer-snapshot commit `6e4de9f388` was therefore reverted. The
+read and write hops again hand the caller's live buffer to the poll
+thread (with the caller blocked in the hop until it completes), and the
+per-hop cancellation/discard API introduced by that commit was removed;
+the one later caller that relied on its cleanup (the certificate-reload
+swap) again handles rejection itself and does not free a snapshot whose
+queued task may still run. Re-measured after the revert with the same
+`8x25` case: 93,760.0 / 94,747.2 / 95,887.7 rps and 10.1 / 9.9 / 9.9
+`us/req`, recovering above the Section 14 report and matching the
+pre-regression trees. The full OpenSSL HTTP/3 suite passes after the
+revert (588 tests, 0 failures, 2 skipped).
+

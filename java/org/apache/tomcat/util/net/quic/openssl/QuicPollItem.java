@@ -44,8 +44,9 @@ public class QuicPollItem {
      * native segment per stream made every accepted stream pay a SharedSession
      * acquire and native allocation (and a matching release on close) just to
      * describe one struct. The poll set has a contiguous native array already;
-     * rebuild() writes the struct for a dirty item directly into its slot. All
-     * access to this item is confined to the QUIC poll thread, as before.
+     * writePollItems() writes the struct for each selected item directly into
+     * its compact-subset slot. All access to this item is confined to the QUIC
+     * poll thread, as before.
      */
 
     /**
@@ -60,11 +61,12 @@ public class QuicPollItem {
     private int slot;
 
     /**
-     * Flag indicating the native struct changed (new item or updated
-     * descriptor/events) and must be copied into the poll set's native array
-     * by the next {@link QuicPollSet#rebuild()}.
+     * Whether this item has been disposed after leaving the poll set or
+     * losing a duplicate-address add. Only a lifecycle marker: the native
+     * struct is written on every poll pass while the item is selected, so no
+     * pending-write state is needed.
      */
-    private volatile boolean dirty;
+    private volatile boolean disposed;
 
     /**
      * Events we want to monitor. Read and written only on the endpoint's poll
@@ -82,26 +84,66 @@ public class QuicPollItem {
     private long revents;
 
     /**
+     * Whether this item is part of the current poll subset. Confined to the
+     * poll thread and managed by {@link QuicPollSet#beginPoll()} /
+     * {@link QuicPollSet#addPollItem(QuicPollItem)}.
+     */
+    private boolean pollActive;
+
+    /**
+     * Number of poll passes for which this stream item should remain in the
+     * subset after its last event. A newly registered or connection-touched
+     * stream can produce buffered read data on the next pass even though the
+     * parent connection is no longer reported ready; the linger bounds that
+     * follow-up without keeping quiescent streams polled forever.
+     */
+    private int pollLinger;
+
+    /**
      * Application data associated with this poll item.
      */
     private Object appData;
+
+    /**
+     * One-shot notifier invoked when {@link #setWantEvents(long)} changes the
+     * interest mask. The endpoint uses it to force the next poll pass even when
+     * no packet, hop or timer would otherwise wake the loop. May be
+     * {@code null} for standalone/test items.
+     */
+    private final Runnable interestChangeNotifier;
 
 
     /**
      * Creates a new poll item for the given SSL object. No native memory is
      * allocated here; {@link #writeTo(MemorySegment, long)} materialises the
-     * struct into the poll set's native array when the item is rebuilt.
+     * struct into the poll set's native array when the item is selected.
      *
      * @param ssl    The SSL* pointer (listener, connection, or stream)
      * @param events The events to monitor
      * @param data   Application data associated with this item
      */
     public QuicPollItem(MemorySegment ssl, long events, Object data) {
+        this(ssl, events, data, null);
+    }
+
+
+    /**
+     * Creates a poll item with a notifier invoked whenever its interest mask
+     * changes.
+     *
+     * @param ssl                   The SSL* pointer
+     * @param events                The initial events mask
+     * @param data                  Application data
+     * @param interestChangeNotifier Notifier for interest changes, or
+     *                              {@code null}
+     */
+    QuicPollItem(MemorySegment ssl, long events, Object data,
+            Runnable interestChangeNotifier) {
         this.ssl = ssl;
         this.wantEvents = events;
         this.revents = 0;
         this.appData = data;
-        this.dirty = true;
+        this.interestChangeNotifier = interestChangeNotifier;
     }
 
     /**
@@ -111,13 +153,25 @@ public class QuicPollItem {
      * to call more than once.
      */
     public void dispose() {
-        dirty = false;
+        disposed = true;
     }
+
+
+    /**
+     * Returns whether this item has been disposed by the poll set or by a
+     * duplicate-address add.
+     *
+     * @return {@code true} if the item's lifecycle state was cleared
+     */
+    boolean isDisposed() {
+        return disposed;
+    }
+
 
     /**
      * Writes this item's SSL_POLL_ITEM struct into the poll set's native
      * array at the given byte offset, zeroing revents. Called by
-     * {@link QuicPollSet#rebuild()} for dirty items only.
+     * {@link QuicPollSet#writePollItems()} for every selected item.
      *
      * @param array  The poll set's native array
      * @param offset Byte offset of this item's slot in the array
@@ -133,14 +187,16 @@ public class QuicPollItem {
 
 
     /**
-     * Updates the events to monitor and marks the item dirty so the next
-     * {@link QuicPollSet#rebuild()} re-copies the struct.
+     * Updates the events to monitor. The next poll pass writes the new mask
+     * into the native array through {@link QuicPollSet#writePollItems()}.
      *
      * @param events The new event mask
      */
     public void setWantEvents(long events) {
         this.wantEvents = events;
-        this.dirty = true;
+        if (interestChangeNotifier != null) {
+            interestChangeNotifier.run();
+        }
     }
 
 
@@ -166,31 +222,42 @@ public class QuicPollItem {
 
 
     /**
-     * Checks if the native struct must be (re-)copied into the poll set's
-     * native array by the next {@link QuicPollSet#rebuild()}.
+     * Reports whether this item belongs to the current poll subset.
      *
-     * @return {@code true} if the item is new or changed
+     * @return {@code true} if the item is in the current poll subset
      */
-    boolean isDirty() {
-        return dirty;
+    boolean isPollActive() {
+        return pollActive;
     }
 
 
     /**
-     * Marks the item dirty so the next {@link QuicPollSet#rebuild()}
-     * re-copies the struct.
+     * Sets whether this item belongs to the current poll subset.
+     *
+     * @param pollActive The new poll subset state
      */
-    void markDirty() {
-        this.dirty = true;
+    void setPollActive(boolean pollActive) {
+        this.pollActive = pollActive;
     }
 
 
     /**
-     * Clears the dirty flag after the struct has been copied into the poll
-     * set's native array.
+     * Returns the remaining linger passes for this stream item.
+     *
+     * @return The linger count; zero for non-lingering items
      */
-    void clearDirty() {
-        this.dirty = false;
+    int getPollLinger() {
+        return pollLinger;
+    }
+
+
+    /**
+     * Sets the remaining linger passes for this stream item.
+     *
+     * @param pollLinger The linger count
+     */
+    void setPollLinger(int pollLinger) {
+        this.pollLinger = pollLinger;
     }
 
 
@@ -225,11 +292,10 @@ public class QuicPollItem {
 
 
     /**
-     * Sets the revents field (used by QuicPollSet to sync from the native
-     * array after SSL_poll returns). Only the Java field is updated:
-     * SSL_poll() initialises the revents of every item in the native array
-     * on each call, and {@link QuicPollSet#rebuild()} zeroes the struct's
-     * revents field before copying the struct into the array.
+     * Sets the revents field (used by QuicPollSet.syncPollRevents() to copy
+     * from the native array after SSL_poll returns). Only the Java field is
+     * updated: SSL_poll() initialises the revents of every item in the
+     * native array on each call.
      *
      * @param revents The revents value
      */
@@ -241,7 +307,8 @@ public class QuicPollItem {
     /**
      * Resets the revents field before the next SSL_poll call so stale event
      * flags are not carried into the native array. The array's revents field
-     * is zeroed by {@link #writeTo(MemorySegment, long)} when it is rebuilt.
+     * is zeroed by {@link #writeTo(MemorySegment, long)} when the item is
+     * written into the compact poll subset.
      */
     public void resetRevents() {
         this.revents = 0;

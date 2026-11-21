@@ -389,7 +389,7 @@ public class TestRfc9218 extends Http3TestBase {
         ClientOutput output = runClient(rawCommandWith(
                 "--control", controlWithPriorityUpdates(
                         H3_PRIORITY_UPDATE_REQUEST, priorityUpdatePayload(2, "u=6")),
-                "--no-request", "--timeout", "3"),
+                "--no-request", "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_ID_ERROR);
@@ -410,7 +410,7 @@ public class TestRfc9218 extends Http3TestBase {
         ClientOutput output = runClient(rawCommandWith(
                 "--control", controlWithPriorityUpdates(
                         H3_PRIORITY_UPDATE_PUSH, priorityUpdatePayload(0, "u=6")),
-                "--no-request", "--timeout", "3"),
+                "--no-request", "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_ID_ERROR);
@@ -433,7 +433,7 @@ public class TestRfc9218 extends Http3TestBase {
                         priorityUpdatePayload(0, "u=6")),
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -452,7 +452,7 @@ public class TestRfc9218 extends Http3TestBase {
                         priorityUpdatePayload(0, "u=6")),
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -472,7 +472,7 @@ public class TestRfc9218 extends Http3TestBase {
         ClientOutput output = runClient(rawCommandWith(
                 "--control", controlWithPriorityUpdates(
                         H3_PRIORITY_UPDATE_REQUEST, new byte[0]),
-                "--no-request", "--timeout", "3"),
+                "--no-request", "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_ERROR);

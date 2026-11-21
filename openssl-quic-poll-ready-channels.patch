@@ -1,0 +1,874 @@
+#
+# OpenSSL QUIC: work-gated poll readout (Phase B, full)
+# =====================================================
+#
+# Applies on top of openssl-quic-work-gated-port-tick.patch (Phase A).
+#
+# Problem
+# -------
+# Even with the engine tick work-gated, SSL_poll() still read out every poll
+# item: one SSL_POLL_ITEM per established connection plus one per active stream.
+# Each QUIC item ran the requested event tests under the domain mutex. Since a
+# keepalive datagram or due timer wakes the poll loop at O(1) rate, the readout
+# cost remained O(connections) per wake - the dominant idle4000 cost.
+#
+# What it does
+# ------------
+# 1. Ready-channel queue.
+#    A QUIC_PORT keeps a queue of accepted connection channels which have
+#    become ready for the application's poll readout. A channel enters the
+#    queue when it is marked active (RX, TX/API action, handshake progress),
+#    when it is ticked from the timer heap, or when it retains a
+#    level-triggered condition (incoming stream or connection close). Channels
+#    which have not yet been returned by SSL_accept_connection() are never
+#    exposed; the listener IC event remains their readiness signal.
+#
+#    New public API:
+#
+#      size_t SSL_get_quic_ready_channels(SSL *ssl, SSL **channels,
+#                                         size_t max_channels);
+#
+#    Passing a NULL array or max_channels == 0 returns the queued count
+#    without draining. Otherwise up to max_channels accepted connection SSL
+#    objects are removed from the queue and returned. The application can then
+#    poll the listener plus only those connections (and their streams), instead
+#    of passing every established connection to SSL_poll().
+#
+# 2. Quiescent-item fast path in the poll readout.
+#    When SSL_poll() is called with SSL_POLL_FLAG_NO_HANDLE_EVENTS, a
+#    handshake-complete connection with no pending RX/TX, no stream work, no
+#    incoming stream queue, no close state and a future timer deadline returns
+#    zero revents immediately. OS credit events are deliberately excluded
+#    because they are level-triggered and not tied to pending channel work.
+#    Existing batched domain locking is retained.
+#
+# No changes are made to SSL_poll() semantics, stream objects or the event
+# masks. The application remains responsible for keeping stream items and any
+# connection with unconsumed level-triggered events in its poll set.
+#
+# Files
+# -----
+#   doc/man3/SSL_get_quic_ready_channels.pod (new)
+#   doc/man3/SSL_poll.pod
+#   include/internal/quic_channel.h
+#   include/internal/quic_port.h
+#   include/internal/quic_ssl.h
+#   include/openssl/ssl.h.in
+#   ssl/quic/quic_channel.c
+#   ssl/quic/quic_channel_local.h
+#   ssl/quic/quic_impl.c
+#   ssl/quic/quic_port.c
+#   ssl/quic/quic_port_local.h
+#   ssl/rio/poll_immediate.c
+#   ssl/ssl_lib.c
+#   test/quicapitest.c
+#   util/libssl.num
+#
+# Validation
+# ----------
+#   make -j8: PASS
+#   OpenSSL QUIC recipes: 19 files, 21 tests, 0 failures
+#     (test_quic_cfq, test_quic_fc, test_quic_fifd, test_quic_lcidm,
+#      test_quic_qlog, test_quic_radix, test_quic_rcidm, test_quic_record,
+#      test_quic_srtm, test_quic_stream, test_quic_tserver, test_quic_txp,
+#      test_quic_txpim, test_quic_wire, test_quic_ackm, test_quic_cc,
+#      test_quic_srt_gen, test_quicapi, test_quicfaults)
+#   New quicapitest coverage: test_get_quic_ready_channels verifies that
+#     pending incoming connections are not exposed, accepted connections are
+#     returned exactly once, and draining removes them from the ready queue.
+#
+# Apply from an OpenSSL source tree with:
+#   git apply /path/to/openssl-quic-poll-ready-channels.patch
+# or:
+#   patch -p1 < /path/to/openssl-quic-poll-ready-channels.patch
+#
+# Generated against OpenSSL master 159cdbc600 (2026-11-20).
+#
+diff -ruN a/doc/man3/SSL_get_quic_ready_channels.pod b/doc/man3/SSL_get_quic_ready_channels.pod
+--- a/doc/man3/SSL_get_quic_ready_channels.pod	1970-01-01 01:00:00.000000000 +0100
++++ b/doc/man3/SSL_get_quic_ready_channels.pod	2026-11-20 16:49:02.241314460 +0100
+@@ -0,0 +1,71 @@
++=pod
++
++=head1 NAME
++
++SSL_get_quic_ready_channels -
++retrieve QUIC connections with pending poll events
++
++=head1 SYNOPSIS
++
++ #include <openssl/ssl.h>
++
++ size_t SSL_get_quic_ready_channels(SSL *ssl, SSL **channels,
++                                    size_t max_channels);
++
++=head1 DESCRIPTION
++
++SSL_get_quic_ready_channels() retrieves accepted QUIC connection SSL objects
++belonging to the QUIC listener I<ssl> which have become ready for polling.
++A channel becomes ready when it is touched by network input, by an application
++action, when one of its timers is due, or when it retains a level-triggered
++condition such as an incoming stream or a connection close.
++
++If I<channels> is NULL or I<max_channels> is zero, this function returns the
++number of ready channels without draining them from the ready queue.
++
++Otherwise, up to I<max_channels> ready connection SSL objects are written to
++the I<channels> array and removed from the ready queue. The returned SSL
++pointers are borrowed and remain owned by the normal QUIC connection lifecycle;
++the caller must not free them. A subsequent call can be used to drain any
++remaining channels.
++
++Channels which have not yet been returned by L<SSL_accept_connection(3)> are
++never returned by this function. Such connections are instead signalled by the
++B<SSL_POLL_EVENT_IC> event on the listener.
++
++This function can be used to avoid polling every established connection.
++Instead, the application can poll the listener and only those connections
++reported by SSL_get_quic_ready_channels(), using the same event masks and
++B<SSL_poll()> flags as before. This is particularly useful for large fleets of
++mostly idle connections, where a per-item readout over every connection would
++otherwise be the dominant cost.
++
++This function must only be called on a QUIC listener SSL object and may be
++called from multiple threads.
++
++=head1 RETURN VALUES
++
++SSL_get_quic_ready_channels() returns the number of ready channels written, or,
++when I<channels> is NULL or I<max_channels> is zero, the number of ready
++channels currently queued. It returns 0 if called on an SSL object other than
++a QUIC listener SSL object, or if no channels are ready.
++
++=head1 SEE ALSO
++
++L<SSL_poll(3)>, L<SSL_accept_connection(3)>, L<SSL_accept_stream(3)>,
++L<SSL_handle_events(3)>, L<openssl-quic(7)>
++
++=head1 HISTORY
++
++SSL_get_quic_ready_channels() was added in OpenSSL 4.0.
++
++=head1 COPYRIGHT
++
++Copyright 2026 The OpenSSL Project Authors. All Rights Reserved.
++
++Licensed under the Apache License 2.0 (the "License").  You may not use
++this file except in compliance with the License.  You can obtain a copy
++in the file LICENSE in the source distribution or at
++L<https://www.openssl.org/source/license.html>.
++
++=cut
+diff -ruN a/doc/man3/SSL_poll.pod b/doc/man3/SSL_poll.pod
+--- a/doc/man3/SSL_poll.pod	2026-11-20 15:26:29.259451201 +0100
++++ b/doc/man3/SSL_poll.pod	2026-11-20 16:49:02.180102457 +0100
+@@ -421,6 +421,7 @@
+ 
+ L<BIO_get_rpoll_descriptor(3)>, L<BIO_get_wpoll_descriptor(3)>,
+ L<SSL_get_rpoll_descriptor(3)>, L<SSL_get_wpoll_descriptor(3)>,
++L<SSL_get_quic_ready_channels(3)>,
+ L<openssl-threads(7)>, L<openssl-quic(7)>,
+ L<openssl-quic-concurrency(7)>
+ 
+diff -ruN a/include/internal/quic_channel.h b/include/internal/quic_channel.h
+--- a/include/internal/quic_channel.h	2026-11-20 15:26:29.368331556 +0100
++++ b/include/internal/quic_channel.h	2026-11-20 16:49:02.184643655 +0100
+@@ -369,6 +369,15 @@
+ int ossl_quic_channel_is_server(const QUIC_CHANNEL *ch);
+ void ossl_quic_channel_notify_flush_done(QUIC_CHANNEL *ch);
+ 
++/*
++ * Returns 1 if a non-blocking SSL_poll() readout can skip testing this
++ * channel's connection-level events because it has no pending work and no
++ * timer is due. Stream objects and OS credit events are never skipped by the
++ * caller, so this only covers connection close and incoming stream events.
++ * Called with the channel mutex held.
++ */
++int ossl_quic_channel_poll_can_skip(const QUIC_CHANNEL *ch);
++
+ QUIC_PORT *ossl_quic_channel_get0_port(QUIC_CHANNEL *ch);
+ QUIC_ENGINE *ossl_quic_channel_get0_engine(QUIC_CHANNEL *ch);
+ QUIC_DEMUX *ossl_quic_channel_get0_demux(QUIC_CHANNEL *ch);
+diff -ruN a/include/internal/quic_port.h b/include/internal/quic_port.h
+--- a/include/internal/quic_port.h	2026-11-20 15:26:29.368372882 +0100
++++ b/include/internal/quic_port.h	2026-11-20 16:49:02.189224618 +0100
+@@ -210,6 +210,18 @@
+ void ossl_quic_port_update_channel_deadline(QUIC_PORT *port, QUIC_CHANNEL *ch);
+ void ossl_quic_port_unlink_channel(QUIC_PORT *port, QUIC_CHANNEL *ch);
+ 
++/*
++ * Returns the number of accepted connection channels which have become ready
++ * for polling, and optionally drains up to max_channels of them into the
++ * caller-provided array. Channels which have not yet been accepted via
++ * SSL_accept_connection() are never returned.
++ *
++ * The returned SSL pointers are borrowed; the caller must not free them.
++ */
++size_t ossl_quic_port_get_num_ready_channels(const QUIC_PORT *port);
++size_t ossl_quic_port_get_ready_channels(QUIC_PORT *port, SSL **channels,
++    size_t max_channels);
++
+ /* Returns the number of queued incoming channels. */
+ size_t ossl_quic_port_get_num_incoming_channels(const QUIC_PORT *port);
+ 
+diff -ruN a/include/internal/quic_ssl.h b/include/internal/quic_ssl.h
+--- a/include/internal/quic_ssl.h	2026-11-20 15:26:29.278452138 +0100
++++ b/include/internal/quic_ssl.h	2026-11-20 16:49:02.193795700 +0100
+@@ -111,6 +111,8 @@
+     uint64_t aec);
+ __owur SSL *ossl_quic_accept_stream(SSL *s, uint64_t flags);
+ __owur size_t ossl_quic_get_accept_stream_queue_len(SSL *s);
++__owur size_t ossl_quic_get_quic_ready_channels(SSL *s, SSL **channels,
++    size_t max_channels);
+ __owur int ossl_quic_get_value_uint(SSL *s, uint32_t class_, uint32_t id,
+     uint64_t *value);
+ __owur int ossl_quic_set_value_uint(SSL *s, uint32_t class_, uint32_t id,
+@@ -176,6 +178,18 @@
+ /* APIs used by the polling infrastructure */
+ int ossl_quic_conn_poll_events(SSL *ssl, uint64_t events, int do_tick,
+     uint64_t *revents);
++
++/*
++ * As ossl_quic_conn_poll_events(), but allows a caller polling several QUIC
++ * objects to reuse the domain lock. *p_lock is the currently held domain
++ * mutex, or NULL. The function may release it and acquire another if the next
++ * object belongs to a different domain. On return the lock is still held; the
++ * caller must release it with ossl_quic_conn_poll_release_lock().
++ */
++int ossl_quic_conn_poll_events_with_lock(SSL *ssl, uint64_t events,
++    int do_tick, uint64_t *revents, CRYPTO_MUTEX **p_lock);
++void ossl_quic_conn_poll_release_lock(CRYPTO_MUTEX **p_lock);
++
+ int ossl_quic_get_notifier_fd(SSL *ssl);
+ /*
+  * Blocking-section registration. Multi-reactor callers (e.g. SSL_poll) must
+diff -ruN a/include/openssl/ssl.h.in b/include/openssl/ssl.h.in
+--- a/include/openssl/ssl.h.in	2026-11-20 15:26:29.291452778 +0100
++++ b/include/openssl/ssl.h.in	2026-11-20 16:49:02.202137531 +0100
+@@ -2386,6 +2386,8 @@
+ #define SSL_ACCEPT_STREAM_BIDI (1U << 2)
+ __owur SSL *SSL_accept_stream(SSL *s, uint64_t flags);
+ __owur size_t SSL_get_accept_stream_queue_len(SSL *s);
++__owur size_t SSL_get_quic_ready_channels(SSL *s, SSL **channels,
++    size_t max_channels);
+ 
+ #ifndef OPENSSL_NO_QUIC
+ __owur int SSL_inject_net_dgram(SSL *s, const unsigned char *buf,
+diff -ruN a/ssl/quic/quic_channel.c b/ssl/quic/quic_channel.c
+--- a/ssl/quic/quic_channel.c	2026-11-20 15:26:29.368605344 +0100
++++ b/ssl/quic/quic_channel.c	2026-11-20 16:49:02.206213839 +0100
+@@ -356,6 +356,7 @@
+      */
+     ch->next_tick_deadline = ossl_time_infinite();
+     ch->timer_heap_idx = SIZE_MAX;
++    ch->accepted = 1;
+ 
+     ossl_ackm_set_tx_max_ack_delay(ch->ackm, ossl_ms2time(ch->tx_max_ack_delay));
+     ossl_ackm_set_rx_max_ack_delay(ch->ackm, ossl_ms2time(ch->rx_max_ack_delay));
+@@ -2153,6 +2154,39 @@
+     return ossl_time_compare(get_time(ch), ch->next_tick_deadline) < 0;
+ }
+ 
++int ossl_quic_channel_poll_can_skip(const QUIC_CHANNEL *ch)
++{
++    QUIC_STREAM_MAP *qsm = (QUIC_STREAM_MAP *)&ch->qsm;
++
++    /*
++     * The handshake layer can have non-network work pending, and a channel
++     * which is still marked active or dirty may have events which the next
++     * readout must report.
++     */
++    if (!ch->handshake_complete || ch->tick_dirty
++        || ch->on_active_channel_list)
++        return 0;
++
++    if (ossl_quic_channel_is_term_any(ch))
++        return 0;
++
++    if (ossl_quic_stream_map_get_total_accept_queue_len(qsm) > 0)
++        return 0;
++
++    if (ossl_quic_stream_map_has_pending_work(qsm))
++        return 0;
++
++    if (ossl_qrx_processed_read_pending(ch->qrx)
++        || ossl_qrx_unprocessed_read_pending(ch->qrx))
++        return 0;
++
++    if (ossl_qtx_get_queue_len_datagrams(ch->qtx) > 0)
++        return 0;
++
++    return ossl_time_compare(get_time((QUIC_CHANNEL *)ch),
++        ch->next_tick_deadline) < 0;
++}
++
+ /*
+  * The central ticker function called by the reactor. This does everything, or
+  * at least everything network I/O related. Best effort - not allowed to fail
+diff -ruN a/ssl/quic/quic_channel_local.h b/ssl/quic/quic_channel_local.h
+--- a/ssl/quic/quic_channel_local.h	2026-11-20 15:26:29.368759466 +0100
++++ b/ssl/quic/quic_channel_local.h	2026-11-20 16:49:02.209685970 +0100
+@@ -69,6 +69,7 @@
+     OSSL_LIST_MEMBER(ch, QUIC_CHANNEL);
+     OSSL_LIST_MEMBER(incoming_ch, QUIC_CHANNEL);
+     OSSL_LIST_MEMBER(active_ch, QUIC_CHANNEL);
++    OSSL_LIST_MEMBER(ready_ch, QUIC_CHANNEL);
+ 
+     /*
+      * The associated TLS 1.3 connection data. Used to provide the handshake
+@@ -514,6 +515,16 @@
+     /* Is this channel on the port's active channel list? */
+     unsigned int on_active_channel_list : 1;
+ 
++    /* Is this channel on the port's ready-channel list? */
++    unsigned int on_ready_channel_list : 1;
++
++    /*
++     * Set once the channel has been returned to the application by
++     * SSL_accept_connection() (or created as an outgoing channel). Pending
++     * incoming channels are never exposed through the ready-channel API.
++     */
++    unsigned int accepted : 1;
++
+     /* Are we currently inside a channel tick? */
+     unsigned int in_subtick : 1;
+ 
+diff -ruN a/ssl/quic/quic_impl.c b/ssl/quic/quic_impl.c
+--- a/ssl/quic/quic_impl.c	2026-11-20 15:26:29.310453715 +0100
++++ b/ssl/quic/quic_impl.c	2026-11-20 16:49:02.213252844 +0100
+@@ -4403,6 +4403,40 @@
+ }
+ 
+ /*
++ * SSL_get_quic_ready_channels
++ * ---------------------------
++ *
++ * Returns accepted connection channels which have become ready for polling,
++ * optionally draining up to max_channels of them into the caller-provided
++ * array. A call with channels == NULL or max_channels == 0 returns the number
++ * of queued channels without draining them.
++ *
++ * The returned SSL pointers are borrowed and remain owned by the normal
++ * connection lifecycle; the caller must not free them.
++ */
++QUIC_TAKES_LOCK
++size_t ossl_quic_get_quic_ready_channels(SSL *s, SSL **channels,
++    size_t max_channels)
++{
++    QCTX ctx;
++    size_t n;
++
++    if (!expect_quic_listener(s, &ctx))
++        return 0;
++
++    qctx_lock(&ctx);
++
++    if (channels == NULL || max_channels == 0)
++        n = ossl_quic_port_get_num_ready_channels(ctx.ql->port);
++    else
++        n = ossl_quic_port_get_ready_channels(ctx.ql->port, channels,
++            max_channels);
++
++    qctx_unlock(&ctx);
++    return n;
++}
++
++/*
+  * SSL_stream_reset
+  * ----------------
+  */
+@@ -5903,9 +5937,21 @@
+     return ossl_quic_port_get_num_incoming_channels(ql->port) > 0;
+ }
+ 
++void ossl_quic_conn_poll_release_lock(CRYPTO_MUTEX **p_lock)
++{
++#if defined(OPENSSL_THREADS)
++    if (*p_lock != NULL) {
++        ossl_crypto_mutex_unlock(*p_lock);
++        *p_lock = NULL;
++    }
++#else
++    *p_lock = NULL;
++#endif
++}
++
+ QUIC_TAKES_LOCK
+-int ossl_quic_conn_poll_events(SSL *ssl, uint64_t events, int do_tick,
+-    uint64_t *p_revents)
++int ossl_quic_conn_poll_events_with_lock(SSL *ssl, uint64_t events,
++    int do_tick, uint64_t *p_revents, CRYPTO_MUTEX **p_lock)
+ {
+     QCTX ctx;
+     uint64_t revents = 0;
+@@ -5913,7 +5959,19 @@
+     if (!expect_quic_csl(ssl, &ctx))
+         return 0;
+ 
+-    qctx_lock(&ctx);
++#if defined(OPENSSL_THREADS)
++    {
++        CRYPTO_MUTEX *mutex = ossl_quic_obj_get0_mutex(ctx.obj);
++
++        if (*p_lock != mutex) {
++            ossl_quic_conn_poll_release_lock(p_lock);
++            ossl_crypto_mutex_lock(mutex);
++            *p_lock = mutex;
++        }
++    }
++#else
++    *p_lock = NULL;
++#endif
+ 
+     if (ctx.qc != NULL && !ctx.qc->started) {
+         /* We can only try to write on non-started connection. */
+@@ -5922,6 +5980,16 @@
+         goto end;
+     }
+ 
++    /*
++     * A readout which is not driving the engine can skip the event tests for a
++     * quiescent connection. OS credit events are excluded because they are
++     * level-triggered and not tied to pending work on the channel.
++     */
++    if (!do_tick && ctx.qc != NULL && !ctx.is_stream && !ctx.is_listener
++        && (events & SSL_POLL_EVENT_OS) == 0
++        && ossl_quic_channel_poll_can_skip(ctx.qc->ch))
++        goto end;
++
+     if (do_tick)
+         ossl_quic_reactor_tick(ossl_quic_obj_get0_reactor(ctx.obj), 0);
+ 
+@@ -5982,12 +6050,23 @@
+     }
+ 
+ end:
+-    qctx_unlock(&ctx);
+     *p_revents = revents;
+     return 1;
+ }
+ 
+ QUIC_TAKES_LOCK
++int ossl_quic_conn_poll_events(SSL *ssl, uint64_t events, int do_tick,
++    uint64_t *p_revents)
++{
++    CRYPTO_MUTEX *lock = NULL;
++    int ret = ossl_quic_conn_poll_events_with_lock(ssl, events, do_tick,
++        p_revents, &lock);
++
++    ossl_quic_conn_poll_release_lock(&lock);
++    return ret;
++}
++
++QUIC_TAKES_LOCK
+ int ossl_quic_get_notifier_fd(SSL *ssl)
+ {
+     QCTX ctx;
+diff -ruN a/ssl/quic/quic_port.c b/ssl/quic/quic_port.c
+--- a/ssl/quic/quic_port.c	2026-11-20 15:26:29.368838596 +0100
++++ b/ssl/quic/quic_port.c	2026-11-20 16:49:02.217086067 +0100
+@@ -32,6 +32,7 @@
+ static void port_default_packet_handler(QUIC_URXE *e, void *arg,
+     const QUIC_CONN_ID *dcid);
+ static void port_rx_pre(QUIC_PORT *port);
++static void port_mark_channel_ready(QUIC_CHANNEL *ch);
+ 
+ /**
+  * @struct validation_token
+@@ -106,6 +107,7 @@
+ DEFINE_LIST_OF_IMPL(ch, QUIC_CHANNEL);
+ DEFINE_LIST_OF_IMPL(incoming_ch, QUIC_CHANNEL);
+ DEFINE_LIST_OF_IMPL(active_ch, QUIC_CHANNEL);
++DEFINE_LIST_OF_IMPL(ready_ch, QUIC_CHANNEL);
+ DEFINE_LIST_OF_IMPL(port, QUIC_PORT);
+ 
+ QUIC_PORT *ossl_quic_port_new(const QUIC_PORT_ARGS *args)
+@@ -214,6 +216,7 @@
+     port->active_conn_id_limit = QUIC_MIN_ACTIVE_CONN_ID_LIMIT;
+ 
+     ossl_list_active_ch_init(&port->active_channel_list);
++    ossl_list_ready_ch_init(&port->ready_channel_list);
+ 
+     port->state = QUIC_PORT_STATE_RUNNING;
+ 
+@@ -248,6 +251,7 @@
+ static void port_cleanup(QUIC_PORT *port)
+ {
+     assert(ossl_list_ch_num(&port->channel_list) == 0);
++    assert(ossl_list_ready_ch_num(&port->ready_channel_list) == 0);
+ 
+     OPENSSL_free(port->timer_heap);
+     port->timer_heap = NULL;
+@@ -734,6 +738,15 @@
+         return NULL;
+ 
+     ossl_list_incoming_ch_remove(&port->incoming_channel_list, ch);
++
++    /*
++     * The channel is now owned by the caller (SSL_accept_connection); make it
++     * visible to the ready-channel readout. The listener IC event remains the
++     * signal for channels which are still queued and therefore not yet owned
++     * by the application.
++     */
++    ch->accepted = 1;
++    port_mark_channel_ready(ch);
+     return ch;
+ }
+ 
+@@ -957,9 +970,63 @@
+         ch->on_active_channel_list = 0;
+     }
+ 
++    if (ch->on_ready_channel_list) {
++        ossl_list_ready_ch_remove(&port->ready_channel_list, ch);
++        ch->on_ready_channel_list = 0;
++    }
++
+     port_timer_heap_remove(port, ch);
+ }
+ 
++/*
++ * Returns the user-facing QUIC connection SSL object for a channel, or NULL if
++ * the channel has no user SSL yet (for example a deferred listen_ex channel).
++ */
++static SSL *ch_get_user_ssl(const QUIC_CHANNEL *ch)
++{
++    SSL_CONNECTION *sc;
++
++    if (ch->tls == NULL)
++        return NULL;
++
++    sc = SSL_CONNECTION_FROM_SSL(ch->tls);
++    if (sc == NULL)
++        return NULL;
++
++    return SSL_CONNECTION_GET_USER_SSL(sc);
++}
++
++/*
++ * Queues an accepted channel for the application's ready-channel readout.
++ * Channels which have not yet been returned by SSL_accept_connection() are
++ * deliberately not exposed: the listener's IC event is their only readiness
++ * signal, and the application does not yet own their SSL object.
++ */
++static void port_mark_channel_ready(QUIC_CHANNEL *ch)
++{
++    QUIC_PORT *port = ch->port;
++
++    if (port == NULL || !ch->on_port_list || !ch->accepted
++        || ch->on_ready_channel_list || ch_get_user_ssl(ch) == NULL)
++        return;
++
++    ossl_list_ready_ch_insert_tail(&port->ready_channel_list, ch);
++    ch->on_ready_channel_list = 1;
++}
++
++/*
++ * Returns 1 if the channel retains a level-triggered poll condition which must
++ * remain visible until the application consumes it: an incoming stream queue or
++ * a connection which is closing/closed.
++ */
++static int ch_has_persistent_poll_event(const QUIC_CHANNEL *ch)
++{
++    QUIC_STREAM_MAP *qsm = (QUIC_STREAM_MAP *)&ch->qsm;
++
++    return ossl_quic_channel_is_term_any(ch)
++        || ossl_quic_stream_map_get_total_accept_queue_len(qsm) > 0;
++}
++
+ void ossl_quic_port_mark_channel_active(QUIC_CHANNEL *ch)
+ {
+     QUIC_PORT *port = ch->port;
+@@ -973,6 +1040,13 @@
+         return;
+ 
+     /*
++     * A channel touched by an API action or by RX has potential poll events;
++     * make sure the application can discover it even if it is no longer on the
++     * active list by the time the next readout runs.
++     */
++    port_mark_channel_ready(ch);
++
++    /*
+      * Work discovered while the channel is already being ticked is serviced by
+      * that tick (or by the deadline it installs); do not queue an immediate
+      * second tick.
+@@ -984,6 +1058,48 @@
+     ch->on_active_channel_list = 1;
+ }
+ 
++size_t ossl_quic_port_get_num_ready_channels(const QUIC_PORT *port)
++{
++    QUIC_CHANNEL *ch;
++    size_t n = 0;
++
++    OSSL_LIST_FOREACH (ch, ready_ch, &port->ready_channel_list)
++        if (ch->accepted && ch_get_user_ssl(ch) != NULL)
++            ++n;
++
++    return n;
++}
++
++size_t ossl_quic_port_get_ready_channels(QUIC_PORT *port, SSL **channels,
++    size_t max_channels)
++{
++    QUIC_CHANNEL *ch, *chn;
++    size_t n = 0;
++
++    if (channels == NULL || max_channels == 0)
++        return 0;
++
++    OSSL_LIST_FOREACH_DELSAFE (ch, chn, ready_ch, &port->ready_channel_list) {
++        SSL *ssl;
++
++        if (!ch->accepted)
++            continue;
++
++        ssl = ch_get_user_ssl(ch);
++        if (ssl == NULL)
++            continue;
++
++        ossl_list_ready_ch_remove(&port->ready_channel_list, ch);
++        ch->on_ready_channel_list = 0;
++        channels[n++] = ssl;
++
++        if (n == max_channels)
++            break;
++    }
++
++    return n;
++}
++
+ /*
+  * Tick function for this port. This does everything related to network I/O for
+  * this port's network BIOs, and services child channels.
+@@ -1021,8 +1137,11 @@
+         OSSL_LIST_FOREACH (ch, ch, &port->channel_list) {
+             QUIC_TICK_RESULT subr = { 0 };
+ 
++            port_mark_channel_ready(ch);
+             ossl_quic_channel_subtick(ch, &subr, flags);
+             ossl_quic_tick_result_merge_into(res, &subr);
++            if (ch_has_persistent_poll_event(ch))
++                port_mark_channel_ready(ch);
+         }
+         return;
+     }
+@@ -1043,8 +1162,11 @@
+         ossl_list_active_ch_remove(&port->active_channel_list, ch);
+         ch->on_active_channel_list = 0;
+ 
++        port_mark_channel_ready(ch);
+         ossl_quic_channel_subtick(ch, &subr, flags);
+         ossl_quic_tick_result_merge_into(res, &subr);
++        if (ch_has_persistent_poll_event(ch))
++            port_mark_channel_ready(ch);
+     }
+ 
+     /* Service channels whose timers have expired. */
+@@ -1070,8 +1192,11 @@
+             ch->on_active_channel_list = 0;
+         }
+ 
++        port_mark_channel_ready(ch);
+         ossl_quic_channel_subtick(ch, &subr, flags);
+         ossl_quic_tick_result_merge_into(res, &subr);
++        if (ch_has_persistent_poll_event(ch))
++            port_mark_channel_ready(ch);
+     }
+ 
+     if (port->timer_heap_num > 0)
+@@ -1147,6 +1272,8 @@
+     } else {
+         ch = port_make_channel(port, NULL, qrx, /* is_server= */ 1,
+             /* is_tserver */ 0);
++        if (ch != NULL)
++            ch->accepted = 0;
+     }
+ 
+     if (ch == NULL)
+diff -ruN a/ssl/quic/quic_port_local.h b/ssl/quic/quic_port_local.h
+--- a/ssl/quic/quic_port_local.h	2026-11-20 15:26:29.368924637 +0100
++++ b/ssl/quic/quic_port_local.h	2026-11-20 16:49:02.221012448 +0100
+@@ -28,6 +28,7 @@
+ DECLARE_LIST_OF(ch, QUIC_CHANNEL);
+ DECLARE_LIST_OF(incoming_ch, QUIC_CHANNEL);
+ DECLARE_LIST_OF(active_ch, QUIC_CHANNEL);
++DECLARE_LIST_OF(ready_ch, QUIC_CHANNEL);
+ 
+ /* A port is always in one of the following states: */
+ enum {
+@@ -77,6 +78,17 @@
+     active_channel_list;
+ 
+     /*
++     * Accepted channels which have become ready for the application's poll
++     * readout. This is the work-gated replacement for walking every connection
++     * poll item: a channel is queued when it is marked active, when a timer is
++     * due, or when it retains a level-triggered condition (incoming stream or
++     * connection close). The application drains this list through
++     * SSL_get_quic_ready_channels().
++     */
++    OSSL_LIST(ready_ch)
++    ready_channel_list;
++
++    /*
+      * Min-heap of channels keyed by next_tick_deadline, used to find channels
+      * whose timers are due without scanning channel_list.
+      */
+diff -ruN a/ssl/rio/poll_immediate.c b/ssl/rio/poll_immediate.c
+--- a/ssl/rio/poll_immediate.c	2026-11-20 15:26:29.333454848 +0100
++++ b/ssl/rio/poll_immediate.c	2026-11-20 16:49:02.228398181 +0100
+@@ -766,6 +766,9 @@
+ #if !defined(OPENSSL_NO_QUIC) || !defined(OPENSSL_NO_DTLS)
+     uint64_t events;
+ #endif
++#ifndef OPENSSL_NO_QUIC
++    CRYPTO_MUTEX *quic_lock = NULL;
++#endif
+     uint64_t revents;
+ 
+     for (i = 0; i < num_items; ++i) {
+@@ -787,7 +790,8 @@
+             case SSL_TYPE_QUIC_LISTENER:
+             case SSL_TYPE_QUIC_CONNECTION:
+             case SSL_TYPE_QUIC_XSO:
+-                if (!ossl_quic_conn_poll_events(ssl, events, do_tick, &revents))
++                if (!ossl_quic_conn_poll_events_with_lock(ssl, events,
++                        do_tick, &revents, &quic_lock))
+                     /* above call raises ERR */
+                     FAIL_ITEM(i);
+ 
+@@ -799,6 +803,9 @@
+ 
+ #ifndef OPENSSL_NO_DTLS
+             case SSL_TYPE_DTLS_LISTENER:
++#ifndef OPENSSL_NO_QUIC
++                ossl_quic_conn_poll_release_lock(&quic_lock);
++#endif
+                 if (!ossl_dtls_listener_poll_events(ssl, events, do_tick, &revents))
+                     /* above call raises ERR */
+                     FAIL_ITEM(i);
+@@ -808,6 +815,9 @@
+                 break;
+             case SSL_TYPE_SSL_CONNECTION:
+                 if (SSL_is_dtls(ssl)) {
++#ifndef OPENSSL_NO_QUIC
++                    ossl_quic_conn_poll_release_lock(&quic_lock);
++#endif
+                     if (!ossl_dtls_conn_poll_events(ssl, events, do_tick, &revents))
+                         /* above call raises ERR */
+                         FAIL_ITEM(i);
+@@ -846,6 +856,9 @@
+     }
+ 
+ out:
++#ifndef OPENSSL_NO_QUIC
++    ossl_quic_conn_poll_release_lock(&quic_lock);
++#endif
+     if (p_result_count != NULL)
+         *p_result_count = result_count;
+ 
+diff -ruN a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+--- a/ssl/ssl_lib.c	2026-11-20 15:26:29.349455637 +0100
++++ b/ssl/ssl_lib.c	2026-11-20 16:49:02.231987498 +0100
+@@ -8568,6 +8568,18 @@
+ #endif
+ }
+ 
++size_t SSL_get_quic_ready_channels(SSL *s, SSL **channels, size_t max_channels)
++{
++#ifndef OPENSSL_NO_QUIC
++    if (!IS_QUIC(s))
++        return 0;
++
++    return ossl_quic_get_quic_ready_channels(s, channels, max_channels);
++#else
++    return 0;
++#endif
++}
++
+ int SSL_stream_reset(SSL *s,
+     const SSL_STREAM_RESET_ARGS *args,
+     size_t args_len)
+diff -ruN a/test/quicapitest.c b/test/quicapitest.c
+--- a/test/quicapitest.c	2026-11-20 15:26:29.356455982 +0100
++++ b/test/quicapitest.c	2026-11-20 16:49:02.235777918 +0100
+@@ -3100,6 +3100,61 @@
+     return TEST_size_t_eq(SSL_get_accept_connection_queue_len(qlistener), 1);
+ }
+ 
++static int test_get_quic_ready_channels(void)
++{
++    SSL_CTX *cctx = NULL, *sctx = NULL;
++    SSL *clientssl = NULL, *serverssl = NULL, *qlistener = NULL;
++    SSL *channels[4];
++    int testresult = 0;
++
++    if (!TEST_ptr(sctx = create_server_ctx())
++        || !TEST_ptr(cctx = create_client_ctx()))
++        goto err;
++
++    if (!create_quic_ssl_objects(sctx, cctx, &qlistener, &clientssl))
++        goto err;
++
++    if (!TEST_true(queue_incoming_connection(qlistener, clientssl)))
++        goto err;
++
++    /*
++     * A connection which has not yet been accepted is not exposed through the
++     * ready-channel API; the listener IC event is its only readiness signal.
++     */
++    if (!TEST_size_t_eq(SSL_get_quic_ready_channels(qlistener, NULL, 0), 0)
++        || !TEST_size_t_eq(SSL_get_quic_ready_channels(qlistener, channels,
++            OSSL_NELEM(channels)), 0))
++        goto err;
++
++    serverssl = SSL_accept_connection(qlistener, SSL_ACCEPT_CONNECTION_NO_BLOCK);
++    if (!TEST_ptr(serverssl))
++        goto err;
++
++    /*
++     * Once accepted, the channel is made ready for the application's readout,
++     * and draining it a second time must not return it again until new work
++     * occurs.
++     */
++    if (!TEST_size_t_eq(SSL_get_quic_ready_channels(qlistener, NULL, 0), 1)
++        || !TEST_size_t_eq(SSL_get_quic_ready_channels(qlistener, channels,
++            OSSL_NELEM(channels)), 1)
++        || !TEST_ptr_eq(channels[0], serverssl)
++        || !TEST_size_t_eq(SSL_get_quic_ready_channels(qlistener, channels,
++            OSSL_NELEM(channels)), 0))
++        goto err;
++
++    testresult = 1;
++
++err:
++    SSL_free(serverssl);
++    SSL_free(clientssl);
++    SSL_free(qlistener);
++    SSL_CTX_free(sctx);
++    SSL_CTX_free(cctx);
++
++    return testresult;
++}
++
+ static SSL *listen_ex_msg_cb_ssl;
+ static char listen_ex_msg_cb_arg;
+ static unsigned int listen_ex_tls_msg_count;
+@@ -5930,6 +5985,7 @@
+     ADD_TEST(test_early_ticks);
+     ADD_TEST(test_ssl_new_from_listener);
+     ADD_TEST(test_ssl_new_from_listener_user_ssl);
++    ADD_TEST(test_get_quic_ready_channels);
+ #ifndef OPENSSL_NO_SSL_TRACE
+     ADD_TEST(test_new_token);
+ #endif
+diff -ruN a/util/libssl.num b/util/libssl.num
+--- a/util/libssl.num	2026-11-20 15:26:29.363456327 +0100
++++ b/util/libssl.num	2026-11-20 16:49:02.239408372 +0100
+@@ -626,3 +626,4 @@
+ SSL_set1_ech_config_list                626	4_0_0	EXIST::FUNCTION:ECH
+ SSL_get0_sigalg                         627	4_0_0	EXIST::FUNCTION:
+ SSL_get0_shared_sigalg                  628	4_0_0	EXIST::FUNCTION:
++SSL_get_quic_ready_channels             629	4_0_0	EXIST::FUNCTION:

@@ -68,7 +68,7 @@ public class TestHttp3RequestStatistics extends Http3TestBase {
                 "--data", Base64.getEncoder().encodeToString(four),
                 "--frame-after-data", frame,
                 "--frame-after-data-delay", "0.5",
-                "--fin-after", "1", "--timeout", "3", "--wait", "1"),
+                "--fin-after", "1", "--timeout", "8", "--wait", "1"),
                 CLIENT_TIMEOUT_SECONDS);
         Assert.assertEquals("Expected the content-length overrun to reset "
                         + "the stream", Integer.valueOf(H3_MESSAGE_ERROR),

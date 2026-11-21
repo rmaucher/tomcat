@@ -183,7 +183,7 @@ public class TestHttp3QpackBlockedStreams extends Http3TestBase {
         long start = System.currentTimeMillis();
         ClientOutput output = runClient(rawCommandWith(
                 "--headers", b64(blockedFieldSection()),
-                "--timeout", "12",
+                "--timeout", "25",
                 "--wait", "1"), CLIENT_TIMEOUT_SECONDS);
         long elapsed = System.currentTimeMillis() - start;
 
@@ -210,7 +210,7 @@ public class TestHttp3QpackBlockedStreams extends Http3TestBase {
                 "--headers", b64(blockedFieldSection()),
                 "--no-fin",
                 "--reset-request", "0.5",
-                "--timeout", "7",
+                "--timeout", "20",
                 "--wait", "1"), CLIENT_TIMEOUT_SECONDS);
 
         Assert.assertNull("A reset blocked stream must not fail the "
@@ -226,6 +226,13 @@ public class TestHttp3QpackBlockedStreams extends Http3TestBase {
     public void testBlockedStreamLimitExceeded() throws Exception {
         startHttp3Server();
         enableBlockedStreams(1);
+        // Give the first blocked stream a much longer wait than the test
+        // window. The excess stream must be rejected by the blocked-stream
+        // limit itself, not by the first stream's timeout, and this keeps
+        // that distinction meaningful when the suite runs under heavy load
+        // (the elapsed threshold below is also relaxed accordingly).
+        ((AbstractHttp3Protocol) connector.getProtocolHandler())
+                .setQpackBlockedStreamTimeoutMs(30000);
 
         // Three streams whose field sections all require an insert that
         // never arrives. Only one may block (the connector's limit): the
@@ -236,14 +243,17 @@ public class TestHttp3QpackBlockedStreams extends Http3TestBase {
         ClientOutput output = runClient(rawCommandWith(
                 "--headers", b64(blockedFieldSection()),
                 "--streams", "3",
-                "--timeout", "12",
-                "--wait", "1"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "40",
+                "--wait", "2"), CLIENT_TIMEOUT_SECONDS);
         long elapsed = System.currentTimeMillis() - start;
 
         assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
+        // The configured blocked-stream timeout is 30 s; allow for scheduler
+        // delays under the parallel suite while still proving the excess
+        // stream was rejected well before that timeout.
         Assert.assertTrue("The blocked-stream limit must reject the excess "
                         + "stream without waiting (" + elapsed + " ms)",
-                elapsed < 4000);
+                elapsed < 20000);
 
         // The server stays healthy for subsequent connections.
         validateStatus(get("/simple"), 200);

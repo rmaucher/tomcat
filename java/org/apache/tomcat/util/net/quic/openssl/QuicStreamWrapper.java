@@ -70,9 +70,12 @@ public class QuicStreamWrapper implements QuicStream {
     private QuicPollItem pollItem;
 
     /**
-     * Read buffer for data received from the stream.
+     * Read buffer for data received from the stream. Replaced when a client
+     * unidirectional stream grows from its small initial buffer to the full
+     * configured size, or shrinks back after it is identified as an unknown
+     * stream whose data is discarded. Accessed only from the poll thread.
      */
-    private final ByteBuffer readBuffer;
+    private ByteBuffer readBuffer;
 
     /**
      * Write buffer for pending data to send on the stream.
@@ -307,6 +310,47 @@ public class QuicStreamWrapper implements QuicStream {
      */
     public ByteBuffer getReadBuffer() {
         return readBuffer;
+    }
+
+
+    /**
+     * Grows the read buffer, preserving buffered put-mode bytes. Used by
+     * client unidirectional streams that started with a small buffer while
+     * their type was unknown: identified control/QPACK streams need the full
+     * configured re-assembly window. Must be called on the poll thread when no
+     * caller holds the old buffer for further use.
+     *
+     * @param capacity The requested capacity; ignored when not larger than
+     *                 the current capacity
+     */
+    public void growReadBuffer(int capacity) {
+        ByteBuffer current = readBuffer;
+        if (current == null || capacity <= current.capacity()) {
+            return;
+        }
+        ByteBuffer grown = ByteBuffer.allocate(capacity);
+        transferPutMode(current, grown);
+        readBuffer = grown;
+    }
+
+
+    /**
+     * Shrinks the read buffer while it is empty. Used after a client
+     * unidirectional stream is identified as an unknown type whose data is
+     * discarded, so open unknown streams do not retain the full configured
+     * re-assembly buffer each. Must be called on the poll thread when the
+     * buffer holds no unconsumed bytes.
+     *
+     * @param capacity The requested capacity; ignored when not smaller than
+     *                 the current capacity or when data is buffered
+     */
+    public void shrinkReadBuffer(int capacity) {
+        ByteBuffer current = readBuffer;
+        if (current == null || capacity <= 0 ||
+                capacity >= current.capacity() || current.position() != 0) {
+            return;
+        }
+        readBuffer = ByteBuffer.allocate(capacity);
     }
 
 

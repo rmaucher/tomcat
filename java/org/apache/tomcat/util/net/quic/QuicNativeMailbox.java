@@ -144,8 +144,10 @@ public class QuicNativeMailbox {
      *
      * @param task The task to run on the poll thread
      *
-     * @return {@code true} if the task was queued, {@code false} if it was
-     *         dropped because the mailbox is closed (endpoint stopped)
+     * @return {@code true} if the task was queued (even if the optional wake
+     *         failed; the poll loop's next timed iteration still runs it),
+     *         {@code false} if it was dropped because the mailbox is closed
+     *         (endpoint stopped)
      */
     public boolean submitPollTask(Runnable task) {
         // The closed check and the add are atomic against close() (see
@@ -159,7 +161,17 @@ public class QuicNativeMailbox {
         }
         Runnable w = waker;
         if (w != null) {
-            w.run();
+            try {
+                w.run();
+            } catch (Throwable t) {
+                // The task is already queued; it will run on the poll loop's
+                // next iteration (a wake failure only delays it until the
+                // current timed wait expires). Propagating the exception
+                // would make the caller believe the task was not accepted and
+                // release accounting that the queued task still owns.
+                ExceptionUtils.handleThrowable(t);
+                log.warn(sm.getString("mailbox.wakerError"), t);
+            }
         }
         return true;
     }

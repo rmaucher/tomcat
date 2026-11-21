@@ -169,7 +169,7 @@ public class TestQuicCertificates extends Http3TestBase {
 
         // Verifying client with the wrong CA must fail the handshake
         CertClientResult failed = certGet("/simple", null, null,
-                CERT_DIR + "quic-default-cert.pem", null);
+                CERT_DIR + "quic-default-cert.pem", null, 3);
         Assert.assertFalse("Handshake with wrong CA must fail",
                 failed.exitCode == 0 && failed.fields.containsKey("STATUS"));
     }
@@ -275,7 +275,7 @@ public class TestQuicCertificates extends Http3TestBase {
 
         startHttp3Server(host);
 
-        CertClientResult result = certGet("/simple", null, null, null, null);
+        CertClientResult result = certGet("/simple", null, null, null, null, 3);
         Assert.assertFalse("Handshake without a usable private key must fail",
                 result.exitCode == 0 && result.fields.containsKey("STATUS"));
     }
@@ -398,7 +398,7 @@ public class TestQuicCertificates extends Http3TestBase {
         // that SNI name must fail instead of serving a name-mismatched
         // certificate.
         CertClientResult mismatch = certGet("/simple", "quic-pkcs12.test",
-                null, null, null);
+                null, null, null, 3);
         Assert.assertFalse("SNI for a host without loadable certificates "
                         + "must fail the handshake, not present the default "
                         + "certificate",
@@ -576,6 +576,17 @@ public class TestQuicCertificates extends Http3TestBase {
      */
     private CertClientResult certGet(String path, String sni, String authority,
             String caFile, String sigpref) throws Exception {
+        return certGet(path, sni, authority, caFile, sigpref, 20);
+    }
+
+
+    /**
+     * Runs the certificate client with an explicit handshake/request timeout.
+     * Tests that expect the handshake to fail use a short timeout so the
+     * client does not wait for the full window before reporting the failure.
+     */
+    private CertClientResult certGet(String path, String sni, String authority,
+            String caFile, String sigpref, int timeoutSeconds) throws Exception {
         List<String> command = new ArrayList<>();
         command.add(PYTHON);
         command.add(CERT_CLIENT_SCRIPT);
@@ -597,6 +608,8 @@ public class TestQuicCertificates extends Http3TestBase {
             command.add("--sigpref");
             command.add(sigpref);
         }
+        command.add("--timeout");
+        command.add(Integer.toString(timeoutSeconds));
 
         Process process = new ProcessBuilder(command).start();
         CertClientResult result = new CertClientResult();

@@ -126,7 +126,7 @@ public class TestHttp3Limits extends Http3TestBase {
                         "content-length", Long.toString(declaredLength)),
                 "--frame-after-data", oversizedDataFrameB64(declaredLength),
                 "--no-fin",
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_FRAME_ERROR);
@@ -155,7 +155,7 @@ public class TestHttp3Limits extends Http3TestBase {
                         Long.toString(first.length + declaredLength)),
                 "--data", Base64.getEncoder().encodeToString(first),
                 "--frame-after-data", oversizedDataFrameB64(declaredLength),
-                "--timeout", "5"),
+                "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_FRAME_ERROR);
@@ -224,7 +224,7 @@ public class TestHttp3Limits extends Http3TestBase {
                 buildFieldSection(simpleGetHeaders("/simple")),
                 "--frame", declaredDataFrameB64(declaredLength, 4),
                 "--no-fin",
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -268,7 +268,8 @@ public class TestHttp3Limits extends Http3TestBase {
         ClientOutput output = runClient(rawCommandWith(
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/sleep?ms=5000")),
-                "--streams", Integer.toString(streamCount)),
+                "--streams", Integer.toString(streamCount),
+                "--timeout", "30"),
                 CLIENT_TIMEOUT_SECONDS);
 
         int resultCount = output.getResponses().size()

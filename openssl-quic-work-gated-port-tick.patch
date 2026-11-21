@@ -1,0 +1,749 @@
+#
+# OpenSSL QUIC: work-gated port tick (Phase A)
+# ============================================
+#
+# Problem
+# -------
+# ossl_quic_port_subtick() serviced every channel on the listener on every
+# engine tick. A channel tick processes queued RX, ticks TLS, checks timers,
+# generates/flushes TX and runs stream GC. One arriving datagram or one due
+# timer therefore cost O(connections), making an idle fleet quadratic.
+#
+# What it does
+# ------------
+# Only channels with pending work are serviced:
+#
+#   * an active-channel list holds channels touched by the demux RX path, by
+#     application actions (SSL_write, stream reset/conclude, close, key update,
+#     ping), or by a stream becoming active;
+#   * a timer min-heap keyed by each channel's cached next tick deadline finds
+#     channels whose timers have expired in O(log N);
+#   * the engine's next-wake deadline is derived from the earliest cached
+#     channel deadline;
+#   * handshaking channels remain scheduled even without network input, so
+#     application-driven progress (for example a certificate-verification
+#     retry) is preserved;
+#   * if the timer heap cannot be allocated, the port falls back to the old
+#     full channel scan;
+#   * the channel tick gets a cheap "nothing to do" fast path guarded by
+#     pending QRX work, queued QTX datagrams, stream-map work, the cached
+#     deadline and the handshake state.
+#
+# No public API, ABI or configuration change is introduced.
+#
+# Files
+# -----
+#   include/internal/quic_channel.h
+#   include/internal/quic_port.h
+#   include/internal/quic_stream_map.h
+#   ssl/quic/quic_channel.c
+#   ssl/quic/quic_channel_local.h
+#   ssl/quic/quic_port.c
+#   ssl/quic/quic_port_local.h
+#   ssl/quic/quic_stream_map.c
+#
+# Validation
+# ----------
+#   make -j8: PASS
+#   OpenSSL QUIC recipes: 19 files, 21 tests, 0 failures
+#     (test_quic_cfq, test_quic_fc, test_quic_fifd, test_quic_lcidm,
+#      test_quic_qlog, test_quic_radix, test_quic_rcidm, test_quic_record,
+#      test_quic_srtm, test_quic_stream, test_quic_tserver, test_quic_txp,
+#      test_quic_txpim, test_quic_wire, test_quic_ackm, test_quic_cc,
+#      test_quic_srt_gen, test_quicapi, test_quicfaults)
+#   Tomcat HTTP/3 suite against the patched libssl: 588 run, 0 failures,
+#     0 errors, 2 skipped.
+#
+# Apply from an OpenSSL source tree with:
+#   git apply /path/to/openssl-quic-work-gated-port-tick.patch
+# or:
+#   patch -p1 < /path/to/openssl-quic-work-gated-port-tick.patch
+#
+# Generated against OpenSSL master 159cdbc600 (2026-11-20).
+#
+diff --git a/include/internal/quic_channel.h b/include/internal/quic_channel.h
+index 47a6202164..3775e9e363 100644
+--- a/include/internal/quic_channel.h
++++ b/include/internal/quic_channel.h
+@@ -314,6 +314,12 @@ void ossl_quic_channel_inject(QUIC_CHANNEL *ch, QUIC_URXE *e);
+ 
+ void ossl_quic_channel_inject_pkt(QUIC_CHANNEL *ch, OSSL_QRX_PKT *qpkt);
+ 
++/*
++ * Marks a channel as having work which requires a full tick on the next port
++ * tick. Safe to call from QUIC API functions and the demux path.
++ */
++void ossl_quic_channel_mark_active(QUIC_CHANNEL *ch);
++
+ /*
+  * Queries and Accessors
+  * =====================
+diff --git a/include/internal/quic_port.h b/include/internal/quic_port.h
+index bd590939fa..a1576f7a19 100644
+--- a/include/internal/quic_port.h
++++ b/include/internal/quic_port.h
+@@ -201,6 +201,15 @@ void ossl_quic_port_restore_err_state(const QUIC_PORT *port);
+ void ossl_quic_port_subtick(QUIC_PORT *port, QUIC_TICK_RESULT *r,
+     uint32_t flags);
+ 
++/*
++ * For use by QUIC_CHANNEL. Schedules the channel for service on the next port
++ * tick and updates its entry in the port's timer heap after its cached
++ * next_tick_deadline has changed.
++ */
++void ossl_quic_port_mark_channel_active(QUIC_CHANNEL *ch);
++void ossl_quic_port_update_channel_deadline(QUIC_PORT *port, QUIC_CHANNEL *ch);
++void ossl_quic_port_unlink_channel(QUIC_PORT *port, QUIC_CHANNEL *ch);
++
+ /* Returns the number of queued incoming channels. */
+ size_t ossl_quic_port_get_num_incoming_channels(const QUIC_PORT *port);
+ 
+diff --git a/include/internal/quic_stream_map.h b/include/internal/quic_stream_map.h
+index 3556bef38b..e115d6c7b6 100644
+--- a/include/internal/quic_stream_map.h
++++ b/include/internal/quic_stream_map.h
+@@ -876,6 +876,12 @@ size_t ossl_quic_stream_map_get_total_accept_queue_len(QUIC_STREAM_MAP *qsm);
+  */
+ void ossl_quic_stream_map_gc(QUIC_STREAM_MAP *qsm);
+ 
++/*
++ * Returns 1 if the stream map holds work which requires a full channel tick
++ * (active streams or streams awaiting GC), 0 otherwise.
++ */
++int ossl_quic_stream_map_has_pending_work(const QUIC_STREAM_MAP *qsm);
++
+ /*
+  * Begins shutdown stream flush triage. Analyses all streams, including deleted
+  * but not yet GC'd streams, to determine if we should wait for that stream to
+diff --git a/ssl/quic/quic_channel.c b/ssl/quic/quic_channel.c
+index b9388a3f3c..0ae8686f00 100644
+--- a/ssl/quic/quic_channel.c
++++ b/ssl/quic/quic_channel.c
+@@ -40,6 +40,7 @@ DEFINE_LIST_OF_IMPL(ch, QUIC_CHANNEL);
+ static void ch_save_err_state(QUIC_CHANNEL *ch);
+ static int ch_rx(QUIC_CHANNEL *ch, int channel_only, int *notify_other_threads);
+ static int ch_tx(QUIC_CHANNEL *ch, int *notify_other_threads);
++static void ch_subtick(QUIC_CHANNEL *ch, QUIC_TICK_RESULT *res, uint32_t flags);
+ static int ch_tick_tls(QUIC_CHANNEL *ch, int channel_only, int *notify_other_threads);
+ static void ch_rx_handle_packet(QUIC_CHANNEL *ch, int channel_only);
+ static OSSL_TIME ch_determine_next_tick_deadline(QUIC_CHANNEL *ch);
+@@ -349,12 +350,21 @@ static int ch_init(QUIC_CHANNEL *ch)
+ 
+     ch->max_idle_timeout = ch->max_idle_timeout_local_req;
+ 
++    /*
++     * Until the first full tick runs, there is no cached deadline and a tick
++     * must not be skipped.
++     */
++    ch->next_tick_deadline = ossl_time_infinite();
++    ch->timer_heap_idx = SIZE_MAX;
++
+     ossl_ackm_set_tx_max_ack_delay(ch->ackm, ossl_ms2time(ch->tx_max_ack_delay));
+     ossl_ackm_set_rx_max_ack_delay(ch->ackm, ossl_ms2time(ch->rx_max_ack_delay));
+ 
+     ch_update_idle(ch);
+     ossl_list_ch_insert_tail(&ch->port->channel_list, ch);
+     ch->on_port_list = 1;
++    ossl_quic_port_update_channel_deadline(ch->port, ch);
++    ossl_quic_channel_mark_active(ch);
+     return 1;
+ 
+ err:
+@@ -436,6 +446,7 @@ static void ch_cleanup(QUIC_CHANNEL *ch)
+     ch->pending_new_token = NULL;
+ 
+     if (ch->on_port_list) {
++        ossl_quic_port_unlink_channel(ch->port, ch);
+         ossl_list_ch_remove(&ch->port->channel_list, ch);
+         ch->on_port_list = 0;
+     }
+@@ -614,6 +625,8 @@ int ossl_quic_channel_schedule_new_token(QUIC_CHANNEL *ch,
+     size_t token_len)
+ {
+     int rc = 0;
++
++    ossl_quic_channel_mark_active(ch);
+     QUIC_CFQ_ITEM *cfq_item;
+     WPACKET wpkt;
+     BUF_MEM *buf_mem = NULL;
+@@ -2110,6 +2123,36 @@ err:
+  * ============================
+  */
+ 
++/*
++ * Returns 1 if the channel has no work which requires a full tick. A full tick
++ * is needed if there is queued RX or TX, if a stream has pending work, or if
++ * the next timer deadline is due. This is deliberately cheap: it is evaluated
++ * for every channel on the port on every engine tick, whereas the full tick is
++ * much more expensive.
++ */
++static int ch_tick_can_skip(QUIC_CHANNEL *ch)
++{
++    /*
++     * The handshake layer can have non-network work pending (for example a
++     * certificate verification retry), so never skip a tick before the
++     * handshake completes.
++     */
++    if (!ch->handshake_complete)
++        return 0;
++
++    if (ossl_qrx_processed_read_pending(ch->qrx)
++        || ossl_qrx_unprocessed_read_pending(ch->qrx))
++        return 0;
++
++    if (ossl_qtx_get_queue_len_datagrams(ch->qtx) > 0)
++        return 0;
++
++    if (ossl_quic_stream_map_has_pending_work(&ch->qsm))
++        return 0;
++
++    return ossl_time_compare(get_time(ch), ch->next_tick_deadline) < 0;
++}
++
+ /*
+  * The central ticker function called by the reactor. This does everything, or
+  * at least everything network I/O related. Best effort - not allowed to fail
+@@ -2117,6 +2160,54 @@ err:
+  */
+ void ossl_quic_channel_subtick(QUIC_CHANNEL *ch, QUIC_TICK_RESULT *res,
+     uint32_t flags)
++{
++    int channel_only = (flags & QUIC_REACTOR_TICK_FLAG_CHANNEL_ONLY) != 0;
++    int dirty = ch->tick_dirty;
++
++    ch->tick_dirty = 0;
++
++    /*
++     * An idle or terminated channel has nothing to do. Handle this here so a
++     * fleet of idle connections does not pay for the full tick below.
++     */
++    if (ch->state == QUIC_CHANNEL_STATE_IDLE
++        || ossl_quic_channel_is_terminated(ch)) {
++        res->net_read_desired = 0;
++        res->net_write_desired = 0;
++        res->notify_other_threads = 0;
++        res->tick_deadline = ossl_time_infinite();
++        if (ossl_time_compare(ch->next_tick_deadline, res->tick_deadline) != 0) {
++            ch->next_tick_deadline = res->tick_deadline;
++            ossl_quic_port_update_channel_deadline(ch->port, ch);
++        }
++        return;
++    }
++
++    if (!channel_only && !dirty && ch_tick_can_skip(ch)) {
++        res->net_read_desired = 1;
++        res->net_write_desired = 0;
++        res->notify_other_threads = 0;
++        res->tick_deadline = ch->next_tick_deadline;
++        return;
++    }
++
++    ch->in_subtick = 1;
++    ch_subtick(ch, res, flags);
++    ch->in_subtick = 0;
++    ch->next_tick_deadline = res->tick_deadline;
++    ossl_quic_port_update_channel_deadline(ch->port, ch);
++
++    /*
++     * The handshake layer can make progress without network input (for example
++     * an application-driven certificate verification retry), so keep a
++     * handshaking channel scheduled until the handshake completes.
++     */
++    if (!ch->handshake_complete && !ossl_quic_channel_is_term_any(ch))
++        ossl_quic_channel_mark_active(ch);
++}
++
++static void ch_subtick(QUIC_CHANNEL *ch, QUIC_TICK_RESULT *res,
++    uint32_t flags)
+ {
+     OSSL_TIME now, deadline;
+     int channel_only = (flags & QUIC_REACTOR_TICK_FLAG_CHANNEL_ONLY) != 0;
+@@ -2967,6 +3058,7 @@ int ossl_quic_channel_start(QUIC_CHANNEL *ch)
+     if (!ch_tick_tls(ch, /*channel_only=*/0, NULL))
+         return 0;
+ 
++    ossl_quic_channel_mark_active(ch);
+     ossl_quic_reactor_tick(ossl_quic_port_get0_reactor(ch->port), 0); /* best effort */
+     return 1;
+ }
+@@ -3258,6 +3350,8 @@ static void ch_start_terminating(QUIC_CHANNEL *ch,
+     const QUIC_TERMINATE_CAUSE *tcause,
+     int force_immediate)
+ {
++    ossl_quic_channel_mark_active(ch);
++
+     /* No point sending anything if we haven't sent anything yet. */
+     if (!ch->have_sent_any_pkt)
+         force_immediate = 1;
+@@ -3517,14 +3611,21 @@ static void ch_save_err_state(QUIC_CHANNEL *ch)
+ 
+ void ossl_quic_channel_inject(QUIC_CHANNEL *ch, QUIC_URXE *e)
+ {
++    ossl_quic_channel_mark_active(ch);
+     ossl_qrx_inject_urxe(ch->qrx, e);
+ }
+ 
+ void ossl_quic_channel_inject_pkt(QUIC_CHANNEL *ch, OSSL_QRX_PKT *qpkt)
+ {
++    ossl_quic_channel_mark_active(ch);
+     ossl_qrx_inject_pkt(ch->qrx, qpkt);
+ }
+ 
++void ossl_quic_channel_mark_active(QUIC_CHANNEL *ch)
++{
++    ossl_quic_port_mark_channel_active(ch);
++}
++
+ void ossl_quic_channel_on_stateless_reset(QUIC_CHANNEL *ch)
+ {
+     QUIC_TERMINATE_CAUSE tcause = { 0 };
+@@ -4147,6 +4248,7 @@ int ossl_quic_channel_trigger_txku(QUIC_CHANNEL *ch)
+     if (!txku_allowed(ch))
+         return 0;
+ 
++    ossl_quic_channel_mark_active(ch);
+     ch->ku_locally_initiated = 1;
+     ch_trigger_txku(ch);
+     return 1;
+@@ -4156,6 +4258,7 @@ int ossl_quic_channel_ping(QUIC_CHANNEL *ch)
+ {
+     int pn_space = ossl_quic_enc_level_to_pn_space(ch->tx_enc_level);
+ 
++    ossl_quic_channel_mark_active(ch);
+     ossl_quic_tx_packetiser_schedule_ack_eliciting(ch->txp, pn_space);
+ 
+     return 1;
+diff --git a/ssl/quic/quic_channel_local.h b/ssl/quic/quic_channel_local.h
+index 2d55f95f2c..e80db04bae 100644
+--- a/ssl/quic/quic_channel_local.h
++++ b/ssl/quic/quic_channel_local.h
+@@ -68,6 +68,7 @@ struct quic_channel_st {
+      */
+     OSSL_LIST_MEMBER(ch, QUIC_CHANNEL);
+     OSSL_LIST_MEMBER(incoming_ch, QUIC_CHANNEL);
++    OSSL_LIST_MEMBER(active_ch, QUIC_CHANNEL);
+ 
+     /*
+      * The associated TLS 1.3 connection data. Used to provide the handshake
+@@ -498,6 +499,27 @@ struct quic_channel_st {
+     /* Are we on the QUIC_PORT linked list of channels? */
+     unsigned int on_port_list : 1;
+ 
++    /*
++     * Cached deadline for the next full channel tick, as determined by the
++     * last full tick. Used to skip the full tick for an idle channel whose
++     * timers are not yet due and which has no pending work. This is what keeps
++     * a fleet of idle connections from being fully serviced on every engine
++     * tick.
++     */
++    OSSL_TIME next_tick_deadline;
++
++    /* Set when an API action requires a full channel tick to be scheduled. */
++    unsigned int tick_dirty : 1;
++
++    /* Is this channel on the port's active channel list? */
++    unsigned int on_active_channel_list : 1;
++
++    /* Are we currently inside a channel tick? */
++    unsigned int in_subtick : 1;
++
++    /* Index of this channel in the port timer min-heap, or SIZE_MAX. */
++    size_t timer_heap_idx;
++
+     /* Has qlog been requested? */
+     unsigned int use_qlog : 1;
+ 
+diff --git a/ssl/quic/quic_port.c b/ssl/quic/quic_port.c
+index ad17019665..a71fae1975 100644
+--- a/ssl/quic/quic_port.c
++++ b/ssl/quic/quic_port.c
+@@ -105,6 +105,7 @@ typedef struct validation_token {
+ 
+ DEFINE_LIST_OF_IMPL(ch, QUIC_CHANNEL);
+ DEFINE_LIST_OF_IMPL(incoming_ch, QUIC_CHANNEL);
++DEFINE_LIST_OF_IMPL(active_ch, QUIC_CHANNEL);
+ DEFINE_LIST_OF_IMPL(port, QUIC_PORT);
+ 
+ QUIC_PORT *ossl_quic_port_new(const QUIC_PORT_ARGS *args)
+@@ -153,6 +154,16 @@ static int port_init(QUIC_PORT *port)
+     if ((port->err_state = OSSL_ERR_STATE_new()) == NULL)
+         goto err;
+ 
++    /*
++     * Preallocate the timer heap so adding the channels of a new connection
++     * does not need an allocation.
++     */
++    port->timer_heap_alloc = 64;
++    port->timer_heap = OPENSSL_malloc(port->timer_heap_alloc
++        * sizeof(*port->timer_heap));
++    if (port->timer_heap == NULL)
++        goto err;
++
+     if ((port->demux = ossl_quic_demux_new(/*BIO=*/NULL,
+              /*Short CID Len=*/rx_short_dcid_len,
+              get_time, port))
+@@ -202,6 +213,8 @@ static int port_init(QUIC_PORT *port)
+     port->disable_active_migration = 1;
+     port->active_conn_id_limit = QUIC_MIN_ACTIVE_CONN_ID_LIMIT;
+ 
++    ossl_list_active_ch_init(&port->active_channel_list);
++
+     port->state = QUIC_PORT_STATE_RUNNING;
+ 
+     ossl_list_port_insert_tail(&port->engine->port_list, port);
+@@ -236,6 +249,11 @@ static void port_cleanup(QUIC_PORT *port)
+ {
+     assert(ossl_list_ch_num(&port->channel_list) == 0);
+ 
++    OPENSSL_free(port->timer_heap);
++    port->timer_heap = NULL;
++    port->timer_heap_num = 0;
++    port->timer_heap_alloc = 0;
++
+     ossl_quic_demux_free(port->demux);
+     port->demux = NULL;
+ 
+@@ -801,33 +819,264 @@ int ossl_quic_port_test_and_set_peeloff(QUIC_PORT *port, int using_peeloff)
+  * =========================
+  */
+ 
++/*
++ * Timer min-heap helpers. The heap has one entry per channel on the port, keyed
++ * by the channel's cached next tick deadline. A channel's entry is updated when
++ * it is ticked, so due timers can be found in O(log n) instead of scanning
++ * every channel. The channel stores its own heap index so a channel can be
++ * removed when it is freed.
++ */
++static int port_timer_less(const QUIC_CHANNEL *a, const QUIC_CHANNEL *b)
++{
++    int c = ossl_time_compare(a->next_tick_deadline, b->next_tick_deadline);
++
++    if (c != 0)
++        return c < 0;
++
++    return (uintptr_t)a < (uintptr_t)b;
++}
++
++static void port_timer_heap_swap(QUIC_PORT *port, size_t a, size_t b)
++{
++    QUIC_CHANNEL *t = port->timer_heap[a];
++
++    port->timer_heap[a] = port->timer_heap[b];
++    port->timer_heap[b] = t;
++    port->timer_heap[a]->timer_heap_idx = a;
++    port->timer_heap[b]->timer_heap_idx = b;
++}
++
++static void port_timer_heap_up(QUIC_PORT *port, size_t idx)
++{
++    while (idx > 0) {
++        size_t parent = (idx - 1) / 2;
++
++        if (!port_timer_less(port->timer_heap[idx],
++                port->timer_heap[parent]))
++            break;
++
++        port_timer_heap_swap(port, idx, parent);
++        idx = parent;
++    }
++}
++
++static void port_timer_heap_down(QUIC_PORT *port, size_t idx)
++{
++    for (;;) {
++        size_t left = idx * 2 + 1, right = left + 1, best = idx;
++
++        if (left < port->timer_heap_num
++            && port_timer_less(port->timer_heap[left],
++                port->timer_heap[best]))
++            best = left;
++
++        if (right < port->timer_heap_num
++            && port_timer_less(port->timer_heap[right],
++                port->timer_heap[best]))
++            best = right;
++
++        if (best == idx)
++            break;
++
++        port_timer_heap_swap(port, idx, best);
++        idx = best;
++    }
++}
++
++static void port_timer_heap_insert(QUIC_PORT *port, QUIC_CHANNEL *ch)
++{
++    QUIC_CHANNEL **nheap;
++    size_t nalloc;
++
++    if (port->timer_heap_broken) {
++        ch->timer_heap_idx = SIZE_MAX;
++        return;
++    }
++
++    if (port->timer_heap_num == port->timer_heap_alloc) {
++        nalloc = port->timer_heap_alloc == 0 ? 16 : port->timer_heap_alloc * 2;
++        nheap = OPENSSL_realloc(port->timer_heap,
++            nalloc * sizeof(*port->timer_heap));
++        if (nheap == NULL) {
++            /*
++             * Allocation failure is not fatal. Fall back to scanning the
++             * channel list on every tick, which does not need the heap.
++             */
++            port->timer_heap_broken = 1;
++            ch->timer_heap_idx = SIZE_MAX;
++            return;
++        }
++
++        port->timer_heap = nheap;
++        port->timer_heap_alloc = nalloc;
++    }
++
++    ch->timer_heap_idx = port->timer_heap_num;
++    port->timer_heap[port->timer_heap_num++] = ch;
++    port_timer_heap_up(port, ch->timer_heap_idx);
++}
++
++static void port_timer_heap_remove(QUIC_PORT *port, QUIC_CHANNEL *ch)
++{
++    size_t idx = ch->timer_heap_idx, last;
++
++    ch->timer_heap_idx = SIZE_MAX;
++    if (port->timer_heap_broken || idx == SIZE_MAX
++        || idx >= port->timer_heap_num)
++        return;
++
++    last = --port->timer_heap_num;
++    if (idx != last) {
++        port->timer_heap[idx] = port->timer_heap[last];
++        port->timer_heap[idx]->timer_heap_idx = idx;
++        port_timer_heap_up(port, idx);
++        port_timer_heap_down(port, idx);
++    }
++
++    port->timer_heap[last] = NULL;
++}
++
++void ossl_quic_port_update_channel_deadline(QUIC_PORT *port, QUIC_CHANNEL *ch)
++{
++    if (port->timer_heap_broken)
++        return;
++
++    if (ch->timer_heap_idx == SIZE_MAX) {
++        port_timer_heap_insert(port, ch);
++        return;
++    }
++
++    port_timer_heap_up(port, ch->timer_heap_idx);
++    port_timer_heap_down(port, ch->timer_heap_idx);
++}
++
++void ossl_quic_port_unlink_channel(QUIC_PORT *port, QUIC_CHANNEL *ch)
++{
++    if (ch->on_active_channel_list) {
++        ossl_list_active_ch_remove(&port->active_channel_list, ch);
++        ch->on_active_channel_list = 0;
++    }
++
++    port_timer_heap_remove(port, ch);
++}
++
++void ossl_quic_port_mark_channel_active(QUIC_CHANNEL *ch)
++{
++    QUIC_PORT *port = ch->port;
++
++    ch->tick_dirty = 1;
++
++    /*
++     * Some unit tests construct a bare channel without a port.
++     */
++    if (port == NULL || !ch->on_port_list)
++        return;
++
++    /*
++     * Work discovered while the channel is already being ticked is serviced by
++     * that tick (or by the deadline it installs); do not queue an immediate
++     * second tick.
++     */
++    if (ch->in_subtick || ch->on_active_channel_list)
++        return;
++
++    ossl_list_active_ch_insert_tail(&port->active_channel_list, ch);
++    ch->on_active_channel_list = 1;
++}
++
+ /*
+  * Tick function for this port. This does everything related to network I/O for
+  * this port's network BIOs, and services child channels.
++ *
++ * Only channels with pending work (the active list) or whose timer deadline has
++ * expired (the timer heap) are ticked. This keeps the cost of a tick
++ * proportional to the work available rather than to the number of connections
++ * on the port.
+  */
+ void ossl_quic_port_subtick(QUIC_PORT *port, QUIC_TICK_RESULT *res,
+     uint32_t flags)
+ {
+     QUIC_CHANNEL *ch;
++    const QUIC_CHANNEL *last_ch = NULL;
++    size_t n;
++    OSSL_TIME now;
+ 
+     res->net_read_desired = ossl_quic_port_is_running(port);
+     res->net_write_desired = 0;
+     res->notify_other_threads = 0;
+     res->tick_deadline = ossl_time_infinite();
+ 
+-    if (!port->engine->inhibit_tick) {
+-        /* Handle any incoming data from network. */
+-        if (ossl_quic_port_is_running(port))
+-            port_rx_pre(port);
++    if (port->engine->inhibit_tick)
++        return;
++
++    /* Handle any incoming data from network. */
++    if (ossl_quic_port_is_running(port))
++        port_rx_pre(port);
+ 
+-        /* Iterate through all channels and service them. */
++    /*
++     * If the timer heap could not be allocated, fall back to the old full
++     * scan. This is only expected on allocation failure.
++     */
++    if (port->timer_heap_broken) {
+         OSSL_LIST_FOREACH (ch, ch, &port->channel_list) {
+             QUIC_TICK_RESULT subr = { 0 };
+ 
+             ossl_quic_channel_subtick(ch, &subr, flags);
+             ossl_quic_tick_result_merge_into(res, &subr);
+         }
++        return;
++    }
++
++    /*
++     * Service channels marked active by the RX path or by an API action. Take
++     * a snapshot of the current list length: a channel marked active during its
++     * own tick is serviced on the next port tick, not recursively here.
++     */
++    n = ossl_list_active_ch_num(&port->active_channel_list);
++    while (n-- > 0) {
++        QUIC_TICK_RESULT subr = { 0 };
++
++        ch = ossl_list_active_ch_head(&port->active_channel_list);
++        if (ch == NULL)
++            break;
++
++        ossl_list_active_ch_remove(&port->active_channel_list, ch);
++        ch->on_active_channel_list = 0;
++
++        ossl_quic_channel_subtick(ch, &subr, flags);
++        ossl_quic_tick_result_merge_into(res, &subr);
+     }
++
++    /* Service channels whose timers have expired. */
++    now = get_time(port);
++    while (port->timer_heap_num > 0) {
++        QUIC_TICK_RESULT subr = { 0 };
++
++        ch = port->timer_heap[0];
++        if (ossl_time_compare(ch->next_tick_deadline, now) > 0)
++            break;
++
++        /*
++         * A tick is expected to advance an expired deadline. If it does not,
++         * leave the channel for the next port tick rather than spinning here.
++         */
++        if (ch == last_ch)
++            break;
++
++        last_ch = ch;
++
++        if (ch->on_active_channel_list) {
++            ossl_list_active_ch_remove(&port->active_channel_list, ch);
++            ch->on_active_channel_list = 0;
++        }
++
++        ossl_quic_channel_subtick(ch, &subr, flags);
++        ossl_quic_tick_result_merge_into(res, &subr);
++    }
++
++    if (port->timer_heap_num > 0)
++        res->tick_deadline = ossl_time_min(res->tick_deadline,
++            port->timer_heap[0]->next_tick_deadline);
+ }
+ 
+ /* Process incoming datagrams, if any. */
+diff --git a/ssl/quic/quic_port_local.h b/ssl/quic/quic_port_local.h
+index 8f7ccf5318..a03f06439f 100644
+--- a/ssl/quic/quic_port_local.h
++++ b/ssl/quic/quic_port_local.h
+@@ -27,6 +27,7 @@
+  */
+ DECLARE_LIST_OF(ch, QUIC_CHANNEL);
+ DECLARE_LIST_OF(incoming_ch, QUIC_CHANNEL);
++DECLARE_LIST_OF(active_ch, QUIC_CHANNEL);
+ 
+ /* A port is always in one of the following states: */
+ enum {
+@@ -67,6 +68,22 @@ struct quic_port_st {
+     OSSL_LIST(ch)
+     channel_list;
+ 
++    /*
++     * Channels with pending work (RX, TX or an API action) which should be
++     * serviced by the next port tick. This is the work-gated subset of
++     * channel_list: idle channels are not walked on every tick.
++     */
++    OSSL_LIST(active_ch)
++    active_channel_list;
++
++    /*
++     * Min-heap of channels keyed by next_tick_deadline, used to find channels
++     * whose timers are due without scanning channel_list.
++     */
++    QUIC_CHANNEL **timer_heap;
++    size_t timer_heap_num, timer_heap_alloc;
++    unsigned int timer_heap_broken : 1;
++
+     /*
+      * Queue of unaccepted incoming channels. Each such channel is also on
+      * channel_list.
+diff --git a/ssl/quic/quic_stream_map.c b/ssl/quic/quic_stream_map.c
+index 77f4953d5e..bfc522ede8 100644
+--- a/ssl/quic/quic_stream_map.c
++++ b/ssl/quic/quic_stream_map.c
+@@ -230,6 +230,13 @@ static void stream_map_mark_active(QUIC_STREAM_MAP *qsm, QUIC_STREAM *s)
+         qsm->rr_cur = s;
+ 
+     s->active = 1;
++
++    /*
++     * The stream map can become active due to an application action (for
++     * example SSL_write) rather than network input. Make sure the port ticks
++     * this channel so the new data is actually sent.
++     */
++    ossl_quic_channel_mark_active(qsm->ch);
+ }
+ 
+ static void stream_map_mark_inactive(QUIC_STREAM_MAP *qsm, QUIC_STREAM *s)
+@@ -862,6 +869,20 @@ void ossl_quic_stream_map_gc(QUIC_STREAM_MAP *qsm)
+     }
+ }
+ 
++int ossl_quic_stream_map_has_pending_work(const QUIC_STREAM_MAP *qsm)
++{
++    if (qsm == NULL || qsm->map == NULL)
++        return 0;
++
++    /*
++     * The active list holds every stream with something to send, retransmit
++     * or signal. The ready-for-GC list holds streams which still need to be
++     * reclaimed. Neither can be serviced without a full channel tick.
++     */
++    return qsm->active_list.next != &qsm->active_list
++        || qsm->ready_for_gc_list.next != &qsm->ready_for_gc_list;
++}
++
+ static int eligible_for_shutdown_flush(QUIC_STREAM *qs)
+ {
+     /*

@@ -2019,31 +2019,7 @@ public final class QuicheBindings {
      *         {@code a} unchanged
      */
     static InetSocketAddress unmapIpv4Mapped(InetSocketAddress a) {
-        if (a == null) {
-            return null;
-        }
-        InetAddress addr = a.getAddress();
-        if (!(addr instanceof Inet6Address)) {
-            return a;
-        }
-        byte[] b = addr.getAddress();
-        // v4-mapped: ten leading zero bytes, then 0xffff, then the address.
-        // (:: itself and ::1 fail the 0xffff test and stay untouched.)
-        for (int i = 0; i < 10; i++) {
-            if (b[i] != 0) {
-                return a;
-            }
-        }
-        if ((b[10] & 0xFF) != 0xFF || (b[11] & 0xFF) != 0xFF) {
-            return a;
-        }
-        try {
-            return new InetSocketAddress(
-                    InetAddress.getByAddress(new byte[] { b[12], b[13], b[14], b[15] }),
-                    a.getPort());
-        } catch (UnknownHostException e) {
-            return a;
-        }
+        return org.apache.tomcat.util.net.quic.QuicEndpoint.unmapIpv4Mapped(a);
     }
 
 

@@ -58,7 +58,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         // terminated with H3_QPACK_DECOMPRESSION_FAILED (RFC 9204
         // Section 2.1.2, Section 6).
         ClientOutput output = runClient(rawCommandWith("--headers",
-                b64(0x00, 0x00, (byte) 0xBF, 0x24), "--timeout", "3"),
+                b64(0x00, 0x00, (byte) 0xBF, 0x24), "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
@@ -74,7 +74,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         // Section 6 the connection is terminated with
         // H3_QPACK_DECOMPRESSION_FAILED.
         ClientOutput output = runClient(rawCommandWith("--headers",
-                b64(0x00, 0x00, 0x29, 0x00, 0x00), "--timeout", "3"),
+                b64(0x00, 0x00, 0x29, 0x00, 0x00), "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
@@ -90,7 +90,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         // RFC 9204 Section 2.2.3 an invalid reference to the dynamic table
         // is a connection error of type H3_QPACK_DECOMPRESSION_FAILED.
         ClientOutput output = runClient(rawCommandWith("--headers",
-                b64(0x00, 0x00, 0x40, 0x00), "--timeout", "3"),
+                b64(0x00, 0x00, 0x40, 0x00), "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
@@ -108,7 +108,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         // is terminated with H3_QPACK_DECOMPRESSION_FAILED (RFC 9204
         // Section 2.1.2).
         ClientOutput output = runClient(rawCommandWith("--headers",
-                b64(0x02, 0x00, (byte) 0x80), "--timeout", "3"),
+                b64(0x02, 0x00, (byte) 0x80), "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
@@ -145,7 +145,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         // survives.
         ClientOutput output = runClient(rawCommandWith("--headers",
                 b64(0x00, 0x00, 0x27, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-                        0x80, 0x80, 0x80, 0x80), "--timeout", "3"),
+                        0x80, 0x80, 0x80, 0x80), "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_QPACK_DECOMPRESSION_FAILED);
@@ -164,7 +164,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         ClientOutput output = runClient(rawCommandWith("--headers",
                 b64(0x00, 0x00, 0x21, 'a', 0x7F, 0x80, 0x80, 0x80, 0x80,
                         0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_QPACK_DECOMPRESSION_FAILED);
@@ -191,7 +191,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         block.flip();
 
         ClientOutput output = runClient(rawCommandWith("--headers",
-                b64(block), "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                b64(block), "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_QPACK_DECOMPRESSION_FAILED);
     }
@@ -213,7 +213,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         block.flip();
 
         ClientOutput output = runClient(rawCommandWith("--headers",
-                b64(block), "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                b64(block), "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_QPACK_DECOMPRESSION_FAILED);
     }
@@ -230,7 +230,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         // section and MUST be treated as a connection error of type
         // QPACK_DECODER_STREAM_ERROR (RFC 9204 Section 4.4.1).
         ClientOutput output = runClient(rawCommandWith("--decoder",
-                b64(0x80), "--no-request", "--timeout", "3"),
+                b64(0x80), "--no-request", "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_DECODER_STREAM_ERROR);
@@ -249,7 +249,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         // 4.4). Both must terminate the connection.
         for (int increment : new int[] { 0x00, 0x01 }) {
             ClientOutput output = runClient(rawCommandWith("--decoder",
-                    b64(increment), "--no-request", "--timeout", "3"),
+                    b64(increment), "--no-request", "--timeout", "8"),
                     CLIENT_TIMEOUT_SECONDS);
 
             assertConnectionError(output, H3_QPACK_DECODER_STREAM_ERROR);
@@ -295,7 +295,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         ClientOutput output = runClient(rawCommandWith("--encoder",
                 b64(0x21), "--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_ENCODER_STREAM_ERROR);
@@ -321,7 +321,7 @@ public class TestHttp3Qpack extends Http3TestBase {
                 b64(0x40, 0x7F, 0xA1, 0x9B, 0x01),
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_ENCODER_STREAM_ERROR);
@@ -344,7 +344,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         block.flip();
 
         ClientOutput output = runClient(rawCommandWith("--headers",
-                b64(block), "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                b64(block), "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
     }
@@ -365,7 +365,7 @@ public class TestHttp3Qpack extends Http3TestBase {
         block.flip();
 
         ClientOutput output = runClient(rawCommandWith("--headers",
-                b64(block), "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                b64(block), "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
     }

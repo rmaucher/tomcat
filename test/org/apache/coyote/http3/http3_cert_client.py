@@ -64,7 +64,11 @@ import aioquic.quic.configuration
 import aioquic.quic.events
 from aioquic.asyncio import QuicConnectionProtocol, connect
 
-TIMEOUT = 10.0
+# The full HTTP/3 suite runs classes in parallel; a handshake/request can take
+# well beyond the QUIC exchange time when the host is busy. Tests that expect
+# the handshake to fail pass a smaller --timeout so failure does not have to
+# wait for this full window.
+TIMEOUT = 20.0
 
 
 class StreamResetError(Exception):
@@ -164,7 +168,7 @@ def _reorder_signature_algorithms(pref):
     aioquic_tls.Context.__init__ = patched
 
 
-async def h3_get(host, port, path, sni, authority, ca_file, sigpref):
+async def h3_get(host, port, path, sni, authority, ca_file, sigpref, timeout):
     configuration = aioquic.quic.configuration.QuicConfiguration(is_client=True)
     configuration.alpn_protocols = ["h3"]
     # A None server name means no SNI extension is sent
@@ -177,14 +181,28 @@ async def h3_get(host, port, path, sni, authority, ca_file, sigpref):
     if sigpref:
         _reorder_signature_algorithms(sigpref)
 
+    # Do not block in connect()'s handshake wait: a deliberately failed
+    # handshake (wrong CA/password/SNI) would otherwise wait out the outer
+    # process timeout before the bounded handshake loop below can report it.
     async with connect(host, port, configuration=configuration,
                        create_protocol=_make_client_protocol(
-                           authority.encode("ascii"))) as client:
+                           authority.encode("ascii")),
+                       wait_connected=False) as client:
+        # wait_connected=False skips connect()'s initial transmit as well as
+        # its unbounded handshake wait; send the ClientHello explicitly and
+        # let the bounded loop below drive/report the handshake result.
+        client.transmit()
         quic = client._quic
-        # Wait for the TLS handshake so the peer certificate is available
-        for _ in range(int(TIMEOUT / 0.1)):
+        # Wait for the TLS handshake so the peer certificate is available.
+        # A rejected handshake (wrong CA/password/SNI) terminates the QUIC
+        # connection without completing; report that immediately instead of
+        # waiting out the whole timeout.
+        for _ in range(int(timeout / 0.1)):
             if quic._handshake_complete:
                 break
+            if getattr(quic, "_close_event", None) is not None:
+                raise ConnectionError(
+                    "QUIC connection terminated before the TLS handshake completed")
             await asyncio.sleep(0.1)
         else:
             raise ConnectionError("TLS handshake did not complete")
@@ -206,7 +224,7 @@ async def h3_get(host, port, path, sni, authority, ca_file, sigpref):
 
         try:
             headers, body = await asyncio.wait_for(
-                client.request_get(path), TIMEOUT)
+                client.request_get(path), timeout)
         except StreamResetError as exc:
             print(f"STREAM_ERROR={exc.error_code}")
             client.close()
@@ -228,7 +246,7 @@ def cmd_get(args):
     try:
         asyncio.run(asyncio.wait_for(
             h3_get(args.host, args.port, args.path, sni, authority,
-                   args.ca, args.sigpref), 2 * TIMEOUT))
+                   args.ca, args.sigpref, args.timeout), 2 * args.timeout))
     except Exception as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
@@ -256,6 +274,9 @@ def main():
                        help="CA file to verify the peer certificate chain")
     p_get.add_argument("--sigpref", choices=["ec", "rsa"], default=None,
                        help="preferred certificate key type")
+    p_get.add_argument("--timeout", type=float, default=TIMEOUT,
+                       metavar="SECS",
+                       help="handshake/request timeout in seconds")
 
     args = parser.parse_args()
     if args.command == "get":

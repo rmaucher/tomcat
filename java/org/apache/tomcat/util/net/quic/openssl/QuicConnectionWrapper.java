@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.net.quic.QuicConnection;
 import org.apache.tomcat.util.net.quic.QuicConnectionManager;
 import org.apache.tomcat.util.net.quic.QuicStream;
@@ -100,6 +101,17 @@ public class QuicConnectionWrapper implements QuicConnection {
     private volatile String sniHostName;
 
     /**
+     * Whether the SNI host name has been resolved authoritatively. An empty
+     * cached {@link #sniHostName} is otherwise ambiguous between "the client
+     * sent no SNI" and "not read yet": the accept path may cache an empty
+     * value before the handshake is complete, and the stream-event path then
+     * needs to retry the native {@code SSL_get_servername()} read. Once the
+     * handshake has completed and the read returned empty, this flag lets
+     * that path stop re-reading on every stream event.
+     */
+    private volatile boolean sniResolved;
+
+    /**
      * Remote address (client).
      */
     private volatile InetSocketAddress remoteAddress;
@@ -125,6 +137,17 @@ public class QuicConnectionWrapper implements QuicConnection {
      * Whether the connection has been fully closed.
      */
     private volatile boolean closed;
+
+    /**
+     * Application error code supplied to the first {@code SSL_shutdown_ex()}
+     * call that initiated the local connection close. The shutdown can complete
+     * only after the stream SSLs are freed, and the completing
+     * {@code SSL_shutdown_ex()} call must present the same error code again:
+     * OpenSSL's {@code ossl_quic_channel_local_close()} uses the arguments
+     * passed to the call that finishes the stream-flush phase. Zero is a valid
+     * code (no application error).
+     */
+    private volatile long connectionCloseErrorCode;
 
     /**
      * Whether the stream-limit GOAWAY notification has already been queued on
@@ -158,6 +181,25 @@ public class QuicConnectionWrapper implements QuicConnection {
      * connection is retained/leaked rather than freed under a live stream.
      */
     private final AtomicBoolean streamFreeFailed = new AtomicBoolean(false);
+
+    /**
+     * Set when freeing the connection SSL itself failed. A failed
+     * {@code SSL_free} may have partially run, so retrying it is unsafe; the
+     * connection must be retained/leaked rather than reported as freed. The
+     * freed CAS is reset on this failure so the Java side never claims the
+     * native object is gone, while this sticky flag prevents a later
+     * explicit/cleaner free attempt.
+     */
+    private final AtomicBoolean connectionFreeFailed = new AtomicBoolean(false);
+
+    /**
+     * Guards the one-time warning emitted when a sticky stream-free failure
+     * makes this connection permanently retained and counted against the
+     * endpoint's connection limits. Later sweeps still see the same failure,
+     * so the warning is logged once per connection instead of on every poll
+     * or stop sweep.
+     */
+    private final AtomicBoolean retentionWarningLogged = new AtomicBoolean(false);
 
     /**
      * Number of executor worker threads currently executing the HTTP handler
@@ -230,13 +272,15 @@ public class QuicConnectionWrapper implements QuicConnection {
     private volatile String cachedSessionId;
 
     /**
-     * Number of client bidirectional and unidirectional streams accepted
-     * during connection bootstrap. Retained so transport-limit reconciliation
-     * can be completed later when the ALPN result was not yet readable at
-     * accept time.
+     * Number of client bidirectional and unidirectional streams accepted on
+     * this connection so far. Retained so transport-limit reconciliation can
+     * recover the advertised initial limit at any time: the remaining remote
+     * credit plus the streams already accepted equals that initial limit,
+     * regardless of whether reconciliation happens during bootstrap or later
+     * when the ALPN result became readable.
      */
-    private volatile int initialBidiStreamsAccepted;
-    private volatile int initialUniStreamsAccepted;
+    private volatile int acceptedBidiStreams;
+    private volatile int acceptedUniStreams;
 
     /**
      * Whether the transport stream limits have been reconciled for this
@@ -256,12 +300,18 @@ public class QuicConnectionWrapper implements QuicConnection {
 
 
     X509Certificate[] getCachedPeerCerts() {
-        return cachedPeerCerts;
+        X509Certificate[] certs = cachedPeerCerts;
+        return certs == null ? null : certs.clone();
     }
 
 
     void setCachedPeerCerts(X509Certificate[] peerCerts) {
-        this.cachedPeerCerts = peerCerts;
+        // The cache must not alias a caller's array: getPeerCertificateChain()
+        // returns the freshly built array to the caller that populated the
+        // cache, and an application can replace/nulls elements in it. Storing
+        // a private copy keeps later streams on the connection from observing
+        // those mutations through getCachedPeerCerts().
+        this.cachedPeerCerts = peerCerts == null ? null : peerCerts.clone();
     }
 
 
@@ -286,24 +336,37 @@ public class QuicConnectionWrapper implements QuicConnection {
 
 
     /**
-     * Stores the number of client streams accepted during bootstrap.
+     * Records accepted client streams. Must be called on the poll thread,
+     * once per stream returned by {@code SSL_accept_stream()}, including
+     * streams that are rejected by the protocol limit: they still consumed
+     * transport credit and so are part of the advertised initial limit.
      *
-     * @param bidiStreamsAccepted Bidirectional streams accepted during bootstrap
-     * @param uniStreamsAccepted  Unidirectional streams accepted during bootstrap
+     * @param bidiStreamsAccepted Bidirectional streams accepted in this pass
+     * @param uniStreamsAccepted  Unidirectional streams accepted in this pass
      */
-    void setInitialStreamCounts(int bidiStreamsAccepted, int uniStreamsAccepted) {
-        this.initialBidiStreamsAccepted = bidiStreamsAccepted;
-        this.initialUniStreamsAccepted = uniStreamsAccepted;
+    void addAcceptedStreams(int bidiStreamsAccepted, int uniStreamsAccepted) {
+        this.acceptedBidiStreams += bidiStreamsAccepted;
+        this.acceptedUniStreams += uniStreamsAccepted;
     }
 
 
-    int getInitialBidiStreamsAccepted() {
-        return initialBidiStreamsAccepted;
+    /**
+     * Returns the number of client bidirectional streams accepted so far.
+     *
+     * @return The accepted client bidirectional stream count
+     */
+    int getAcceptedBidiStreams() {
+        return acceptedBidiStreams;
     }
 
 
-    int getInitialUniStreamsAccepted() {
-        return initialUniStreamsAccepted;
+    /**
+     * Returns the number of client unidirectional streams accepted so far.
+     *
+     * @return The accepted client unidirectional stream count
+     */
+    int getAcceptedUniStreams() {
+        return acceptedUniStreams;
     }
 
 
@@ -393,7 +456,7 @@ public class QuicConnectionWrapper implements QuicConnection {
         // Pass the shared freed flag (not 'this') to the State so the Cleaner
         // does not keep this wrapper strongly reachable.
         State state = new State(ssl, this.freed, this.streamFreeFailed,
-                cleanerConnectionFrees);
+                this.connectionFreeFailed, cleanerConnectionFrees);
         cleaner.register(this, state);
     }
 
@@ -476,6 +539,20 @@ public class QuicConnectionWrapper implements QuicConnection {
      * @return the SNI host name, or an empty string if none was sent or the
      *         value could not be determined; never {@code null}
      */
+    public boolean isSniResolved() {
+        return sniResolved;
+    }
+
+
+    /**
+     * Marks the cached SNI host name as authoritatively resolved (including
+     * the case where the client sent none).
+     */
+    void setSniResolved() {
+        this.sniResolved = true;
+    }
+
+
     @Override
     public String getSniHostName() {
         String result = sniHostName;
@@ -495,7 +572,9 @@ public class QuicConnectionWrapper implements QuicConnection {
                 result = endpoint.callOnPollThread(this::readSniHostNameCached);
             } catch (Throwable t) {
                 // The poll thread is not (or no longer) reachable: the SNI
-                // host name is not critical, report "no SNI".
+                // host name is not critical, report "no SNI". Fatal VM
+                // errors still propagate.
+                ExceptionUtils.handleThrowable(t);
                 result = "";
             }
         }
@@ -518,6 +597,7 @@ public class QuicConnectionWrapper implements QuicConnection {
         }
         String value = readSniHostName();
         sniHostName = value;
+        sniResolved = true;
         return value;
     }
 
@@ -589,6 +669,13 @@ public class QuicConnectionWrapper implements QuicConnection {
      */
     public void setSniHostName(String sniHostName) {
         this.sniHostName = sniHostName;
+        if (sniHostName != null && !sniHostName.isEmpty()) {
+            // A non-empty value is authoritative regardless of handshake
+            // timing; an empty cached value at setup may simply mean the
+            // ClientHello has not been processed yet, so leave the resolved
+            // flag unset for the stream-event path to retry.
+            this.sniResolved = true;
+        }
     }
 
 
@@ -625,9 +712,11 @@ public class QuicConnectionWrapper implements QuicConnection {
             // no new work starts on it, then arrange a best-effort poll-thread
             // teardown: the timed-out hop itself will hit the endpoint's
             // isClosed() guard when it eventually runs, which would otherwise
-            // leave the native state alive until stop.
+            // leave the native state alive until stop. Fatal VM errors still
+            // propagate after the retry has been scheduled.
             setClosed();
             endpoint.scheduleHopFailureTeardown(this, appErrorCode, reason);
+            ExceptionUtils.handleThrowable(t);
         }
     }
 
@@ -708,6 +797,28 @@ public class QuicConnectionWrapper implements QuicConnection {
     }
 
     /**
+     * Records the application error code of the local connection close so the
+     * shutdown-completion call can present the same code after the stream SSLs
+     * are freed.
+     *
+     * @param errorCode The application error code supplied to the initial
+     *                  {@code SSL_shutdown_ex()} call
+     */
+    void setConnectionCloseErrorCode(long errorCode) {
+        this.connectionCloseErrorCode = errorCode;
+    }
+
+    /**
+     * Returns the application error code of the local connection close.
+     *
+     * @return The application error code, or zero if no local close was
+     *         initiated
+     */
+    long getConnectionCloseErrorCode() {
+        return connectionCloseErrorCode;
+    }
+
+    /**
      * Returns whether the stream-limit GOAWAY notification has already been
      * queued for this connection.
      *
@@ -750,6 +861,17 @@ public class QuicConnectionWrapper implements QuicConnection {
      */
     boolean hasStreamFreeFailure() {
         return streamFreeFailed.get();
+    }
+
+
+    /**
+     * Returns whether the one-time retention warning for this connection has
+     * not been logged yet, atomically claiming it.
+     *
+     * @return {@code true} for the first caller only
+     */
+    boolean claimRetentionWarningLog() {
+        return retentionWarningLogged.compareAndSet(false, true);
     }
 
     /**
@@ -804,7 +926,7 @@ public class QuicConnectionWrapper implements QuicConnection {
      *         already {@code true}.
      */
     public boolean freeSslOnce() {
-        return freeSslOnce(ssl, freed, streamFreeFailed);
+        return freeSslOnce(ssl, freed, streamFreeFailed, connectionFreeFailed);
     }
 
 
@@ -813,25 +935,42 @@ public class QuicConnectionWrapper implements QuicConnection {
      * Cleaner's {@link DeferredConnectionFree}, so both copies cannot drift on
      * the stream-free-failure check or the freed CAS.
      *
-     * @param ssl              The connection SSL
-     * @param freed            Shared freed flag
-     * @param streamFreeFailed Shared sticky stream-free-failure flag
+     * @param ssl                 The connection SSL
+     * @param freed               Shared freed flag
+     * @param streamFreeFailed    Shared sticky stream-free-failure flag
+     * @param connectionFreeFailed Shared sticky connection-free-failure flag
      *
      * @return {@code true} only if this call performed {@code SSL_free}
      */
     static boolean freeSslOnce(MemorySegment ssl, AtomicBoolean freed,
-            AtomicBoolean streamFreeFailed) {
+            AtomicBoolean streamFreeFailed,
+            AtomicBoolean connectionFreeFailed) {
         if (streamFreeFailed.get()) {
             // At least one stream SSL free failed; freeing the connection now
             // could violate SSL_new_stream(3). Leave the connection allocated
             // (leaked) rather than risking a free under a live stream.
             return false;
         }
+        if (connectionFreeFailed.get()) {
+            // A previous SSL_free() failed; it may have partially run, so
+            // retrying is unsafe. Keep the native object retained.
+            return false;
+        }
         if (freed.getAndSet(true)) {
             return false;
         }
-        openssl_h.SSL_free(ssl);
-        return true;
+        try {
+            openssl_h.SSL_free(ssl);
+            return true;
+        } catch (Throwable t) {
+            // Do not leave freed=true: the callers use isFreed() to decide
+            // whether the native object is gone and can drop retention
+            // entries. Mark the connection sticky-first so a concurrent
+            // Cleaner cannot retry the unsafe free.
+            connectionFreeFailed.set(true);
+            freed.set(false);
+            throw t;
+        }
     }
 
     /**
@@ -1060,6 +1199,15 @@ public class QuicConnectionWrapper implements QuicConnection {
                 // loses protocol data). Leave the bytes pending so the caller
                 // stops this flush attempt, and fail the connection on the
                 // next poll-loop iteration, after this method has returned.
+                // Drain the handled native failure so a later accept check
+                // cannot mistake it for an accept failure.
+                if (log.isDebugEnabled()) {
+                    log.debug("QUIC stream write failed: stream=" +
+                            s.getStreamId() + " sslError=" + sslError +
+                            " errors=" + QuicDiagnostics.dumpErrorQueue());
+                } else {
+                    QuicDiagnostics.clearErrorQueue();
+                }
                 QuicOpenSSLEndpoint ep = endpoint;
                 if (ep != null) {
                     ep.submitPollTask(
@@ -1164,6 +1312,9 @@ public class QuicConnectionWrapper implements QuicConnection {
             // poll item dispatching handler code against a half-torn stream.
             stream.setDeregistered();
             try {
+                if (endpoint != null) {
+                    endpoint.untrackStreamPollItem(stream);
+                }
                 QuicPollItem item = stream.getPollItem();
                 if (item != null) {
                     QuicPollSet pollSet = endpoint == null ? null : endpoint.getPollSet();
@@ -1190,6 +1341,7 @@ public class QuicConnectionWrapper implements QuicConnection {
             } catch (Throwable t) {
                 failed = true;
                 markStreamFreeFailed();
+                ExceptionUtils.handleThrowable(t);
                 log.warn(sm.getString("quicEndpoint.streamTeardownError",
                         Long.toHexString(stream.getSslAddress())), t);
             }
@@ -1260,20 +1412,23 @@ public class QuicConnectionWrapper implements QuicConnection {
         private final MemorySegment ssl;
         private final AtomicBoolean freed;
         private final AtomicBoolean streamFreeFailed;
+        private final AtomicBoolean connectionFreeFailed;
 
         DeferredConnectionFree(MemorySegment ssl, AtomicBoolean freed,
-                AtomicBoolean streamFreeFailed) {
+                AtomicBoolean streamFreeFailed,
+                AtomicBoolean connectionFreeFailed) {
             this.ssl = ssl;
             this.freed = freed;
             this.streamFreeFailed = streamFreeFailed;
+            this.connectionFreeFailed = connectionFreeFailed;
         }
 
         void run() {
             // Shared single-free guard: skips when a stream SSL free failed
-            // (stream-before-connection ordering) and CASes with every other
-            // free path (teardownConnection, freeConnectionOrDefer,
-            // stopInternal).
-            freeSslOnce(ssl, freed, streamFreeFailed);
+            // (stream-before-connection ordering), when a previous connection
+            // free failed, and CASes with every other free path
+            // (teardownConnection, freeConnectionOrDefer, stopInternal).
+            freeSslOnce(ssl, freed, streamFreeFailed, connectionFreeFailed);
         }
     }
 
@@ -1289,6 +1444,9 @@ public class QuicConnectionWrapper implements QuicConnection {
         // Shared stream-free-failure flag (NOT the wrapper) so the Cleaner
         // does not free the connection after a failed stream free.
         private final AtomicBoolean streamFreeFailed;
+        // Shared connection-free-failure flag so a failed SSL_free() is not
+        // retried by the Cleaner or a later explicit free path.
+        private final AtomicBoolean connectionFreeFailed;
         // The endpoint's poll-thread queue for deferred connection frees (NOT
         // the endpoint) so the free decision is serialized with the teardown
         // sequences and stays inside the poll thread's native-access
@@ -1298,11 +1456,13 @@ public class QuicConnectionWrapper implements QuicConnection {
 
         State(MemorySegment ssl, AtomicBoolean freed,
                 AtomicBoolean streamFreeFailed,
+                AtomicBoolean connectionFreeFailed,
                 ConcurrentLinkedQueue<DeferredConnectionFree>
                         cleanerConnectionFrees) {
             this.ssl = ssl;
             this.freed = freed;
             this.streamFreeFailed = streamFreeFailed;
+            this.connectionFreeFailed = connectionFreeFailed;
             this.cleanerConnectionFrees = cleanerConnectionFrees;
         }
 
@@ -1333,9 +1493,15 @@ public class QuicConnectionWrapper implements QuicConnection {
                 // leaked rather than freed under a possibly-live stream.
                 return;
             }
+            if (connectionFreeFailed.get()) {
+                // A previous connection SSL_free() failed and may have
+                // partially run; do not retry it from the Cleaner.
+                return;
+            }
             if (cleanerConnectionFrees != null) {
                 cleanerConnectionFrees.add(
-                        new DeferredConnectionFree(ssl, freed, streamFreeFailed));
+                        new DeferredConnectionFree(ssl, freed,
+                                streamFreeFailed, connectionFreeFailed));
             } else {
                 // Never call SSL_free on the Cleaner thread: leave the
                 // native connection allocated rather than touching OpenSSL

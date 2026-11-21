@@ -67,7 +67,10 @@ async def run(port):
         await asyncio.sleep(0.1)
         client.send(request_stream, frame[split:], fin=True)
 
-        deadline = asyncio.get_event_loop().time() + 5
+        # The response/trailer is local and immediate; keep the observation
+        # bounded to a few seconds so the test does not add a fixed 5 s wait
+        # when the trailer is complete.
+        deadline = asyncio.get_event_loop().time() + 2
         while asyncio.get_event_loop().time() < deadline:
             if request_stream in client._eof or \
                     request_stream in client.stream_errors:

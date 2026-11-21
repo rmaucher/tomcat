@@ -109,7 +109,7 @@ public class TestQuicConnectionFailure extends Http3TestBase {
         // received, then the connection dies without a CONNECTION_CLOSE.
         ClientOutput output = runClient(rawCommandWith("--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
-                "--streams", "8", "--timeout", "5", "--abandon"),
+                "--streams", "8", "--timeout", "20", "--abandon"),
                 CLIENT_TIMEOUT_SECONDS);
         Assert.assertTrue("Client must have died abruptly: "
                 + output.getLines(), hasLine(output, "ABANDONED"));

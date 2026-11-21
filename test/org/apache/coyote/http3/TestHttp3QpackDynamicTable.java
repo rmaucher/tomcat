@@ -226,7 +226,7 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
                 "--data", Base64.getEncoder().encodeToString(
                         "body!".getBytes(StandardCharsets.UTF_8)),
                 "--frame-after-data", truncatedTrailerFrame(section),
-                "--timeout", "10"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "20"), CLIENT_TIMEOUT_SECONDS);
 
         Assert.assertNull("A connection-level trailer failure must not be "
                 + "reported as a stream error", output.getStreamError());
@@ -307,7 +307,7 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
                 "--encoder", b64(encoder),
                 "--encoder-delay", "0.5",
                 "--headers", b64(section),
-                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_QPACK_DECOMPRESSION_FAILED);
 
@@ -384,6 +384,7 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
                 "--trailers",
                 Base64.getEncoder().encodeToString(
                         dynamicTrailerSection()),
+                "--timeout", "10",
                 "--wait", "2"), CLIENT_TIMEOUT_SECONDS);
 
         validateStatus(output.getResponse(), 200);
@@ -421,7 +422,7 @@ public class TestHttp3QpackDynamicTable extends Http3TestBase {
                 "--frame-after-data", truncatedTrailerFrame(section),
                 "--no-fin",
                 "--wait", "2",
-                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         validateStatus(output.getResponse(), 400);
         Assert.assertTrue("Expected a Stream Cancellation for the abandoned "

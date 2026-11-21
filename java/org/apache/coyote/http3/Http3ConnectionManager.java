@@ -380,6 +380,21 @@ public class Http3ConnectionManager implements QuicConnectionManager {
     /**
      * {@inheritDoc}
      * <p>
+     * Unknown stream types are read and discarded per RFC 9114 Section 9.
+     * The endpoint checks this before growing a client unidirectional
+     * stream's read buffer so discarded streams stay on their small buffer.
+     */
+    @Override
+    public boolean isClientUniStreamDiscarded(QuicConnection connection,
+            long streamId) {
+        ConnectionState state = connections.get(connection);
+        return state != null && state.isUniStreamDiscarded(streamId);
+    }
+
+
+    /**
+     * {@inheritDoc}
+     * <p>
      * A critical client uni stream truncated at FIN maps to the frame or
      * QPACK stream error required by RFC 9114 Section 7.1 / RFC 9204, not to
      * the generic "critical stream closed" error used for a clean FIN at a

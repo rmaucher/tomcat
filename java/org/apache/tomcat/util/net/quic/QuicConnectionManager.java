@@ -95,6 +95,23 @@ public interface QuicConnectionManager {
 
 
     /**
+     * Returns whether a client-initiated unidirectional stream has been
+     * identified as an unknown type whose payload is being read and discarded
+     * (RFC 9114 Section 9). The endpoint uses this to keep such a stream on a
+     * small read buffer: its data is not retained, so the full re-assembly
+     * window is not needed.
+     *
+     * @param connection The QUIC connection
+     * @param streamId   The client unidirectional stream identifier
+     *
+     * @return {@code true} if the stream is an unknown type being discarded
+     */
+    default boolean isClientUniStreamDiscarded(QuicConnection connection, long streamId) {
+        return false;
+    }
+
+
+    /**
      * Returns the protocol-specific connection error code to use when a
      * critical client-initiated unidirectional stream terminates with data
      * that the protocol parser retained as an incomplete frame/instruction,

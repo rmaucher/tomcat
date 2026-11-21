@@ -125,7 +125,78 @@ public class TestQuicPollSet {
             Assert.assertSame(first, set.get(FIRST_ADDRESS));
             Assert.assertSame(first, set.itemAt(0));
             // The discarded item is disposed by the duplicate-add path.
-            Assert.assertFalse(duplicate.isDirty());
+            Assert.assertTrue(duplicate.isDisposed());
+        } finally {
+            set.clear();
+            set.close();
+        }
+    }
+
+
+    @Test
+    public void testPollSubset() throws Exception {
+        QuicPollSet set = new QuicPollSet();
+        try {
+            QuicPollItem first = item(FIRST_ADDRESS, Integer.valueOf(0));
+            QuicPollItem second = item(FIRST_ADDRESS + 1, Integer.valueOf(1));
+            QuicPollItem third = item(FIRST_ADDRESS + 2, Integer.valueOf(2));
+            set.add(first);
+            set.add(second);
+            set.add(third);
+
+            set.beginPoll();
+            set.addPollItem(second);
+            set.addPollItem(first);
+            set.addPollItem(second);
+            Assert.assertEquals(2, set.getPollCount());
+            Assert.assertSame(second, set.pollItemAt(0));
+            Assert.assertSame(first, set.pollItemAt(1));
+
+            set.beginPoll();
+            Assert.assertEquals(0, set.getPollCount());
+
+            set.beginPoll();
+            set.addAllPollItems();
+            Assert.assertEquals(3, set.getPollCount());
+            Assert.assertSame(first, set.pollItemAt(0));
+            Assert.assertSame(second, set.pollItemAt(1));
+            Assert.assertSame(third, set.pollItemAt(2));
+
+            // A new poll pass clears the previous membership flags, so the
+            // same item can be selected again.
+            set.beginPoll();
+            set.addPollItem(first);
+            Assert.assertEquals(1, set.getPollCount());
+            Assert.assertSame(first, set.pollItemAt(0));
+        } finally {
+            set.clear();
+            set.close();
+        }
+    }
+
+
+    @Test
+    public void testPollSubsetSurvivesShrink() throws Exception {
+        QuicPollSet set = new QuicPollSet();
+        try {
+            for (int i = 0; i < 300; i++) {
+                set.add(item(FIRST_ADDRESS + i, Integer.valueOf(i)));
+            }
+            set.beginPoll();
+            set.addAllPollItems();
+            Assert.assertEquals(300, set.getPollCount());
+
+            // Removing members shrinks the set while the poll subset still has
+            // 300 selected items. The resize must preserve the live subset
+            // instead of throwing when the new slot array is smaller.
+            for (int i = 0; i < 250; i++) {
+                set.remove(FIRST_ADDRESS + i);
+            }
+            Assert.assertEquals(50, set.size());
+            Assert.assertEquals(300, set.getPollCount());
+
+            set.beginPoll();
+            Assert.assertEquals(0, set.getPollCount());
         } finally {
             set.clear();
             set.close();

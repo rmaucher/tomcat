@@ -230,6 +230,25 @@ public final class QuicPoll {
 
 
     /**
+     * Releases the calling thread's reusable {@code SSL_poll()} timeval
+     * scratch and removes its ThreadLocal entry. Must be called from the
+     * thread that owns the confined arena, at the end of the poll-loop
+     * lifetime: otherwise the thread's arena stays allocated until the
+     * ThreadLocal entry is collected.
+     */
+    static void releaseThreadScratch() {
+        PollScratch scratch = POLL_SCRATCH.get();
+        POLL_SCRATCH.remove();
+        try {
+            scratch.arena.close();
+        } catch (Throwable t) {
+            // Best-effort cleanup at thread exit; the arena is confined to
+            // this thread and is not used after this call.
+        }
+    }
+
+
+    /**
      * Returns the aligned stride for an array of SSL_POLL_ITEM structs.
      *
      * @return The stride in bytes

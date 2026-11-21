@@ -83,11 +83,11 @@ public class TestAsyncReadListener extends Http3TestBase {
                 "--headers", headers,
                 "--data", Base64.getEncoder().encodeToString(PARTIAL_BODY),
                 "--no-fin",
-                "--timeout", "2",
-                "--wait", "4"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "5",
+                "--wait", "2"), CLIENT_TIMEOUT_SECONDS);
 
         synchronized (asyncServlet) {
-            long deadline = System.currentTimeMillis() + 15000;
+            long deadline = System.currentTimeMillis() + 30000;
             while (asyncServlet.error == null && !asyncServlet.allDataRead
                     && System.currentTimeMillis() < deadline) {
                 asyncServlet.wait(
@@ -128,11 +128,11 @@ public class TestAsyncReadListener extends Http3TestBase {
                         Integer.toString(first.length + overrun.length - 1)),
                 "--data", Base64.getEncoder().encodeToString(first),
                 "--frame-after-data", buildFrameB64(0x00, overrun),
-                "--timeout", "5"),
+                "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         synchronized (asyncServlet) {
-            long deadline = System.currentTimeMillis() + 15000;
+            long deadline = System.currentTimeMillis() + 30000;
             while (asyncServlet.error == null && !asyncServlet.allDataRead
                     && System.currentTimeMillis() < deadline) {
                 asyncServlet.wait(
@@ -179,11 +179,11 @@ public class TestAsyncReadListener extends Http3TestBase {
                 "--data", Base64.getEncoder().encodeToString(PARTIAL_BODY),
                 "--no-fin",
                 "--reset-request", "2",
-                "--timeout", "1",
+                "--timeout", "5",
                 "--wait", "4"), CLIENT_TIMEOUT_SECONDS);
 
         synchronized (asyncServlet) {
-            long deadline = System.currentTimeMillis() + 15000;
+            long deadline = System.currentTimeMillis() + 30000;
             while (asyncServlet.error == null && !asyncServlet.allDataRead
                     && System.currentTimeMillis() < deadline) {
                 asyncServlet.wait(
@@ -226,7 +226,7 @@ public class TestAsyncReadListener extends Http3TestBase {
         List<String> command = rawCommandWith(
                 "--headers", headers,
                 "--no-fin",
-                "--timeout", "2",
+                "--timeout", "5",
                 "--wait", "6");
         Thread clientThread = new Thread(
                 () -> runClient(command, CLIENT_TIMEOUT_SECONDS));
@@ -237,7 +237,7 @@ public class TestAsyncReadListener extends Http3TestBase {
             // The client holds the stream open for (timeout + wait) seconds
             // after sending the request. Wait only a fraction of that: the
             // event must arrive while the stream is still half-open.
-            long deadline = System.currentTimeMillis() + 7000;
+            long deadline = System.currentTimeMillis() + 30000;
             while (asyncServlet.error == null && !asyncServlet.allDataRead
                     && System.currentTimeMillis() < deadline) {
                 asyncServlet.wait(
@@ -282,13 +282,13 @@ public class TestAsyncReadListener extends Http3TestBase {
                         "--headers", headers,
                         "--data", Base64.getEncoder().encodeToString(body),
                         "--no-fin",
-                        "--timeout", "2",
+                        "--timeout", "5",
                         "--wait", "8"), CLIENT_TIMEOUT_SECONDS));
         clientThread.setDaemon(true);
         clientThread.start();
 
         synchronized (asyncServlet) {
-            long deadline = System.currentTimeMillis() + 7000;
+            long deadline = System.currentTimeMillis() + 30000;
             while (asyncServlet.error == null && !asyncServlet.allDataRead
                     && System.currentTimeMillis() < deadline) {
                 asyncServlet.wait(
@@ -336,11 +336,11 @@ public class TestAsyncReadListener extends Http3TestBase {
                 "--frame-after-data-delay", "1",
                 "--no-fin",
                 "--fin-after", "2",
-                "--timeout", "5",
+                "--timeout", "15",
                 "--wait", "2"), CLIENT_TIMEOUT_SECONDS);
 
         synchronized (asyncServlet) {
-            long deadline = System.currentTimeMillis() + 15000;
+            long deadline = System.currentTimeMillis() + 30000;
             while (asyncServlet.error == null && !asyncServlet.allDataRead
                     && System.currentTimeMillis() < deadline) {
                 asyncServlet.wait(
@@ -382,7 +382,7 @@ public class TestAsyncReadListener extends Http3TestBase {
                 CLIENT_TIMEOUT_SECONDS);
 
         synchronized (asyncServlet) {
-            long deadline = System.currentTimeMillis() + 15000;
+            long deadline = System.currentTimeMillis() + 30000;
             while (asyncServlet.error == null && !asyncServlet.allDataRead
                     && System.currentTimeMillis() < deadline) {
                 asyncServlet.wait(

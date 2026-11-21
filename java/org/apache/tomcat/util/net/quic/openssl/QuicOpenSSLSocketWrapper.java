@@ -92,12 +92,27 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     private final ReentrantLock writeLock = new ReentrantLock();
 
     /**
+     * Monotonic count of bytes accepted by the native stream write path. The
+     * write-interest sweep compares snapshots across a non-blocking flush to
+     * distinguish a flush that made progress from one that could not write
+     * (flow-control/send-buffer stall) while the interest latch stays set.
+     */
+    private volatile long acceptedBytes;
+
+    /**
      * Latched write interest. The endpoint's poll-loop sweep uses it to
      * re-drive writes even when OpenSSL reports no W event because the native
      * send buffer is full (see
      * {@link QuicOpenSSLEndpoint#addWriteInterest(QuicOpenSSLSocketWrapper)}).
      */
     private final AtomicBoolean writeInterest = new AtomicBoolean(false);
+
+    /**
+     * Serializes the write-interest latch and the endpoint sweep entry so a
+     * clear cannot remove a registration that raced it. See
+     * {@link #clearWriteInterestIfUnlatched()}.
+     */
+    private final Object writeInterestLock = new Object();
 
     /**
      * Creates a new socket wrapper for a QUIC stream.
@@ -283,8 +298,14 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                 }
                 endpoint.handleEvents(conn.getSsl(), "stream pump");
             });
-        } catch (IOException e) {
-            // Ignore - the poll loop will surface any real errors
+        } catch (IOException | RuntimeException e) {
+            // Ignore - the poll loop will surface any real errors. A stopped
+            // mailbox rejects the hop with RejectedExecutionException, which
+            // must not escape into a blocking read/write that declares only
+            // IOException; the wait below still observes close/interrupt.
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("socketWrapper.quicPumpIgnored"), e);
+            }
         }
     }
 
@@ -384,12 +405,26 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                 quicStream.getReadState() == QuicStream.ReadState.FINISHED) {
             return true;
         }
-        return fillReadBuffer(handler) > 0;
+        // The probe itself may discover EOF (fillReadBuffer() returns -1 and
+        // leaves the stream FINISHED). SocketWrapperBase.isReadyForRead()
+        // documents that true may be returned at the end of the input because
+        // the next read can report EOF immediately; returning false here
+        // would delay that read by one more readiness cycle. A zero result is
+        // a would-block, not EOF.
+        return fillReadBuffer(handler) != 0;
     }
 
 
     @Override
     public int read(boolean block, byte[] b, int off, int len) throws IOException {
+        if (len == 0) {
+            // The ByteBuffer overload already treats an empty destination as a
+            // no-op. The byte-array overload must do the same before it can
+            // fill the internal buffer or wait for data/EOF: a zero-length read
+            // of a blocking stream would otherwise block (and consume data
+            // into the socket read buffer) instead of returning 0 immediately.
+            return 0;
+        }
         checkNotClosed();
         SocketBufferHandler handler = socketBufferHandler;
         if (handler == null) {
@@ -735,6 +770,26 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     }
 
 
+    /**
+     * Flushes staged write data non-blocking and reports whether the native
+     * transport actually accepted any bytes. The write-interest sweep uses
+     * this to avoid treating a would-blocking flush as progress (and
+     * re-dispatching an OPEN_WRITE handler pass that cannot write anything):
+     * only a flush that moves bytes counts as progress.
+     *
+     * @return {@code true} if the flush drained or partially accepted staged
+     *         data, {@code false} if it could not write (including the case
+     *         where an application writer owns the lock)
+     *
+     * @throws IOException If the flush fails
+     */
+    boolean flushNonBlockingWithProgress() throws IOException {
+        long before = acceptedBytes;
+        flushNonBlocking();
+        return acceptedBytes != before;
+    }
+
+
     private boolean flushNonBlockingLocked() throws IOException {
         if (socketBufferHandler == null) {
             // Closed (see the doClose() contract): nothing to stage into or
@@ -836,6 +891,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
             if (written >= 0) {
                 buffer.position(startPos + written);
+                acceptedBytes += written;
                 if (buffer.remaining() == 0) {
                     // Full write; conclude is handled at the top of the loop
                     // next iteration. No pump needed: the queued data is
@@ -1024,25 +1080,51 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     @Override
     public void registerWriteInterest() {
         // Reference: pe_resume_write adds W to want_events
-        // Set the latch and add the wrapper unconditionally. The set add is
-        // idempotent; doing it on every registration also repairs the case
-        // where a concurrent clear removed the wrapper after the latch was
-        // already set (for example when a close races this registration).
-        writeInterest.set(true);
-        endpoint.addWriteInterest(this);
-        resumeInterest(QuicPoll.SSL_POLL_EVENT_W);
+        // Keep the latch and the sweep entry in one critical section. The
+        // endpoint may ignore the registration while stopped, in which case
+        // the latch must not remain set without a sweep entry.
+        boolean registered;
+        synchronized (writeInterestLock) {
+            registered = endpoint.addWriteInterest(this);
+            writeInterest.set(registered);
+        }
+        if (registered) {
+            resumeInterest(QuicPoll.SSL_POLL_EVENT_W);
+        }
     }
 
 
     /**
-     * Clears the latched write interest, releasing the endpoint's sweep entry.
-     * The removal is unconditional: a clear racing a registration may run
-     * before the registration's set add, and the sweep must be able to
-     * discard the resulting latch-false entry rather than retain it forever.
+     * Clears the latched write interest and releases the endpoint's sweep
+     * entry. Called by close paths, where clearing a concurrently registered
+     * interest is harmless because the stream is going away.
      */
     void clearWriteInterest() {
-        writeInterest.set(false);
-        endpoint.removeWriteInterest(this);
+        synchronized (writeInterestLock) {
+            writeInterest.set(false);
+            endpoint.removeWriteInterest(this);
+        }
+    }
+
+
+    /**
+     * Removes a stale sweep entry only if no registration has set the latch
+     * since the caller observed it clear. This closes the race where a
+     * registration sets the latch and adds the wrapper between the caller's
+     * check and the removal: the conditional clear then leaves the new
+     * registration intact.
+     *
+     * @return {@code true} if the entry was removed, {@code false} if a
+     *         concurrent registration made it live again
+     */
+    boolean clearWriteInterestIfUnlatched() {
+        synchronized (writeInterestLock) {
+            if (writeInterest.get()) {
+                return false;
+            }
+            endpoint.removeWriteInterest(this);
+            return true;
+        }
     }
 
 
@@ -1288,12 +1370,28 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     @Override
     public boolean needSemaphores() {
+        // The semaphores are created when this returns true, keeping direct
+        // vectored-I/O calls well formed so they can fail cleanly below.
         return true;
     }
 
 
     /**
-     * Operation state for QUIC vectored I/O.
+     * The OpenSSL QUIC endpoint does not resume a vectored operation after it
+     * would block: stream readiness is delivered to the HTTP handler and there
+     * is no poller hook that calls {@code OperationState.process()}. Do not
+     * advertise the capability to code that chooses an async-I/O path.
+     *
+     * @return {@code false} always
+     */
+    @Override
+    public boolean hasAsyncIO() {
+        return false;
+    }
+
+
+    /**
+     * Failing operation state for the unsupported QUIC vectored-I/O surface.
      *
      * @param <A> The attachment type
      */
@@ -1316,133 +1414,11 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
         @Override
         public void run() {
-            long nBytes = 0;
-            IOException error = getError();
-            if (error == null) {
-                try {
-                    synchronized (this) {
-                        if (!completionDone) {
-                            if (log.isTraceEnabled()) {
-                                log.trace("Skip concurrent " + (read ? "read" : "write") + " notification");
-                            }
-                            return;
-                        }
-                    }
-
-                    if (read) {
-                        for (int i = 0; i < length; i++) {
-                            ByteBuffer buffer = buffers[offset + i];
-                            if (!buffer.hasRemaining()) {
-                                // A zero-length destination returns 0 without
-                                // touching the stream; that is not a
-                                // would-block signal. Skip it and continue
-                                // with the later buffers.
-                                continue;
-                            }
-                            int bytes = read(false, buffer);
-                            if (bytes < 0) {
-                                // EOF: treating it as would-block (0) would
-                                // re-run the operation or report no progress
-                                // forever instead of completing at end of
-                                // stream. If bytes were already transferred,
-                                // report them: they have been consumed and
-                                // cannot be read again.
-                                if (nBytes > 0) {
-                                    completion.completed(Long.valueOf(nBytes), this);
-                                } else {
-                                    completion.failed(new EOFException(
-                                            sm.getString("socketWrapper.quicStreamClosed")), this);
-                                }
-                                return;
-                            }
-                            if (bytes > 0) {
-                                nBytes += bytes;
-                            } else {
-                                // Only a non-empty buffer that returns 0 is
-                                // would-block.
-                                break;
-                            }
-                        }
-                    } else {
-                        // The vectored loop mutates the same per-wrapper write
-                        // state as every other writer. Take writeLock for the
-                        // whole loop: the poll thread's opportunistic
-                        // flushNonBlocking() uses tryLock(), so it cannot block
-                        // here, and the NIO2 machinery keeps at most one
-                        // operation state per wrapper in flight. This matches
-                        // the quiche and ngtcp2 twins; keep the three in step.
-                        writeLock.lock();
-                        try {
-                            for (int i = 0; i < length; i++) {
-                                int start = buffers[offset + i].position();
-                                doWrite(false, buffers[offset + i]);
-                                nBytes += buffers[offset + i].position() - start;
-                                if (buffers[offset + i].hasRemaining()) {
-                                    // Non-blocking would-block (flow control /
-                                    // full send buffer): the remainder of this
-                                    // buffer is still queued in front of the
-                                    // later buffers, so stop here. Writing
-                                    // buffers[i+1] now would append its bytes
-                                    // to the stream ahead of the undelivered
-                                    // remainder and corrupt the byte order.
-                                    // doWrite() has re-armed write interest;
-                                    // the completion handler reports the
-                                    // partial transfer and the caller resumes
-                                    // later.
-                                    break;
-                                }
-                            }
-                        } finally {
-                            writeLock.unlock();
-                        }
-                    }
-                } catch (IOException ioe) {
-                    // Bytes accepted by earlier buffers are already consumed
-                    // from the stream/socket and cannot be replayed. Report
-                    // that progress instead of discarding it; fail only when
-                    // no bytes were transferred.
-                    if (nBytes > 0) {
-                        completion.completed(Long.valueOf(nBytes), this);
-                    } else {
-                        completion.failed(ioe, this);
-                    }
-                    return;
-                } catch (RuntimeException | Error e) {
-                    // read()/doWrite() can throw unchecked exceptions too (for
-                    // example RejectedExecutionException/IllegalStateException
-                    // when the poll thread or mailbox is gone during shutdown).
-                    // The NIO2 completion must still be resolved, otherwise the
-                    // application's pending async operation hangs forever.
-                    ExceptionUtils.handleThrowable(e);
-                    if (nBytes > 0) {
-                        completion.completed(Long.valueOf(nBytes), this);
-                    } else {
-                        completion.failed(e, this);
-                    }
-                    return;
-                }
-            } else {
-                // An error recorded by the wrapper (closed stream, failed poll
-                // hop, ...) must fail the operation. Falling through to
-                // completed(0) would make the completion check re-run this
-                // state and recurse until a StackOverflowError.
-                completion.failed(error, this);
-                return;
-            }
-            if (nBytes > 0 || !buffersArrayHasRemaining(buffers, offset, length)) {
-                completion.completed(Long.valueOf(nBytes), this);
-            } else {
-                // Would-block with no progress: leave the operation pending,
-                // like NioEndpoint, and register interest so the poll loop
-                // wakes the operation once the stream can make progress.
-                // Completing with 0 here would make COMPLETE_READ/WRITE
-                // return CONTINUE and re-run this state recursively.
-                if (read) {
-                    registerReadInterest();
-                } else {
-                    registerWriteInterest();
-                }
-            }
+            // The OpenSSL endpoint does not resume vectored operations after a
+            // would-block (see hasAsyncIO()). Fail the operation explicitly
+            // instead of leaving it PENDING forever and holding its semaphore.
+            completion.failed(new UnsupportedOperationException(
+                    sm.getString("socketWrapper.quicAsyncIOUnsupported")), this);
         }
     }
 
@@ -1574,6 +1550,10 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                                     if (derLen <= 0) {
                                         log.warn(sm.getString(
                                                 "socketWrapper.quicPeerCertSkipped", "i2d_X509"));
+                                        // Handled native failure: keep the
+                                        // error queue clean for a later accept
+                                        // diagnostic.
+                                        QuicDiagnostics.clearErrorQueue();
                                         continue;
                                     }
                                     MemorySegment derBuf = outPtr.get(ValueLayout.ADDRESS, 0);
@@ -1626,6 +1606,11 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                                     } finally {
                                         openssl_h.CRYPTO_free(leafBuf, MemorySegment.NULL, 0);
                                     }
+                                } else {
+                                    // Handled native failure: do not leave the
+                                    // error queue dirty for a later accept
+                                    // diagnostic.
+                                    QuicDiagnostics.clearErrorQueue();
                                 }
                             }
                         }

@@ -255,7 +255,7 @@ public class TestHttp3Functional extends Http3TestBase {
                 "--streams", "2",
                 "--reset-request", "2",
                 "--wait", "1",
-                "--timeout", "5"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "15"), CLIENT_TIMEOUT_SECONDS);
 
         Assert.assertEquals("Both completed requests must have responses",
                 2, output.getResponses().size());
@@ -311,7 +311,7 @@ public class TestHttp3Functional extends Http3TestBase {
                 "--data", Base64.getEncoder().encodeToString(first),
                 "--frame-after-data",
                 buildFrameB64(0x00, overrun),
-                "--timeout", "5"),
+                "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_MESSAGE_ERROR);
@@ -343,7 +343,7 @@ public class TestHttp3Functional extends Http3TestBase {
                 "--data", Base64.getEncoder().encodeToString(first),
                 "--frame-after-data",
                 buildFrameB64(0x00, overrun),
-                "--timeout", "5"),
+                "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_MESSAGE_ERROR);
@@ -372,7 +372,7 @@ public class TestHttp3Functional extends Http3TestBase {
                         Integer.toString(body.length + 5000)),
                 "--data", Base64.getEncoder().encodeToString(body),
                 "--frame-after-data", buildFrameB64(0x04, new byte[] { 0 }),
-                "--timeout", "5"),
+                "--timeout", "15"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionErrorCode(output, H3_FRAME_UNEXPECTED);
@@ -676,7 +676,7 @@ public class TestHttp3Functional extends Http3TestBase {
                 "--data",
                 Base64.getEncoder().encodeToString(
                         "123456789".getBytes(StandardCharsets.US_ASCII)),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_MESSAGE_ERROR);

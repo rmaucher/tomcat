@@ -120,6 +120,14 @@ public class QuicCertificateManager {
     private boolean pskOptionWarned;
 
     /**
+     * Set when the native context's {@code SSL_OP_ALLOW_NO_DHE_KEX} option
+     * could not be aligned with the current snapshot. In that state the
+     * endpoint must not offer pre-shared keys, because it cannot tell whether
+     * a PSK handshake would use the non-forward-secret no-DHE mode.
+     */
+    private volatile boolean pskOptionMisaligned;
+
+    /**
      * Set once the PSK-only (no-DHE) forward-secrecy tradeoff was reported, so
      * a certificate reload or context re-initialisation does not repeat it.
      */
@@ -196,7 +204,26 @@ public class QuicCertificateManager {
             throw new IllegalStateException(sm.getString(
                     "quicEndpoint.certificateManagerAlreadyInitialized"));
         }
+        // A previous initialize() that failed in SSL_CTX_new() left its
+        // initial snapshot owned by this manager (sslCtx is still NULL). A
+        // retry must release that snapshot before replacing it; otherwise its
+        // native X509/EVP_PKEY objects and arena are lost. release() is still
+        // the normal cleanup for a failed bind, this makes a direct retry on
+        // the public manager API safe as well.
+        QuicCertConfig previousConfig = certConfig;
         certConfig = initialConfig;
+        if (previousConfig != null && previousConfig != initialConfig) {
+            // Never free the snapshot that is being installed. A caller may
+            // retry initialize() with the same QuicCertConfig object it passed
+            // before; freeing it here would leave certConfig (and the SNI/PSK
+            // callbacks) pointing at freed native X509/EVP_PKEY objects and a
+            // closed arena.
+            try {
+                previousConfig.free();
+            } finally {
+                CertificateLoader.closeQuietly(previousConfig.arena);
+            }
+        }
         createNativeSslContext();
     }
 
@@ -360,9 +387,13 @@ public class QuicCertificateManager {
         boolean optionSet =
                 (openssl_h_Compatibility.SSL_CTX_get_options(sslCtx)
                         & QuicBindings.SSL_OP_ALLOW_NO_DHE_KEX) != 0;
-        if (optionSet != wantOption) {
+        pskOptionMisaligned = optionSet != wantOption;
+        if (pskOptionMisaligned) {
             // Handled non-fatal native failure: drain the error queue entry so
-            // it cannot be mistaken for a later accept failure.
+            // it cannot be mistaken for a later accept failure. PSK selection
+            // is disabled while the option state is unknown (see
+            // resolvePskSelector) so a certificate endpoint can never fall
+            // back to a non-forward-secret PSK handshake.
             QuicDiagnostics.clearErrorQueue();
             if (!pskOptionWarned) {
                 pskOptionWarned = true;
@@ -417,8 +448,27 @@ public class QuicCertificateManager {
      *
      * @param newConfig The configuration to install
      * @param reason    A short description of what triggered the reload
+     *
+     * @throws IllegalArgumentException If the cipher policy cannot be parsed;
+     *         the caller still owns {@code newConfig}
+     * @throws IllegalStateException If the manager has already been released;
+     *         {@code newConfig} is discarded and freed here, so the caller
+     *         must not release it again
      */
     public synchronized void swapConfig(QuicCertConfig newConfig, String reason) {
+        if (sslCtx == null || sslCtx.equals(MemorySegment.NULL)) {
+            // A swap after release() would replace certConfig with a snapshot
+            // that nothing will ever free (the context and arena owner is
+            // gone). Discard the new snapshot here so a public-API caller
+            // cannot leak it, and reject the operation.
+            try {
+                newConfig.free();
+            } finally {
+                CertificateLoader.closeQuietly(newConfig.arena);
+            }
+            throw new IllegalStateException(sm.getString(
+                    "quicEndpoint.certificateManagerReleased"));
+        }
         // Validate and apply the new cipher policy before taking ownership of
         // the snapshot. On failure the caller still owns newConfig and the
         // previous snapshot stays active; applyCipherSuites() does not change
@@ -426,7 +476,9 @@ public class QuicCertificateManager {
         applyCipherSuites(newConfig);
         QuicCertConfig oldConfig = certConfig;
         certConfig = newConfig;
-        if (oldConfig != null) {
+        if (oldConfig != null && oldConfig != newConfig) {
+            // Installing the same snapshot again must not free the live
+            // configuration now referenced by certConfig (see initialize()).
             try {
                 oldConfig.free();
             } finally {
@@ -562,10 +614,11 @@ public class QuicCertificateManager {
 
 
     /**
-     * ALPN select callback - selects the first offered protocol that the
-     * application protocol ({@link QuicProtocol#getAlpnIdentifiers()})
-     * supports. When no application protocol has been configured yet, no
-     * identifier can be selected and the handshake is rejected. Returns
+     * ALPN select callback - selects the first identifier, in the preference
+     * order supplied by the application protocol
+     * ({@link QuicProtocol#getAlpnIdentifiers()}), that the client offered.
+     * When no application protocol has been configured yet, no identifier can
+     * be selected and the handshake is rejected. Returns
      * {@code SSL_TLSEXT_ERR_OK} (0) on success and
      * {@code SSL_TLSEXT_ERR_ALERT_FATAL} (2) when no supported protocol is
      * offered.
@@ -600,28 +653,41 @@ public class QuicCertificateManager {
                 // past the offered-protocol list. The writes to out/outlen
                 // need no such treatment.
                 in = in.reinterpret(inlen, localArena, null);
-                int offset = 0;
-                while (offset < inlen) {
-                    int protoLen = in.get(ValueLayout.JAVA_BYTE, offset) & 0xFF;
-                    if (protoLen == 0) {
-                        break;
+                // Server preference order: for each configured identifier, scan
+                // the client's list. This honours the order documented by
+                // QuicProtocol.getAlpnIdentifiers(); scanning the client list
+                // first would select the client's preferred match instead.
+                for (String identifier : identifiers) {
+                    int identifierLength = identifier.length();
+                    if (identifierLength <= 0 || identifierLength > 255) {
+                        continue;
                     }
-                    // A malformed offered-protocol list can declare a length
-                    // that overruns the buffer. Reject it explicitly (fall
-                    // through to the no-match ALERT_FATAL below) rather than
-                    // relying on the outer catch to turn an out-of-bounds
-                    // read into an alert by accident.
-                    if (protoLen > inlen - (offset + 1)) {
-                        break;
+                    int offset = 0;
+                    while (offset < inlen) {
+                        int protoLen = in.get(ValueLayout.JAVA_BYTE, offset) & 0xFF;
+                        if (protoLen == 0) {
+                            break;
+                        }
+                        // A malformed offered-protocol list can declare a
+                        // length that overruns the buffer. Reject it explicitly
+                        // (fall through to the no-match ALERT_FATAL below)
+                        // rather than relying on the outer catch to turn an
+                        // out-of-bounds read into an alert by accident.
+                        if (protoLen > inlen - (offset + 1)) {
+                            break;
+                        }
+                        if (protoLen == identifierLength &&
+                                matchesAlpnIdentifier(in, offset + 1,
+                                        identifierLength, identifier)) {
+                            out.set(ValueLayout.ADDRESS, 0,
+                                    MemorySegment.ofAddress(
+                                            in.address() + offset + 1));
+                            outlen.set(ValueLayout.JAVA_BYTE, 0,
+                                    (byte) protoLen);
+                            return QuicBindings.SSL_TLSEXT_ERR_OK;
+                        }
+                        offset += 1 + protoLen;
                     }
-                    if (matchesAlpnIdentifier(in, offset + 1, protoLen,
-                            identifiers)) {
-                        out.set(ValueLayout.ADDRESS, 0, MemorySegment.ofAddress(
-                                in.address() + offset + 1));
-                        outlen.set(ValueLayout.JAVA_BYTE, 0, (byte) protoLen);
-                        return QuicBindings.SSL_TLSEXT_ERR_OK;
-                    }
-                    offset += 1 + protoLen;
                 }
             }
         } catch (Throwable t) {
@@ -639,36 +705,27 @@ public class QuicCertificateManager {
 
     /**
      * Checks whether the protocol bytes offered at the given position of the
-     * ALPN list match one of the identifiers the application protocol
-     * supports.
+     * ALPN list match one supported identifier.
      *
-     * @param in          The (reinterpreted) offered-protocol list
-     * @param start       Offset of the first byte of the offered protocol
-     * @param length      Length of the offered protocol
-     * @param identifiers The identifiers supported by the application protocol
+     * @param in         The (reinterpreted) offered-protocol list
+     * @param start      Offset of the first byte of the offered protocol
+     * @param length     Length of the offered protocol
+     * @param identifier The identifier supported by the application protocol
      *
-     * @return {@code true} if the offered protocol matches a supported
-     *         identifier
+     * @return {@code true} if the offered protocol matches the identifier
      */
     private static boolean matchesAlpnIdentifier(MemorySegment in, long start,
-            int length, String[] identifiers) {
-        for (String identifier : identifiers) {
-            if (identifier.length() != length) {
-                continue;
-            }
-            boolean matches = true;
-            for (int i = 0; i < length; i++) {
-                if (in.get(ValueLayout.JAVA_BYTE, start + i) !=
-                        (byte) identifier.charAt(i)) {
-                    matches = false;
-                    break;
-                }
-            }
-            if (matches) {
-                return true;
+            int length, String identifier) {
+        if (identifier.length() != length) {
+            return false;
+        }
+        for (int i = 0; i < length; i++) {
+            if (in.get(ValueLayout.JAVA_BYTE, start + i) !=
+                    (byte) identifier.charAt(i)) {
+                return false;
             }
         }
-        return false;
+        return true;
     }
 
 
@@ -732,25 +789,64 @@ public class QuicCertificateManager {
      * {@link #setupSniCallback()}, hence {@code @SuppressWarnings("unused")}.
      *
      * @param ssl the connection SSL object
-     * @param al  pointer to the alert value to send on rejection (unused)
+     * @param al  pointer to the alert value to send on rejection
      * @param arg unused
      *
-     * @return always {@code SSL_TLSEXT_ERR_OK}
+     * @return {@code SSL_TLSEXT_ERR_OK} when the host's certificate material
+     *         was applied, otherwise {@code SSL_TLSEXT_ERR_ALERT_FATAL}; a
+     *         host that also has pre-shared keys must not continue with PSK
+     *         authentication after its configured certificates failed to
+     *         apply, because that would silently change the authentication
+     *         mode
      */
     @SuppressWarnings("unused")
     private int sniCallback(MemorySegment ssl, MemorySegment al,
             MemorySegment arg) {
         try {
             QuicCertConfig config = certConfig;
-            if (config != null) {
-                applyCertEntries(ssl, resolveCertEntries(ssl, config));
+            if (config == null) {
+                return QuicBindings.SSL_TLSEXT_ERR_OK;
             }
+            if (!applyCertEntries(ssl, resolveCertEntries(ssl, config))) {
+                if (log.isErrorEnabled()) {
+                    log.error(sm.getString("quicEndpoint.sniCertApplyFailed"));
+                }
+                setSniAlert(al, QuicBindings.SSL_AD_INTERNAL_ERROR);
+                return QuicBindings.SSL_TLSEXT_ERR_ALERT_FATAL;
+            }
+            return QuicBindings.SSL_TLSEXT_ERR_OK;
         } catch (Throwable t) {
             if (log.isErrorEnabled()) {
                 log.error(sm.getString("quicEndpoint.sniCallbackError"), t);
             }
+            // A throwable escaping an FFM upcall ends the process. Reject the
+            // handshake instead of continuing without the configured material.
+            setSniAlert(al, QuicBindings.SSL_AD_INTERNAL_ERROR);
+            return QuicBindings.SSL_TLSEXT_ERR_ALERT_FATAL;
         }
-        return QuicBindings.SSL_TLSEXT_ERR_OK;
+    }
+
+
+    /**
+     * Sets the alert value OpenSSL sends when the SNI callback returns
+     * {@code SSL_TLSEXT_ERR_ALERT_FATAL}. Failure to write the optional
+     * pointer is ignored; OpenSSL then uses its default alert.
+     *
+     * @param al    The {@code int *al} callback argument
+     * @param alert The TLS alert description
+     */
+    private static void setSniAlert(MemorySegment al, int alert) {
+        if (al == null || al.equals(MemorySegment.NULL)) {
+            return;
+        }
+        try {
+            al.reinterpret(ValueLayout.JAVA_INT.byteSize())
+                    .set(ValueLayout.JAVA_INT, 0, alert);
+        } catch (Throwable t) {
+            if (log.isDebugEnabled()) {
+                log.debug("Could not set QUIC SNI alert", t);
+            }
+        }
     }
 
 
@@ -856,14 +952,18 @@ public class QuicCertificateManager {
      *
      * @param ssl     The connection SSL object
      * @param entries The entries to apply; an empty list applies nothing
+     *
+     * @return {@code true} if every entry was applied (including the vacuous
+     *         case of an empty list), {@code false} if at least one failed
      */
-    private void applyCertEntries(MemorySegment ssl,
+    private boolean applyCertEntries(MemorySegment ssl,
             List<CertificateLoader.CertificateEntry> entries) {
         // Apply every entry of the host. Entries of different key types
         // coexist on the connection (a repeated
         // SSL_use_certificate()/SSL_use_PrivateKey() pair only replaces the
         // certificate of the same key type), and OpenSSL selects among them
         // per handshake according to the client's signature algorithms.
+        boolean allApplied = true;
         for (CertificateLoader.CertificateEntry entry : entries) {
             try {
                 int rcCert = QuicBindings.SSL_use_certificate(ssl,
@@ -914,7 +1014,10 @@ public class QuicCertificateManager {
                     }
                 }
             } catch (Throwable t) {
-                // Applying this entry failed.
+                // Applying this entry failed; keep trying the remaining
+                // entries but report the failure to the caller so the
+                // handshake can be rejected instead of falling back to PSK.
+                allApplied = false;
                 // SSL_use_certificate() only replaces a previously set
                 // certificate of the *same* key type
                 // (SSL_CTX_use_certificate(3)), so the entries already
@@ -935,6 +1038,7 @@ public class QuicCertificateManager {
                 }
             }
         }
+        return allApplied;
     }
 
 
@@ -993,14 +1097,27 @@ public class QuicCertificateManager {
      */
     private OpenSSLPreSharedKeySelector resolvePskSelector(MemorySegment ssl) {
         QuicCertConfig config = certConfig;
-        if (config == null) {
+        if (config == null || pskOptionMisaligned) {
+            // If the context option could not be aligned with the snapshot,
+            // the endpoint cannot know whether a PSK handshake would be
+            // non-forward-secret. Fail closed by not offering PSK identities;
+            // certificate authentication remains available.
             return null;
         }
         // Resolve the serving host once and use it for both the certificate
         // entries and the PSK selector instead of reading the native SNI
         // value twice per PSK handshake.
         String hostKey = resolveServingHostKey(ssl, config);
-        applyCertEntries(ssl, resolveCertEntries(config, hostKey));
+        if (!applyCertEntries(ssl, resolveCertEntries(config, hostKey))) {
+            // Do not offer a PSK identity after the configured certificate
+            // material failed to apply: that would let a certificate host
+            // complete the handshake with pre-shared-key authentication
+            // instead. The SNI callback runs later in this handshake and
+            // rejects the connection if the re-application also fails; a
+            // transient failure can still fall back to the certificate
+            // handshake with no authentication downgrade.
+            return null;
+        }
         OpenSSLPreSharedKeySelector selector =
                 config.pskByHost.get(hostKey);
         if (selector == null && hostKey.equals(config.defaultHostName)) {

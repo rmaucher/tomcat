@@ -41,7 +41,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                 new byte[] { 0x01, 0x0A, 0x00, 0x00 };
         ClientOutput output = runClient(rawCommandWith(
                 "--frame", Base64.getEncoder().encodeToString(truncatedHeaders),
-                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_ERROR);
     }
@@ -64,7 +64,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                         "content-length", "10"),
                 "--frame-after-data",
                 Base64.getEncoder().encodeToString(truncatedData),
-                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_ERROR);
     }
@@ -88,7 +88,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                         "body!".getBytes()),
                 "--frame-after-data",
                 Base64.getEncoder().encodeToString(truncatedTrailer),
-                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_ERROR);
     }
@@ -108,7 +108,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
         long declaredLength = 16L * 1024 * 1024 + 1;
         ClientOutput output = runClient(rawCommandWith(
                 "--frame", oversizedDataFrameB64(declaredLength),
-                "--timeout", "3"), CLIENT_TIMEOUT_SECONDS);
+                "--timeout", "8"), CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
     }
@@ -125,7 +125,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                 "--frame", buildFrameB64(0x05, new byte[] { 0 }),
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -143,7 +143,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                 "--frame", buildFrameB64(0x07, encodeVarint(0)),
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -161,7 +161,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                 "--frame", buildFrameB64(0x03, new byte[0]),
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -179,7 +179,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                 "--frame", buildFrameB64(0x0D, encodeVarint(0)),
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/simple")),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -199,7 +199,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                     "--frame", buildFrameB64(frameType, new byte[0]),
                     "--headers",
                     buildFieldSection(simpleGetHeaders("/simple")),
-                    "--timeout", "3"),
+                    "--timeout", "8"),
                     CLIENT_TIMEOUT_SECONDS);
 
             assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -227,7 +227,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                         "12345".getBytes()),
                 "--frame-after-data",
                 buildFrameB64(0x06, new byte[0]),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -313,7 +313,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                 Base64.getEncoder().encodeToString(
                         "hello".getBytes()),
                 "--frame-after-data", buildFrameB64(0x04, new byte[] { 0 }),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -333,7 +333,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                 "--headers",
                 buildFieldSection(simpleGetHeaders("/sleep?ms=1000")),
                 "--frame-after-data", buildFrameB64(0x04, new byte[] { 0 }),
-                "--no-fin", "--timeout", "3"),
+                "--no-fin", "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         // The response may already have been sent when the after-response
@@ -370,7 +370,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
                         ":scheme", "https",
                         ":authority", "127.0.0.1:" + port, ":path",
                         "/echo", "content-length", "5"),
-                "--timeout", "3"),
+                "--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertConnectionError(output, H3_FRAME_UNEXPECTED);
@@ -406,7 +406,7 @@ public class TestHttp3Section_7_2 extends Http3TestBase {
         // produced and the server aborts the stream with
         // H3_REQUEST_INCOMPLETE rather than waiting for headers that can
         // never arrive.
-        ClientOutput output = runClient(rawCommandWith("--timeout", "3"),
+        ClientOutput output = runClient(rawCommandWith("--timeout", "8"),
                 CLIENT_TIMEOUT_SECONDS);
 
         assertStreamError(output, H3_REQUEST_INCOMPLETE);

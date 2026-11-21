@@ -55,7 +55,7 @@ public class TestHttp3Psk extends Http3TestBase {
     private static final String PSK_KEY =
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    private static final long CLIENT_TIMEOUT_SECONDS = 15;
+    private static final long CLIENT_TIMEOUT_SECONDS = 30;
 
 
     @Override
@@ -152,7 +152,11 @@ public class TestHttp3Psk extends Http3TestBase {
     public void testCertlessPlainHandshakeFails() throws Exception {
         startHttp3Server(pskOnlyHostConfig());
 
-        ClientResult result = runSClient();
+        // A client that does not offer the configured identity cannot
+        // complete the handshake. s_client does not exit promptly on a failed
+        // QUIC handshake, so bound this expected-failure run instead of
+        // waiting out the full successful-handshake timeout.
+        ClientResult result = runSClient(3L);
 
         // The connector has no certificate; a client that does not offer the
         // configured identity cannot complete the handshake.
@@ -205,6 +209,17 @@ public class TestHttp3Psk extends Http3TestBase {
      * @return the client result (exit code and combined output)
      */
     private ClientResult runSClient(String... args) throws Exception {
+        return runSClient(CLIENT_TIMEOUT_SECONDS, args);
+    }
+
+
+    /**
+     * Runs {@code openssl s_client} with an explicit process timeout. Used by
+     * tests that expect the handshake to fail and therefore cannot rely on
+     * s_client exiting on its own.
+     */
+    private ClientResult runSClient(long timeoutSeconds, String... args)
+            throws Exception {
         String[] command = new String[args.length + 8];
         int i = 0;
         command[i++] = OPENSSL;
@@ -222,7 +237,7 @@ public class TestHttp3Psk extends Http3TestBase {
         Process process = processBuilder.start();
         process.getOutputStream().close();
 
-        ProcessResult result = runProcess(process, CLIENT_TIMEOUT_SECONDS);
+        ProcessResult result = runProcess(process, timeoutSeconds);
         return new ClientResult(result.exitCode(), result.output());
     }
 
