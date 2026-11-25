@@ -342,6 +342,8 @@ public class AjpProcessor extends AbstractProcessor {
         // Expected to block on the first read as there should be at least one
         // AJP message to read.
         boolean firstRead = true;
+        // recycle() resets the error state so track separately if the connection must be closed
+        boolean closeConnection = false;
 
         while (!getErrorState().isError() && !protocol.isPaused()) {
             // Parsing the request header
@@ -468,12 +470,21 @@ public class AjpProcessor extends AbstractProcessor {
             // Set keep alive timeout for next request
             socketWrapper.setReadTimeout(protocol.getKeepAliveTimeout());
 
+            /*
+             * Recycling resets the error state. If the request ended in error, the connection must be closed without
+             * reading any further messages. Any unread body packet is still on the connection and must not be parsed
+             * as the start of the next request.
+             */
+            closeConnection = getErrorState().isError();
             recycle();
+            if (closeConnection) {
+                break;
+            }
         }
 
         rp.setStage(org.apache.coyote.Constants.STAGE_ENDED);
 
-        if (getErrorState().isError() || protocol.isPaused()) {
+        if (closeConnection || getErrorState().isError() || protocol.isPaused()) {
             return SocketState.CLOSED;
         } else {
             if (isAsync()) {
@@ -625,6 +636,8 @@ public class AjpProcessor extends AbstractProcessor {
 
         // Request more data immediately
         if (!waitingForBodyMessage) {
+            // Make sure the non-blocking write buffer is empty before sending the get body chunk message.
+            socketWrapper.flush(true);
             socketWrapper.write(true, getBodyMessageArray, 0, getBodyMessageArray.length);
             socketWrapper.flush(true);
             waitingForBodyMessage = true;
@@ -1035,11 +1048,13 @@ public class AjpProcessor extends AbstractProcessor {
         // Calling code should ensure that there is no data in the buffers for
         // non-blocking writes.
         if (!responseFinished && getErrorState().isIoAllowed()) {
+            // Make sure the non-blocking write buffer is empty before sending the flush message.
+            socketWrapper.flush(true);
             if (protocol.getAjpFlush()) {
                 // Send the flush message
                 socketWrapper.write(true, flushMessageArray, 0, flushMessageArray.length);
+                socketWrapper.flush(true);
             }
-            socketWrapper.flush(true);
         }
     }
 
