@@ -181,9 +181,12 @@ public class QuicCertConfig {
      * certificates is accepted when it is pre-shared-key-only. A host that
      * configures both certificates and pre-shared keys but whose certificates
      * all fail to load is rejected (the build fails), because serving it would
-     * silently change its authentication mode to pre-shared-key-only. The
-     * method returns {@code null} (and logs the error) when the default host
-     * has neither a loadable certificate nor pre-shared keys.
+     * silently change its authentication mode to pre-shared-key-only. A host
+     * that configures neither a loadable certificate nor pre-shared keys also
+     * rejects the whole build. The method returns {@code null} (after logging
+     * the specific error) when the build cannot produce a usable snapshot;
+     * {@link #buildCertConfigOrThrow(SSLHostConfig, SSLHostConfig[])} is the
+     * variant that propagates the specific failure instead.
      *
      * @param defaultHostConfig The configuration of the default host, whose
      *                          certificates and pre-shared keys are used when
@@ -191,11 +194,38 @@ public class QuicCertConfig {
      * @param hostConfigs       The configurations of all hosts (including
      *                          the default one) to load material for
      *
-     * @return the new configuration, or {@code null} if the default host has
-     *         no loadable certificate and no pre-shared keys
+     * @return the new configuration, or {@code null} if the snapshot cannot
+     *         be built
      */
     public static QuicCertConfig buildCertConfig(SSLHostConfig defaultHostConfig,
             SSLHostConfig[] hostConfigs) {
+        return buildCertConfigInternal(defaultHostConfig, hostConfigs, false);
+    }
+
+
+    /**
+     * Builds the certificate snapshot like {@link #buildCertConfig(SSLHostConfig,
+     * SSLHostConfig[])} but propagates configuration failures as an
+     * {@link IllegalStateException} containing the specific reason instead of
+     * returning {@code null}. Used by the OpenSSL endpoint so a bind/reload
+     * error names the real failure (for example unsupported required client
+     * authentication) instead of a generic "no certificate" message.
+     *
+     * @param defaultHostConfig The configuration of the default host
+     * @param hostConfigs       The configurations of all hosts
+     *
+     * @return the new configuration
+     *
+     * @throws IllegalStateException If the snapshot cannot be built
+     */
+    static QuicCertConfig buildCertConfigOrThrow(SSLHostConfig defaultHostConfig,
+            SSLHostConfig[] hostConfigs) {
+        return buildCertConfigInternal(defaultHostConfig, hostConfigs, true);
+    }
+
+
+    private static QuicCertConfig buildCertConfigInternal(SSLHostConfig defaultHostConfig,
+            SSLHostConfig[] hostConfigs, boolean throwOnFailure) {
         Arena arena = Arena.ofShared();
         // Every entry successfully loaded before a failure leaves this
         // method must be released on the failure paths: the native X509 and
@@ -305,12 +335,10 @@ public class QuicCertConfig {
                         // pre-shared-key-only host. Fail the build (and
                         // therefore the bind or keep the previous reload
                         // snapshot) instead of accepting that downgrade.
-                        log.error(sm.getString(
+                        return failBuild(sm.getString(
                                 "certificateLoader.mixedAuthCertificateLoadFailed",
-                                hostConfig.getHostName()));
-                        freeLoadedEntries(loaded);
-                        CertificateLoader.closeQuietly(arena);
-                        return null;
+                                hostConfig.getHostName()), throwOnFailure, loaded,
+                                arena);
                     } else if (pskSelector != null) {
                         // Host intentionally has no certificate: connections
                         // are authenticated with its pre-shared keys. Map it
@@ -323,12 +351,16 @@ public class QuicCertConfig {
                                     hostConfig.getHostName()));
                         }
                     } else {
-                        // Nothing to map for this host: a previously mapped
-                        // configuration for the same (lower-cased) name stays
-                        // in effect.
-                        displaced = null;
-                        log.warn(sm.getString("certificateLoader.certificateLoadFailed",
-                                hostConfig.getHostName(), sm.getString("certificateLoader.noCertificate")));
+                        // The host is neither pre-shared-key-only nor has a
+                        // loadable certificate. Accepting it would make the
+                        // endpoint start successfully but every handshake for
+                        // this SNI fail later with no certificate to apply.
+                        // Reject the whole build instead.
+                        return failBuild(sm.getString(
+                                "certificateLoader.certificateLoadFailed",
+                                hostConfig.getHostName(),
+                                sm.getString("certificateLoader.noCertificate")),
+                                throwOnFailure, loaded, arena);
                     }
                 } else {
                     displaced = certsByHost.put(hostName, entries);
@@ -366,25 +398,60 @@ public class QuicCertConfig {
             }
             OpenSSLPreSharedKeySelector defaultPskSelector = pskByHost.get(defaultHostName);
             if (defaultCerts.isEmpty() && defaultPskSelector == null) {
-                log.error(sm.getString("certificateLoader.certificateLoadFailed",
+                return failBuild(sm.getString(
+                        "certificateLoader.certificateLoadFailed",
                         defaultHostConfig.getHostName(),
-                        sm.getString("certificateLoader.noCertificateOrPsk")));
-                freeLoadedEntries(loaded);
-                CertificateLoader.closeQuietly(arena);
-                return null;
+                        sm.getString("certificateLoader.noCertificateOrPsk")),
+                        throwOnFailure, loaded, arena);
             }
             boolean pskOnly = !pskByHost.isEmpty() && !certsByHost.values().stream()
                     .anyMatch(entries -> !entries.isEmpty());
             return new QuicCertConfig(defaultHostName, defaultCerts, certsByHost, pskByHost,
                     defaultPskSelector, pskOnly,
                     defaultHostConfig.getCipherSuites(), arena);
+        } catch (IllegalStateException e) {
+            freeLoadedEntries(loaded);
+            CertificateLoader.closeQuietly(arena);
+            if (throwOnFailure) {
+                throw e;
+            }
+            log.error(sm.getString("certificateLoader.certificateBuildError"), e);
+            return null;
         } catch (Throwable t) {
             ExceptionUtils.handleThrowable(t);
             freeLoadedEntries(loaded);
             CertificateLoader.closeQuietly(arena);
+            if (throwOnFailure) {
+                throw new IllegalStateException(
+                        sm.getString("certificateLoader.certificateBuildError"), t);
+            }
             log.error(sm.getString("certificateLoader.certificateBuildError"), t);
             return null;
         }
+    }
+
+
+    /**
+     * Releases the partially built material and either fails the build with a
+     * specific message or logs it and returns {@code null}, depending on
+     * {@code throwOnFailure}.
+     *
+     * @param message        The specific failure message
+     * @param throwOnFailure Whether to throw or return {@code null}
+     * @param loaded         Entries loaded before the failure
+     * @param arena          The snapshot arena
+     *
+     * @return {@code null} when not throwing
+     */
+    private static QuicCertConfig failBuild(String message, boolean throwOnFailure,
+            List<CertificateEntry> loaded, Arena arena) {
+        log.error(message);
+        if (throwOnFailure) {
+            throw new IllegalStateException(message);
+        }
+        freeLoadedEntries(loaded);
+        CertificateLoader.closeQuietly(arena);
+        return null;
     }
 
 

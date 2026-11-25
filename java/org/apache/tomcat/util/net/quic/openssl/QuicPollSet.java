@@ -23,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.res.StringManager;
 
 /**
@@ -78,7 +79,8 @@ public class QuicPollSet {
 
     /**
      * Arena holding the current native poll array. Replaced (and the
-     * previous arena closed) each time the array grows.
+     * previous arena closed) whenever the array is resized, including on
+     * growth and on the shrink path.
      */
     private Arena arrayArena;
 
@@ -184,6 +186,7 @@ public class QuicPollSet {
             try {
                 arena.close();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 // Ignore - the allocation failure is the reportable error
             }
         }
@@ -312,46 +315,6 @@ public class QuicPollSet {
 
 
     /**
-     * Moves an active item to the last membership slot. This only reorders the
-     * set's slot array; the poll loop's compact subset is ordered independently
-     * by the caller (the listener is appended last by the endpoint).
-     * <p>
-     * The endpoint no longer needs this operation (the listener is always
-     * appended last when building the poll subset); it remains as a
-     * test/tool-facing ordering primitive.
-     *
-     * @param item The item to move
-     */
-    public void moveToEnd(QuicPollItem item) {
-        if (item == null) {
-            return;
-        }
-        QuicPollItem current = items.get(item.getSsl().address());
-        if (current != item) {
-            if (current == null) {
-                // The item is not tracked; nothing to reorder.
-                return;
-            }
-            item = current;
-        }
-        int slot = item.getSlot();
-        if (slot < 0 || slot >= count || count == 0) {
-            return;
-        }
-        int last = count - 1;
-        if (slot == last) {
-            return;
-        }
-        QuicPollItem swapped = slots[last];
-        slots[slot] = swapped;
-        swapped.setSlot(slot);
-        slots[last] = item;
-        item.setSlot(last);
-        changed = true;
-    }
-
-
-    /**
      * Starts a new poll-subset pass. Clears the previous subset's membership
      * flags; the caller then selects items with {@link #addPollItem} and
      * writes the subset with {@link #writePollItems()}.
@@ -396,17 +359,6 @@ public class QuicPollSet {
         pollItems[pollCount] = item;
         pollCount++;
         item.setPollActive(true);
-    }
-
-
-    /**
-     * Adds every member of the set to the current poll subset. Used by the
-     * compatibility path when the ready-channel API is unavailable.
-     */
-    public void addAllPollItems() {
-        for (int i = 0; i < count; i++) {
-            addPollItem(slots[i]);
-        }
     }
 
 
@@ -556,6 +508,7 @@ public class QuicPollSet {
         try {
             arrayArena.close();
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             if (log.isDebugEnabled()) {
                 log.debug(sm.getString("quicPollSet.closeArenaError", "native array"), t);
             }
@@ -563,6 +516,7 @@ public class QuicPollSet {
         try {
             resultCountArena.close();
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             if (log.isDebugEnabled()) {
                 log.debug(sm.getString("quicPollSet.closeArenaError", "result_count"), t);
             }
@@ -620,6 +574,7 @@ public class QuicPollSet {
             try {
                 newArena.close();
             } catch (Throwable closeFailure) {
+                ExceptionUtils.handleThrowable(closeFailure);
                 // Ignore - the original allocation failure is more useful.
             }
             throw t;
@@ -634,6 +589,7 @@ public class QuicPollSet {
         try {
             oldArena.close();
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             if (log.isDebugEnabled()) {
                 log.debug(sm.getString("quicPollSet.closeArenaError", "old native array"), t);
             }

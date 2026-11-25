@@ -31,6 +31,7 @@ import java.util.function.Supplier;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.net.SSLHostConfig;
 import org.apache.tomcat.util.net.openssl.OpenSSLPreSharedKeySelector;
 import org.apache.tomcat.util.net.openssl.panama.CertificateLoader;
@@ -141,6 +142,33 @@ public class QuicCertificateManager {
     private long lastSniMissingLogMs;
     private static final long SNI_MISSING_LOG_INTERVAL_MS = 60_000;
 
+    /**
+     * Last time a certificate-application failure was logged and the number
+     * of failures seen so far. A client can repeatedly handshake against a
+     * host whose configured material cannot be applied, so these failures are
+     * reported at most once per interval with a cumulative count instead of
+     * once per entry per handshake.
+     */
+    private long lastCertApplyFailureLogMs;
+    private long certApplyFailureCount;
+
+    /**
+     * Last time the SNI-callback certificate-application rejection was logged
+     * and the number of rejections seen so far (same rate limit as the
+     * per-entry failure above).
+     */
+    private long lastSniCertApplyFailureLogMs;
+    private long sniCertApplyFailureCount;
+
+    /**
+     * Last time an invalid SNI host name was rejected and the number seen so
+     * far; client-triggered and rate-limited like the other handshake warnings.
+     */
+    private long lastInvalidSniNameLogMs;
+    private long invalidSniNameCount;
+
+    private static final long CERT_APPLY_FAILURE_LOG_INTERVAL_MS = 60_000;
+
 
     /**
      * Creates the certificate manager for an endpoint.
@@ -192,8 +220,12 @@ public class QuicCertificateManager {
      * @param initialConfig The certificate snapshot built by the endpoint
      *                      before this call
      *
-     * @throws IllegalStateException If the manager is already initialized
-     * @throws Exception If the context or a callback could not be created
+     * @throws IllegalStateException If the manager is already initialized;
+     *         ownership of {@code initialConfig} stays with the caller, which
+     *         must release it
+     * @throws Exception If the context or a callback could not be created; the
+     *         manager keeps ownership of {@code initialConfig} and releases it
+     *         with {@link #release()}
      */
     public synchronized void initialize(QuicCertConfig initialConfig)
             throws Exception {
@@ -508,6 +540,7 @@ public class QuicCertificateManager {
             try {
                 openssl_h.SSL_CTX_free(sslCtx);
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error freeing QUIC SSL_CTX during bind cleanup",
                             t);
@@ -528,6 +561,7 @@ public class QuicCertificateManager {
             try {
                 alpnCallbackArena.close();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error closing ALPN arena during bind cleanup", t);
                 }
@@ -538,6 +572,7 @@ public class QuicCertificateManager {
             try {
                 sniCallbackArena.close();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error closing SNI arena during bind cleanup", t);
                 }
@@ -548,6 +583,7 @@ public class QuicCertificateManager {
             try {
                 pskCallbackArena.close();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Error closing PSK arena during bind cleanup", t);
                 }
@@ -607,6 +643,7 @@ public class QuicCertificateManager {
                 log.debug("ALPN callback set for QUIC");
             }
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             throw new java.io.IOException(
                     sm.getString("quicEndpoint.alpnCallbackSetError"), t);
         }
@@ -691,6 +728,7 @@ public class QuicCertificateManager {
                 }
             }
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             // Must not throw across the native boundary; report and reject
             // the handshake instead of failing silently.
             log.warn(sm.getString("quicEndpoint.alpnSelectError"), t);
@@ -807,15 +845,37 @@ public class QuicCertificateManager {
             if (config == null) {
                 return QuicBindings.SSL_TLSEXT_ERR_OK;
             }
-            if (!applyCertEntries(ssl, resolveCertEntries(ssl, config))) {
-                if (log.isErrorEnabled()) {
-                    log.error(sm.getString("quicEndpoint.sniCertApplyFailed"));
+            String hostKey = resolveServingHostKey(ssl, config);
+            if (hostKey == null) {
+                // Invalid SNI (a trailing period is rejected by RFC 6066, like
+                // Tomcat's TLSClientHelloExtractor). Fail the handshake rather
+                // than silently serving the default certificate.
+                long count = ++invalidSniNameCount;
+                long now = System.currentTimeMillis();
+                if (now - lastInvalidSniNameLogMs >=
+                        CERT_APPLY_FAILURE_LOG_INTERVAL_MS) {
+                    lastInvalidSniNameLogMs = now;
+                    log.warn(sm.getString("quicEndpoint.invalidSniHostName",
+                            Long.valueOf(count)));
+                }
+                setSniAlert(al, QuicBindings.SSL_AD_INTERNAL_ERROR);
+                return QuicBindings.SSL_TLSEXT_ERR_ALERT_FATAL;
+            }
+            if (!applyCertEntries(ssl, resolveCertEntries(config, hostKey))) {
+                long count = ++sniCertApplyFailureCount;
+                long now = System.currentTimeMillis();
+                if (now - lastSniCertApplyFailureLogMs >=
+                        CERT_APPLY_FAILURE_LOG_INTERVAL_MS) {
+                    lastSniCertApplyFailureLogMs = now;
+                    log.error(sm.getString("quicEndpoint.sniCertApplyFailed") +
+                            " (occurrence [" + count + "])");
                 }
                 setSniAlert(al, QuicBindings.SSL_AD_INTERNAL_ERROR);
                 return QuicBindings.SSL_TLSEXT_ERR_ALERT_FATAL;
             }
             return QuicBindings.SSL_TLSEXT_ERR_OK;
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             if (log.isErrorEnabled()) {
                 log.error(sm.getString("quicEndpoint.sniCallbackError"), t);
             }
@@ -843,28 +903,11 @@ public class QuicCertificateManager {
             al.reinterpret(ValueLayout.JAVA_INT.byteSize())
                     .set(ValueLayout.JAVA_INT, 0, alert);
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             if (log.isDebugEnabled()) {
                 log.debug("Could not set QUIC SNI alert", t);
             }
         }
-    }
-
-
-    /**
-     * Resolves the certificate entries of the host that serves one connection,
-     * applying the endpoint's host resolution and default-host fallback.
-     *
-     * @param ssl    The connection SSL object
-     * @param config The current configuration snapshot
-     *
-     * @return The entries of the serving host: the default host's entries when
-     *         no SNI was sent or no configured host matched; an empty list
-     *         for a pre-shared key-only host and for a host whose
-     *         certificates failed to load (the latter is logged)
-     */
-    private List<CertificateLoader.CertificateEntry> resolveCertEntries(
-            MemorySegment ssl, QuicCertConfig config) {
-        return resolveCertEntries(config, resolveServingHostKey(ssl, config));
     }
 
 
@@ -922,7 +965,10 @@ public class QuicCertificateManager {
      *
      * @return The lower-cased key of the serving host in the snapshot maps;
      *         {@link QuicCertConfig#defaultHostName} when no SNI was sent or
-     *         the name resolved to no host at all
+     *         the name resolved to no host at all; {@code null} for an invalid
+     *         trailing-dot SNI, which callers treat as a failed handshake (SNI
+     *         callback) or as "do not offer a PSK identity" (find-session
+     *         callback)
      */
     private String resolveServingHostKey(MemorySegment ssl, QuicCertConfig config) {
         // Single shared SNI read (TLSEXT_NAMETYPE_HOST_NAME + lower-casing),
@@ -931,6 +977,14 @@ public class QuicCertificateManager {
 
         if (name == null) {
             return config.defaultHostName;
+        }
+        if (name.endsWith(".")) {
+            // RFC 6066 server names do not have a trailing period; Tomcat's
+            // TLSClientHelloExtractor rejects such names. Return a sentinel
+            // that the callers treat as a failed handshake (the SNI callback)
+            // or as "do not offer a PSK" (the find-session callback) instead
+            // of falling back to the default host's identity.
+            return null;
         }
         SSLHostConfig hostConfig = hostResolver.apply(name);
         if (hostConfig == null) {
@@ -1014,6 +1068,7 @@ public class QuicCertificateManager {
                     }
                 }
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 // Applying this entry failed; keep trying the remaining
                 // entries but report the failure to the caller so the
                 // handshake can be rejected instead of falling back to PSK.
@@ -1031,10 +1086,18 @@ public class QuicCertificateManager {
                 // message formatted with the return codes) and this method is
                 // not SNI-specific (the PSK resolver applies entries too), so
                 // report it under its own message rather than a
-                // callback-specific headline.
-                if (log.isWarnEnabled()) {
+                // callback-specific headline. A client can trigger this on
+                // every handshake for a misconfigured host, so log it at a
+                // bounded interval with a cumulative occurrence count.
+                long count = ++certApplyFailureCount;
+                long now = System.currentTimeMillis();
+                if (now - lastCertApplyFailureLogMs >=
+                        CERT_APPLY_FAILURE_LOG_INTERVAL_MS) {
+                    lastCertApplyFailureLogMs = now;
                     String message = t.getMessage();
-                    log.warn(message != null ? message : t.toString(), t);
+                    log.warn(sm.getString("quicEndpoint.certApplyFailure",
+                            Long.valueOf(count),
+                            message != null ? message : t.toString()), t);
                 }
             }
         }
@@ -1063,6 +1126,7 @@ public class QuicCertificateManager {
                 log.debug("PSK find-session callback set for QUIC");
             }
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             throw new java.io.IOException(
                     sm.getString("quicEndpoint.pskCallbackSetError"), t);
         }
@@ -1097,25 +1161,33 @@ public class QuicCertificateManager {
      */
     private OpenSSLPreSharedKeySelector resolvePskSelector(MemorySegment ssl) {
         QuicCertConfig config = certConfig;
-        if (config == null || pskOptionMisaligned) {
-            // If the context option could not be aligned with the snapshot,
-            // the endpoint cannot know whether a PSK handshake would be
-            // non-forward-secret. Fail closed by not offering PSK identities;
-            // certificate authentication remains available.
+        if (config == null) {
             return null;
         }
         // Resolve the serving host once and use it for both the certificate
         // entries and the PSK selector instead of reading the native SNI
         // value twice per PSK handshake.
         String hostKey = resolveServingHostKey(ssl, config);
+        if (hostKey == null) {
+            // Invalid SNI: do not offer a PSK identity. The SNI callback then
+            // rejects the handshake fail-closed.
+            return null;
+        }
         if (!applyCertEntries(ssl, resolveCertEntries(config, hostKey))) {
             // Do not offer a PSK identity after the configured certificate
             // material failed to apply: that would let a certificate host
             // complete the handshake with pre-shared-key authentication
-            // instead. The SNI callback runs later in this handshake and
-            // rejects the connection if the re-application also fails; a
-            // transient failure can still fall back to the certificate
-            // handshake with no authentication downgrade.
+            // instead. The SNI callback runs later and rejects the handshake
+            // when it cannot apply the material either. Note that a client
+            // that offered a PSK identity may be terminated by OpenSSL's PSK
+            // parser before that callback if no certificate was applied here.
+            return null;
+        }
+        if (pskOptionMisaligned) {
+            // The certificate entries were applied above, so a client that
+            // offered an unresolvable PSK identity can still fall back to the
+            // certificate handshake. Do not offer PSK identities: the endpoint
+            // cannot know whether a PSK handshake would be non-forward-secret.
             return null;
         }
         OpenSSLPreSharedKeySelector selector =

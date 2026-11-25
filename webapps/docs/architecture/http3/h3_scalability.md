@@ -645,3 +645,41 @@ queued task may still run. Re-measured after the revert with the same
 pre-regression trees. The full OpenSSL HTTP/3 suite passes after the
 revert (588 tests, 0 failures, 2 skipped).
 
+## 16. Final OpenSSL defect-fix regression check (2026-11-23)
+
+A quick regression check covered the complete OpenSSL QUIC defect-fix
+series on top of parent `b356608c9c`. The benchmark base was
+`/home/opencode/tomcat-http3`. Its existing `tomcat-coyote.jar` predated
+the current `SSLHostConfigCertificate.setSslContextGenerated()` API and
+was incompatible with the current QUIC classes, so the current tree's
+`tomcat-coyote.jar` was installed on the base for both variants. That jar
+is byte-identical between the current and parent trees, so the A/B
+isolates the `tomcat-coyote-ffm.jar` differences. The server was
+restarted between variants and a `1x32` run preceded each batch. The
+documented `8x25` load case (`connections=8`, `streams=25`, `procs=8`,
+3 s warm-up, 12 s window) was used. Host load average ranged from about
+9 to 20; the poller was at about 94 % in every run and all runs had zero
+errors.
+
+| tree | runs (rps) | mean rps | us/req |
+|---|---:|---:|---:|
+| current defect-fix tree | 91,997.7 / 94,179.2 / 94,703.7 / 92,282.4 | 93,290.8 | 10.15 |
+| parent `b356608c9c` | 92,030.2 / 93,574.3 / 94,539.4 / 94,496.6 | 93,660.1 | 10.08 |
+| Section 15 after-revert report | 93,760.0 / 94,747.2 / 95,887.7 | 94,798.3 | 9.97 |
+
+The current tree is 0.4 % below the parent in mean rps and 0.07 µs/req
+above it; both are well inside the shared-host run-to-run spread. The
+current low-load runs (94,179 and 94,704 rps, 10.0–10.1 µs/req) overlap
+the Section 15 range (93.8–95.9k rps, 9.9–10.1 µs/req). The parent is
+also about 1.2 % below the Section 15 mean in this window, so the
+remaining gap is host-state noise rather than a transport change.
+
+No regression attributable to the defect fixes was measurable. Reviewed
+hot-path deltas are limited to the occasional `running` check in blocking
+read/write waits, volatile reads of lifecycle fields, and a `freed` read
+on deferred stream cleanup; none adds a Java allocation or a native hop
+to a normal request. Poller and JVM CPU were effectively unchanged
+between the variants (about 94 % and 500–518 % respectively). No
+code-path cause was found, and the benchmark base's original
+`tomcat-coyote-ffm.jar` was restored afterwards.
+

@@ -522,22 +522,10 @@ public class QuicConnectionWrapper implements QuicConnection {
 
 
     /**
-     * Returns the SNI host name sent by the client.
-     * <p>
-     * The value is normally read on the poll thread during connection setup and
-     * cached, so this method does not make a native call on the calling (worker)
-     * thread. Only if the setup-time read did not populate the cache is the
-     * native read hopped to the poll thread once and cached; with no endpoint to
-     * hop to (early setup) or an unreachable poll thread the native object is
-     * not touched (the connection SSL is not thread-safe and a worker must never
-     * call into it directly).
-     * <p>
-     * An empty string is returned both when the client sent no SNI and when the
-     * value could not be obtained, and these two cases cannot be distinguished
-     * through this method; callers must treat an empty result as "no usable SNI".
+     * Whether the cached SNI host name is authoritative.
      *
-     * @return the SNI host name, or an empty string if none was sent or the
-     *         value could not be determined; never {@code null}
+     * @return {@code true} if the setup-time read resolved the cached value
+     *         (including the case where the client sent no SNI)
      */
     public boolean isSniResolved() {
         return sniResolved;
@@ -553,6 +541,25 @@ public class QuicConnectionWrapper implements QuicConnection {
     }
 
 
+    /**
+     * Returns the SNI host name sent by the client.
+     * <p>
+     * The value is read on the poll thread during connection setup and cached,
+     * so this method normally makes no native call on the calling (worker)
+     * thread. If the cache was never populated ({@code null}) the native read
+     * is hopped to the poll thread once and cached; with no endpoint to hop to
+     * (early setup) or an unreachable poll thread the native object is not
+     * touched.
+     * <p>
+     * An empty cached value is <b>not</b> re-read here: it means "no usable
+     * SNI" (either the client sent none or the setup-time ClientHello was not
+     * processed yet). {@code ensureServedProtocol()} performs the explicit
+     * native retry once the handshake has progressed. Callers must therefore
+     * treat an empty result as "no usable SNI".
+     *
+     * @return the SNI host name, or an empty string if none was sent or the
+     *         value could not be determined; never {@code null}
+     */
     @Override
     public String getSniHostName() {
         String result = sniHostName;
@@ -646,10 +653,9 @@ public class QuicConnectionWrapper implements QuicConnection {
 
     /**
      * Reads the SNI host name from the native connection SSL. Must only be
-     * called on the QUIC poll thread. The endpoint's connection setup caches
-     * the value via {@link #setSniHostName(String)} and worker threads use
-     * {@link #getSniHostName()} (which re-reads through this method on a
-     * cache miss).
+     * called on the QUIC poll thread. Used by the setup-time cache and by the
+     * explicit retry in {@code ensureServedProtocol()}; {@link #getSniHostName()}
+     * does not call it for an already-cached empty value.
      *
      * @return the SNI host name, in lower case, or an empty string if the
      *         client sent no SNI or the read failed
@@ -861,6 +867,18 @@ public class QuicConnectionWrapper implements QuicConnection {
      */
     boolean hasStreamFreeFailure() {
         return streamFreeFailed.get();
+    }
+
+
+    /**
+     * Returns whether the connection SSL free failed once and must not be
+     * retried. The wrapper is retained (and remains counted against the
+     * endpoint's connection limit) in that case.
+     *
+     * @return {@code true} if a previous connection SSL free failed
+     */
+    boolean hasConnectionFreeFailure() {
+        return connectionFreeFailed.get();
     }
 
 
@@ -1162,7 +1180,8 @@ public class QuicConnectionWrapper implements QuicConnection {
         QuicStreamWrapper s = (QuicStreamWrapper) stream;
         QuicConnectionWrapper conn = (QuicConnectionWrapper) s.getConnection();
         if (s.isFreed() || (conn != null &&
-                (conn.isClosed() || conn.isFreed()))) {
+                (conn.isClosed() || conn.isFreed() ||
+                        conn.hasConnectionFreeFailure()))) {
             // The stream or its connection has already been torn down. Do not
             // touch the stream SSL; report all bytes as consumed so the
             // protocol caller drops its pending state instead of retrying a
@@ -1399,13 +1418,15 @@ public class QuicConnectionWrapper implements QuicConnection {
      * and every other native call runs), so it no longer executes on the GC
      * thread outside the OpenSSL QUIC single-threaded threading contract
      * while the poll thread may be inside SSL_poll()/SSL_handle_events() on
-     * the shared engine. Reaching the request means the wrapper was
-     * phantom-reachable, which (per the connections field invariant of
-     * QuicOpenSSLEndpoint) only happens once every live stream SSL is
-     * freed-or-deferred and the connection free is not otherwise claimed, so
-     * no processing claim is needed for the free to be safe. Carries only the
-     * shared flags (never the wrapper) so nothing keeps the wrapper
-     * reachable. Mirrors QuicStreamWrapper.DeferredStreamFree.
+     * the shared engine. The endpoint's maps normally keep a connection with
+     * live streams strongly reachable, so phantom reachability means the
+     * connection free is not otherwise claimed. Cleaner processing order is
+     * not guaranteed to match registration order; the native lifetime
+     * ordering is enforced by OpenSSL's XSO-to-connection reference count and
+     * by the mailbox draining stream-free requests before connection-free
+     * requests that are already queued. Carries only the shared flags (never
+     * the wrapper) so nothing keeps the wrapper reachable. Mirrors
+     * QuicStreamWrapper.DeferredStreamFree.
      */
     static final class DeferredConnectionFree {
 

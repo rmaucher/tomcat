@@ -110,13 +110,22 @@ public class QuicBindings {
     public static final boolean QUIC_AVAILABLE;
 
     /**
-     * Required OpenSSL symbols whose lookup or downcall binding failed during
-     * static initialisation, populated by {@code createHandle()}. Empty means
-     * every required OpenSSL symbol this class binds is present in the linked
-     * library. Optional symbols bound by {@code createOptionalHandle()} are not
-     * recorded here.
+     * Required OpenSSL symbols that were not found in the linked library
+     * during static initialisation, populated by {@code createHandle()}.
+     * Symbols that were found but could not be bound are recorded separately
+     * in {@link #FAILED_OPENSSL_BINDINGS}. Empty means every required symbol
+     * was resolved. Optional symbols bound by {@code createOptionalHandle()}
+     * are not recorded here.
      */
     private static final Set<String> MISSING_OPENSSL_SYMBOLS = new LinkedHashSet<>();
+
+    /**
+     * Required OpenSSL symbols that were found in the linked library but whose
+     * downcall descriptor could not be bound. Kept separate from
+     * {@link #MISSING_OPENSSL_SYMBOLS} so a binding/layout error is not
+     * reported as a missing library symbol.
+     */
+    private static final Set<String> FAILED_OPENSSL_BINDINGS = new LinkedHashSet<>();
 
     /**
      * The ABI used for the OpenSSL downcall descriptors. On Linux LP64 this is
@@ -1526,18 +1535,23 @@ public class QuicBindings {
     // -------------------------------------------------- Helpers
 
     private static MethodHandle createHandle(String symbol, FunctionDescriptor desc) {
-        try {
-            MemorySegment addr = openssl_h.SYMBOL_LOOKUP.find(symbol)
-                    .orElseThrow(() -> new UnsatisfiedLinkError("unresolved QUIC symbol: " + symbol));
-            return Linker.nativeLinker().downcallHandle(addr, desc);
-        } catch (Throwable e) {
-            // Fatal VM errors (for example OOM) must not be misreported as a
-            // missing OpenSSL symbol.
-            ExceptionUtils.handleThrowable(e);
+        MemorySegment addr = openssl_h.SYMBOL_LOOKUP.find(symbol).orElse(null);
+        if (addr == null) {
             // The bind attempt itself is the availability probe: record the
             // failure so QUIC_AVAILABLE turns false at the end of static
             // initialisation (see the field's javadoc).
             MISSING_OPENSSL_SYMBOLS.add(symbol);
+            return null;
+        }
+        try {
+            return Linker.nativeLinker().downcallHandle(addr, desc);
+        } catch (Throwable e) {
+            // Fatal VM errors (for example OOM) must not be misreported as a
+            // binding failure.
+            ExceptionUtils.handleThrowable(e);
+            // The symbol exists; the descriptor/layout is wrong. Keep this
+            // distinct from a missing symbol in the startup diagnostic.
+            FAILED_OPENSSL_BINDINGS.add(symbol + " (" + e + ")");
             return null;
         }
     }
@@ -1577,7 +1591,8 @@ public class QuicBindings {
         QuicPlatformSupport platform = QuicPlatformSupport.get();
         boolean platformSupported = platform.isAvailable() &&
                 platform.abi().isSupported();
-        QUIC_AVAILABLE = MISSING_OPENSSL_SYMBOLS.isEmpty() && platformSupported;
+        QUIC_AVAILABLE = MISSING_OPENSSL_SYMBOLS.isEmpty() &&
+                FAILED_OPENSSL_BINDINGS.isEmpty() && platformSupported;
         if (!platformSupported) {
             String reason = platform.unavailableReason();
             if (reason == null) {
@@ -1589,6 +1604,10 @@ public class QuicBindings {
         if (!MISSING_OPENSSL_SYMBOLS.isEmpty()) {
             log.warn(sm.getString("quicEndpoint.quicBindingsMissingSymbols",
                     String.join(", ", MISSING_OPENSSL_SYMBOLS)));
+        }
+        if (!FAILED_OPENSSL_BINDINGS.isEmpty()) {
+            log.warn(sm.getString("quicEndpoint.quicBindingsBindingFailed",
+                    String.join(", ", FAILED_OPENSSL_BINDINGS)));
         }
     }
 }

@@ -195,7 +195,14 @@ public class SSLHostConfigCertificate implements Serializable {
     }
 
 
-    void setSslContextGenerated(SSLContext sslContext) {
+    /**
+     * Sets the SSLContext generated from the certificate configuration.
+     * Generated contexts are cleared when an endpoint is unbound, unlike a
+     * context explicitly provided via {@link #setSslContext(SSLContext)}.
+     *
+     * @param sslContext the generated SSLContext, or {@code null} to clear it
+     */
+    public void setSslContextGenerated(SSLContext sslContext) {
         this.sslContextGenerated = sslContext;
     }
 

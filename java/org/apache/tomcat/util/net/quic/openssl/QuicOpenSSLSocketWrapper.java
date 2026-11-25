@@ -233,7 +233,15 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     private <T> T onPollThread(Callable<T> task) throws IOException {
         try {
             return endpoint.callOnPollThread(task);
-        } catch (IOException | RuntimeException | Error e) {
+        } catch (IOException | Error e) {
+            throw e;
+        } catch (RejectedExecutionException e) {
+            // The mailbox was closed or the poll thread has stopped. A
+            // blocking read/write declares IOException, so the shutdown
+            // rejection must not escape as an unchecked exception (see
+            // pumpConnectionEvents()).
+            throw new IOException(sm.getString("socketWrapper.quicPollTaskRejected"), e);
+        } catch (RuntimeException e) {
             throw e;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -251,6 +259,11 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             }
             if (cause instanceof IOException ioe) {
                 throw ioe;
+            }
+            if (cause instanceof RejectedExecutionException rejected) {
+                // The task was queued but discarded by mailbox close/open.
+                throw new IOException(sm.getString("socketWrapper.quicPollTaskRejected"),
+                        rejected);
             }
             if (cause instanceof RuntimeException re) {
                 throw re;
@@ -327,13 +340,18 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      */
     @Override
     public boolean awaitReadableData(long deadlineNanos) {
+        if (!endpoint.isEndpointRunning()) {
+            // The endpoint is shutting down and no longer signals waiters.
+            return false;
+        }
         long seq = readWakeups().get();
         Thread self = Thread.currentThread();
         readWaiter().set(self);
         try {
             pumpConnectionEvents();
             registerReadInterest();
-            if (System.nanoTime() >= deadlineNanos) {
+            if (!endpoint.isEndpointRunning() ||
+                    System.nanoTime() >= deadlineNanos) {
                 return false;
             }
             if (endpoint.isPollThread()) {
@@ -359,13 +377,18 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      * @return {@code true} to retry the write, {@code false} to give up
      */
     private boolean awaitWritable(long deadlineNanos) {
+        if (!endpoint.isEndpointRunning()) {
+            // The endpoint is shutting down and no longer signals waiters.
+            return false;
+        }
         long seq = writeWakeups().get();
         Thread self = Thread.currentThread();
         writeWaiter().set(self);
         try {
             pumpConnectionEvents();
             registerWriteInterest();
-            if (System.nanoTime() >= deadlineNanos) {
+            if (!endpoint.isEndpointRunning() ||
+                    System.nanoTime() >= deadlineNanos) {
                 return false;
             }
             if (endpoint.isPollThread()) {
@@ -630,10 +653,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         // conclusion triggered from within a write path re-enters the lock.
         writeLock.lock();
         try {
-            if (!concludeStream(stream)) {
-                throw new IOException(sm.getString("socketWrapper.quicConcludeFailed",
-                        QuicDiagnostics.dumpErrorQueue()));
-            }
+            concludeStream(stream);
             stream.setConcluded();
         } finally {
             writeLock.unlock();
@@ -860,11 +880,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             if (remaining == 0) {
                 // Entire buffer written; conclude the stream if requested.
                 if (conclude) {
-                    if (!concludeStream(stream)) {
-                        throw new IOException(sm.getString(
-                                "socketWrapper.quicConcludeFailed",
-                                QuicDiagnostics.dumpErrorQueue()));
-                    }
+                    concludeStream(stream);
                     stream.setConcluded();
                 }
                 return;
@@ -1058,13 +1074,25 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
      * redundant under the single-tick loop and scale with the whole
      * connection fleet, so they were removed; this is what keeps the
      * per-response worker-hop cost constant in the fleet size.
+     * <p>
+     * The error queue is per-thread, so a failure is rendered inside the
+     * poll-thread task before the exception is propagated to the worker.
      *
-     * @return {@code true} if SSL_stream_conclude() reported success
+     * @throws IOException If SSL_stream_conclude() failed; the message
+     *                     contains the OpenSSL error-queue contents captured
+     *                     on the poll thread
      */
-    private boolean concludeStream(QuicStreamWrapper stream) throws IOException {
-        return Boolean.TRUE.equals(onPollThread(() ->
-                Boolean.valueOf(QuicBindings.SSL_stream_conclude(
-                        requireLiveSsl(stream), 0L) == 1)));
+    private void concludeStream(QuicStreamWrapper stream) throws IOException {
+        onPollThread(() -> {
+            int rc = QuicBindings.SSL_stream_conclude(
+                    requireLiveSsl(stream), 0L);
+            if (rc != 1) {
+                throw new IOException(sm.getString(
+                        "socketWrapper.quicConcludeFailed",
+                        QuicDiagnostics.dumpErrorQueue()));
+            }
+            return Boolean.TRUE;
+        });
     }
 
 
@@ -1184,7 +1212,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     }
 
 
-    // ------------------------------------- Sendfile (emulated via read+write for QUIC)
+    // ------------------------------------- Sendfile (not supported for QUIC)
 
     @Override
     public SendfileDataBase createSendfileData(String filename, long pos, long length) {
@@ -1492,6 +1520,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             } catch (IOException ioe) {
                 return null;
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Failed to read the QUIC cipher suite", t);
                 }
@@ -1619,6 +1648,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                         conn.setCachedPeerCerts(result);
                         return result;
                     } catch (Throwable t) {
+                        ExceptionUtils.handleThrowable(t);
                         // Cache the failure so i2d_X509 is not re-run on
                         // every request
                         if (log.isDebugEnabled()) {
@@ -1632,12 +1662,15 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     }
                 });
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Failed to hop the QUIC peer certificate read to the poll thread", t);
                 }
-                if (conn != null) {
-                    conn.setPeerCertsResolved(true);
-                }
+                // A hop timeout/rejection means the native read never ran. Do
+                // not mark the connection's peer-certificate cache resolved:
+                // a later call must be able to retry. The native-resolution
+                // path inside the task sets peerCertsResolved in its finally
+                // block when it actually attempted the read.
                 return null;
             }
         }
@@ -1688,6 +1721,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     }
                 });
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Failed to read the QUIC session id", t);
                 }
@@ -1724,6 +1758,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     return version;
                 }
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 // Fall through
             }
             return "QUIC";
@@ -1746,12 +1781,28 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         }
 
 
+        /**
+         * {@inheritDoc}
+         * <p>
+         * Deliberately unavailable: QUIC hides the TLS ClientHello cipher list
+         * from the application protocol, so there is no meaningful requested
+         * cipher list to report here.
+         *
+         * @return {@code null} always
+         */
         @Override
         public String getRequestedCiphers() throws IOException {
             return null;
         }
 
 
+        /**
+         * {@inheritDoc}
+         * <p>
+         * Not exposed by the current OpenSSL bindings.
+         *
+         * @return {@code null} always
+         */
         @Override
         public Integer getKeySize() throws IOException {
             // Key size not available in current OpenSSL bindings

@@ -82,9 +82,10 @@ final class QuicEventDispatcher {
         /**
          * An error bucket was hit that none of the specific handlers claims
          * (for example a non-listener EL with no EC/ECD/ER/EW). Nothing runs,
-         * but the bucket was reached, which the endpoint counts as progress.
+         * so it must not count as progress; otherwise a persistent
+         * level-triggered flag would keep the poll loop spinning.
          */
-        ERROR_OTHER(true),
+        ERROR_OTHER(false),
         INCOMING_CONNECTION(true),
         INCOMING_STREAM(true),
         READABLE(true),

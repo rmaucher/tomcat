@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.res.StringManager;
 
 
@@ -130,6 +131,7 @@ abstract class QuicPlatformSupport {
         try {
             return initialize(new QuicLinuxPlatformSupport());
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             return new QuicPlatformUnavailable("linux",
                     System.getProperty("os.arch", ""), t.toString());
         }
@@ -148,6 +150,7 @@ abstract class QuicPlatformSupport {
                     clazz.getDeclaredConstructor().newInstance();
             return initialize(candidate);
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             return new QuicPlatformUnavailable("", "", sm.getString(
                     "quicPlatform.overrideClassInvalid", className, t.toString()));
         }
@@ -167,6 +170,7 @@ abstract class QuicPlatformSupport {
                     System.getProperty("os.arch", ""),
                     candidate.unavailableReason());
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             return new QuicPlatformUnavailable(candidate.id().name(),
                     System.getProperty("os.arch", ""), t.toString());
         }

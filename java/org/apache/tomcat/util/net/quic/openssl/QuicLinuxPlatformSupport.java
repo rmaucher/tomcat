@@ -65,6 +65,8 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
     private static final int IPV6_V6ONLY = 26;
     private static final int EPERM = 1;
     private static final int EINTR = 4;
+    private static final int EINVAL = 22;
+    private static final int ENOPROTOOPT = 92;
     private static final int EAFNOSUPPORT = 97;
     private static final int EADDRNOTAVAIL = 99;
     private static final short POLLIN = 0x0001;
@@ -281,6 +283,17 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
     BoundUdpSocket bindUdpSocket(InetAddress address, int port,
             UdpSocketOptions options) throws QuicPlatformException {
         boolean ipv6 = address instanceof Inet6Address;
+        if (ipv6) {
+            int scopeId = ((Inet6Address) address).getScopeId();
+            if (scopeId != 0) {
+                // sin6_scope_id is not translated by buildSockaddrIn6(). A
+                // nonzero scope must fail rather than bind with scope zero,
+                // which could select the wrong interface.
+                throw new QuicPlatformException("bind", 0,
+                        "IPv6 scope ID " + scopeId + " is not supported",
+                        false, false, false);
+            }
+        }
         int af = ipv6 ? AF_INET6 : AF_INET;
         int socketFd;
         int socketError;
@@ -408,9 +421,16 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
             // The caller's familyFailure flag only says that a family-related
             // error may be meaningful for this option. It must not turn an
             // unrelated errno (EINVAL/ENOPROTOOPT/ENOBUFS/...) into an
-            // address-family failure.
+            // address-family failure, except for IPV6_V6ONLY: EINVAL and
+            // ENOPROTOOPT there mean the kernel/container cannot provide the
+            // requested dual-stack socket, which must let the default bind
+            // fall back to the IPv4 wildcard instead of failing the endpoint.
+            boolean addressFamilyFailure = familyFailure &&
+                    (isAddressFamilyError(error) ||
+                            (option == IPV6_V6ONLY &&
+                                    (error == EINVAL || error == ENOPROTOOPT)));
             throw failure("setsockopt(" + name + ")", error,
-                    familyFailure && isAddressFamilyError(error));
+                    addressFamilyFailure);
         }
     }
 
@@ -729,6 +749,7 @@ final class QuicLinuxPlatformSupport extends QuicPlatformSupport {
         try {
             close$handle.invokeExact(fd);
         } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
             // Ignore close failures on cleanup paths.
         }
     }

@@ -19,10 +19,12 @@ package org.apache.tomcat.util.net.quic.openssl;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.res.StringManager;
 
 /**
@@ -88,6 +90,15 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
     private final ConcurrentLinkedQueue<QuicConnectionWrapper.DeferredConnectionFree>
             cleanerConnectionFrees = new ConcurrentLinkedQueue<>();
 
+    /**
+     * Ensures the warning about an unavailable native stream write-buffer
+     * statistic is logged at most once per mailbox. The statistic is optional
+     * in the OpenSSL value table and is the only way to decide whether a
+     * deferred stream SSL still has unacknowledged response bytes.
+     */
+    private final AtomicBoolean writeBufStatUnavailableWarned =
+            new AtomicBoolean(false);
+
 
     /**
      * Creates the mailbox.
@@ -103,20 +114,55 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
 
 
     /**
+     * Closes the mailbox and drains the transport-specific deferred-free
+     * queues. A late worker or Cleaner request can be enqueued after the
+     * endpoint stop's explicit drain pass but before the mailbox close; leaving
+     * it here would keep its wrapper and native SSL reachable across a
+     * destroy/unbind or until the next start. The poll thread is stopped when
+     * the endpoint closes the mailbox, so the closing thread is the permitted
+     * single native caller.
+     */
+    @Override
+    public void close() {
+        super.close();
+        drainDeferredQueues();
+    }
+
+
+    /**
+     * Drains deferred work left by the previous generation before re-opening
+     * the mailbox for a new start. The endpoint already drains these queues
+     * before calling open(); this second drain closes the small window in
+     * which a late worker enqueued work between that drain and the open.
+     */
+    @Override
+    public void open() {
+        drainDeferredQueues();
+        super.open();
+    }
+
+
+    private void drainDeferredQueues() {
+        drainPendingStreamDrains(null, true);
+        drainPendingStreamFrees();
+        drainCleanerStreamFrees();
+        drainCleanerConnectionFrees();
+    }
+
+
+    /**
      * Reports whether any deferred stream or connection SSL free is queued
-     * (from a close path or from either Cleaner). The poll loop treats a
-     * non-empty queue as pending work so a queued free is not delayed by an
-     * idle-rate {@code SSL_poll()} timeout.
+     * (from a close path or from either Cleaner).
      * <p>
-     * That statement is a steady-state one: it holds for every iteration that
-     * observes the queue before computing its wait. Close-path enqueues run
-     * on the poll thread (the loop sees them before waiting); the Cleaner's
-     * enqueue happens on the GC thread and does not kick the wake descriptor
-     * (see the note in {@code QuicStreamWrapper.State.run()} for why), so a
-     * free queued while a wait is already in progress waits out at most that
-     * wait - bounded by
-     * the loop's idle-rate timeout, or {@code pollTimeoutMs} while the
-     * endpoint is busy - before the next iteration drains it. Bounded
+     * The poll loop treats a non-empty queue as pending work, so a free that
+     * is already queued when an iteration computes its wait is not delayed by
+     * an idle-rate {@code SSL_poll()} timeout. Close-path enqueues run on the
+     * poll thread (the loop sees them before waiting). A Cleaner enqueue
+     * happens on the GC thread and does not kick the wake descriptor (see the
+     * note in {@code QuicStreamWrapper.State.run()} for why), so a free queued
+     * while a wait is already in progress waits out at most that wait - bounded
+     * by the loop's idle-rate timeout, or {@code pollTimeoutMs} while the
+     * endpoint is busy - before the next iteration drains it. This is bounded
      * latency, not a lost free.
      *
      * @return {@code true} if at least one deferred free is queued
@@ -170,7 +216,11 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
             if (stream.isFreed()) {
                 continue;
             }
-            if (stream.isProcessing()) {
+            // Atomically claim the stream before inspecting its write buffer
+            // or freeing its SSL. A plain isProcessing() read leaves a window
+            // in which a dispatch worker claims the stream between the check
+            // and the free, turning the deferred free into a use-after-free.
+            if (!stream.compareAndSetProcessing(false, true)) {
                 // A handler still owns the stream: do not free its SSL
                 // regardless of force flags. The worker's
                 // finishStreamDispatch() queues the free once the handler has
@@ -178,6 +228,7 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
                 waiting.add(stream);
                 continue;
             }
+            boolean keep = false;
             try {
                 QuicConnectionWrapper conn = stream.getConnection();
                 boolean force = forceAll ||
@@ -186,17 +237,38 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
                         conn.isFreed();
                 long used = force ? 0L
                         : QuicBindings.SSL_get_stream_write_buf_used(stream.getSsl());
-                if (used > 0L) {
-                    waiting.add(stream);
+                if (used != 0L) {
+                    // A positive value means unacknowledged bytes remain. A
+                    // negative value means the query could not be answered
+                    // (for example because the linked OpenSSL does not expose
+                    // SSL_VALUE_STREAM_WRITE_BUF_USED), so the safe default is
+                    // to keep the SSL rather than discard buffered response
+                    // bytes. The connection teardown paths force the free once
+                    // delivery can no longer be guaranteed.
+                    keep = true;
+                    if (used < 0L && writeBufStatUnavailableWarned.compareAndSet(
+                            false, true)) {
+                        log.warn(sm.getString(
+                                "quicEndpoint.streamWriteBufStatUnavailable",
+                                Long.valueOf(stream.getStreamId())));
+                    }
                 } else {
-                    pendingStreamFrees.add(stream);
+                    stream.freeSslOnce();
                 }
             } catch (Throwable t) {
-                // Never leak the stream SSL on a failed check: the close
-                // request already owns its lifetime.
+                ExceptionUtils.handleThrowable(t);
+                // freeSslOnce() marks the shared freed flag before calling
+                // SSL_free(), so a failed free cannot be retried safely. The
+                // connection's sticky stream-free-failure flag keeps the
+                // connection SSL retained/leaked instead of freeing it under
+                // a possibly-live stream.
                 log.warn(sm.getString("quicEndpoint.streamFreeDrainError",
                         Long.valueOf(stream.getStreamId())), t);
-                pendingStreamFrees.add(stream);
+            } finally {
+                stream.clearProcessing();
+            }
+            if (keep) {
+                waiting.add(stream);
             }
         }
         pendingStreamDrains.addAll(waiting);
@@ -215,19 +287,28 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
         confinementCheck.accept("drainPendingStreamFrees");
         QuicStreamWrapper deferredStream;
         while ((deferredStream = pendingStreamFrees.poll()) != null) {
-            if (!deferredStream.isFreed() && deferredStream.isProcessing()) {
-                // The stream was queued while a handler still owned it (for
-                // example a wrapper close from inside the handler). Keep it
-                // for the worker's completion path instead of freeing it
-                // underneath the handler.
+            if (deferredStream.isFreed()) {
+                continue;
+            }
+            // Claim the processing flag atomically before freeing: a plain
+            // isProcessing() read leaves a window in which a worker claims the
+            // stream between the check and SSL_free(), creating a use-after-
+            // free. A stream still owned by a handler is re-queued to the
+            // drain queue and released by the worker that clears the claim.
+            if (!deferredStream.compareAndSetProcessing(false, true)) {
                 pendingStreamDrains.add(deferredStream);
                 continue;
             }
             try {
-                deferredStream.freeSslOnce();
+                if (!deferredStream.isFreed()) {
+                    deferredStream.freeSslOnce();
+                }
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 log.warn(sm.getString("quicEndpoint.streamFreeDeferredError",
                         Long.valueOf(deferredStream.getStreamId())), t);
+            } finally {
+                deferredStream.clearProcessing();
             }
         }
     }
@@ -250,6 +331,7 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
             try {
                 request.run();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 log.warn(sm.getString("quicEndpoint.streamFreeCleanerError"), t);
             }
         }
@@ -271,6 +353,7 @@ class QuicNativeMailbox extends org.apache.tomcat.util.net.quic.QuicNativeMailbo
             try {
                 request.run();
             } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
                 log.warn(sm.getString("quicEndpoint.connectionFreeCleanerError"), t);
             }
         }

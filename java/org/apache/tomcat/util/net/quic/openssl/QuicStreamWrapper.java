@@ -202,6 +202,16 @@ public class QuicStreamWrapper implements QuicStream {
     */
     private volatile boolean primaryUniStream;
 
+   /**
+    * The protocol-assigned index of a server-initiated unidirectional stream
+    * (for HTTP/3: 0 control, 1 QPACK encoder, 2 QPACK decoder), or -1 for
+    * every other stream. Unlike the QUIC stream ID, this index is assigned by
+    * {@code QuicConnectionManager.nextServerUniStream()} and must be used for
+    * protocol notifications because the two are not guaranteed to be in
+    * the same order.
+    */
+    private volatile int serverUniIndex = -1;
+
 
     /**
      * Creates a new stream wrapper.
@@ -387,9 +397,17 @@ public class QuicStreamWrapper implements QuicStream {
         }
         src.flip();
         src.limit(toCopy);
-        dst.put(src);
-        src.limit(available);
-        src.compact();
+        try {
+            dst.put(src);
+        } finally {
+            // Restore the documented put-mode invariant even if the
+            // destination rejected the copy (for example a read-only or
+            // concurrently modified buffer). Leaving the source flipped would
+            // make the next read treat the retained bytes as empty and
+            // overwrite them with fresh native data.
+            src.limit(available);
+            src.compact();
+        }
         return toCopy;
     }
 
@@ -582,11 +600,13 @@ public class QuicStreamWrapper implements QuicStream {
      * connection (per {@code SSL_new_stream(3)} the connection must not be
      * freed while a stream SSL may still be alive).
      *
-     * @return {@code true} if this call claimed the flag and freed the stream
-     *         SSL; {@code false} if an executor worker still owns the stream,
-     *         or if the owning connection already carries a sticky stream-free
-     *         failure (in which case the caller must retain the connection).
-     *         A free failure raised by this call is thrown, not reported as
+     * @return {@code true} if this call acquired the processing claim and the
+     *         stream is freed on return (by this call or by an earlier free
+     *         path); {@code false} if an executor worker still owns the
+     *         stream. The owning connection may still carry a sticky
+     *         stream-free failure from a different stream; callers retain the
+     *         connection based on that flag, not on this return value. A free
+     *         failure raised by this call is thrown, not reported as
      *         {@code false}.
      */
     public boolean freeSslIfIdle() {
@@ -598,7 +618,7 @@ public class QuicStreamWrapper implements QuicStream {
         } finally {
             clearProcessing();
         }
-        return connection == null || !connection.hasStreamFreeFailure();
+        return isFreed();
     }
 
     /**
@@ -621,6 +641,29 @@ public class QuicStreamWrapper implements QuicStream {
      */
     public boolean isPrimaryUniStream() {
         return primaryUniStream;
+    }
+
+
+    /**
+     * Returns the protocol-assigned index of this server-initiated
+     * unidirectional stream.
+     *
+     * @return The protocol index, or {@code -1} for a non-server-unidirectional
+     *         stream
+     */
+    int getServerUniIndex() {
+        return serverUniIndex;
+    }
+
+
+    /**
+     * Records the protocol-assigned index of this server-initiated
+     * unidirectional stream.
+     *
+     * @param serverUniIndex The protocol index
+     */
+    void setServerUniIndex(int serverUniIndex) {
+        this.serverUniIndex = serverUniIndex;
     }
 
 

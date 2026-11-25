@@ -371,9 +371,10 @@ public class TestQuicCertificates extends Http3TestBase {
     @Test
     public void testPkcs12CertificateFileWrongPassword() throws Exception {
         assumeAdvancedCertificates();
-        // A wrong PKCS#12 password must fail the load cleanly (logged,
-        // host config dropped); the connector must still come up with the
-        // remaining hosts and refuse the unknown SNI host.
+        // A wrong PKCS#12 password must fail the load cleanly. A non-default
+        // host that is neither pre-shared-key-only nor has a loadable
+        // certificate is an invalid configuration and must fail the build
+        // instead of starting a connector whose SNI can never handshake.
         SSLHostConfig host = new SSLHostConfig();
         host.setHostName("quic-pkcs12.test");
         host.setSslProtocol("tls");
@@ -384,25 +385,12 @@ public class TestQuicCertificates extends Http3TestBase {
         certificate.setCertificateKeyPassword("wrong-password");
         host.addCertificate(certificate);
 
-        startHttp3Server(
+        Connector started = startHttp3Server(
                 pemHost(null, "quic-default-cert.pem", "quic-default-key.pem"),
                 host);
-
-        // The default host still serves.
-        CertClientResult result = certGet("/simple", null, null, null, null);
-        Assert.assertEquals("CN=localhost", result.fields.get("PEER_SUBJECT"));
-        Assert.assertEquals("200", result.fields.get("STATUS"));
-
-        // A configured host whose certificate failed to load must not
-        // silently present the default host's identity: the handshake for
-        // that SNI name must fail instead of serving a name-mismatched
-        // certificate.
-        CertClientResult mismatch = certGet("/simple", "quic-pkcs12.test",
-                null, null, null, 3);
-        Assert.assertFalse("SNI for a host without loadable certificates "
-                        + "must fail the handshake, not present the default "
-                        + "certificate",
-                mismatch.exitCode == 0 && mismatch.fields.containsKey("STATUS"));
+        Assert.assertFalse("The connector must not be running when a"
+                        + " non-default host has no loadable certificate",
+                started.getState().isAvailable());
     }
 
 
