@@ -191,6 +191,46 @@ abstract class ConnectionSetupBase extends JdbcPoolBaseTest {
         Assertions.assertEquals(1, ds.getIdle());
     }
 
+    /**
+     * A session whose borrower ended its transaction with a commit and then
+     * did nothing else has no pending work for the next borrower: the state
+     * interceptor must not pay a rollback round trip on that borrow. The
+     * driver wrapper counts the rollbacks, so a regression to an unconditional
+     * termination is visible here.
+     */
+    @Test
+    void aCommittedTransactionDoesNotForceARollbackOnTheNextBorrow() throws Exception {
+        DataSource ds = newDataSource();
+        ds.setDriverClassName(FailingRestoreDriver.class.getName());
+        ds.getPoolProperties().setJdbcInterceptors(ConnectionState.class.getName());
+        ds.getPoolProperties().setDefaultAutoCommit(Boolean.FALSE);
+        ds.createPool();
+        String t = uniqueTable();
+        try (Connection admin = adminConnection(); Statement st = admin.createStatement()) {
+            st.execute("CREATE TABLE " + t + " (v INT)");
+        }
+        ROLLBACKS.set(0);
+
+        Connection first = ds.getConnection();
+        setSessionMarker(first, 72);
+        try (Statement st = first.createStatement()) {
+            st.executeUpdate("INSERT INTO " + t + " VALUES (1)");
+        }
+        first.commit();
+        first.close();
+        Assertions.assertEquals(0, ROLLBACKS.get(),
+                "the borrower ended its transaction; the return itself must not roll it back");
+
+        try (Connection second = ds.getConnection()) {
+            Assertions.assertEquals(Integer.valueOf(72), sessionMarker(second),
+                    "the same physical session must have been reused");
+            Assertions.assertEquals(1, rowCount(second, t),
+                    "the committed work must still be there");
+        }
+        Assertions.assertEquals(0, ROLLBACKS.get(),
+                "a clean session must not pay a rollback on the next borrow");
+    }
+
     @Test
     void anUnusableTransactionIsolationSettingDoesNotBlockThePool() throws Exception {
         DataSource ds = newDataSource();
@@ -214,20 +254,14 @@ abstract class ConnectionSetupBase extends JdbcPoolBaseTest {
     /*
      * A permanently refused isolation default used to leave the pool in a
      * loop: the failed restore re-nulled the cache, so every later borrow
-     * again saw a restore to do, again terminated whatever the previous
-     * borrower left pending - work the doomed restore could never make right
-     * - and again attempted, and logged, the same refused
-     * setTransactionIsolation. The refusal is now recorded per session, for
-     * the refused level (and logged there and then), so later borrows stop
-     * treating the level as a restore need: nothing is terminated, attempted
-     * or logged for it again, while a healthy restore still terminates as
-     * ever, and a later configuration of a different level is applied as
-     * usual. The honest
-     * trade-off, pinned below: with the refused level as the only restore
-     * need, a transaction the previous borrower left open now reaches the
-     * next one - the pre-existing behavior of a pool that configures no
-     * defaults at all, still covered by rollbackOnReturn or abandon handling
-     * where those are configured.
+     * again saw a restore to do, again attempted, and logged, the same
+     * refused setTransactionIsolation. The refusal is now recorded per
+     * session, for the refused level (and logged there and then), so later
+     * borrows stop treating the level as a restore need while a healthy
+     * restore still runs as ever, and a later configuration of a different
+     * level is applied as usual. The session's initial auto-commit is still
+     * restored for later borrowers, so the transaction the first borrower
+     * left open is terminated on the first later borrow.
      */
     @Test
     void aRefusedIsolationRestoreConvergesAfterTheFirstRefusal() throws Exception {
@@ -256,9 +290,10 @@ abstract class ConnectionSetupBase extends JdbcPoolBaseTest {
         Assertions.assertEquals(1, ISOLATION_ATTEMPTS.get(),
                 "the configured level must be attempted once on the first borrow");
 
-        // The two later borrows: pre-fix each of them rolled the abandoned
-        // row away and re-attempted (and re-logged) the doomed restore; now
-        // neither does, and the abandoned work survives to the new borrower.
+        // The two later borrows: the refused isolation restore is no longer
+        // re-attempted or re-logged, and the session's initial auto-commit
+        // restore terminates the transaction the first borrower left open on
+        // the first of them.
         for (int borrow = 2; borrow <= 3; borrow++) {
             try (Connection later = ds.getConnection()) {
                 Assertions.assertEquals(Integer.valueOf(51), sessionMarker(later),
@@ -267,13 +302,14 @@ abstract class ConnectionSetupBase extends JdbcPoolBaseTest {
                         later.getTransactionIsolation(),
                         "borrow " + borrow + " must be told the session's real "
                                 + "isolation level, never the refused default");
-                Assertions.assertEquals(1, rowCount(later, t),
-                        "borrow " + borrow + " must not terminate the transaction "
+                Assertions.assertEquals(0, rowCount(later, t),
+                        "borrow " + borrow + " must not inherit the transaction "
                                 + "the previous borrower left open");
             }
         }
-        Assertions.assertEquals(0, ROLLBACKS.get(),
-                "no borrow after the refusal may roll the session back");
+        Assertions.assertEquals(1, ROLLBACKS.get(),
+                "restoring the initial auto-commit must roll the abandoned "
+                        + "transaction back once");
         Assertions.assertEquals(1, ISOLATION_ATTEMPTS.get(),
                 "the refused level must not be re-attempted on later borrows");
         Assertions.assertEquals(1, poolSessions(), "the refused session stays in service");
@@ -294,7 +330,8 @@ abstract class ConnectionSetupBase extends JdbcPoolBaseTest {
         Assertions.assertEquals(2, ISOLATION_ATTEMPTS.get(),
                 "the re-configured level must be attempted exactly once");
         Assertions.assertEquals(1, ROLLBACKS.get(),
-                "restoring the re-configured level must terminate the transaction left open");
+                "restoring the re-configured level must not add a rollback: "
+                        + "the earlier borrow already terminated the transaction");
 
         // and it sticks: the cache shows it in place, so later borrows neither
         // re-attempt nor terminate for it
@@ -307,7 +344,7 @@ abstract class ConnectionSetupBase extends JdbcPoolBaseTest {
         Assertions.assertEquals(2, ISOLATION_ATTEMPTS.get(),
                 "the re-configured level must not be re-attempted once it is in place");
         Assertions.assertEquals(1, ROLLBACKS.get(),
-                "and no borrow after the restore may terminate a transaction for it");
+                "and no later borrow may add another rollback");
     }
 
     /*
@@ -656,15 +693,18 @@ abstract class ConnectionSetupBase extends JdbcPoolBaseTest {
                     "the confirmation must clear the phantom transaction with exactly one rollback");
             Assertions.assertEquals(1, ds.getIdle(), "and the session must be back in the idle pool");
 
-            // The confirmed restore cached the state: a later borrow neither
-            // restores nor terminates anything for it.
+            // The confirmed restore cached the state: a later borrow does not
+            // restore it again. The marker read on the previous borrow executed
+            // a statement, so a session left with auto-commit off has work that
+            // the next borrow terminates; in auto-commit mode there is no
+            // transaction to terminate.
             try (Connection later = ds.getConnection()) {
                 Assertions.assertEquals(Integer.valueOf(71), sessionMarker(later),
                         "the later borrow must reuse the same physical session");
                 assertConfiguredDefault(later, method, value);
             }
-            Assertions.assertEquals(1, ROLLBACKS.get(),
-                    "an applied state must not make a later borrow terminate anything");
+            Assertions.assertEquals("setAutoCommit".equals(method) ? 2 : 1, ROLLBACKS.get(),
+                    "an applied state must not make a later borrow restore anything");
         } finally {
             TRANSIENT_STATE_REFUSAL.set(null);
             PHANTOM_TRANSACTION.set(false);

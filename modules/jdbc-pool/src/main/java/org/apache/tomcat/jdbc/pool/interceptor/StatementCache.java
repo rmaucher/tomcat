@@ -176,6 +176,12 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
     @Override
     public void setProperties(Map<String, InterceptorProperty> properties) {
         super.setProperties(properties);
+        for (Map.Entry<String, InterceptorProperty> entry : properties.entrySet()) {
+            if (!isKnownProperty(entry.getKey())) {
+                log.warn(MessageFactory.get("statementCache.unknownProperty", entry.getKey(),
+                        entry.getValue().getValue()));
+            }
+        }
         InterceptorProperty p = properties.get("prepared");
         if (p != null) {
             warnInvalidBoolean("prepared", p, cachePrepared);
@@ -204,6 +210,19 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
     }
 
     /**
+     * Whether this interceptor configuration reads the named property. {@code useEquals} belongs to the base class;
+     * the rest are this interceptor's own names.
+     *
+     * @param name the property name to test
+     *
+     * @return {@code true} if the name configures this interceptor
+     */
+    protected boolean isKnownProperty(String name) {
+        return "prepared".equals(name) || "callable".equals(name) || "max".equals(name)
+                || "useEquals".equals(name);
+    }
+
+    /**
      * Warns when a boolean property was supplied with a value the property parser does not recognise. The parser keeps
      * the current value silently, which hides a configuration typo.
      *
@@ -213,7 +232,8 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
      */
     private void warnInvalidBoolean(String name, InterceptorProperty property, boolean current) {
         String value = property.getValue();
-        if (value != null && !"true".equals(value) && !"false".equals(value)) {
+        if (value != null && !"true".equalsIgnoreCase(value.trim())
+                && !"false".equalsIgnoreCase(value.trim())) {
             log.warn(MessageFactory.get("interceptor.invalidBooleanProperty", name, value,
                     Boolean.valueOf(current)));
         }
@@ -231,7 +251,7 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
         String value = property.getValue();
         if (value != null) {
             try {
-                Integer.parseInt(value);
+                Integer.parseInt(value.trim());
             } catch (NumberFormatException x) {
                 log.warn(MessageFactory.get("interceptor.invalidIntegerProperty", name, value,
                         Integer.valueOf(current)));
@@ -709,6 +729,10 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
      * Renders SQL text for interpolation into a log message. JULI writes message text without newline escaping, and
      * SQL is application- and user-shaped data, so embedded CR/LF would forge additional log lines. They are replaced
      * by spaces, keeping the statement readable in the one line the log entry owns.
+     * <p>
+     * The text is not masked or truncated. This cache only reports SQL on a debug diagnostic, but SQL literals can
+     * still carry application or credential data; enable debug logging for this interceptor only where that exposure
+     * is acceptable.
      *
      * @param sql the SQL text, possibly null
      *
@@ -799,7 +823,7 @@ public class StatementCache extends StatementDecoratorInterceptor implements Sta
          * Poolable hint set by the application. Tracked here as some drivers (e.g. H2) always return false from
          * {@code isPoolable()}.
          */
-        private boolean poolable = true;
+        private volatile boolean poolable = true;
         /**
          * Whether the application set a cursor name on this statement. A
          * cached statement must not hand a previous borrower's cursor name to

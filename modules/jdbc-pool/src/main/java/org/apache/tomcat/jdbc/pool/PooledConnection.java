@@ -20,7 +20,9 @@ package org.apache.tomcat.jdbc.pool;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -112,6 +114,16 @@ public class PooledConnection implements PooledConnectionMBean {
      */
     private volatile boolean discarded = false;
     /**
+     * Whether a statement has executed, or a row has been changed, since the transaction was last ended. A transaction
+     * exists on the session only when auto-commit is off and work has been done in it; the state interceptor uses this
+     * marker to decide whether a borrow must roll a pending transaction back, instead of paying a rollback round trip
+     * on every borrow of a pool whose sessions run in manual commit mode. It is raised before the execution reaches
+     * the driver, so a failed execution whose transaction state is unknown still forces the rollback. Ending
+     * operations - {@code commit()}, {@code rollback()} without a savepoint and {@code setAutoCommit(true)} - clear it
+     * once the driver accepted them; a validation that ends the transaction itself clears it the same way.
+     */
+    private volatile boolean transactionDirty = false;
+    /**
      * The Timestamp when the last time the connect() method was called successfully
      */
     private volatile long lastConnected = -1;
@@ -126,7 +138,12 @@ public class PooledConnection implements PooledConnectionMBean {
      */
     protected ConnectionPool parent;
 
-    private HashMap<Object, Object> attributes = new HashMap<>();
+    /**
+     * The per-connection attribute map shared with the interceptor chain. Synchronized, because a late statement-cache
+     * call from an ended borrow can read it while a reconnect stages credentials or the connect path writes a
+     * statement-cache binding; it must also accept a null credential value.
+     */
+    private final Map<Object, Object> attributes = Collections.synchronizedMap(new HashMap<>());
 
     private volatile long connectionVersion = 0;
 
@@ -211,19 +228,19 @@ public class PooledConnection implements PooledConnectionMBean {
      * @return true if the pool must reconnect
      */
     public boolean shouldForceReconnect(String username, String password) {
-
-        if (!getPoolProperties().isAlternateUsernameAllowed()) {
+        PoolConfiguration configuration = configuration();
+        if (!configuration.isAlternateUsernameAllowed()) {
             // With alternate identities disallowed, the identity every session
             // must serve under is the pool's configured one.
-            username = poolProperties.getUsername();
-            password = poolProperties.getPassword();
+            username = configuration.getUsername();
+            password = configuration.getPassword();
         }
 
         if (username == null) {
-            username = poolProperties.getUsername();
+            username = configuration.getUsername();
         }
         if (password == null) {
-            password = poolProperties.getPassword();
+            password = configuration.getPassword();
         }
 
         String storedUsr = (String) getAttributes().get(PROP_USER);
@@ -254,6 +271,10 @@ public class PooledConnection implements PooledConnectionMBean {
         if (released.get()) {
             throw new SQLException(MessageFactory.get("pooledConnection.cannotReestablish"));
         }
+        if (parent != null && parent.isClosed()) {
+            throw new SQLException(MessageFactory.get("connectionPool.poolClosed"));
+        }
+        PoolConfiguration configuration = connectConfiguration();
         if (connection != null || xaConnection != null || cpdsConnection != null) {
             try {
                 this.disconnect(false);
@@ -276,28 +297,30 @@ public class PooledConnection implements PooledConnectionMBean {
             this.discarded = false;
         }
         try {
-            if (poolProperties.getDataSource() != null) {
-                connectUsingDataSource();
+            if (configuration.getDataSource() != null) {
+                connectUsingDataSource(configuration);
             } else {
-                connectUsingDriver();
+                connectUsingDriver(configuration);
             }
 
             // Set up the default state, unless we expect the interceptor to do it
             if (!hasConnectionStateInterceptor()) {
-                if (poolProperties.getDefaultTransactionIsolation() != DataSourceFactory.UNKNOWN_TRANSACTIONISOLATION) {
-                    connection.setTransactionIsolation(poolProperties.getDefaultTransactionIsolation());
+                if (configuration.getDefaultTransactionIsolation() != DataSourceFactory.UNKNOWN_TRANSACTIONISOLATION) {
+                    connection.setTransactionIsolation(configuration.getDefaultTransactionIsolation());
                 }
-                if (poolProperties.getDefaultReadOnly() != null) {
-                    connection.setReadOnly(poolProperties.getDefaultReadOnly().booleanValue());
+                if (configuration.getDefaultReadOnly() != null) {
+                    connection.setReadOnly(configuration.getDefaultReadOnly().booleanValue());
                 }
-                if (poolProperties.getDefaultAutoCommit() != null) {
-                    connection.setAutoCommit(poolProperties.getDefaultAutoCommit().booleanValue());
+                if (configuration.getDefaultAutoCommit() != null) {
+                    connection.setAutoCommit(configuration.getDefaultAutoCommit().booleanValue());
                 }
-                if (poolProperties.getDefaultCatalog() != null) {
-                    connection.setCatalog(poolProperties.getDefaultCatalog());
+                if (configuration.getDefaultCatalog() != null) {
+                    connection.setCatalog(configuration.getDefaultCatalog());
                 }
             }
             this.lastConnected = System.currentTimeMillis();
+            // A new session starts with no transaction of a previous borrower on it.
+            this.transactionDirty = false;
             // The validation timestamp belongs to the session that was just given
             // up: a new physical session must be due for its own validation, or a
             // recently validated predecessor lets the configured testOnBorrow /
@@ -318,6 +341,23 @@ public class PooledConnection implements PooledConnectionMBean {
             if (parent.getJmxPool() != null) {
                 createMBean();
             }
+            // A release may have won while the driver connect was in flight.
+            // The release claim is taken under this monitor; check it after
+            // the session has been installed so a connect that passed the
+            // entry check cannot leave a live session behind in a released
+            // object. The monitor is only held for the check, never across
+            // the driver call.
+            boolean releasedAfterConnect;
+            boolean poolClosedAfterConnect;
+            synchronized (this) {
+                releasedAfterConnect = released.get();
+                poolClosedAfterConnect = parent != null && parent.isClosed();
+            }
+            if (releasedAfterConnect || poolClosedAfterConnect) {
+                disconnect(true);
+                throw new SQLException(MessageFactory.get(releasedAfterConnect
+                        ? "pooledConnection.cannotReestablish" : "connectionPool.poolClosed"));
+            }
         } catch (Throwable x) {
             ExceptionUtils.handleThrowable(x);
             // The attempt did not establish the replacement session, or it failed after establishing it. Either
@@ -333,6 +373,33 @@ public class PooledConnection implements PooledConnectionMBean {
     }
 
     /**
+     * The configuration the ordinary connection methods read. A connection the pool created holds the pool's live
+     * configuration view; a connection constructed directly around a caller's configuration reads that configuration.
+     *
+     * @return the configuration for the current operation
+     */
+    private PoolConfiguration configuration() {
+        return poolProperties;
+    }
+
+    /**
+     * The configuration one connect decision reads.
+     * <p>
+     * A connection the pool created holds the pool's live configuration view; for it, the immutable snapshot behind
+     * the view is used, so one connect reads one generation. A connection constructed directly around a caller's
+     * configuration keeps reading that configuration, which is what the standalone and test uses of this class
+     * expect.
+     *
+     * @return the configuration snapshot for the current connect
+     */
+    private PoolConfiguration connectConfiguration() {
+        if (parent != null && poolProperties == parent.getPoolProperties()) {
+            return parent.getCurrentConfiguration();
+        }
+        return poolProperties;
+    }
+
+    /**
      * Returns <code>true</code> if the configured interceptor chain contains the {@link ConnectionState} interceptor
      * or a subclass of it, which applies the configured default connection state itself every time the connection is
      * borrowed.
@@ -344,7 +411,26 @@ public class PooledConnection implements PooledConnectionMBean {
      * @return <code>true</code> if a {@link ConnectionState} interceptor is configured
      */
     private boolean hasConnectionStateInterceptor() {
-        for (PoolProperties.InterceptorDefinition definition : poolProperties.getJdbcInterceptorsAsArray()) {
+        // Once a chain has been built, the connection keeps it for its whole
+        // life; a live jdbcInterceptors change only affects chains built
+        // later. The decision must therefore be made on the chain this
+        // connection actually runs, not on the current configuration, or a
+        // connection with a cached chain that lacks ConnectionState would
+        // skip the defaults at reconnect because the configuration now lists
+        // the interceptor that the cached chain does not contain.
+        JdbcInterceptor interceptor = handler;
+        if (interceptor != null) {
+            while (interceptor != null) {
+                if (interceptor instanceof ConnectionState) {
+                    return true;
+                }
+                interceptor = interceptor.getNext();
+            }
+            return false;
+        }
+        // A connection with no chain yet will build one from the current
+        // configuration during setup.
+        for (PoolProperties.InterceptorDefinition definition : configuration().getJdbcInterceptorsAsArray()) {
             try {
                 if (ConnectionState.class.isAssignableFrom(definition.getInterceptorClass())) {
                     return true;
@@ -363,22 +449,41 @@ public class PooledConnection implements PooledConnectionMBean {
      * @throws SQLException if unable to obtain a connection from the DataSource
      */
     protected void connectUsingDataSource() throws SQLException {
-        String usr = null;
-        String pwd = null;
-        if (getAttributes().containsKey(PROP_USER)) {
-            usr = (String) getAttributes().get(PROP_USER);
-        } else {
-            usr = poolProperties.getUsername();
-            getAttributes().put(PROP_USER, usr);
+        connectUsingDataSource(connectConfiguration());
+    }
+
+    /**
+     * Connects using the DataSource held by the given configuration generation.
+     *
+     * @param configuration the configuration generation this connect reads
+     *
+     * @throws SQLException if unable to obtain a connection from the DataSource
+     */
+    protected void connectUsingDataSource(PoolConfiguration configuration) throws SQLException {
+        String usr;
+        String pwd;
+        // A caller-supplied configuration is still mutable and its credential
+        // setters publish the field and its database-properties entry together
+        // under its monitor; take the pair under that monitor. The pool's own
+        // snapshot is immutable, so the same block only makes the read atomic
+        // for a custom configuration.
+        synchronized (configuration) {
+            if (getAttributes().containsKey(PROP_USER)) {
+                usr = (String) getAttributes().get(PROP_USER);
+            } else {
+                usr = configuration.getUsername();
+                getAttributes().put(PROP_USER, usr);
+            }
+            if (getAttributes().containsKey(PROP_PASSWORD)) {
+                pwd = (String) getAttributes().get(PROP_PASSWORD);
+            } else {
+                pwd = configuration.getPassword();
+                getAttributes().put(PROP_PASSWORD, pwd);
+            }
         }
-        if (getAttributes().containsKey(PROP_PASSWORD)) {
-            pwd = (String) getAttributes().get(PROP_PASSWORD);
-        } else {
-            pwd = poolProperties.getPassword();
-            getAttributes().put(PROP_PASSWORD, pwd);
-        }
-        if (poolProperties.getDataSource() instanceof javax.sql.XADataSource) {
-            javax.sql.XADataSource xds = (javax.sql.XADataSource) poolProperties.getDataSource();
+        Object dataSource = configuration.getDataSource();
+        if (dataSource instanceof javax.sql.XADataSource) {
+            javax.sql.XADataSource xds = (javax.sql.XADataSource) dataSource;
             javax.sql.XAConnection pooled = (usr != null || pwd != null) ? xds.getXAConnection(usr, pwd)
                     : xds.getXAConnection();
             if (pooled == null) {
@@ -432,8 +537,8 @@ public class PooledConnection implements PooledConnectionMBean {
             // handle directly, and the wrapper below only delegates - a close
             // through the field still physically closes the session.
             xaConnection = new XABranchTracker(pooled);
-        } else if (poolProperties.getDataSource() instanceof javax.sql.DataSource) {
-            javax.sql.DataSource ds = (javax.sql.DataSource) poolProperties.getDataSource();
+        } else if (dataSource instanceof javax.sql.DataSource) {
+            javax.sql.DataSource ds = (javax.sql.DataSource) dataSource;
             if (usr != null || pwd != null) {
                 connection = ds.getConnection(usr, pwd);
             } else {
@@ -447,8 +552,8 @@ public class PooledConnection implements PooledConnectionMBean {
                 throw new SQLException(MessageFactory.get("pooledConnection.dataSourceNullConnection",
                         objectIdentity(ds)));
             }
-        } else if (poolProperties.getDataSource() instanceof javax.sql.ConnectionPoolDataSource) {
-            javax.sql.ConnectionPoolDataSource ds = (javax.sql.ConnectionPoolDataSource) poolProperties.getDataSource();
+        } else if (dataSource instanceof javax.sql.ConnectionPoolDataSource) {
+            javax.sql.ConnectionPoolDataSource ds = (javax.sql.ConnectionPoolDataSource) dataSource;
             javax.sql.PooledConnection pooled = (usr != null || pwd != null) ? ds.getPooledConnection(usr, pwd)
                     : ds.getPooledConnection();
             if (pooled == null) {
@@ -496,7 +601,7 @@ public class PooledConnection implements PooledConnectionMBean {
             }
         } else {
             throw new SQLException(MessageFactory.get("pooledConnection.unknownDataSource",
-                    (poolProperties.getDataSource() != null ? poolProperties.getDataSource().getClass() : "null")));
+                    (dataSource != null ? dataSource.getClass() : "null")));
         }
     }
 
@@ -519,8 +624,18 @@ public class PooledConnection implements PooledConnectionMBean {
      * @throws SQLException if unable to instantiate the driver or obtain a connection
      */
     protected void connectUsingDriver() throws SQLException {
+        connectUsingDriver(connectConfiguration());
+    }
 
-        String configuredDriver = poolProperties.getDriverClassName();
+    /**
+     * Connects using the JDBC Driver class held by the given configuration generation.
+     *
+     * @param configuration the configuration generation this connect reads
+     *
+     * @throws SQLException if unable to instantiate the driver or obtain a connection
+     */
+    protected void connectUsingDriver(PoolConfiguration configuration) throws SQLException {
+        String configuredDriver = configuration.getDriverClassName();
         try {
             if (driver != null && !Objects.equals(driverClass, configuredDriver)) {
                 // The configuration named a different driver since this
@@ -542,8 +657,9 @@ public class PooledConnection implements PooledConnectionMBean {
                         // is a standard support step, so a URL that carries
                         // its credential inline must reach this line masked
                         // as well - the driver is handed the real URL below.
-                        log.debug("Instantiating driver using class: " + configuredDriver +
-                                " [url=" + PoolProperties.maskCredentials(poolProperties.getUrl()) + "]");
+                        log.debug("Instantiating driver using class: " +
+                                PoolUtilities.maskAndFlatten(configuredDriver) +
+                                " [url=" + PoolUtilities.maskAndFlatten(configuration.getUrl()) + "]");
                     }
                     driver = (java.sql.Driver) ClassLoaderUtil.loadClass(configuredDriver,
                             PooledConnection.class.getClassLoader(), Thread.currentThread().getContextClassLoader())
@@ -559,50 +675,83 @@ public class PooledConnection implements PooledConnectionMBean {
             ex.initCause(cn);
             throw ex;
         }
-        String driverURL = poolProperties.getUrl();
-        String usr = null;
-        String pwd = null;
-        if (getAttributes().containsKey(PROP_USER)) {
-            usr = (String) getAttributes().get(PROP_USER);
-        } else {
-            usr = poolProperties.getUsername();
-            getAttributes().put(PROP_USER, usr);
-        }
-        if (getAttributes().containsKey(PROP_PASSWORD)) {
-            pwd = (String) getAttributes().get(PROP_PASSWORD);
-        } else {
-            pwd = poolProperties.getPassword();
-            getAttributes().put(PROP_PASSWORD, pwd);
-        }
+        String driverURL = configuration.getUrl();
+        String usr;
+        String pwd;
         // A null database-properties collection becomes an empty one: the URL
         // and credentials are enough for the driver. The configured
         // connectionProperties string is a source of driver properties in its
         // own right and must still reach the driver, so it is parsed here when
         // there is no collection to hold its pairs; the string and the null
         // collection are read under the same monitor, so the driver cannot
-        // receive a torn mix of two configurations.
+        // receive a torn mix of two configurations. The credential fields and
+        // the database-properties collection are published together under that
+        // monitor, which is their snapshot boundary, so the credentials are
+        // read there as well: a rotation that lands between an unlocked field
+        // read and the copy would otherwise be undone by overlaying the
+        // superseded value on the new collection. The pool's own configuration
+        // is an immutable snapshot, so for it this block only makes the read
+        // atomic for a direct caller's mutable configuration.
         Properties properties;
-        synchronized (poolProperties) {
-            Properties dbProperties = poolProperties.getDbProperties();
+        boolean clearedUsername = false;
+        boolean clearedPassword = false;
+        synchronized (configuration) {
+            Properties dbProperties = configuration.getDbProperties();
             if (dbProperties == null) {
                 try {
                     properties = PoolProperties.getProperties(
-                            poolProperties.getConnectionProperties(), new Properties());
+                            configuration.getConnectionProperties(), new Properties());
                 } catch (RuntimeException x) {
                     SQLException ex = new SQLException(
                             MessageFactory.get("pooledConnection.invalidConnectionProperties"));
                     ex.initCause(x);
                     throw ex;
                 }
+                if (configuration instanceof PoolProperties) {
+                    // The string is the only place a credential can now come
+                    // from, so an explicit clear has to be applied to the parse
+                    // rather than to a collection that does not exist.
+                    PoolProperties poolProperties = (PoolProperties) configuration;
+                    clearedUsername = poolProperties.isUsernameCleared();
+                    clearedPassword = poolProperties.isPasswordCleared();
+                }
             } else {
                 properties = PoolUtilities.clone(dbProperties);
             }
+            if (getAttributes().containsKey(PROP_USER)) {
+                usr = (String) getAttributes().get(PROP_USER);
+            } else {
+                usr = configuration.getUsername();
+                getAttributes().put(PROP_USER, usr);
+            }
+            if (getAttributes().containsKey(PROP_PASSWORD)) {
+                pwd = (String) getAttributes().get(PROP_PASSWORD);
+            } else {
+                pwd = configuration.getPassword();
+                getAttributes().put(PROP_PASSWORD, pwd);
+            }
         }
+        // The overlay is the credential setters' every-spelling rule at the
+        // last boundary: while a credential field is set its value replaces
+        // every spelling of the key, so a superseded pass, pwd, PASSWORD or
+        // USER entry in the live collection cannot reach the driver next to
+        // the canonical one. With the field unset nothing is removed: the
+        // entry in the collection is then the one the driver gets, as
+        // documented. The one exception is a credential explicitly cleared by
+        // a setter while there was no collection to remove it from: the parsed
+        // connectionProperties string is the remaining source of the
+        // superseded value and must be stripped as well.
         if (usr != null) {
+            PoolUtilities.removeUsernameKeys(properties);
             properties.setProperty(PROP_USER, usr);
+        } else if (clearedUsername) {
+            PoolUtilities.removeUsernameKeys(properties);
         }
         if (pwd != null) {
+            PoolUtilities.removeCredentialKeys(properties);
             properties.setProperty(PROP_PASSWORD, pwd);
+        } else if (clearedPassword) {
+            PoolUtilities.removeCredentialKeys(properties);
         }
 
         try {
@@ -617,7 +766,7 @@ public class PooledConnection implements PooledConnectionMBean {
                 // failure this line exists to diagnose, so it is masked and
                 // logged without the raw exception.
                 log.debug("Unable to connect to database. " + x.getClass().getName() + ": " +
-                        PoolProperties.maskCredentials(x.getMessage()));
+                        PoolUtilities.maskAndFlatten(x.getMessage()));
             }
             // Read the pool's JMX object only once: close() gives it up
             // concurrently, and a second read can observe the null the first
@@ -667,8 +816,12 @@ public class PooledConnection implements PooledConnectionMBean {
      */
     @Override
     public boolean isMaxAgeExpired() {
-        if (getPoolProperties().getMaxAge() > 0) {
-            return (System.currentTimeMillis() - getLastConnected()) > getPoolProperties().getMaxAge();
+        // Read the configured value once: a concurrent live change between a
+        // guard read and a calculation read would make the expiry decision
+        // describe a configuration that never existed.
+        long maxAge = getPoolProperties().getMaxAge();
+        if (maxAge > 0) {
+            return (System.currentTimeMillis() - getLastConnected()) > maxAge;
         } else {
             return false;
         }
@@ -700,27 +853,69 @@ public class PooledConnection implements PooledConnectionMBean {
      *                         before the call.
      */
     public void reconnectWith(String username, String password) throws SQLException {
+        // The credentials staged here are consumed by the connect this method
+        // performs immediately afterwards, so they must come from the same
+        // configuration generation that connect reads for the URL and driver
+        // properties. Reading the live view here would let a credential write
+        // that has not been published yet be paired with the older generation.
+        PoolConfiguration configuration = connectConfiguration();
         if (username == null) {
-            username = poolProperties.getUsername();
+            username = configuration.getUsername();
         }
         if (password == null) {
-            password = poolProperties.getPassword();
+            password = configuration.getPassword();
         }
 
         // The state a refused attempt has to hand back: the session this
         // connection is serving and the identity that session was opened
-        // with.
-        java.sql.Connection served = connection;
-        javax.sql.XAConnection servedXa = xaConnection;
-        javax.sql.PooledConnection servedCpds = cpdsConnection;
-        long servedLastConnected = lastConnected;
-        long servedLastValidated = lastValidated;
-        boolean servedDiscarded = discarded;
-        HashMap<Object, Object> sessionAttributes = getAttributes();
-        boolean hadUser = sessionAttributes.containsKey(PROP_USER);
-        Object servedUser = sessionAttributes.get(PROP_USER);
-        boolean hadPassword = sessionAttributes.containsKey(PROP_PASSWORD);
-        Object servedPassword = sessionAttributes.get(PROP_PASSWORD);
+        // with. Capture and detach it under the same monitor as the release
+        // claim, so a release that arrives after this block cannot close the
+        // served session from underneath the attempt; a release that arrived
+        // before the block owns the session and this attempt refuses without
+        // touching it.
+        java.sql.Connection served;
+        javax.sql.XAConnection servedXa;
+        javax.sql.PooledConnection servedCpds;
+        long servedLastConnected;
+        long servedLastValidated;
+        boolean servedDiscarded;
+        Map<Object, Object> sessionAttributes = getAttributes();
+        boolean hadUser;
+        Object servedUser;
+        boolean hadPassword;
+        Object servedPassword;
+        boolean stagedServed;
+        synchronized (this) {
+            if (released.get()) {
+                throw new SQLException(MessageFactory.get("pooledConnection.cannotReestablish"));
+            }
+            served = connection;
+            servedXa = xaConnection;
+            servedCpds = cpdsConnection;
+            servedLastConnected = lastConnected;
+            servedLastValidated = lastValidated;
+            servedDiscarded = discarded;
+            hadUser = sessionAttributes.containsKey(PROP_USER);
+            servedUser = sessionAttributes.get(PROP_USER);
+            hadPassword = sessionAttributes.containsKey(PROP_PASSWORD);
+            servedPassword = sessionAttributes.get(PROP_PASSWORD);
+            stagedServed = served != null || servedXa != null || servedCpds != null;
+            // Set the session being replaced out of reach of the connect
+            // below, which closes any session it finds before it opens the new
+            // one. This one has to stay open until the attempt that replaces it
+            // is known to have succeeded. The connected timestamp goes with it:
+            // while the fields read null, the published LastConnected must read
+            // -1 like in every other no-session state, as the per-connection
+            // MBean stays registered across this window.
+            connection = null;
+            xaConnection = null;
+            cpdsConnection = null;
+            lastConnected = -1;
+            // The validation timestamp belongs to the session being replaced too. Clear it with the other
+            // session fields so the per-connection MBean, which stays registered across this window, does
+            // not report a timestamp for a session that is no longer current.
+            lastValidated = 0;
+        }
 
         // Stage the credentials the attempt is made under. A null stands for
         // the pool's default, which the connect substitutes the same way it
@@ -736,21 +931,6 @@ public class PooledConnection implements PooledConnectionMBean {
             sessionAttributes.put(PROP_PASSWORD, password);
         }
 
-        // Set the session being replaced out of reach of the connect below,
-        // which closes any session it finds before it opens the new one. This
-        // one has to stay open until the attempt that replaces it is known to
-        // have succeeded. The connected timestamp goes with it: while the
-        // fields read null, the published LastConnected must read -1 like in
-        // every other no-session state, as the per-connection MBean stays
-        // registered across this window.
-        connection = null;
-        xaConnection = null;
-        cpdsConnection = null;
-        lastConnected = -1;
-        // The validation timestamp belongs to the session being replaced too. Clear it with the other
-        // session fields so the per-connection MBean, which stays registered across this window, does
-        // not report a timestamp for a session that is no longer current.
-        lastValidated = 0;
         try {
             connect();
         } catch (Throwable x) {
@@ -762,30 +942,60 @@ public class PooledConnection implements PooledConnectionMBean {
             // served anyone, and the state the chain holds belongs to the
             // session that is about to be back in service.
             ExceptionUtils.handleThrowable(x);
+            java.sql.Connection partial;
+            javax.sql.XAConnection partialXa;
+            javax.sql.PooledConnection partialCpds;
+            boolean releasedNow;
+            synchronized (this) {
+                partial = connection;
+                partialXa = xaConnection;
+                partialCpds = cpdsConnection;
+                connection = null;
+                xaConnection = null;
+                cpdsConnection = null;
+                lastConnected = -1;
+                lastValidated = 0;
+                releasedNow = released.get();
+                if (releasedNow) {
+                    // Release owns the terminal lifecycle. Do not restore the
+                    // served session into a released object.
+                    discarded = true;
+                } else {
+                    // Restore even if the partial session could not be closed:
+                    // the served session is what the pool still owns, and a
+                    // null field would leave it open but unreachable.
+                    connection = served;
+                    xaConnection = servedXa;
+                    cpdsConnection = servedCpds;
+                    lastConnected = servedLastConnected;
+                    lastValidated = servedLastValidated;
+                    discarded = servedDiscarded;
+                    if (hadUser) {
+                        sessionAttributes.put(PROP_USER, servedUser);
+                    } else {
+                        sessionAttributes.remove(PROP_USER);
+                    }
+                    if (hadPassword) {
+                        sessionAttributes.put(PROP_PASSWORD, servedPassword);
+                    } else {
+                        sessionAttributes.remove(PROP_PASSWORD);
+                    }
+                }
+            }
             try {
-                closeSession(connection, xaConnection, cpdsConnection);
+                closeSession(partial, partialXa, partialCpds);
             } catch (Throwable closeFailure) {
                 ExceptionUtils.handleThrowable(closeFailure);
                 x.addSuppressed(closeFailure);
-            } finally {
-                // Restore even if the partial session could not be closed:
-                // the served session is what the pool still owns, and a null
-                // field would leave it open but unreachable.
-                connection = served;
-                xaConnection = servedXa;
-                cpdsConnection = servedCpds;
-                lastConnected = servedLastConnected;
-                lastValidated = servedLastValidated;
-                discarded = servedDiscarded;
-                if (hadUser) {
-                    sessionAttributes.put(PROP_USER, servedUser);
-                } else {
-                    sessionAttributes.remove(PROP_USER);
-                }
-                if (hadPassword) {
-                    sessionAttributes.put(PROP_PASSWORD, servedPassword);
-                } else {
-                    sessionAttributes.remove(PROP_PASSWORD);
+            }
+            if (releasedNow && stagedServed) {
+                // The release could not see the served session: it was staged
+                // out of the fields before the release claim was settled.
+                try {
+                    closeSession(served, servedXa, servedCpds);
+                } catch (Throwable closeFailure) {
+                    ExceptionUtils.handleThrowable(closeFailure);
+                    x.addSuppressed(closeFailure);
                 }
             }
             if (x instanceof SQLException) {
@@ -808,21 +1018,89 @@ public class PooledConnection implements PooledConnectionMBean {
         }
 
         // The database accepted the credentials, so the session they replace
-        // can be given up now. The fields are turned back to it while it is
-        // retired, so that the chain is told - as it is for every other
-        // retirement - about the session it has been serving rather than
-        // about the one that takes its place.
-        java.sql.Connection accepted = connection;
-        javax.sql.XAConnection acceptedXa = xaConnection;
-        javax.sql.PooledConnection acceptedCpds = cpdsConnection;
-        connection = served;
-        xaConnection = servedXa;
-        cpdsConnection = servedCpds;
-        notifyDisconnected(false);
+        // can be given up now. The chain is told about it - as it is for every
+        // other retirement - before the session is closed. The release claim
+        // and this retirement share the monitor, which is held only for the
+        // state transitions: the served session is removed from the fields
+        // under it, and the notification that may run interceptor and driver
+        // code runs outside it, the same split disconnect() uses. A release
+        // arriving after the transition therefore cannot capture the served
+        // session and close it a second time, and a hook that blocks cannot
+        // hold up release, connect or JMX work on this connection.
+        java.sql.Connection accepted;
+        javax.sql.XAConnection acceptedXa;
+        javax.sql.PooledConnection acceptedCpds;
+        long acceptedLastConnected;
+        long acceptedLastValidated;
+        boolean releasedNow;
+        boolean notifyServed;
+        boolean acceptedOwned = false;
+        synchronized (this) {
+            accepted = connection;
+            acceptedXa = xaConnection;
+            acceptedCpds = cpdsConnection;
+            acceptedLastConnected = lastConnected;
+            acceptedLastValidated = lastValidated;
+            releasedNow = released.get();
+            notifyServed = !releasedNow && accepted != null;
+            if (notifyServed) {
+                // Clear the fields before leaving the monitor: the notification
+                // below must not leave the terminal session reachable, and a
+                // release that captures from the fields must not find it.
+                connection = null;
+                xaConnection = null;
+                cpdsConnection = null;
+                lastConnected = -1;
+                lastValidated = 0;
+            } else if (releasedNow) {
+                // A release won while the replacement was being established.
+                // If the fields still hold the accepted session, take it out
+                // of the released object and close it; otherwise the release
+                // already captured it.
+                if (accepted != null && connection == accepted) {
+                    connection = null;
+                    xaConnection = null;
+                    cpdsConnection = null;
+                    lastConnected = -1;
+                    lastValidated = 0;
+                    discarded = true;
+                    acceptedOwned = true;
+                }
+            }
+        }
+        if (notifyServed) {
+            notifyDisconnected(false);
+        }
+        if (releasedNow) {
+            closeSession(served, servedXa, servedCpds);
+            if (acceptedOwned) {
+                closeSession(accepted, acceptedXa, acceptedCpds);
+            }
+            throw new SQLException(MessageFactory.get("pooledConnection.cannotReestablish"));
+        }
         closeSession(served, servedXa, servedCpds);
-        connection = accepted;
-        xaConnection = acceptedXa;
-        cpdsConnection = acceptedCpds;
+
+        // Publish the accepted session only if a release did not land while
+        // the served session was being retired. If it did, the accepted
+        // session is not the released connection's to keep.
+        synchronized (this) {
+            releasedNow = released.get();
+            if (!releasedNow) {
+                connection = accepted;
+                xaConnection = acceptedXa;
+                cpdsConnection = acceptedCpds;
+                lastConnected = acceptedLastConnected;
+                lastValidated = acceptedLastValidated;
+            } else if (accepted != null) {
+                acceptedOwned = true;
+            }
+        }
+        if (releasedNow) {
+            if (acceptedOwned) {
+                closeSession(accepted, acceptedXa, acceptedCpds);
+            }
+            throw new SQLException(MessageFactory.get("pooledConnection.cannotReestablish"));
+        }
     }
 
     /**
@@ -832,28 +1110,55 @@ public class PooledConnection implements PooledConnectionMBean {
      *                     teardown reset is performed once by {@link ConnectionPool#release(PooledConnection)}
      */
     private void disconnect(boolean finalize) {
-        if (isDiscarded() && connection == null && xaConnection == null && cpdsConnection == null) {
-            return;
-        }
-        setDiscarded(true);
-        if (connection != null || xaConnection != null || cpdsConnection != null) {
-            if (connection != null) {
-                notifyDisconnected(finalize);
+        java.sql.Connection session;
+        javax.sql.XAConnection xa;
+        javax.sql.PooledConnection cpds;
+        // Take the terminal session out of the fields under the monitor shared
+        // with the release claim and the connect completion check. Only this
+        // call captures it, so a concurrent release/connect/post-connect
+        // discard cannot close the same session twice, and a session that is
+        // installed after the capture is caught by the connect completion
+        // check instead. The physical close itself runs outside the monitor.
+        synchronized (this) {
+            if (isDiscarded() && connection == null && xaConnection == null && cpdsConnection == null) {
+                return;
             }
+            setDiscarded(true);
+            session = connection;
+            xa = xaConnection;
+            cpds = cpdsConnection;
+            connection = null;
+            xaConnection = null;
+            cpdsConnection = null;
+            lastConnected = -1;
+            // The validation timestamp belongs to the session that was just given
+            // up. Clearing it here keeps the published value at the documented 0
+            // for a connection whose current session has not been validated, even
+            // across the reconnect window while the per-connection MBean stays
+            // registered.
+            lastValidated = 0;
+            transactionDirty = false;
+        }
+        if (session != null) {
+            // The session fields have already been cleared, so this notification
+            // does not leave the terminal session reachable from the object. It
+            // runs outside the monitor, so a listener or interceptor hook that
+            // blocks cannot hold up another release/connect transition.
+            notifyDisconnected(finalize);
+        }
+        if (session != null || xa != null || cpds != null) {
             // Close any handle too: an XA/CPDS handle owns the physical
             // session even when obtaining its logical connection failed.
-            closeSession(connection, xaConnection, cpdsConnection);
+            closeSession(session, xa, cpds);
         }
-        connection = null;
-        xaConnection = null;
-        cpdsConnection = null;
-        lastConnected = -1;
-        // The validation timestamp belongs to the session that was just given
-        // up. Clearing it here keeps the published value at the documented 0
-        // for a connection whose current session has not been validated, even
-        // across the reconnect window while the per-connection MBean stays
-        // registered.
-        lastValidated = 0;
+        if (finalize) {
+            // The terminal release ends the connection's ability to renew
+            // itself, so the cached credentials have no further use and must
+            // not stay in the attribute map of an object other code may still
+            // hold.
+            attributes.remove(PROP_USER);
+            attributes.remove(PROP_PASSWORD);
+        }
         // The chain's teardown reset is delivered once, by the release that
         // clears the handler after it has freed the pool slot - see
         // ConnectionPool.release(). The disconnect event above is a separate
@@ -958,10 +1263,14 @@ public class PooledConnection implements PooledConnectionMBean {
      * @return abandon timeout in milliseconds
      */
     public long getAbandonTimeout() {
-        if (poolProperties.getRemoveAbandonedTimeout() <= 0) {
+        // Read the configured timeout once: a concurrent live change between
+        // the guard read and the multiplication would turn a guard that passed
+        // on a positive value into a zero or negative abandon timeout.
+        int removeAbandonedTimeout = configuration().getRemoveAbandonedTimeout();
+        if (removeAbandonedTimeout <= 0) {
             return Long.MAX_VALUE;
         } else {
-            return poolProperties.getRemoveAbandonedTimeout() * 1000L;
+            return removeAbandonedTimeout * 1000L;
         }
     }
 
@@ -971,16 +1280,17 @@ public class PooledConnection implements PooledConnectionMBean {
      * @param action The validation action
      */
     private boolean doValidate(int action) {
-        if (action == VALIDATE_BORROW && poolProperties.isTestOnBorrow()) {
+        PoolConfiguration configuration = configuration();
+        if (action == VALIDATE_BORROW && configuration.isTestOnBorrow()) {
             return true;
-        } else if (action == VALIDATE_RETURN && poolProperties.isTestOnReturn()) {
+        } else if (action == VALIDATE_RETURN && configuration.isTestOnReturn()) {
             return true;
-        } else if (action == VALIDATE_IDLE && poolProperties.isTestWhileIdle()) {
+        } else if (action == VALIDATE_IDLE && configuration.isTestWhileIdle()) {
             return true;
-        } else if (action == VALIDATE_INIT && poolProperties.isTestOnConnect()) {
+        } else if (action == VALIDATE_INIT && configuration.isTestOnConnect()) {
             return true;
         } else if (action == VALIDATE_INIT &&
-                PoolProperties.configuredStatement(poolProperties.getInitSQL()) != null) {
+                PoolProperties.configuredStatement(configuration.getInitSQL()) != null) {
             return true;
         } else {
             return false;
@@ -1034,6 +1344,7 @@ public class PooledConnection implements PooledConnectionMBean {
      *             failed and the pool takes the connection out of service.
      */
     public boolean validate(int validateAction, String sql) {
+        PoolConfiguration configuration = configuration();
         if (connection == null) {
             // Never connected - a wake-up placeholder that no borrower took
             // - or already disconnected; there is nothing to validate and it
@@ -1051,8 +1362,8 @@ public class PooledConnection implements PooledConnectionMBean {
 
         // Don't bother validating if already have recently enough
         long now = System.currentTimeMillis();
-        if (validateAction != VALIDATE_INIT && poolProperties.getValidationInterval() > 0 &&
-                (now - this.lastValidated) < poolProperties.getValidationInterval()) {
+        if (validateAction != VALIDATE_INIT && configuration.getValidationInterval() > 0 &&
+                (now - this.lastValidated) < configuration.getValidationInterval()) {
             return true;
         }
 
@@ -1066,7 +1377,7 @@ public class PooledConnection implements PooledConnectionMBean {
         // run that one mid-borrow and name it in a log line about work
         // the first one did. The snapshot decides, is called, and signs
         // the log lines alike.
-        final Validator validator = poolProperties.getValidator();
+        final Validator validator = configuration.getValidator();
         if (validator != null) {
             boolean valid;
             try {
@@ -1085,7 +1396,7 @@ public class PooledConnection implements PooledConnectionMBean {
                 // common one - and that is a check that cannot vouch for the
                 // session, nothing else. Only the fatal conditions that
                 // handleThrowable re-throws keep propagating.
-                if (getPoolProperties().getLogValidationErrors()) {
+                if (configuration().getLogValidationErrors()) {
                     log.error(MessageFactory.get("pooledConnection.customValidationThrew",
                             validator), PoolUtilities.maskCredentials(x));
                 } else if (log.isDebugEnabled()) {
@@ -1097,7 +1408,7 @@ public class PooledConnection implements PooledConnectionMBean {
                 this.lastValidated = System.currentTimeMillis();
                 return true;
             } else {
-                if (getPoolProperties().getLogValidationErrors()) {
+                if (configuration().getLogValidationErrors()) {
                     log.error(MessageFactory.get("pooledConnection.customValidationFailed",
                             validator));
                 }
@@ -1114,7 +1425,7 @@ public class PooledConnection implements PooledConnectionMBean {
         // session that connect() established moments ago, so the transaction
         // this execution opens is the pool's own initialization work, and
         // nothing a borrower could have left behind on it.
-        String initSql = PoolProperties.configuredStatement(poolProperties.getInitSQL());
+        String initSql = PoolProperties.configuredStatement(configuration.getInitSQL());
         boolean executingInitSql = validateAction == VALIDATE_INIT && initSql != null;
 
         if (executingInitSql) {
@@ -1122,12 +1433,12 @@ public class PooledConnection implements PooledConnectionMBean {
         }
 
         if (query == null) {
-            query = PoolProperties.configuredStatement(poolProperties.getValidationQuery());
+            query = PoolProperties.configuredStatement(configuration.getValidationQuery());
         }
 
         if (query == null) {
             boolean transactionTerminated = false;
-            int validationQueryTimeout = poolProperties.getValidationQueryTimeout();
+            int validationQueryTimeout = configuration.getValidationQueryTimeout();
             if (validationQueryTimeout < 0) {
                 validationQueryTimeout = 0;
             }
@@ -1141,7 +1452,7 @@ public class PooledConnection implements PooledConnectionMBean {
                     transactionTerminated = silentlyRollbackTransactionIfNeeded();
                     return transactionTerminated;
                 } else {
-                    if (getPoolProperties().getLogValidationErrors()) {
+                    if (configuration().getLogValidationErrors()) {
                         log.error(MessageFactory.get("pooledConnection.isValidReturnedFalse"));
                     }
                     return false;
@@ -1154,7 +1465,7 @@ public class PooledConnection implements PooledConnectionMBean {
                 // escaping from here unwinds the borrow path between the
                 // idle and busy queues and strands the pooled connection -
                 // permanently shrinking the pool
-                if (getPoolProperties().getLogValidationErrors()) {
+                if (configuration().getLogValidationErrors()) {
                     log.error(MessageFactory.get("pooledConnection.isValidFailed"),
                             PoolUtilities.maskCredentials(e));
                 } else if (e instanceof RuntimeException) {
@@ -1180,7 +1491,7 @@ public class PooledConnection implements PooledConnectionMBean {
                 // nothing better than an exception would; handleThrowable
                 // keeps the fatal conditions it keeps everywhere else.
                 ExceptionUtils.handleThrowable(x);
-                if (getPoolProperties().getLogValidationErrors()) {
+                if (configuration().getLogValidationErrors()) {
                     log.error(MessageFactory.get("pooledConnection.isValidFailed"),
                             PoolUtilities.maskCredentials(x));
                 } else {
@@ -1202,7 +1513,7 @@ public class PooledConnection implements PooledConnectionMBean {
         try {
             stmt = connection.createStatement();
 
-            int validationQueryTimeout = poolProperties.getValidationQueryTimeout();
+            int validationQueryTimeout = configuration.getValidationQueryTimeout();
             if (validationQueryTimeout > 0) {
                 stmt.setQueryTimeout(validationQueryTimeout);
             }
@@ -1238,7 +1549,7 @@ public class PooledConnection implements PooledConnectionMBean {
             // the borrow path between the idle and busy queues and strands
             // the pooled connection, whatever the throw's type.
             ExceptionUtils.handleThrowable(ex);
-            if (getPoolProperties().getLogValidationErrors()) {
+            if (configuration().getLogValidationErrors()) {
                 log.error(MessageFactory.get("pooledConnection.sqlValidationError"),
                         PoolUtilities.maskCredentials(ex));
             } else if (log.isDebugEnabled()) {
@@ -1277,15 +1588,20 @@ public class PooledConnection implements PooledConnectionMBean {
             if (!connection.getAutoCommit()) {
                 connection.commit();
             }
+            transactionDirty = false;
             return true;
         } catch (SQLException e) {
-            log.debug("Failed to commit transaction", PoolUtilities.maskCredentials(e));
+            if (configuration().getLogValidationErrors()) {
+                log.error(MessageFactory.get("pooledConnection.commitFailed"), PoolUtilities.maskCredentials(e));
+            } else if (log.isDebugEnabled()) {
+                log.debug("Failed to commit transaction", PoolUtilities.maskCredentials(e));
+            }
         } catch (Throwable e) {
             // A non-fatal Error is the same failed commit an unchecked
             // exception is: it must not escape through the caller's finally
             // block and strand the connection.
             ExceptionUtils.handleThrowable(e);
-            if (getPoolProperties().getLogValidationErrors()) {
+            if (configuration().getLogValidationErrors()) {
                 log.error(MessageFactory.get("pooledConnection.commitFailed"), PoolUtilities.maskCredentials(e));
             } else {
                 // The unchecked variant is logged at warn rather than debug,
@@ -1305,9 +1621,14 @@ public class PooledConnection implements PooledConnectionMBean {
             if (!connection.getAutoCommit()) {
                 connection.rollback();
             }
+            transactionDirty = false;
             return true;
         } catch (SQLException e) {
-            log.debug("Failed to rollback transaction", PoolUtilities.maskCredentials(e));
+            if (configuration().getLogValidationErrors()) {
+                log.error(MessageFactory.get("pooledConnection.rollbackFailed"), PoolUtilities.maskCredentials(e));
+            } else if (log.isDebugEnabled()) {
+                log.debug("Failed to rollback transaction", PoolUtilities.maskCredentials(e));
+            }
         } catch (Throwable e) {
             // A non-fatal Error is handled exactly like the unchecked
             // failure below.
@@ -1319,7 +1640,7 @@ public class PooledConnection implements PooledConnectionMBean {
             // through a caller's finally block, outside the catch that
             // converts it, and strand the pooled connection between the
             // idle and busy queues
-            if (getPoolProperties().getLogValidationErrors()) {
+            if (configuration().getLogValidationErrors()) {
                 log.error(MessageFactory.get("pooledConnection.rollbackFailed"), PoolUtilities.maskCredentials(e));
             } else {
                 // The unchecked variant is an anomaly of the same kind as
@@ -1343,7 +1664,7 @@ public class PooledConnection implements PooledConnectionMBean {
      * @return {@link PoolConfiguration#getMinEvictableIdleTimeMillis()}
      */
     public long getReleaseTime() {
-        return this.poolProperties.getMinEvictableIdleTimeMillis();
+        return configuration().getMinEvictableIdleTimeMillis();
     }
 
     /**
@@ -1547,10 +1868,41 @@ public class PooledConnection implements PooledConnectionMBean {
     }
 
     /**
+     * Returns whether a statement has executed, or a row has been changed, since the transaction was last ended. A
+     * connection running in manual commit mode can hold an open transaction only after work has been done in it, so the
+     * state interceptor uses this marker to skip a rollback that would have nothing to undo. The marker is raised
+     * before the work reaches the driver and cleared when {@code commit()}, {@code rollback()} without a savepoint or
+     * {@code setAutoCommit(true)} succeeds, or when a validation ends the transaction itself.
+     *
+     * @return {@code true} if work may have been done since the last transaction-ending operation
+     */
+    public boolean isTransactionDirty() {
+        return transactionDirty;
+    }
+
+    /**
+     * Clears the transaction-dirty marker after the pending transaction has been terminated, or when the session is
+     * known to have no transaction to terminate.
+     */
+    public void clearTransactionDirty() {
+        transactionDirty = false;
+    }
+
+    /**
+     * Marks the session as having work that may belong to an open transaction. Called by the statement facade before a
+     * statement execution or a result set row change reaches the driver.
+     */
+    void markTransactionDirty() {
+        transactionDirty = true;
+    }
+
+    /**
      * Returns the timestamp at which the last successful validation completed on the current physical session. While
      * the session has not been validated it reports 0, so a validation inherited from the session a reconnect replaced
      * cannot be mistaken for one of this session. Before any session has been established, it reports the time this
-     * pooled connection was created; disconnecting the session clears the timestamp with it.
+     * pooled connection was created: a placeholder that no borrower has taken yet carries its creation stamp, while a
+     * pooled connection that has been connected and then disconnected reports 0. Disconnecting the session clears the
+     * timestamp with it.
      *
      * @return the timestamp at which the last successful validation completed as defined by
      *             {@link System#currentTimeMillis()}, or 0 while the current session has not been validated
@@ -1575,7 +1927,7 @@ public class PooledConnection implements PooledConnectionMBean {
      * threads are performing operations on the connection. Otherwise this is a noop for performance
      */
     public void lock() {
-        if (poolProperties.getUseLock() || this.poolProperties.isPoolSweeperEnabled()) {
+        if (configuration().getUseLock() || configuration().isPoolSweeperEnabled()) {
             // Optimized, only use a lock when there is concurrency
             lock.writeLock().lock();
         }
@@ -1750,14 +2102,17 @@ public class PooledConnection implements PooledConnectionMBean {
      * Returns the attributes map for this connection.
      * <p>
      * This is the live internal map, not a copy: the pool and the interceptor chain read and write it while the
-     * session runs. It also holds the plaintext credential entries the connect path mirrors there, so it is intended
-     * for internal and trusted interceptor code; application code that obtains a {@link PooledConnection} through the
-     * delegate or reflection must not treat this as a public, credential-free view. The wrapper contract refuses the
-     * internal pooled connection; this accessor is the one internal surface that still exposes it.
+     * session runs. It is a synchronized map, so a late statement-cache call from an ended borrow can read it while a
+     * reconnect stages credentials on the same connection. It holds the plaintext credential entries the connect path
+     * mirrors there while the connection is in service - they are removed when the session is terminally released -
+     * so it is intended for internal and trusted interceptor code; application code that obtains a
+     * {@link PooledConnection} through the delegate or reflection must not treat this as a public, credential-free
+     * view. The wrapper contract refuses the internal pooled connection; this accessor is the one internal surface
+     * that still exposes it.
      *
      * @return the live attributes map for this connection
      */
-    public HashMap<Object, Object> getAttributes() {
+    public Map<Object, Object> getAttributes() {
         return attributes;
     }
 
@@ -1789,8 +2144,10 @@ public class PooledConnection implements PooledConnectionMBean {
     /**
      * Releases the MBeans published for this connection and for the interceptors of its chain, without releasing the
      * physical session. The pool uses this when its own MBean is released while the pool stays live: the connection
-     * and its chain remain usable, and a later reconnect, or the sweep that runs when the pool's own MBean is registered
-     * again, can publish them again. An ordinary borrow does not publish a connection MBean.
+     * and its chain remain usable. A later reconnect, or the sweep that runs when the pool's own MBean is registered
+     * again, publishes the connection MBean again. The interceptor MBeans are published again by the next borrow, when
+     * the chain's reset runs; those paths do not rebuild or re-register them. An ordinary borrow does not publish a
+     * connection MBean.
      */
     public void unregisterMBean() {
         synchronized (this) {

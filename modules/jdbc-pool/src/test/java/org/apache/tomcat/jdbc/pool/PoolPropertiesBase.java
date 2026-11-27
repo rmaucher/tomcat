@@ -20,6 +20,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.sql.Connection;
 import java.util.ArrayList;
@@ -236,6 +237,42 @@ abstract class PoolPropertiesBase {
         Assertions.assertTrue(dump.contains("useStatementFacade="),
                 "a hostile toString() must not truncate the fields that follow it");
         Assertions.assertTrue(dump.endsWith("]"), "the dump must stay bracket-balanced");
+    }
+
+    @Test
+    void aFailingGetterTextIsMaskedAndFlattenedInTheDump() {
+        PoolProperties properties = new PoolProperties() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public String getUrl() {
+                throw new RuntimeException("failed for jdbc:h2:mem:test;PASSWORD=leaked\nforged");
+            }
+        };
+
+        String dump = properties.toString();
+
+        Assertions.assertFalse(dump.contains("leaked"),
+                "a credential carried by a failing getter must not reach the dump, was: " + dump);
+        Assertions.assertTrue(dump.contains("PASSWORD=********"),
+                "the credential must be masked in place, was: " + dump);
+        Assertions.assertFalse(dump.contains("\nforged") || dump.contains("\rforged"),
+                "a line break in the failure text must not forge a dump line, was: " + dump);
+    }
+
+    @Test
+    void aSnapshotCopyDoesNotConsumeADefaultPoolName() {
+        int before = PoolProperties.getPoolCounter();
+        PoolProperties source = new PoolProperties();
+        Assertions.assertEquals(before + 1, PoolProperties.getPoolCounter(),
+                "precondition: constructing a configuration consumes one default name");
+
+        PoolProperties copy = PoolProperties.copyOf(source);
+
+        Assertions.assertEquals(before + 1, PoolProperties.getPoolCounter(),
+                "a snapshot copy carries the source's name and must not consume another default name");
+        Assertions.assertEquals(source.getPoolName(), copy.getPoolName(),
+                "the copy must carry the source's pool name");
     }
 
     @Test
@@ -628,6 +665,65 @@ abstract class PoolPropertiesBase {
     }
 
     @Test
+    void interceptorPropertyParsersAcceptTrimmedAndMixedCaseValues() {
+        PoolProperties.InterceptorProperty bool =
+                new PoolProperties.InterceptorProperty("flag", " TRUE ");
+        Assertions.assertTrue(bool.getValueAsBoolean(false),
+                "a boolean property must be case-insensitive and tolerate whitespace");
+
+        PoolProperties.InterceptorProperty number =
+                new PoolProperties.InterceptorProperty("size", " 42 ");
+        Assertions.assertEquals(42, number.getValueAsInt(-1),
+                "a numeric property must tolerate surrounding whitespace");
+        Assertions.assertEquals(42L, number.getValueAsLong(-1L));
+    }
+
+    @Test
+    void blankConnectionPropertiesNormalizeToNull() {
+        PoolProperties properties = new PoolProperties();
+        properties.setConnectionProperties("keep=yes");
+
+        properties.setConnectionProperties("   ");
+
+        Assertions.assertNull(properties.getConnectionProperties(),
+                "a blank string means the unset value, not an empty configured string");
+        Assertions.assertTrue(properties.getDbProperties().isEmpty(),
+                "the previous string's pairs must be removed with the blank reconfiguration");
+    }
+
+    @Test
+    void aDeserializedConfigurationRebuildsThePreviousStringsKeys() throws Exception {
+        PoolProperties properties = new PoolProperties();
+        properties.setConnectionProperties("stale=leftover");
+        properties.getDbProperties().setProperty("user", DEFAULT_USER);
+        Field keys = PoolProperties.class.getDeclaredField("connectionPropertyKeys");
+        keys.setAccessible(true);
+        keys.set(properties, null); // the state a pre-field serialized stream produces
+
+        properties.setConnectionProperties("fresh=value");
+
+        Assertions.assertEquals("value", properties.getDbProperties().getProperty("fresh"));
+        Assertions.assertNull(properties.getDbProperties().getProperty("stale"),
+                "a reconfiguration must still remove the keys the previous string contributed, "
+                        + "even when the tracking field was absent from a deserialized configuration");
+        Assertions.assertEquals(DEFAULT_USER, properties.getDbProperties().getProperty("user"),
+                "a credential outside the string must survive the reconfiguration");
+    }
+
+    @Test
+    void aMalformedConnectionPropertiesAttributeFailsTheFactoryNamingIt() {
+        Properties attrs = new Properties();
+        attrs.setProperty("connectionProperties", "good=1;bad=\\uZZ");
+
+        IllegalArgumentException failure = Assertions.assertThrows(IllegalArgumentException.class,
+                () -> DataSourceFactory.parsePoolProperties(attrs),
+                "a malformed connectionProperties value must fail the lookup");
+
+        Assertions.assertTrue(failure.getMessage().contains("connectionProperties"),
+                "the refusal must name the attribute, was: " + failure.getMessage());
+    }
+
+    @Test
     void clearedConnectionPropertiesRemoveEveryParsedPair() {
         PoolProperties properties = new PoolProperties();
         properties.setConnectionProperties("stale=leftover");
@@ -863,6 +959,50 @@ abstract class PoolPropertiesBase {
     }
 
     @Test
+    void toStringMasksUserinfoPasswordsCarryingUrlOrPropertiesSeparators() {
+        String[][] cases = {
+                { "jdbc:mysql://u:ab?cd@h/db", "jdbc:mysql://u:********@h/db", "ab?cd" },
+                { "jdbc:mysql://u:ab&cd@h/db", "jdbc:mysql://u:********@h/db", "ab&cd" },
+                { "jdbc:mysql://u:ab;cd@h/db", "jdbc:mysql://u:********@h/db", "ab;cd" },
+                { "jdbc:oracle:thin:user/pass?word@host:1521:sid",
+                        "jdbc:oracle:thin:user/********@host:1521:sid", "pass?word" },
+                { "jdbc:oracle:thin:user/pass&word@host:1521:sid",
+                        "jdbc:oracle:thin:user/********@host:1521:sid", "pass&word" },
+                { "jdbc:oracle:thin:user/pass;word@host:1521:sid",
+                        "jdbc:oracle:thin:user/********@host:1521:sid", "pass;word" },
+        };
+        for (String[] c : cases) {
+            PoolProperties properties = new PoolProperties();
+            properties.setUrl(c[0]);
+
+            String asString = properties.toString();
+
+            Assertions.assertFalse(asString.contains(c[2]),
+                    "the password carrying a separator must not leak: " + c[0] + ", was: " + asString);
+            Assertions.assertTrue(asString.contains("url=" + c[1]),
+                    "the user and host must stay readable around the mask: " + c[0] + ", was: " + asString);
+        }
+    }
+
+    @Test
+    void toStringDoesNotMistakeAFragmentOrQueryAtSignForAUserinfoPassword() {
+        String[] urls = {
+                "jdbc:mysql://host:80#frag@x",
+                "jdbc:postgresql://host:5432/db?mail=admin@corp.com",
+        };
+        for (String url : urls) {
+            PoolProperties properties = new PoolProperties();
+            properties.setUrl(url);
+
+            String asString = properties.toString();
+
+            Assertions.assertTrue(asString.contains("url=" + url),
+                    "an '@' after the authority, in a fragment or query, must not be masked as a "
+                            + "userinfo password: " + url + ", was: " + asString);
+        }
+    }
+
+    @Test
     void toStringLeavesUrlAuthoritiesWithoutAUserinfoPasswordUntouched() {
         String[] urls = {
                 "jdbc:mysql://host:3306/db",
@@ -1076,6 +1216,21 @@ abstract class PoolPropertiesBase {
         Assertions.assertTrue(asString.contains("jdbcInterceptors=ResetAbandonedTimer;"
                         + "custom.MyInterceptor(user=bob,password=********,PWD=********)"),
                 "the class name and the other properties must stay readable, was: " + asString);
+    }
+
+    @Test
+    void toStringMasksAnInterceptorCredentialContainingADefinitionSeparator() {
+        PoolProperties properties = new PoolProperties();
+        properties.setJdbcInterceptors("StatementCache(password=ab;cd,prepared=true)");
+
+        String asString = properties.toString();
+
+        Assertions.assertFalse(asString.contains("ab;cd"),
+                "a semicolon inside a credential value must not end the definition and leak the tail, was: "
+                        + asString);
+        Assertions.assertTrue(asString.contains(
+                        "StatementCache(password=********,prepared=true)"),
+                "the class, the rest of the value and the following pair must stay readable, was: " + asString);
     }
 
     @Test

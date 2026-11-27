@@ -270,6 +270,11 @@ public class SlowQueryReport extends AbstractQueryReport {
      * line the report owns. The length is not bounded here: surfacing the slow statement in full is what this
      * interceptor is configured for. The JMX notification for the same event sanitises it the same way, because a
      * listener may log the text it receives; the statistics store keeps the statement as executed.
+     * <p>
+     * The SQL text is not masked: literals can contain application data, tenant data or credentials typed into
+     * statements such as {@code CREATE USER} or {@code SET PASSWORD}. Slow and failed query logging deliberately
+     * exposes the statement text, and the {@code logSlow}/{@code logFailed} options should only be enabled where that
+     * exposure is acceptable. This flattening only prevents log-line forgery; it is not a data-protection measure.
      * </p>
      *
      * @param sql the SQL text to report, possibly {@code null}
@@ -761,10 +766,14 @@ public class SlowQueryReport extends AbstractQueryReport {
      *             read as false
      */
     protected static Boolean flagValue(String value) {
-        if ("true".equalsIgnoreCase(value)) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        if ("true".equalsIgnoreCase(trimmed)) {
             return Boolean.TRUE;
         }
-        if ("false".equalsIgnoreCase(value)) {
+        if ("false".equalsIgnoreCase(trimmed)) {
             return Boolean.FALSE;
         }
         return null;
@@ -908,9 +917,11 @@ public class SlowQueryReport extends AbstractQueryReport {
 
         static final String[] FIELD_DESCRIPTIONS = new String[] { "The SQL query",
                 "The number of query invocations, a call to executeXXX",
-                "The longest time for this query in milliseconds, 0 while no execution has been recorded yet",
+                "The longest time for this query in milliseconds, 0 while no execution has been recorded yet "
+                        + "in this composite view (the Java getter returns Long.MIN_VALUE until then)",
                 "The time and date for when the longest query took place",
-                "The shortest time for this query in milliseconds, 0 while no execution has been recorded yet",
+                "The shortest time for this query in milliseconds, 0 while no execution has been recorded yet "
+                        + "in this composite view (the Java getter returns Long.MAX_VALUE until then)",
                 "The time and date for when the shortest query took place",
                 "The total amount of milliseconds spent executing this query", "The number of failures for this query",
                 "The number of times this query was prepared (prepareStatement/prepareCall)",

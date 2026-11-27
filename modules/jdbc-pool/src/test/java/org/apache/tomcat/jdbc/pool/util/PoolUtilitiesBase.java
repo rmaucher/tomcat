@@ -16,6 +16,7 @@
  */
 package org.apache.tomcat.jdbc.pool.util;
 
+import java.sql.SQLException;
 import java.util.Collections;
 import java.util.Properties;
 
@@ -185,6 +186,58 @@ abstract class PoolUtilitiesBase {
                 masked.stringPropertyNames(),
                 "a credential the source resolves through its defaults must not survive"
                         + " into the tableless copy");
+    }
+
+    @Test
+    void maskingAThrowableFlattensEveryMessage() {
+        SQLException failure = new SQLException(
+                "driver failed\npassword=top-secret\rsecond line", "08001", 7);
+        failure.initCause(new SQLException("cause\npassword=nested-secret"));
+
+        Throwable masked = PoolUtilities.maskCredentials(failure);
+
+        Assertions.assertInstanceOf(SQLException.class, masked);
+        Assertions.assertEquals("08001", ((SQLException) masked).getSQLState());
+        Assertions.assertEquals(7, ((SQLException) masked).getErrorCode());
+        Assertions.assertFalse(masked.getMessage().contains("\n")
+                || masked.getMessage().contains("\r"),
+                "a throwable message must be flattened, was: " + masked.getMessage());
+        Assertions.assertFalse(masked.getMessage().contains("top-secret"),
+                "a credential in the throwable message must be masked, was: " + masked.getMessage());
+        Assertions.assertTrue(masked.getMessage().contains("password=********"),
+                "the credential must be masked in place, was: " + masked.getMessage());
+        Assertions.assertNotNull(masked.getCause(), "the cause must survive the copy");
+        Assertions.assertFalse(masked.getCause().getMessage().contains("\n")
+                || masked.getCause().getMessage().contains("\r"),
+                "the cause message must be flattened too, was: " + masked.getCause().getMessage());
+        Assertions.assertFalse(masked.getCause().getMessage().contains("nested-secret"));
+    }
+
+    @Test
+    void cloneWithoutPasswordMasksCredentialsEmbeddedInPropertyValues() {
+        Properties source = new Properties();
+        source.setProperty("url", "jdbc:mysql://user:url-secret@host/db");
+        source.setProperty("logUrl", "http://admin:log-secret@host/path");
+        source.setProperty("connectionString", "user=bob&password=value-secret");
+        source.setProperty("applicationName", "plain-value");
+
+        Properties masked = PoolUtilities.cloneWithoutPassword(source);
+
+        Assertions.assertEquals("jdbc:mysql://user:********@host/db",
+                masked.getProperty("url"),
+                "a credential in a URL-shaped property value must be masked");
+        Assertions.assertEquals("http://admin:********@host/path",
+                masked.getProperty("logUrl"),
+                "a credential in any URL-shaped value must be masked");
+        Assertions.assertEquals("user=bob&password=********",
+                masked.getProperty("connectionString"),
+                "a credential pair inside a value must be masked");
+        Assertions.assertEquals("plain-value", masked.getProperty("applicationName"),
+                "an ordinary value must be unchanged");
+
+        Assertions.assertEquals("jdbc:mysql://user:url-secret@host/db",
+                source.getProperty("url"),
+                "masking the copy must leave the source alone");
     }
 
     @Test

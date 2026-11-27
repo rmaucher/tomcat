@@ -111,29 +111,113 @@ public class PoolUtilities {
     }
 
     /**
+     * Whether {@code key} names the user name, ignoring case and surrounding whitespace. The credential setters
+     * replace every spelling of the key, so the connect path recognizes the same spellings when it normalizes the
+     * properties it hands to the driver.
+     *
+     * @param key the property key to test, possibly {@code null}
+     *
+     * @return {@code true} when the key names the user name
+     */
+    static boolean isUsernameKey(String key) {
+        return key != null && PROP_USER.equalsIgnoreCase(key.trim());
+    }
+
+    /**
+     * Removes every entry whose key is recognized by {@link #isCredentialKey(String)} from the given properties. The
+     * caller passes a defaults-free copy - the properties the connect path hands to the driver are one - so a plain
+     * removal reaches every credential entry.
+     *
+     * @param properties the properties to normalize
+     */
+    static void removeCredentialKeys(Properties properties) {
+        for (Object key : properties.keySet().toArray()) {
+            if (key instanceof String && isCredentialKey((String) key)) {
+                properties.remove(key);
+            }
+        }
+    }
+
+    /**
+     * Removes every entry whose key is recognized by {@link #isUsernameKey(String)} from the given properties. The
+     * caller passes a defaults-free copy, as for {@link #removeCredentialKeys(Properties)}.
+     *
+     * @param properties the properties to normalize
+     */
+    static void removeUsernameKeys(Properties properties) {
+        for (Object key : properties.keySet().toArray()) {
+            if (key instanceof String && isUsernameKey((String) key)) {
+                properties.remove(key);
+            }
+        }
+    }
+
+    /**
      * Creates a copy of the given properties as {@link #clone(Properties)}
-     * does, with every credential entry removed. A credential entry is one
-     * whose key is recognised by {@link #isCredentialKey(String)}:
-     * {@code password}, {@code pass} and {@code pwd}, ignoring case and
-     * surrounding whitespace. The copy carries no defaults table, so the
+     * does, with every credential entry removed and every credential embedded
+     * in a string value masked. A credential entry is one whose key is
+     * recognised by {@link #isCredentialKey(String)}: {@code password},
+     * {@code pass} and {@code pwd}, ignoring case and surrounding whitespace.
+     * A value can itself carry a credential - a {@code url} property whose
+     * value is a URL with a userinfo password, or a value holding a
+     * credential pair - so string values are passed through the same masking
+     * the configuration dump uses. The copy carries no defaults table, so the
      * removal also reaches a credential the source only resolved through its
      * defaults - a reference copy would let the remove walk past the defaults
      * table and leave the credential resolvable.
      *
      * @param p the properties to clone, not {@code null}
      *
-     * @return a new Properties instance with all entries except the credentials
+     * @return a new Properties instance with credentials removed or masked
      *
      * @throws NullPointerException if the source is {@code null}
      */
     public static Properties cloneWithoutPassword(Properties p) {
         Properties result = clone(p);
         for (Object key : result.keySet().toArray()) {
-            if (key instanceof String && isCredentialKey((String) key)) {
-                result.remove(key);
+            if (key instanceof String) {
+                if (isCredentialKey((String) key)) {
+                    result.remove(key);
+                    continue;
+                }
+                Object value = result.get(key);
+                if (value instanceof String) {
+                    String masked = PoolProperties.maskCredentials((String) value);
+                    if (!masked.equals(value)) {
+                        result.put(key, masked);
+                    }
+                }
             }
         }
         return result;
+    }
+
+    /**
+     * Masks any credentials in a diagnostic text and flattens carriage returns and line feeds, so third-party or
+     * application-shaped text cannot leak a credential or forge additional log lines. This is the common shape of the
+     * module's log diagnostics: the configuration dump and the pool's messages use it for every value that may come
+     * from outside the pool's own code.
+     *
+     * @param value the raw text, possibly {@code null}
+     *
+     * @return the masked and flattened text, or {@code null} when the input is {@code null}
+     */
+    public static String maskAndFlatten(String value) {
+        return flatten(PoolProperties.maskCredentials(value));
+    }
+
+    /**
+     * Replaces carriage returns and line feeds with spaces, so text carrying them cannot forge additional log lines.
+     *
+     * @param value the text, possibly {@code null}
+     *
+     * @return the flattened text, or {@code null} when the input is {@code null}
+     */
+    private static String flatten(String value) {
+        if (value == null || (value.indexOf('\r') < 0 && value.indexOf('\n') < 0)) {
+            return value;
+        }
+        return value.replace('\r', ' ').replace('\n', ' ');
     }
 
     /**
@@ -154,7 +238,10 @@ public class PoolUtilities {
         if (previous != null) {
             return previous;
         }
-        String message = PoolProperties.maskCredentials(value.getMessage());
+        // The throwable's text is third-party: mask it and flatten line breaks,
+        // as the string diagnostics do, so a driver message cannot forge a log
+        // line through a Throwable-carrying log record.
+        String message = flatten(PoolProperties.maskCredentials(value.getMessage()));
         Throwable copy;
         if (value instanceof SQLException) {
             SQLException sql = (SQLException) value;

@@ -223,7 +223,13 @@ public class AsyncContextImpl implements AsyncContext, AsyncContextCallback {
         // Calls check() so local copies are validated
         HttpServletRequest hsr = getRequest() instanceof HttpServletRequest h ? h : request;
         String path = hsr.getRequestURI();
-        String cpath = RequestUtil.getContextPathEncoded(request.getConnector(), hsr);
+        String cpath;
+        try {
+            cpath = RequestUtil.getContextPathEncoded(request.getConnector(), hsr);
+        } catch (IllegalStateException ise) {
+            failDispatch(ise);
+            throw ise;
+        }
         if (cpath.length() > 1) {
             path = path.substring(cpath.length());
         }
@@ -235,8 +241,44 @@ public class AsyncContextImpl implements AsyncContext, AsyncContextCallback {
         try {
             uriEncoded.set(Boolean.TRUE);
             dispatch(path);
+        } catch (UnsupportedOperationException | IllegalArgumentException e) {
+            failDispatch(e);
+            throw e;
         } finally {
             uriEncoded.set(Boolean.FALSE);
+        }
+    }
+
+
+    /**
+     * Called when {@link #dispatch()} fails because the dispatch path, that was derived by the container, could not be
+     * used. The application can't be expected to recover from this.
+     * <p>
+     * If the caller is the container thread that is processing the request, the exception propagates out of the
+     * application and is handled by the container. In any other case nothing would handle the exception on behalf of
+     * the container and the request would remain in the asynchronous state until the asynchronous timeout expired
+     * (which might be never). Dispatch to a container thread, as for a normal dispatch, but rather than dispatching
+     * the request, throw the exception so that it is handled in the same way as any other failure of an asynchronous
+     * dispatch.
+     *
+     * @param t The reason the dispatch failed
+     */
+    private void failDispatch(RuntimeException t) {
+        if (request.getCoyoteRequest().isRequestThread()) {
+            return;
+        }
+        synchronized (asyncContextLock) {
+            if (dispatch != null) {
+                // A dispatch has already been requested
+                return;
+            }
+            // Runs on a container thread where the failure is handled like any other failure of an async dispatch
+            dispatch = () -> {
+                // As for a normal dispatch, the dispatch is now being processed
+                request.getCoyoteRequest().action(ActionCode.ASYNC_DISPATCHED, null);
+                throw t;
+            };
+            request.getCoyoteRequest().action(ActionCode.ASYNC_DISPATCH, null);
         }
     }
 
@@ -256,16 +298,18 @@ public class AsyncContextImpl implements AsyncContext, AsyncContextCallback {
             if (dispatch != null) {
                 throw new IllegalStateException(sm.getString("asyncContextImpl.dispatchingStarted"));
             }
+            final RequestDispatcher requestDispatcher = servletContext.getRequestDispatcher(path);
+            if (!(requestDispatcher instanceof AsyncDispatcher applicationDispatcher)) {
+                // Fail before changing the state of the request so the caller can recover (e.g. complete() or
+                // dispatch to a different path)
+                throw new UnsupportedOperationException(sm.getString("asyncContextImpl.noAsyncDispatcher"));
+            }
             if (request.getAttribute(ASYNC_REQUEST_URI) == null) {
                 request.setAttribute(ASYNC_REQUEST_URI, request.getRequestURI());
                 request.setAttribute(ASYNC_CONTEXT_PATH, request.getContextPath());
                 request.setAttribute(ASYNC_SERVLET_PATH, request.getServletPath());
                 request.setAttribute(ASYNC_PATH_INFO, request.getPathInfo());
                 request.setAttribute(ASYNC_QUERY_STRING, request.getQueryString());
-            }
-            final RequestDispatcher requestDispatcher = servletContext.getRequestDispatcher(path);
-            if (!(requestDispatcher instanceof AsyncDispatcher applicationDispatcher)) {
-                throw new UnsupportedOperationException(sm.getString("asyncContextImpl.noAsyncDispatcher"));
             }
             final ServletRequest servletRequest = getRequest();
             final ServletResponse servletResponse = getResponse();
@@ -521,14 +565,23 @@ public class AsyncContextImpl implements AsyncContext, AsyncContextCallback {
             AsyncEvent errorEvent =
                     new AsyncEvent(event.getAsyncContext(), event.getSuppliedRequest(), event.getSuppliedResponse(), t);
             List<AsyncListenerWrapper> listenersCopy = new ArrayList<>(listeners);
-            for (AsyncListenerWrapper listener : listenersCopy) {
-                try {
-                    listener.fireOnError(errorEvent);
-                } catch (Throwable t2) {
-                    ExceptionUtils.handleThrowable(t2);
-                    log.warn(sm.getString("asyncContextImpl.onErrorError", listener.getClass().getName()), t2);
-                } finally {
-                    hasOnErrorReturned.set(true);
+            // The listeners are application code so need the application's context. Not all callers have bound it.
+            Context context = this.context;
+            ClassLoader oldCL = context == null ? null : context.bind(null);
+            try {
+                for (AsyncListenerWrapper listener : listenersCopy) {
+                    try {
+                        listener.fireOnError(errorEvent);
+                    } catch (Throwable t2) {
+                        ExceptionUtils.handleThrowable(t2);
+                        log.warn(sm.getString("asyncContextImpl.onErrorError", listener.getClass().getName()), t2);
+                    } finally {
+                        hasOnErrorReturned.set(true);
+                    }
+                }
+            } finally {
+                if (context != null) {
+                    context.unbind(oldCL);
                 }
             }
         }

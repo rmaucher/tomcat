@@ -19,6 +19,8 @@ package org.apache.catalina.core;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
@@ -29,6 +31,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.LogManager;
 
@@ -39,6 +43,7 @@ import jakarta.servlet.DispatcherType;
 import jakarta.servlet.GenericServlet;
 import jakarta.servlet.RequestDispatcher;
 import jakarta.servlet.Servlet;
+import jakarta.servlet.ServletContext;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.ServletRequest;
@@ -50,6 +55,7 @@ import jakarta.servlet.ServletResponseWrapper;
 import jakarta.servlet.WriteListener;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletRequestWrapper;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.junit.Assert;
@@ -2544,6 +2550,579 @@ public class TestAsyncContextImpl extends TomcatBaseTest {
         Assert.assertEquals(200, rc);
         // Same pathInfo before and after the dispatch
         Assert.assertEquals("/foo;bar|/foo;bar", responseBody.toString());
+    }
+
+
+    /*
+     * The request URI includes dot segments that return to the context path. The remainder of the URI must still be
+     * used for the dispatch. The servlet should see exactly the same path info before and after the dispatch.
+     */
+    @Test
+    public void testAsyncDispatchDotSegmentsAfterContextPath() throws Exception {
+        doTestAsyncDispatchPath("/test/../test/semicolon/foo", "/foo|/foo");
+    }
+
+
+    @Test
+    public void testAsyncDispatchDotSegmentsAfterContextPathRepeated() throws Exception {
+        doTestAsyncDispatchPath("/test/../test/../test/semicolon/foo", "/foo|/foo");
+    }
+
+
+    /*
+     * The dot segments that climb out of the context follow other segments rather than immediately following the
+     * context path.
+     */
+    @Test
+    public void testAsyncDispatchDotSegmentsLaterClimbOutOfContext() throws Exception {
+        doTestAsyncDispatchPath("/test/a/b/c/../../../../test/semicolon/foo", "/foo|/foo");
+    }
+
+
+    @Test
+    public void testAsyncDispatchEncodedDotSegmentsAfterContextPath() throws Exception {
+        doTestAsyncDispatchPath("/test/%2e%2e/test/semicolon/foo", "/foo|/foo");
+    }
+
+
+    /*
+     * The path for the dispatch in AsyncContext.dispatch() is derived by the container so, if it can't be used, the
+     * application can't be expected to recover. If the caller is not the container thread that is processing the
+     * request there is nothing to handle the exception so the container must complete the request rather than leave
+     * it waiting for the async timeout (which could be infinite).
+     */
+    @Test
+    public void testAsyncDispatchNoArgFailureNonContainerThread() throws Exception {
+        AsyncDispatchNoArgFailureServlet servlet = new AsyncDispatchNoArgFailureServlet(false);
+        long elapsed = doTestAsyncDispatchNoArgFailure(servlet);
+
+        // The async timeout is 10s
+        Assert.assertTrue("Request waited for the async timeout: " + elapsed + "ms", elapsed < 5000);
+        Assert.assertTrue("The caller must be told about the failure", servlet.callerException.get() instanceof
+                UnsupportedOperationException);
+        // The failure is handled like any other failure of an async dispatch so may be wrapped
+        Throwable listenerThrowable = servlet.listenerThrowable.get();
+        while (listenerThrowable != null && !(listenerThrowable instanceof UnsupportedOperationException)) {
+            listenerThrowable = listenerThrowable.getCause();
+        }
+        Assert.assertNotNull("onError() must be called with the failure", listenerThrowable);
+        Assert.assertTrue("onComplete() must be called", servlet.completed.await(5, TimeUnit.SECONDS));
+    }
+
+
+    /*
+     * As above but the caller is the container thread that is processing the request so the exception propagates out
+     * of the application and is handled in the usual way.
+     */
+    @Test
+    public void testAsyncDispatchNoArgFailureContainerThread() throws Exception {
+        AsyncDispatchNoArgFailureServlet servlet = new AsyncDispatchNoArgFailureServlet(true);
+        long elapsed = doTestAsyncDispatchNoArgFailure(servlet);
+
+        Assert.assertTrue("Request waited for the async timeout: " + elapsed + "ms", elapsed < 5000);
+        Assert.assertTrue("onComplete() must be called", servlet.completed.await(5, TimeUnit.SECONDS));
+    }
+
+
+    /*
+     * The failure is handled in the same way as any other failure so a mapped error page for the exception must be
+     * used.
+     */
+    @Test
+    public void testAsyncDispatchNoArgFailureNonContainerThreadErrorPage() throws Exception {
+        AsyncDispatchNoArgFailureServlet servlet = new AsyncDispatchNoArgFailureServlet(false);
+        ByteChunk responseBody = new ByteChunk();
+        long elapsed = doTestAsyncDispatchNoArgFailure(servlet, context -> {
+            Tomcat.addServlet(context, "errorPage", new HttpServlet() {
+                private static final long serialVersionUID = 1L;
+
+                @Override
+                protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+                    resp.setContentType("text/plain");
+                    resp.getWriter().print("ERROR-PAGE:" +
+                            ((Class<?>) req.getAttribute(RequestDispatcher.ERROR_EXCEPTION_TYPE)).getName());
+                }
+            });
+            context.addServletMapping("/errorPage", "errorPage");
+            ErrorPage errorPage = new ErrorPage();
+            errorPage.setExceptionType(UnsupportedOperationException.class.getName());
+            errorPage.setLocation("/errorPage");
+            context.addErrorPage(errorPage);
+        }, responseBody);
+
+        Assert.assertTrue("Request waited for the async timeout: " + elapsed + "ms", elapsed < 5000);
+        Assert.assertEquals("ERROR-PAGE:" + UnsupportedOperationException.class.getName(),
+                responseBody.toString());
+    }
+
+
+    /*
+     * Each listener must be able to use the AsyncContext to recover from the failure, not just the first.
+     */
+    @Test
+    public void testAsyncDispatchNoArgFailureNonContainerThreadSecondListenerCompletes() throws Exception {
+        AsyncDispatchNoArgFailureServlet servlet = new AsyncDispatchNoArgFailureServlet(false);
+        servlet.secondListenerCompletes = true;
+        ByteChunk responseBody = new ByteChunk();
+        long elapsed = doTestAsyncDispatchNoArgFailure(servlet, null, responseBody);
+
+        Assert.assertTrue("Request waited for the async timeout: " + elapsed + "ms", elapsed < 5000);
+        Assert.assertNull("The second listener must be able to use the AsyncContext",
+                servlet.secondListenerException.get());
+        Assert.assertTrue("onComplete() must be called", servlet.completed.await(5, TimeUnit.SECONDS));
+    }
+
+
+    /*
+     * The failure is handled like the failure of any other asynchronous dispatch so an error page must be able to start
+     * asynchronous processing.
+     */
+    @Test
+    public void testAsyncDispatchNoArgFailureNonContainerThreadErrorPageStartsAsync() throws Exception {
+        AsyncDispatchNoArgFailureServlet servlet = new AsyncDispatchNoArgFailureServlet(false);
+        AtomicReference<Throwable> errorPageException = new AtomicReference<>();
+        ByteChunk responseBody = new ByteChunk();
+        long elapsed = doTestAsyncDispatchNoArgFailure(servlet, context -> {
+            Wrapper w = Tomcat.addServlet(context, "errorPage", new HttpServlet() {
+                private static final long serialVersionUID = 1L;
+
+                @Override
+                protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+                    try {
+                        AsyncContext ac = req.startAsync();
+                        resp.setContentType("text/plain");
+                        resp.getWriter().print("ERROR-PAGE-ASYNC");
+                        ac.complete();
+                    } catch (RuntimeException e) {
+                        errorPageException.set(e);
+                    }
+                }
+            });
+            w.setAsyncSupported(true);
+            context.addServletMapping("/errorPage", "errorPage");
+            ErrorPage errorPage = new ErrorPage();
+            errorPage.setExceptionType(UnsupportedOperationException.class.getName());
+            errorPage.setLocation("/errorPage");
+            context.addErrorPage(errorPage);
+        }, responseBody, 500);
+
+        Assert.assertTrue("Request waited for the async timeout: " + elapsed + "ms", elapsed < 5000);
+        Assert.assertNull("The error page must be able to start async processing", errorPageException.get());
+        Assert.assertEquals("ERROR-PAGE-ASYNC", responseBody.toString());
+    }
+
+
+    private long doTestAsyncDispatchNoArgFailure(AsyncDispatchNoArgFailureServlet servlet) throws Exception {
+        return doTestAsyncDispatchNoArgFailure(servlet, null, new ByteChunk());
+    }
+
+
+    private long doTestAsyncDispatchNoArgFailure(AsyncDispatchNoArgFailureServlet servlet,
+            Consumer<Context> contextConfig, ByteChunk responseBody) throws Exception {
+        return doTestAsyncDispatchNoArgFailure(servlet, contextConfig, responseBody, 500);
+    }
+
+
+    private long doTestAsyncDispatchNoArgFailure(AsyncDispatchNoArgFailureServlet servlet,
+            Consumer<Context> contextConfig, ByteChunk responseBody, int expectedStatus) throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Context context = tomcat.addContext("/test", null);
+        // Disable class path scanning - it slows the tests down by almost an order of magnitude
+        ((StandardJarScanner) context.getJarScanner()).setScanClassPath(false);
+
+        Wrapper w = Tomcat.addServlet(context, "failure", servlet);
+        w.setAsyncSupported(true);
+        context.addServletMapping("/failure", "failure");
+        if (contextConfig != null) {
+            contextConfig.accept(context);
+        }
+        tomcat.start();
+
+        long start = System.nanoTime();
+        int rc = getUrl("http://localhost:" + getPort() + "/test/failure", responseBody, null);
+        long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+        Assert.assertEquals(responseBody.toString(), expectedStatus, rc);
+        return elapsed;
+    }
+
+
+    /*
+     * Starts async processing with a request that provides a ServletContext that can't provide a dispatcher that
+     * supports async dispatching. This simulates a failure in the container.
+     */
+    private static class AsyncDispatchNoArgFailureServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        private final boolean containerThread;
+        private boolean secondListenerCompletes = false;
+        private final transient AtomicReference<Throwable> callerException = new AtomicReference<>();
+        private final transient AtomicReference<Throwable> listenerThrowable = new AtomicReference<>();
+        private final transient AtomicReference<Throwable> secondListenerException = new AtomicReference<>();
+        private final transient CountDownLatch completed = new CountDownLatch(1);
+
+        AsyncDispatchNoArgFailureServlet(boolean containerThread) {
+            this.containerThread = containerThread;
+        }
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            ServletContext realContext = req.getServletContext();
+            ServletContext brokenContext = (ServletContext) Proxy.newProxyInstance(
+                    getClass().getClassLoader(), new Class<?>[] { ServletContext.class }, (proxy, method, args) -> {
+                        if ("getRequestDispatcher".equals(method.getName())) {
+                            // Not an AsyncDispatcher
+                            return new RequestDispatcher() {
+                                @Override
+                                public void forward(ServletRequest request, ServletResponse response) {
+                                    // NO-OP
+                                }
+
+                                @Override
+                                public void include(ServletRequest request, ServletResponse response) {
+                                    // NO-OP
+                                }
+                            };
+                        }
+                        try {
+                            return method.invoke(realContext, args);
+                        } catch (InvocationTargetException e) {
+                            throw e.getCause();
+                        }
+                    });
+            HttpServletRequest brokenRequest = new HttpServletRequestWrapper(req) {
+                @Override
+                public ServletContext getServletContext() {
+                    return brokenContext;
+                }
+            };
+
+            AsyncContext ac = req.startAsync(brokenRequest, resp);
+            // Long enough that the test fails if the request is left to time out
+            ac.setTimeout(10000);
+            ac.addListener(new AsyncListener() {
+                @Override
+                public void onComplete(AsyncEvent event) {
+                    completed.countDown();
+                }
+
+                @Override
+                public void onTimeout(AsyncEvent event) {
+                    // NO-OP
+                }
+
+                @Override
+                public void onError(AsyncEvent event) {
+                    listenerThrowable.set(event.getThrowable());
+                }
+
+                @Override
+                public void onStartAsync(AsyncEvent event) {
+                    // NO-OP
+                }
+            });
+            if (secondListenerCompletes) {
+                ac.addListener(new AsyncListener() {
+                    @Override
+                    public void onComplete(AsyncEvent event) {
+                        // NO-OP
+                    }
+
+                    @Override
+                    public void onTimeout(AsyncEvent event) {
+                        // NO-OP
+                    }
+
+                    @Override
+                    public void onError(AsyncEvent event) {
+                        try {
+                            event.getAsyncContext().complete();
+                        } catch (RuntimeException e) {
+                            secondListenerException.set(e);
+                        }
+                    }
+
+                    @Override
+                    public void onStartAsync(AsyncEvent event) {
+                        // NO-OP
+                    }
+                });
+            }
+
+            if (containerThread) {
+                ac.dispatch();
+            } else {
+                new Thread(() -> {
+                    try {
+                        ac.dispatch();
+                    } catch (RuntimeException e) {
+                        callerException.set(e);
+                    }
+                }).start();
+            }
+        }
+    }
+
+
+    /*
+     * AsyncListener.onError() is application code so must be called using the web application's class loader when an
+     * asynchronous dispatch fails.
+     */
+    @Test
+    public void testAsyncDispatchFailureListenerClassLoader() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Context context = tomcat.addContext("/test", null);
+        // Disable class path scanning - it slows the tests down by almost an order of magnitude
+        ((StandardJarScanner) context.getJarScanner()).setScanClassPath(false);
+
+        AtomicReference<ClassLoader> webappClassLoader = new AtomicReference<>();
+        AtomicReference<ClassLoader> listenerClassLoader = new AtomicReference<>();
+        CountDownLatch completed = new CountDownLatch(1);
+
+        Wrapper start = Tomcat.addServlet(context, "start", new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void doGet(HttpServletRequest req, HttpServletResponse resp) {
+                webappClassLoader.set(Thread.currentThread().getContextClassLoader());
+                AsyncContext ac = req.startAsync();
+                ac.addListener(new AsyncListener() {
+                    @Override
+                    public void onComplete(AsyncEvent event) {
+                        completed.countDown();
+                    }
+
+                    @Override
+                    public void onTimeout(AsyncEvent event) {
+                        // NO-OP
+                    }
+
+                    @Override
+                    public void onError(AsyncEvent event) {
+                        listenerClassLoader.set(Thread.currentThread().getContextClassLoader());
+                    }
+
+                    @Override
+                    public void onStartAsync(AsyncEvent event) {
+                        // NO-OP
+                    }
+                });
+                ac.dispatch("/failing");
+            }
+        });
+        start.setAsyncSupported(true);
+        context.addServletMapping("/start", "start");
+
+        Wrapper failing = Tomcat.addServlet(context, "failing", new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException {
+                throw new ServletException("Expected");
+            }
+        });
+        failing.setAsyncSupported(true);
+        context.addServletMapping("/failing", "failing");
+        tomcat.start();
+
+        int rc = getUrl("http://localhost:" + getPort() + "/test/start", new ByteChunk(), null);
+
+        Assert.assertEquals(500, rc);
+        Assert.assertTrue("onComplete() must be called", completed.await(5, TimeUnit.SECONDS));
+        Assert.assertNotNull(listenerClassLoader.get());
+        Assert.assertSame(webappClassLoader.get(), listenerClassLoader.get());
+    }
+
+
+    /*
+     * A failed dispatch must not change the state of the request. The application must be able to recover from the
+     * failure. In particular, the async attributes that record the original request must not have been set by the
+     * failed attempt.
+     */
+    @Test
+    public void testAsyncDispatchFailureLeavesRequestUnchanged() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Context context = tomcat.addContext("/test", null);
+        // Disable class path scanning - it slows the tests down by almost an order of magnitude
+        ((StandardJarScanner) context.getJarScanner()).setScanClassPath(false);
+
+        Wrapper w = Tomcat.addServlet(context, "recover", new AsyncDispatchFailureServlet());
+        w.setAsyncSupported(true);
+        context.addServletMapping("/recover", "recover");
+        tomcat.start();
+
+        ByteChunk responseBody = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + "/test/recover", responseBody, null);
+
+        Assert.assertEquals(200, rc);
+        // Failed with UnsupportedOperationException, no async attribute set, then the recovery dispatch worked
+        Assert.assertEquals("UOE|null|dispatched", responseBody.toString());
+    }
+
+
+    private static class AsyncDispatchFailureServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            if (req.getDispatcherType() == DispatcherType.ASYNC) {
+                resp.setContentType("text/plain");
+                resp.getWriter().print(req.getAttribute("result") + "|dispatched");
+                return;
+            }
+
+            AsyncContext ac = req.startAsync();
+            String result;
+            try {
+                // Escapes the context so there is no dispatcher
+                ac.dispatch("/../outside");
+                result = "dispatched?";
+            } catch (UnsupportedOperationException e) {
+                result = "UOE";
+            }
+            // The async attributes (set when a dispatch is made) must not have been set by the failed attempt
+            result = result + "|" + req.getAttribute(AsyncContext.ASYNC_REQUEST_URI);
+            req.setAttribute("result", result);
+            // Recover from the failure
+            ac.dispatch();
+        }
+    }
+
+
+    /*
+     * The connector decodes encoded solidus so, when the context path is removed from the request URI, an encoded solidus
+     * may be the first character of the path that is used for the dispatch. That is only a valid path if the context
+     * is configured to decode encoded solidus. The servlet must see exactly the same path info before and after the
+     * dispatch.
+     */
+    private static final String[][] ENCODED_SOLIDUS_CASES = {
+            { "/test%2fsemicolon%2ffoo", "/foo|/foo" },
+            { "/test/../test%2fsemicolon/foo", "/foo|/foo" },
+            { "/test%2f..%2ftest%2fsemicolon%2ffoo", "/foo|/foo" },
+            { "/test/../test%2fx/../semicolon/foo", "/foo|/foo" },
+            // Only one level of decoding
+            { "/test%2fsemicolon%2ffoo%252fbar", "/foo%2fbar|/foo%2fbar" } };
+
+
+    @Test
+    public void testAsyncDispatchEncodedSolidusDecodeContextDecode() throws Exception {
+        doTestAsyncDispatchPaths(ENCODED_SOLIDUS_CASES, "decode", "reject", "decode", "reject", false, 200);
+    }
+
+
+    @Test
+    public void testAsyncDispatchEncodedSolidusDecodeContextReject() throws Exception {
+        // The path used for the dispatch starts with an encoded solidus which the context rejects
+        doTestAsyncDispatchPaths(
+                new String[][] { ENCODED_SOLIDUS_CASES[0], ENCODED_SOLIDUS_CASES[1], ENCODED_SOLIDUS_CASES[2] },
+                "decode", "reject", "reject", "reject", false, 500);
+    }
+
+
+    @Test
+    public void testAsyncDispatchEncodedSolidusDecodeContextPassThrough() throws Exception {
+        // The encoded solidus is not decoded so the path used for the dispatch does not start with a '/'
+        doTestAsyncDispatchPaths(new String[][] { ENCODED_SOLIDUS_CASES[0] }, "decode", "reject", "passthrough",
+                "reject", false, 500);
+    }
+
+
+    /*
+     * The encoded solidus are passed through so test%2fx is a single path segment. The dot segments return to the
+     * context path after it. The path used for the dispatch does not contain an encoded solidus so does not depend on
+     * the configuration of the context.
+     */
+    @Test
+    public void testAsyncDispatchEncodedSolidusPassThroughContextReject() throws Exception {
+        doTestAsyncDispatchPaths(new String[][] { { "/test/../test%2fx/../test/semicolon/foo", "/foo|/foo" } },
+                "passthrough", "passthrough", "reject", "reject", false, 200);
+    }
+
+
+    @Test
+    public void testAsyncDispatchEncodedSolidusPassThroughContextPassThrough() throws Exception {
+        doTestAsyncDispatchPaths(new String[][] { { "/test/../test%2fx/../test/semicolon/foo", "/foo|/foo" } },
+                "passthrough", "passthrough", "passthrough", "passthrough", false, 200);
+    }
+
+
+    /*
+     * Path parameters are removed before the request URI is decoded so an encoded solidus or reverse solidus within one
+     * is not a separator. The path used for the dispatch is the path that follows the path parameters.
+     */
+    @Test
+    public void testAsyncDispatchEncodedSeparatorInPathParameter() throws Exception {
+        doTestAsyncDispatchPaths(new String[][] { { "/test;v=%2fignored/semicolon/foo", "/foo|/foo" },
+                { "/test;v=%5cignored/semicolon/foo", "/foo|/foo" } }, "decode", "decode", "decode", "decode", true,
+                200);
+    }
+
+
+    @Test
+    public void testAsyncDispatchEncodedReverseSolidusDecodeContextDecode() throws Exception {
+        doTestAsyncDispatchPaths(
+                new String[][] { { "/test%5csemicolon%5cfoo", "/foo|/foo" },
+                        { "/test/../test%5cx/../semicolon/foo", "/foo|/foo" } },
+                "reject", "decode", "reject", "decode", true, 200);
+    }
+
+
+    @Test
+    public void testAsyncDispatchEncodedReverseSolidusDecodeContextReject() throws Exception {
+        doTestAsyncDispatchPaths(new String[][] { { "/test%5csemicolon%5cfoo", "/foo|/foo" } }, "reject", "decode",
+                "reject", "reject", true, 500);
+    }
+
+
+    private void doTestAsyncDispatchPaths(String[][] cases, String encodedSolidusHandling,
+            String encodedReverseSolidusHandling, String contextEncodedSolidusHandling,
+            String contextEncodedReverseSolidusHandling, boolean allowBackslash, int expectedStatus)
+            throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        tomcat.getConnector().setEncodedSolidusHandling(encodedSolidusHandling);
+        tomcat.getConnector().setEncodedReverseSolidusHandling(encodedReverseSolidusHandling);
+        tomcat.getConnector().setAllowBackslash(allowBackslash);
+        Context context = tomcat.addContext("/test", null);
+        context.setEncodedSolidusHandling(contextEncodedSolidusHandling);
+        context.setEncodedReverseSolidusHandling(contextEncodedReverseSolidusHandling);
+        // Disable class path scanning - it slows the tests down by almost an order of magnitude
+        ((StandardJarScanner) context.getJarScanner()).setScanClassPath(false);
+
+        Wrapper w = Tomcat.addServlet(context, "semicolon", new AsyncDispatchPathInfoServlet());
+        w.setAsyncSupported(true);
+        context.addServletMapping("/semicolon/*", "semicolon");
+        tomcat.start();
+
+        for (String[] testCase : cases) {
+            ByteChunk responseBody = new ByteChunk();
+            int rc = getUrl("http://localhost:" + getPort() + testCase[0], responseBody, null);
+
+            Assert.assertEquals(testCase[0], expectedStatus, rc);
+            if (expectedStatus == 200) {
+                Assert.assertEquals(testCase[0], testCase[1], responseBody.toString());
+            }
+        }
+    }
+
+
+    private void doTestAsyncDispatchPath(String path, String expected) throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Context context = tomcat.addContext("/test", null);
+        // Disable class path scanning - it slows the tests down by almost an order of magnitude
+        ((StandardJarScanner) context.getJarScanner()).setScanClassPath(false);
+
+        Wrapper w = Tomcat.addServlet(context, "semicolon", new AsyncDispatchPathInfoServlet());
+        w.setAsyncSupported(true);
+        context.addServletMapping("/semicolon/*", "semicolon");
+        tomcat.start();
+
+        ByteChunk responseBody = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + path, responseBody, null);
+
+        Assert.assertEquals(200, rc);
+        Assert.assertEquals(expected, responseBody.toString());
     }
 
 

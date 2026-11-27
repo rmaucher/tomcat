@@ -258,10 +258,10 @@ bytebuddy.jar=${bytebuddy.home}/byte-buddy-${bytebuddy.version}.jar
 bytebuddy.loc=${base-maven.loc}/net/bytebuddy/byte-buddy/${bytebuddy.version}/byte-buddy-${bytebuddy.version}.jar
 
 # ----- UnboundID, used by unit tests, version 5.1.4 or later -----
-unboundid.version=7.0.5
+unboundid.version=7.0.6
 unboundid.checksum.enabled=true
 unboundid.checksum.algorithm=MD5|SHA-1
-unboundid.checksum.value=ddb876e766af6e41b0d4db7392538ff9|398b875694b82dd80a78aad88c065b455e4b90d9
+unboundid.checksum.value=685df65977b8da90699d4e39cd78624e|5a0899344163201880aec9d01ab794a5ac67b966
 unboundid.home=${base.path}/unboundid-${unboundid.version}
 unboundid.jar=${unboundid.home}/unboundid-ldapsdk-${unboundid.version}.jar
 unboundid.loc=${base-maven.loc}/com/unboundid/unboundid-ldapsdk/${unboundid.version}/unboundid-ldapsdk-${unboundid.version}.jar
@@ -285,13 +285,13 @@ jacoco.jar=${jacoco.home}/lib/jacocoant.jar
 jacoco.loc=${base-maven.loc}/org/jacoco/jacoco/${jacoco.version}/jacoco-${jacoco.version}.zip
 
 # ----- SpotBugs (originally FindBugs) -----
-spotbugs.version=4.10.4
+spotbugs.version=4.10.5
 spotbugs.checksum.enabled=true
 spotbugs.checksum.algorithm=SHA-512
-spotbugs.checksum.value=e0720c7d51825353f4f6724757f97b5ca1eb169a3579497c2e00002bb36595a7c9f2ab70f53be4f5bba9a44bda2016d1784690cb6e766655be6c43179b42fcb5
+spotbugs.checksum.value=616ba9f60e6ccff6106137fd5752378e7d1db9d1e9fa1d33076018f67be4354f16852ee4e547a14702aef98402c504e4f873ca6dd3a8d4c65dfb311bf25fde80
 spotbugs.home=${base.path}/spotbugs-${spotbugs.version}
 spotbugs.jar=${spotbugs.home}/lib/spotbugs-ant.jar
-spotbugs.loc=${base-maven.loc}/com/github/spotbugs/spotbugs/${spotbugs.version}/spotbugs-${spotbugs.version}.tgz
+spotbugs.loc=${base-gh.loc}/spotbugs/spotbugs/releases/download/${spotbugs.version}/spotbugs-${spotbugs.version}.tgz
 
 findsecbugs.version=1.14.0
 findsecbugs.loc=${base-maven.loc}/com/h3xstream/findsecbugs/findsecbugs-plugin/${findsecbugs.version}/findsecbugs-plugin-${findsecbugs.version}.jar
@@ -303,10 +303,10 @@ findsecbugs.home=${base.path}/spotbugs-${spotbugs.version}/plugin
 
 # ----- bnd, version 6.3.0 or later  -----
 # ----- provides OSGI metadata for JARs       -----
-bnd.version=7.4.0
+bnd.version=7.5.0
 bnd.checksum.enabled=true
 bnd.checksum.algorithm=MD5|SHA-1
-bnd.checksum.value=50b9f54131937462e0733b5819a2a6be|db23fe628928bfee11a86151e8a5140d1bda38a9
+bnd.checksum.value=0c17de9ca68e8706b1dab1d21f948458|cad572e52b30db4eeeaa6925bd07078b9216273e
 
 bnd.home=${base.path}/bnd-${bnd.version}
 bnd.jar=${bnd.home}/biz.aQute.bnd-${bnd.version}.jar
@@ -354,16 +354,16 @@ derby-tools.jar=${derby.home}/derby-tools-${derby.version}.jar
 derby-tools.loc=${base-maven.loc}/org/apache/derby/derbytools/${derby.version}/derbytools-${derby.version}.jar
 
 # ----- Bouncy Castle, used by unit tests ----
-bouncycastle.version=1.86
+bouncycastle.version=1.87
 bouncycastle-provider.checksum.enabled=true
 bouncycastle-provider.checksum.algorithm=SHA-512
-bouncycastle-provider.checksum.value=4502851281929ef645316ae96ad7d6db6a54d11ce024a66bec654c2eef62b80f174b67a2a15de86b2698f33b696459e21ecfec4a846350f4297394e9a331c43b
+bouncycastle-provider.checksum.value=fec4187f2d152ec10dcbb6928407bfa6dacea393d716bd024cbed907251d181e4eeda389501792435d6b5dac13a468b2f230c2fac80dd6382b9c0a6e4d85ff71
 bouncycastle-pkix.checksum.enabled=true
 bouncycastle-pkix.checksum.algorithm=SHA-512
-bouncycastle-pkix.checksum.value=2923c0da3848b47d1953bdba3ae50441f3a3416f3646a26244c080414f31fbde875e4e50619a0ef34670c877367a45438a346260fc8b047e753b553debd40b37
+bouncycastle-pkix.checksum.value=2536343dc1593cc0f6f80a71ea2ef2ea56460bbca4a6a301f306e5e144d5baaa633ae448a5e431fbb0483a6c902c5a56ca7e10fe98a0bd69dbaf5e504a481436
 bouncycastle-util.checksum.enabled=true
 bouncycastle-util.checksum.algorithm=SHA-512
-bouncycastle-util.checksum.value=aeb9138f96d5c48491974974534bb3b07931a18d36ccbed828940ae0361f5ef8f5b0ad6c776a1aebb4d2c0416edf8b7d143d821bfe7136d7948c4e5807b1c426
+bouncycastle-util.checksum.value=bc24b3c837e2a8acd80a587be5e61c886ac36ad2a7a27d63496a7e28c8cc92d429605daf3999a6da208f27f1fa101d880f368c2bcddc298a2781191f49897669
 
 bouncycastle.home=${base.path}/bouncycastle-${bouncycastle.version}
 bouncycastle-provider.jar=${bouncycastle.home}/bouncycastle-provider-${bouncycastle.version}.jar

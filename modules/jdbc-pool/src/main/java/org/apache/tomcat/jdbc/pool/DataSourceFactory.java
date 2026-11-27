@@ -348,7 +348,8 @@ public class DataSourceFactory implements ObjectFactory {
         }
 
         if (!ok) {
-            log.warn(MessageFactory.get("dataSourceFactory.invalidClassName", ref.getClassName()));
+            log.warn(MessageFactory.get("dataSourceFactory.invalidClassName",
+                    PoolUtilities.maskAndFlatten(ref.getClassName())));
             return null;
         }
 
@@ -365,7 +366,8 @@ public class DataSourceFactory implements ObjectFactory {
                     // so note the skip where an operator wondering why a
                     // configured attribute did not take effect will look.
                     if (log.isDebugEnabled()) {
-                        log.debug(MessageFactory.get("dataSourceFactory.nullContentProperty", propertyName));
+                        log.debug(MessageFactory.get("dataSourceFactory.nullContentProperty",
+                                PoolUtilities.maskAndFlatten(propertyName)));
                     }
                     continue;
                 }
@@ -406,7 +408,8 @@ public class DataSourceFactory implements ObjectFactory {
             String addressName = addresses.nextElement().getType();
             if (!knownPropertyNames.contains(addressName)
                     && !RESERVED_JNDI_ADDRESS_NAMES.contains(addressName)) {
-                log.warn(MessageFactory.get("dataSourceFactory.invalidProperty", addressName));
+                log.warn(MessageFactory.get("dataSourceFactory.invalidProperty",
+                        PoolUtilities.maskAndFlatten(addressName)));
             }
         }
 
@@ -518,6 +521,18 @@ public class DataSourceFactory implements ObjectFactory {
                         throw new IllegalArgumentException(MessageFactory.get(
                                 "dataSourceFactory.invalidTransactionIsolation", trimmed,
                                 PROP_DEFAULTTRANSACTIONISOLATION), e);
+                    }
+                    if (level != Connection.TRANSACTION_NONE
+                            && level != Connection.TRANSACTION_READ_UNCOMMITTED
+                            && level != Connection.TRANSACTION_READ_COMMITTED
+                            && level != Connection.TRANSACTION_REPEATABLE_READ
+                            && level != Connection.TRANSACTION_SERIALIZABLE) {
+                        // A number the driver will refuse at connection time
+                        // fails the lookup here, naming the property, rather
+                        // than being stored and failing every connect later.
+                        throw new IllegalArgumentException(MessageFactory.get(
+                                "dataSourceFactory.invalidTransactionIsolation", trimmed,
+                                PROP_DEFAULTTRANSACTIONISOLATION));
                     }
                 }
                 poolProperties.setDefaultTransactionIsolation(level);
@@ -762,8 +777,15 @@ public class DataSourceFactory implements ObjectFactory {
         if (value != null && !value.trim().isEmpty()) {
             // The canonical setter parses the pairs into the driver
             // properties and keeps the string round-tripping through
-            // getConnectionProperties().
-            poolProperties.setConnectionProperties(value);
+            // getConnectionProperties(). A malformed value fails the lookup
+            // naming the attribute, as the factory's strict parsing contract
+            // promises.
+            try {
+                poolProperties.setConnectionProperties(value);
+            } catch (IllegalArgumentException x) {
+                throw new IllegalArgumentException(MessageFactory.get(
+                        "dataSourceFactory.invalidConnectionProperties", x.getMessage()), x);
+            }
         } else if (value != null) {
             // A blank attribute means the default, null: storing "" would
             // make the configuration dump and the getter report a value that
@@ -1142,7 +1164,8 @@ public class DataSourceFactory implements ObjectFactory {
         } catch (NamingException e) {
             if (log.isDebugEnabled()) {
                 log.debug(MessageFactory.get("dataSourceFactory.jndiLocalNameNotFound",
-                        poolProperties.getDataSourceJNDI()), e);
+                        PoolUtilities.maskAndFlatten(poolProperties.getDataSourceJNDI())),
+                        PoolUtilities.maskCredentials(e));
             }
         }
         NamingException initialContextFailure = null;
@@ -1166,7 +1189,7 @@ public class DataSourceFactory implements ObjectFactory {
                         // Closing a context the lookup is done with is
                         // housekeeping; a container context that refuses the
                         // close must not replace the lookup's outcome.
-                        log.debug("Unable to close the initial JNDI context.", x);
+                        log.debug("Unable to close the initial JNDI context.", PoolUtilities.maskCredentials(x));
                     }
                 }
             }

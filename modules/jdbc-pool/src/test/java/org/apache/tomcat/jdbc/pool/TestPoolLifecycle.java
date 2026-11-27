@@ -39,6 +39,10 @@ class TestPoolLifecycle {
     }
 
     @Nested
+    class CloseDuringInit extends CloseDuringInitBase {
+    }
+
+    @Nested
     class DataSourceProxyPublicationCleanup extends DataSourceProxyPublicationCleanupBase {
     }
 
@@ -48,6 +52,10 @@ class TestPoolLifecycle {
 
     @Nested
     class DuplicatePoolCleaner extends DuplicatePoolCleanerBase {
+    }
+
+    @Nested
+    class FailedCleanerSchedule extends FailedCleanerScheduleBase {
     }
 
     @Nested
@@ -80,6 +88,10 @@ class TestPoolLifecycle {
 
     @Nested
     class LoginTimeoutMapping extends LoginTimeoutMappingBase {
+    }
+
+    @Nested
+    class ConcurrentClose extends ConcurrentCloseBase {
     }
 
 }

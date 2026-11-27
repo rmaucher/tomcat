@@ -110,6 +110,186 @@ abstract class AllIdleClaimBase extends JdbcPoolBaseTest {
         lastConnected.setLong(pc, System.currentTimeMillis() - 120000L);
     }
 
+    private static volatile CountDownLatch RECONNECT_ENTERED = new CountDownLatch(1);
+    private static volatile CountDownLatch RECONNECT_RELEASE = new CountDownLatch(1);
+    private static volatile CountDownLatch RECONNECTED = new CountDownLatch(1);
+    private static volatile CountDownLatch RECONNECTED_RELEASE = new CountDownLatch(1);
+
+    /** Counts the validation calls made by the idle pass. */
+    private static final class CountingValidator implements Validator {
+        final AtomicInteger actions = new AtomicInteger();
+
+        @Override
+        public boolean validate(Connection connection, int validateAction) {
+            actions.incrementAndGet();
+            return true;
+        }
+    }
+
+    /**
+     * Parks the idle pass after the reconnect has completed and before the
+     * validation would start, so the test can close the pool in that window.
+     */
+    private static final class ParkingAfterReconnectPool extends ConnectionPool {
+
+        ParkingAfterReconnectPool(PoolProperties properties) throws SQLException {
+            super(properties);
+        }
+
+        @Override
+        protected boolean reconnectIfExpired(PooledConnection con) {
+            boolean expired = con.isMaxAgeExpired();
+            boolean result = super.reconnectIfExpired(con);
+            if (expired && result) {
+                RECONNECTED.countDown();
+                try {
+                    RECONNECTED_RELEASE.await(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException x) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return result;
+        }
+    }
+
+    /**
+     * Parks the idle pass between the decision that the connection is expired and the reconnect itself, so the test can
+     * close the pool before the reconnect work starts.
+     */
+    private static final class ParkingReconnectPool extends ConnectionPool {
+
+        ParkingReconnectPool(PoolProperties properties) throws SQLException {
+            super(properties);
+        }
+
+        @Override
+        protected boolean reconnectIfExpired(PooledConnection con) {
+            if (con.isMaxAgeExpired()) {
+                RECONNECT_ENTERED.countDown();
+                try {
+                    RECONNECT_RELEASE.await(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException x) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return super.reconnectIfExpired(con);
+        }
+    }
+
+    @Test
+    void aPoolClosedBeforeAnIdleReconnectStopsTheDriverConnect() throws Exception {
+        resetDriver();
+        RECONNECT_ENTERED = new CountDownLatch(1);
+        RECONNECT_RELEASE = new CountDownLatch(1);
+        PoolProperties properties = new PoolProperties();
+        properties.setUrl(getUrl());
+        properties.setDriverClassName(LatchingDriver.class.getName());
+        properties.setUsername("sa");
+        properties.setPassword("");
+        properties.setJmxEnabled(false);
+        properties.setInitialSize(1);
+        properties.setMinIdle(0);
+        properties.setMaxActive(1);
+        properties.setMaxIdle(1);
+        properties.setMaxAge(60000);
+        properties.setTimeBetweenEvictionRunsMillis(0);
+        properties.setMaxWait(15000);
+        ParkingReconnectPool pool = new ParkingReconnectPool(properties);
+        try {
+            Assertions.assertEquals(1, pool.getIdle(), "precondition: the pool holds one idle connection");
+            PooledConnection pc;
+            try (Connection borrowed = pool.getConnection()) {
+                pc = internalOf(borrowed);
+            }
+            awaitUntil(() -> pool.getIdle() == 1);
+            forceExpired(pc);
+
+            Thread sweep = new Thread(() -> pool.testAllIdle(true), "idle-reconnect");
+            sweep.setDaemon(true);
+            sweep.start();
+            try {
+                Assertions.assertTrue(RECONNECT_ENTERED.await(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                        "the idle pass must reach the reconnect decision");
+                Assertions.assertEquals(1, CONNECTS.get(),
+                        "precondition: only the initial physical session exists");
+
+                pool.close(true);
+                RECONNECT_RELEASE.countDown();
+                sweep.join(AWAIT_TIMEOUT_MS);
+                Assertions.assertFalse(sweep.isAlive(), "the idle pass must finish after the close");
+                Assertions.assertEquals(0, pool.getReconnectedCount(),
+                        "a reconnect for a closed pool must not be counted as successful");
+                Assertions.assertEquals(1, CONNECTS.get(),
+                        "the idle pass must not open a new physical session after the pool closed");
+            } finally {
+                RECONNECT_RELEASE.countDown();
+                sweep.join(AWAIT_TIMEOUT_MS);
+            }
+            awaitSessions(0);
+        } finally {
+            RECONNECT_RELEASE.countDown();
+            pool.close(true);
+        }
+    }
+
+    @Test
+    void aCloseBetweenTheIdleReconnectAndItsValidationSkipsTheValidation() throws Exception {
+        resetDriver();
+        RECONNECTED = new CountDownLatch(1);
+        RECONNECTED_RELEASE = new CountDownLatch(1);
+        CountingValidator validator = new CountingValidator();
+        PoolProperties properties = new PoolProperties();
+        properties.setUrl(getUrl());
+        properties.setDriverClassName(LatchingDriver.class.getName());
+        properties.setUsername("sa");
+        properties.setPassword("");
+        properties.setJmxEnabled(false);
+        properties.setInitialSize(1);
+        properties.setMinIdle(0);
+        properties.setMaxActive(1);
+        properties.setMaxIdle(1);
+        properties.setMaxAge(60000);
+        properties.setTimeBetweenEvictionRunsMillis(0);
+        properties.setTestWhileIdle(true);
+        properties.setValidator(validator);
+        properties.setMaxWait(15000);
+        ParkingAfterReconnectPool pool = new ParkingAfterReconnectPool(properties);
+        try {
+            Assertions.assertEquals(1, pool.getIdle(), "precondition: the pool holds one idle connection");
+            PooledConnection pc;
+            try (Connection borrowed = pool.getConnection()) {
+                pc = internalOf(borrowed);
+            }
+            awaitUntil(() -> pool.getIdle() == 1);
+            forceExpired(pc);
+
+            Thread sweep = new Thread(() -> pool.testAllIdle(false), "idle-validation");
+            sweep.setDaemon(true);
+            sweep.start();
+            try {
+                Assertions.assertTrue(RECONNECTED.await(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                        "the idle pass must reach the point after its reconnect");
+                Assertions.assertEquals(1, pool.getReconnectedCount(),
+                        "precondition: the reconnect completed");
+
+                pool.close(true);
+                RECONNECTED_RELEASE.countDown();
+                sweep.join(AWAIT_TIMEOUT_MS);
+                Assertions.assertFalse(sweep.isAlive(), "the idle pass must finish after the close");
+                Assertions.assertEquals(0, validator.actions.get(),
+                        "a close landing between the reconnect and the validation must skip the "
+                                + "validation query for the closed pool");
+            } finally {
+                RECONNECTED_RELEASE.countDown();
+                sweep.join(AWAIT_TIMEOUT_MS);
+            }
+            awaitSessions(0);
+        } finally {
+            RECONNECTED_RELEASE.countDown();
+            pool.close(true);
+        }
+    }
+
     @Test
     void aConnectionTheIdleTestIsReconnectingIsOutOfTheQueueAndUnborrowable() throws Exception {
         resetDriver();
@@ -298,6 +478,85 @@ abstract class AllIdleClaimBase extends JdbcPoolBaseTest {
         awaitSessions(1);
         ds.close();
         awaitSessions(0);
+    }
+
+    private static volatile CountDownLatch VERSION_READ = new CountDownLatch(1);
+    private static volatile CountDownLatch VERSION_RELEASE = new CountDownLatch(1);
+    private static volatile boolean versionReadArmed;
+
+    private static final class VersionReadingConnection extends PooledConnection {
+
+        VersionReadingConnection(PoolConfiguration properties, ConnectionPool parent) {
+            super(properties, parent);
+        }
+
+        @Override
+        public long getConnectionVersion() {
+            if (versionReadArmed) {
+                versionReadArmed = false;
+                VERSION_READ.countDown();
+                try {
+                    VERSION_RELEASE.await(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException x) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return super.getConnectionVersion();
+        }
+    }
+
+    private static final class VersionReadingPool extends ConnectionPool {
+
+        VersionReadingPool(PoolProperties properties) throws SQLException {
+            super(properties);
+        }
+
+        @Override
+        protected PooledConnection create(boolean incrementCounter) {
+            return new VersionReadingConnection(getPoolProperties(), this);
+        }
+    }
+
+    @Test
+    void aPurgeRacingAnIdleValidationDoesNotLeaveTheStaleConnectionIdle() throws Exception {
+        VERSION_READ = new CountDownLatch(1);
+        VERSION_RELEASE = new CountDownLatch(1);
+        // Do not arm the hook until the pool is built: the pre-load returns
+        // its connection through the same version check this test parks.
+        versionReadArmed = false;
+        PoolProperties properties = new PoolProperties();
+        properties.setUrl(getUrl());
+        properties.setDriverClassName("org.h2.Driver");
+        properties.setUsername("sa");
+        properties.setPassword("");
+        properties.setJmxEnabled(false);
+        properties.setInitialSize(1);
+        properties.setMinIdle(0);
+        properties.setMaxActive(1);
+        properties.setMaxIdle(1);
+        properties.setTimeBetweenEvictionRunsMillis(0);
+        VersionReadingPool pool = new VersionReadingPool(properties);
+        try {
+            Assertions.assertEquals(1, pool.getIdle(), "precondition: the pool has one idle connection");
+            versionReadArmed = true;
+            Thread test = new Thread(() -> pool.testAllIdle(), "idle-validator");
+            test.setDaemon(true);
+            test.start();
+            Assertions.assertTrue(VERSION_READ.await(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+                    "the idle validation must reach the claimed connection's version check");
+
+            pool.purge();
+            VERSION_RELEASE.countDown();
+            test.join(AWAIT_TIMEOUT_MS);
+            Assertions.assertFalse(test.isAlive(), "the idle validation must finish");
+            Assertions.assertEquals(0, pool.getSize(),
+                    "a connection marked stale by a purge during idle validation must be released");
+            Assertions.assertEquals(0, pool.getIdle(),
+                    "a purge-stale connection must not be offered back to the idle queue");
+        } finally {
+            VERSION_RELEASE.countDown();
+            pool.close(true);
+        }
     }
 
     /**

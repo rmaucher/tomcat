@@ -17,6 +17,7 @@
 package org.apache.tomcat.jdbc.pool;
 
 import java.io.PrintWriter;
+import java.lang.ref.WeakReference;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
@@ -60,6 +61,23 @@ public class DataSourceProxy implements PoolConfiguration {
      * published any more and creation fails with an {@link SQLException}.
      */
     private volatile boolean closed = false;
+
+    /**
+     * The pool the first close took out of {@link #pool}, held weakly so a later
+     * {@link #close(boolean)} can escalate a graceful close to a forced one. A weak reference does not keep a
+     * closed pool alive on its own; while in-use sessions remain they hold their pool through their pooled
+     * connections, so a forced request can still reach it, and after the sessions are gone there is nothing left
+     * to force.
+     */
+    private volatile WeakReference<ConnectionPool> closedPool = null;
+
+    /**
+     * Whether a pool construction is in progress, guarded by this data source's monitor. The start-time setters take
+     * that monitor as well, so a write racing the construction is rejected instead of landing in a configuration the
+     * constructor has already read. The construction itself runs outside the monitor, as recorded at
+     * {@link #poolCreationLock}: it can block in the driver.
+     */
+    private boolean constructing = false;
 
     /**
      * Serializes pool construction away from this proxy's monitor. The constructor pre-connects the initial
@@ -170,7 +188,8 @@ public class DataSourceProxy implements PoolConfiguration {
             return createPool().getConnection(username, password);
         } else {
             if (connectionWithoutCredentialsWarningIssued.compareAndSet(false, true)) {
-                log.warn(MessageFactory.get("dataSourceProxy.alternateUsernameIgnored", username));
+                log.warn(MessageFactory.get("dataSourceProxy.alternateUsernameIgnored",
+                        PoolUtilities.maskAndFlatten(username)));
             }
             return getConnection();
         }
@@ -232,11 +251,41 @@ public class DataSourceProxy implements PoolConfiguration {
             if (existing != null) {
                 return existing;
             }
+            // Mark the construction and sample the configuration in one step
+            // under the monitor the start-time setters take. From here until
+            // the pool is published, a setter that decides what this
+            // construction builds - or which configuration object it builds
+            // from - is rejected instead of landing too late. The construction
+            // itself keeps running outside the monitor: it can block in the
+            // driver during the pre-load.
+            final PoolConfiguration configuration;
+            synchronized (this) {
+                constructing = true;
+                configuration = poolProperties;
+            }
             // The constructor - and with it the driver connects of the
             // initial pre-load - runs with the close monitor free. A failure
             // here propagates directly: an init that fails after starting
             // anything tears its pool down itself before throwing.
-            final ConnectionPool fresh = new ConnectionPool(poolProperties);
+            final ConnectionPool fresh;
+            try {
+                fresh = new ConnectionPool(configuration);
+            } catch (Throwable x) {
+                synchronized (this) {
+                    constructing = false;
+                }
+                ExceptionUtils.handleThrowable(x);
+                if (x instanceof SQLException) {
+                    throw (SQLException) x;
+                } else if (x instanceof RuntimeException) {
+                    throw (RuntimeException) x;
+                } else if (x instanceof Error) {
+                    throw (Error) x;
+                }
+                SQLException sx = new SQLException(x.getMessage());
+                sx.initCause(x);
+                throw sx;
+            }
             final boolean rejected;
             try {
                 synchronized (this) {
@@ -248,19 +297,46 @@ public class DataSourceProxy implements PoolConfiguration {
                     // is never neither - that was the leak - and never both.
                     rejected = closed;
                     if (!rejected) {
+                        // A startup callback can close the pool while it is
+                        // still being constructed. Publishing it would leave
+                        // the data source holding a pool that already refused
+                        // every borrow and whose cleanup no longer runs from
+                        // this construction path. Treat that as a failed
+                        // creation instead.
+                        if (fresh.isClosed()) {
+                            throw new SQLException(
+                                    MessageFactory.get("dataSourceProxy.poolClosedDuringCreation"));
+                        }
                         // Finish the configuration before the pool can be read
                         // from. A write of one of the attributes the check
                         // corrects lands its value in the shared configuration
                         // but skips that correction, because the setters run it
                         // only once a pool is reachable. The check has to come
                         // before the cleaner is looked over: it decides the
-                        // interval the cleaner should be running on.
-                        fresh.checkPoolConfiguration(poolProperties);
-                        fresh.reconcilePoolCleaner(poolProperties);
+                        // interval the cleaner should be running on. Both use
+                        // the pool's own builder, the private copy this
+                        // construction was built from, not the caller's object
+                        // or whatever the shared field might hold by now.
+                        PoolConfiguration built = fresh.getMutableConfiguration();
+                        fresh.checkPoolConfiguration(built);
+                        fresh.reconcilePoolCleaner(built);
+                        fresh.publishConfiguration(built);
                         pool = fresh;
+                        // The bean surface now reads and writes through the
+                        // pool's live view: reads come from the immutable
+                        // snapshot, writes through the single apply path.
+                        poolProperties = fresh.getPoolProperties();
                     }
+                    // The construction is over on this path as well: a start-time
+                    // setter queued behind this monitor is answered by the
+                    // published pool or by the closure, never by the stale
+                    // construction state.
+                    constructing = false;
                 }
             } catch (Throwable x) {
+                synchronized (this) {
+                    constructing = false;
+                }
                 // What handleThrowable lets through is not recoverable, so
                 // check that first. Otherwise the constructor has already
                 // pre-loaded sessions and may have armed the cleaner, so close
@@ -315,7 +391,9 @@ public class DataSourceProxy implements PoolConfiguration {
      * <p>
      * A future for a connection that was already available completes while this method runs. Such a future cannot
      * be cancelled; its caller must retrieve the connection and close it to return it to the pool. Cancelling a
-     * future that is still waiting returns its queued connection request to the pool.
+     * future that is still waiting returns its queued connection request to the pool. The future is
+     * single-consumption: the first retrieval takes the connection, and a later {@link Future#get()} fails with an
+     * {@link IllegalStateException} rather than handing the same handle to a second caller.
      *
      * @return a Future containing a reference to the connection when it becomes available
      *
@@ -381,10 +459,9 @@ public class DataSourceProxy implements PoolConfiguration {
      * free session or fails with pool exhaustion rather than with a database error. Its
      * {@link java.sql.Connection#close() close()} returns the session to the pool instead of closing the physical
      * connection. The connection obtained from the returned handle's
-     * {@link javax.sql.PooledConnection#getConnection()} is the driver's raw logical session, not a pool-managed
-     * connection: the pool's interceptors and features do not apply to it, and closing it invalidates the session
-     * under the pool's own notion of a live connection. Release the borrowed session by closing the handle, not that
-     * connection.
+     * {@link javax.sql.PooledConnection#getConnection()} is the pooled handle itself: closing it returns the session to
+     * the pool, exactly as closing the handle does, and its statements pass through the pool's interceptor chain. The
+     * raw provider session is never exposed through that accessor.
      *
      * @return the borrowed pooled-connection handle
      *
@@ -474,6 +551,21 @@ public class DataSourceProxy implements PoolConfiguration {
         closed = true;
         final ConnectionPool p = pool;
         pool = null;
+        if (p != null) {
+            // Keep a weak handle on the pool the graceful close is draining, so
+            // a later forced close can escalate it. A pool with in-use sessions
+            // stays reachable through their pooled connections; a pool with
+            // nothing left can be collected, and there is nothing to force.
+            closedPool = new WeakReference<>(p);
+        }
+        if (p != null && poolProperties == p.getPoolProperties()) {
+            // The live view holds the pool it belongs to. Keeping it in this
+            // field after the pool is taken would keep the closed pool and its
+            // busy sessions reachable from a data source that is itself being
+            // dropped. Keep the configuration values instead: reads after close
+            // still answer, and nothing of the pool is pinned.
+            poolProperties = ConnectionPool.copyConfiguration(p.getCurrentConfiguration());
+        }
         return p;
     }
 
@@ -484,12 +576,24 @@ public class DataSourceProxy implements PoolConfiguration {
      * not propagated: the closure already happened when the flag was set, and one failing session must not stop
      * the rest from being disconnected or hide the closure from the caller.
      *
-     * @param p   the pool to close, or {@code null} to close nothing
+     * A {@code null} pool is the second or later close: the first close already took the pool from this data source.
+     * A forced request then escalates the graceful close through the weakly held closed pool, while a graceful
+     * request has nothing left to do. The escalation runs the forced drain without repeating the one-time terminal
+     * work, which belongs to the close that claimed the pool.
+     *
+     * @param p   the pool to close, or {@code null} when an earlier close already took it
      * @param all if true close all connections, otherwise only idle ones
      */
     protected void closePool(ConnectionPool p, boolean all) {
         if (p == null) {
-            return;
+            if (!all) {
+                return;
+            }
+            WeakReference<ConnectionPool> reference = closedPool;
+            p = reference == null ? null : reference.get();
+            if (p == null) {
+                return;
+            }
         }
         try {
             p.close(all);
@@ -540,7 +644,8 @@ public class DataSourceProxy implements PoolConfiguration {
      *
      * @throws NullPointerException if the configuration is null
      * @throws IllegalArgumentException if the configuration is a display-only bean/JMX view
-     * @throws UnsupportedOperationException if the pool has already been created or this data source has been closed
+     * @throws UnsupportedOperationException if the pool is being created, has already been created or this data source
+     *                                          has been closed
      */
     public synchronized void setPoolProperties(PoolConfiguration poolProperties) {
         if (poolProperties == null) {
@@ -564,11 +669,13 @@ public class DataSourceProxy implements PoolConfiguration {
 
     /**
      * Sets the number of connections pre-loaded when the pool starts. The value is used when the pool is created; a
-     * later write would only change the configuration without pre-loading any connection.
+     * later write would only change the configuration without pre-loading any connection, so it is rejected like the
+     * other start-time properties.
      *
      * @param initialSize the number of connections to pre-load
      *
-     * @throws UnsupportedOperationException if the pool has already been created or this data source has been closed
+     * @throws UnsupportedOperationException if the pool is being created, has already been created or this data source
+     *                                          has been closed
      */
     @Override
     public synchronized void setInitialSize(int initialSize) {
@@ -762,6 +869,13 @@ public class DataSourceProxy implements PoolConfiguration {
     }
 
 
+    /**
+     * Sets the interceptor list. This is the authoritative surface for a live write: a pool that has already started
+     * applies the new list to the chains it builds for later borrows, while connections that already have a cached
+     * chain keep it. The pool's JMX MBean refuses this attribute and points an operator here.
+     *
+     * @param interceptors the interceptor list
+     */
     @Override
     public void setJdbcInterceptors(String interceptors) {
         this.getPoolProperties().setJdbcInterceptors(interceptors);
@@ -773,14 +887,34 @@ public class DataSourceProxy implements PoolConfiguration {
      *
      * @param property the property name
      *
-     * @throws UnsupportedOperationException if the pool exists or this data source is closed
+     * @throws UnsupportedOperationException if the pool is being created, has already been created, or this data
+     *                                          source has been closed
      */
     private void checkPoolNotStarted(String property) {
+        checkPoolNotStarted(property, true);
+    }
+
+
+    /**
+     * Rejects a write to a property that is read only while the pool is being
+     * created.
+     *
+     * @param property           the property name
+     * @param rejectConstructing whether a write that lands while the pool is
+     *                               being built is rejected; {@code initialSize}
+     *                               is deliberately not, as its consumption is
+     *                               bounded where the pre-load array is allocated
+     *
+     * @throws UnsupportedOperationException if the pool exists, the construction
+     *                                          rejects start-time writes, or this
+     *                                          data source is closed
+     */
+    private void checkPoolNotStarted(String property, boolean rejectConstructing) {
         if (closed) {
             throw new UnsupportedOperationException(
                     MessageFactory.get("dataSourceProxy.startTimePropertyAfterClose", property));
         }
-        if (pool != null) {
+        if ((rejectConstructing && constructing) || pool != null) {
             throw new UnsupportedOperationException(
                     MessageFactory.get("dataSourceProxy.startTimePropertyAfterStart", property));
         }
@@ -795,14 +929,15 @@ public class DataSourceProxy implements PoolConfiguration {
      *
      * @param enabled whether JMX is enabled
      *
-     * @throws UnsupportedOperationException if the pool has already been created or this data source has been closed
+     * @throws UnsupportedOperationException if the pool is being created, has already been created or this data source
+     *                                          has been closed
      */
     @Override
     public synchronized void setJmxEnabled(boolean enabled) {
         if (closed) {
             throw new UnsupportedOperationException(MessageFactory.get("dataSourceProxy.jmxEnabledAfterClose"));
         }
-        if (pool != null) {
+        if (constructing || pool != null) {
             throw new UnsupportedOperationException(MessageFactory.get("dataSourceProxy.jmxEnabledAfterStart"));
         }
         this.getPoolProperties().setJmxEnabled(enabled);
@@ -815,7 +950,8 @@ public class DataSourceProxy implements PoolConfiguration {
      *
      * @param fairQueue {@code true} to use a fair idle queue
      *
-     * @throws UnsupportedOperationException if the pool has already been created or this data source has been closed
+     * @throws UnsupportedOperationException if the pool is being created, has already been created or this data source
+     *                                          has been closed
      */
     @Override
     public synchronized void setFairQueue(boolean fairQueue) {
@@ -1642,7 +1778,8 @@ public class DataSourceProxy implements PoolConfiguration {
      *
      * @param ignoreExceptionOnPreLoad {@code true} to ignore pre-load failures
      *
-     * @throws UnsupportedOperationException if the pool has already been created or this data source has been closed
+     * @throws UnsupportedOperationException if the pool is being created, has already been created or this data source
+     *                                          has been closed
      */
     @Override
     public synchronized void setIgnoreExceptionOnPreLoad(boolean ignoreExceptionOnPreLoad) {

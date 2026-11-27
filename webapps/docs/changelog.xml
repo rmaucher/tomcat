@@ -252,6 +252,72 @@
         Make handling of <code>allowSpecialPaths</code> within the WebDAV
         servlet consistent for all WebDAV methods. (markt)
       </fix>
+      <fix>
+        When the rewrite valve reaches the limit on the number of rounds
+        triggered by the <code>[N]</code> (next) flag, reject the request with a
+        500 response rather than processing it using a URL that the remaining
+        rewrite rules have not been applied to. (markt)
+      </fix>
+      <update>
+        Allow <code>HttpServletRequest.upgrade()</code> to be called after
+        <code>startAsync()</code> provided it is called before
+        <code>AsyncContext.complete()</code> or
+        <code>AsyncContext.dispatch()</code> and before an asynchronous error
+        has occurred. The upgrade takes place when the
+        asynchronous processing completes, regardless of whether keep-alive is
+        enabled for the request. (markt)
+      </update>
+      <fix>
+        Ensure that <code>HttpServletRequest.upgrade()</code> can only be called
+        once per request. A second call previously created a second
+        <code>HttpUpgradeHandler</code> instance that was never destroyed.
+        (markt)
+      </fix>
+      <fix>
+        Ensure that the <code>HttpUpgradeHandler</code> instance created by
+        <code>HttpServletRequest.upgrade()</code> is destroyed if the upgrade
+        fails because the protocol in use, such as AJP or HTTP/2, does not
+        support HTTP upgrade. (markt)
+      </fix>
+      <fix>
+        Fix <code>AsyncContext.dispatch()</code> when the request URI contains
+        <code>..</code> segments that return to the context path, such as
+        <code>/examples/../examples/async</code>. The context path derived from
+        the request URI now includes those segments so that the remainder of
+        the URI remains within the context. The context path, decoded as per the
+        connector settings, is removed before the remaining path is processed as
+        per the context decoding settings. Also ensure that a failed
+        asynchronous dispatch does not modify the request attributes. (markt)
+      </fix>
+      <fix>
+        If <code>AsyncContext.dispatch()</code> is unable to dispatch the
+        request, for example because of a bug, and it is not called by the
+        container thread processing the request then treat the failure as an
+        error. Fire <code>AsyncListener.onError()</code>, generate the error
+        response and complete the request. (markt)
+      </fix>
+      <fix>
+        Ensure that the web application's class loader and naming context are
+        bound when <code>AsyncListener.onError()</code> is called for a failed
+        asynchronous dispatch. (markt)
+      </fix>
+      <fix>
+        Limit the number of distinct properties that a WebDAV
+        <code>PROPFIND</code> request may request to 100. The limit is
+        configurable using the new <code>maxPropfindProperties</code>
+        <code>init-param</code>. Properties that are requested more than once
+        are ignored. The namespace of a requested property that is not found is
+        now declared once on the root element of the response rather than being
+        repeated for every property of every resource. (markt)
+      </fix>
+      <fix>
+        When <code>JNDIRealm</code> uses <code>userPattern</code> and the
+        pattern allows the user name to form the start of the distinguished
+        name (DN), reject a user name that results in a DN that starts with a
+        URL scheme such as <code>ldap://</code>. JNDI treats such a DN as a URL
+        and connects to the host named in the URL using the credentials of the
+        realm. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Coyote">
@@ -401,6 +467,47 @@
         Previously, a body packet that had not been read could be processed as
         the start of a new AJP request. (markt)
       </fix>
+      <fix>
+        Fix the parsing of chunk header lines so that a CR that has been consumed
+        is always followed by an LF. (markt)
+      </fix>
+      <fix>
+        Fix a HTTP/2 request that is in asynchronous mode when it enters an error
+        state that still permits I/O, such as when
+        <code>swallowAbortedUploads</code> is <code>false</code> and a form POST
+        declares a body larger than <code>maxPostSize</code>. The request and
+        response were recycled, and returned to the pool for re-use, while the
+        application still owned them. The stream is now closed once asynchronous
+        processing ends. (markt)
+      </fix>
+      <fix>
+        Do not add a <code>Connection: close</code> header to an HTTP
+        <code>101</code> (switching protocols) response when keep-alive has been
+        disabled for the request. The header contradicted the
+        <code>Connection: upgrade</code> header required by the protocol being
+        switched to and could cause the client to reject the upgrade. (markt)
+      </fix>
+      <fix>
+        Ensure that the <code>HttpUpgradeHandler</code> instance is destroyed,
+        and that the processor that handled the HTTP request is not released
+        twice, if a failure occurs after the HTTP request has been processed but
+        before the upgrade processor has taken ownership of the handler. (markt)
+      </fix>
+      <fix>
+        Ensure that an exception thrown by
+        <code>HttpUpgradeHandler.destroy()</code> does not prevent the
+        connection and its processor from being cleaned up. Also ensure that
+        <code>destroy()</code> is only called if <code>init()</code> was called
+        for the handler. (markt)
+      </fix>
+      <fix>
+        Improve performance of String based URI normalization. (markt)
+      </fix>
+      <fix>
+        Ensure that, when a client resets an HTTP/2 stream, the error
+        notification for the request is only dispatched once, even if the reset
+        is processed more than once. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Jasper">
@@ -512,6 +619,13 @@
         <code>Writer</code> and <code>OutputStream</code>. (markt)
       </fix>
       <!-- Entries for backport and removal before 12.0.0-M1 below this line -->
+      <fix>
+        Fix the handling of compressed WebSocket messages for which there is no
+        message handler when the <code>permessage-deflate</code> extension is
+        used with context takeover. Such messages are now decompressed and
+        discarded so that later messages are decompressed using the correct
+        window. (markt)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Web applications">
@@ -546,6 +660,20 @@
   <subsection name="jdbc-pool">
     <changelog>
       <!-- Entries for backport and removal before 12.0.0-M1 below this line -->
+      <update>
+        Introduce an immutable configuration snapshot and a single validated
+        apply path for live pool reconfiguration. Connection establishment and
+        credential handling read the snapshot atomically, while the data source
+        and JMX surfaces continue to expose the live configuration with
+        start-time properties fixed when the pool is created. (remm)
+      </update>
+      <fix>
+        <code>PooledConnection</code>/<code>XAConnection</code>: Answer
+        <code>getConnection()</code> with the pooled logical handle instead of
+        the raw driver session, so closing it returns the connection to the pool,
+        statements created through it use the pool's interceptors, and the
+        physical session is not discarded. (remm)
+      </fix>
     </changelog>
   </subsection>
   <subsection name="Other">
@@ -578,6 +706,18 @@
         Tomcat locally. Refactoring line-ending management in build.xml to
         reduce repeated line-ending changes. (markt)
       </fix>
+      <update>
+        Update UnboundID to 7.0.6. (markt)
+      </update>
+      <update>
+        Update SpotBugs to 4.10.5. (markt)
+      </update>
+      <update>
+        Update bnd to 7.5.0. (markt)
+      </update>
+      <update>
+        Update Bouncy Castle to 1.87. (markt)
+      </update>
     </changelog>
   </subsection>
 </section>

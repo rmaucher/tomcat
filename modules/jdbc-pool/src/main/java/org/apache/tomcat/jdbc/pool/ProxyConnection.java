@@ -39,6 +39,15 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
  */
 public class ProxyConnection extends JdbcInterceptor {
 
+    /*
+     * Connection methods that end or start a transaction on the session. They maintain the pooled connection's dirty
+     * marker, which the state interceptor consults before it rolls a pending transaction back.
+     */
+    private static final String COMMIT_VAL = "commit";
+    private static final String ROLLBACK_VAL = "rollback";
+    private static final String SET_AUTO_COMMIT_VAL = "setAutoCommit";
+    private static final String SET_SAVEPOINT_VAL = "setSavepoint";
+
     /**
      * The underlying pooled connection. Volatile because writes that end or re-arm a borrow have no synchronization on
      * the reader's side.
@@ -456,37 +465,36 @@ public class ProxyConnection extends JdbcInterceptor {
         } else if (compare(TOSTRING_VAL, method)) {
             return this.toString();
         } else if (compare(GETCONNECTION_VAL, method)) {
-            // javax.sql.PooledConnection#getConnection(). The pooled
-            // connection is read once, into a snapshot, the way the dispatch
-            // at the bottom of this method reads it, and the physical session
-            // is handed out only while that snapshot still shows this
-            // handle's borrow. The accessor promises the session behind a
-            // live connection: a handle whose session the pool discarded
-            // while borrowed must not reveal that very session - the caller
-            // would keep working on a connection the pool has committed to
-            // retiring - and a session the pool disconnected behind the
-            // handle (an abandon, a forced pool close) holds null by then,
-            // which as this call's answer would only surface as an unrelated
-            // NullPointerException at the caller's first use. A handle whose
-            // borrow has ended is owed the same answer: the session this
-            // field now names may be the one a later borrower is being
-            // served, and the borrow identity is what tells the two apart.
-            // As in the dispatch below, a seal or a re-arm landing after the
-            // snapshot fails the re-check, and a session found null after it
-            // is refused on the same ground - failing closed is the honest
-            // answer. A snapshot that already reads closed is not served
-            // here; the closed guard below gives it the failure every other
-            // use of a closed handle gets.
+            // javax.sql.PooledConnection#getConnection(). The accessor answers
+            // with this pooled handle itself, not with the session behind the
+            // chain. That session is a raw driver object: closing it would
+            // close or invalidate the physical session under the pool's own
+            // notion of a live connection, so the pool would retire a session
+            // it should reuse; and statements created on it would bypass every
+            // interceptor. This handle is the logical connection of the borrow,
+            // so closing it returns the session to the pool, and everything
+            // created through it stays on the chain.
+            //
+            // The handle's own state is answered first, on a snapshot of the
+            // pooled connection the way the dispatch at the bottom of this
+            // method does: a handle whose session the pool discarded while
+            // borrowed must not hand itself out as a live logical connection -
+            // the caller would keep working on a session the pool has
+            // committed to retiring - and a handle whose borrow has ended is
+            // owed the same answer. As in the dispatch below, a seal or a
+            // re-arm landing after the snapshot fails the re-check; failing
+            // closed is the honest answer. A snapshot that already reads closed
+            // is not served here; the closed guard below gives it the failure
+            // every other use of a closed handle gets.
             PooledConnection poolc = connection;
             if (poolc != null && !poolc.isDiscarded() && servesHandle(proxy)) {
                 if (connection != poolc || poolc.isDiscarded() || !servesHandle(proxy)) {
                     throw new SQLException(MessageFactory.get("proxyConnection.connectionClosed"));
                 }
-                Connection physical = poolc.getConnection();
-                if (physical == null) {
+                if (poolc.getConnection() == null) {
                     throw new SQLException(MessageFactory.get("proxyConnection.connectionClosed"));
                 }
-                return physical;
+                return proxy;
             }
         } else if (method.getDeclaringClass() != Object.class &&
                 method.getDeclaringClass().isAssignableFrom(XAConnection.class) && connection != null) {
@@ -668,7 +676,21 @@ public class ProxyConnection extends JdbcInterceptor {
             throw new SQLException(MessageFactory.get("proxyConnection.connectionClosed"));
         }
         try {
-            return method.invoke(physical, args);
+            Object result = method.invoke(physical, args);
+            if (compare(COMMIT_VAL, method) ||
+                    (compare(ROLLBACK_VAL, method) && (args == null || args.length == 0)) ||
+                    (compare(SET_AUTO_COMMIT_VAL, method) && args != null && args.length > 0 &&
+                            Boolean.TRUE.equals(args[0]))) {
+                // The driver accepted an operation that ended the transaction;
+                // the state interceptor no longer needs to roll anything back
+                // for the next borrower.
+                poolc.clearTransactionDirty();
+            } else if (compare(SET_SAVEPOINT_VAL, method)) {
+                // A savepoint can start a transaction even with no statement
+                // executed yet, so record it conservatively.
+                poolc.markTransactionDirty();
+            }
+            return result;
         } catch (Throwable t) {
             if (t instanceof InvocationTargetException) {
                 throw t.getCause() != null ? t.getCause() : t;
@@ -679,9 +701,13 @@ public class ProxyConnection extends JdbcInterceptor {
     }
 
     /**
-     * Returns true if the underlying connection has been closed or discarded.
+     * Returns whether this facade is closed for the pool: the pooled connection has been discarded, or the facade holds
+     * no delegate. This reports the pool's lifecycle state and does not query the driver's physical session; a session
+     * closed behind the pool's back is detected by the pool's own return path, while some drivers can block in
+     * {@code isClosed()}. The proxy's {@link java.sql.Connection#isClosed()} also answers true for a handle whose own
+     * borrow has ended.
      *
-     * @return true if closed or discarded
+     * @return true if the pooled connection is discarded or the facade has no delegate
      */
     public boolean isClosed() {
         // Read the field once: this is the state the closed guard of invoke()

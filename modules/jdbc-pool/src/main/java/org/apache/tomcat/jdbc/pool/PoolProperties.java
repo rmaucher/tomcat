@@ -48,6 +48,13 @@ import org.apache.tomcat.jdbc.pool.util.MessageFactory;
  * their changes under this instance's monitor, which is also the monitor {@link #clone()} and serialization take.
  * Those setters are the snapshot boundary for the state they own. Setters that assign a single plain field do not take
  * the monitor, so a copy taken under it is not a consistent snapshot of those fields against a concurrent write.
+ * <p>
+ * This class is a programmatic configuration surface and returns raw configured values: {@link #getPassword()},
+ * {@link #getUrl()}, {@link #getConnectionProperties()}, {@link #getJdbcInterceptors()} and the database-properties
+ * entries are not masked here. The bean ({@link DataSourceProxy}) and JMX
+ * ({@link org.apache.tomcat.jdbc.pool.jmx.ConnectionPool}) surfaces that publish the same configuration mask
+ * credentials for display; code that exposes configuration across a security boundary should use those masked
+ * accessors rather than this object.
  */
 public class PoolProperties implements PoolConfiguration, Cloneable, Serializable {
 
@@ -58,9 +65,22 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     private static final String PASSWORD_MASK = "********";
 
     /**
-     * Constructs a PoolProperties with default values.
+     * Constructs a PoolProperties with default values and a generated default pool name. The counter makes the names of
+     * programmatically built pools distinct within this class loader; container-managed pools are given their own name
+     * before they start.
      */
     public PoolProperties() {
+        this("Tomcat Connection Pool[" + (poolCounter.addAndGet(1)) + "]");
+    }
+
+    /**
+     * Constructs a PoolProperties carrying the given name without consuming a default-name counter value. Snapshot
+     * copies use this: they carry the source configuration's name and are not pools of their own.
+     *
+     * @param name the pool name, possibly {@code null}
+     */
+    private PoolProperties(String name) {
+        this.name = name;
     }
 
     /**
@@ -133,20 +153,31 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     /** Whether to log abandoned connections. */
     private volatile boolean logAbandoned = false;
     /**
-     * The pool name. This default is the fallback for a pool nobody named: a
-     * container-managed pool is given a name of its own before it starts, so
-     * what is left to name here is a pool built programmatically, once per
-     * {@code PoolProperties} instance. The counter is what makes those names
-     * distinct within this class loader; upstream's default also carried the
-     * identity hash of this class object, which identifies only the class
-     * loader that loaded it - the same value for every pool in a JVM - and so
-     * is not in the name any more.
+     * The pool name. A programmatically built configuration receives a generated default in its constructor; a
+     * snapshot copy carries the source configuration's name instead. The counter is what makes the generated names
+     * distinct within this class loader; upstream's default also carried the identity hash of this class object, which
+     * identifies only the class loader that loaded it - the same value for every pool in a JVM - and so is not in the
+     * name any more.
      */
-    private volatile String name = "Tomcat Connection Pool[" + (poolCounter.addAndGet(1)) + "]";
+    private volatile String name;
     /** The database password. */
     private volatile String password;
+    /**
+     * Whether {@link #setPassword(String)} explicitly cleared the password. A
+     * cleared password must also stop a password supplied by the
+     * {@code connectionProperties} string from authenticating connections when
+     * there is no database-properties collection to remove it from.
+     */
+    private volatile boolean passwordCleared = false;
     /** The database username. */
     private volatile String username;
+    /**
+     * Whether {@link #setUsername(String)} explicitly cleared the user name. A
+     * cleared user name must also stop a user name supplied by the
+     * {@code connectionProperties} string from authenticating connections when
+     * there is no database-properties collection to remove it from.
+     */
+    private volatile boolean usernameCleared = false;
     /** The validation interval in milliseconds. */
     private volatile long validationInterval = 3000;
     /** Whether JMX registration is enabled. */
@@ -336,6 +367,18 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     }
 
 
+    /**
+     * Whether the password was explicitly cleared with {@link #setPassword(String)}. The connect path uses this to
+     * remove a password carried by the {@code connectionProperties} string when there is no database-properties
+     * collection to remove it from.
+     *
+     * @return {@code true} if the password was explicitly cleared
+     */
+    boolean isPasswordCleared() {
+        return passwordCleared;
+    }
+
+
     @Override
     public String getPoolName() {
         return getName();
@@ -387,6 +430,18 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     @Override
     public String getUsername() {
         return username;
+    }
+
+
+    /**
+     * Whether the user name was explicitly cleared with {@link #setUsername(String)}. The connect path uses this to
+     * remove a user name carried by the {@code connectionProperties} string when there is no database-properties
+     * collection to remove it from.
+     *
+     * @return {@code true} if the user name was explicitly cleared
+     */
+    boolean isUsernameCleared() {
+        return usernameCleared;
     }
 
 
@@ -657,13 +712,48 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
      */
     @Override
     public synchronized void setConnectionProperties(String connectionProperties) {
+        // A blank string is the unset value, as the JNDI factory has always
+        // treated it: storing it would make the getter report a value that was
+        // never configured while the effective behaviour is "no pairs".
+        if (connectionProperties != null && connectionProperties.trim().isEmpty()) {
+            connectionProperties = null;
+        }
+        String previousConnectionProperties = this.connectionProperties;
         Properties dbProps = getDbProperties();
         // Parse into a fresh collection before anything is mutated: that is
         // what tells apart the keys this string contributes from the ones
         // dbProperties holds from elsewhere, and a string the parse rejects
-        // must not have cost the previous configuration its pairs yet.
-        Properties parsed = dbProps == null ? null : getProperties(connectionProperties, new Properties());
+        // must not have cost the previous configuration its pairs yet. When
+        // there is no collection, the parse is only needed to see whether the
+        // string declares a credential again, which clears the explicit-clear
+        // marker; the connect path performs the parse that matters and reports
+        // a malformed string there.
+        Properties parsed;
+        if (dbProps == null) {
+            try {
+                parsed = getProperties(connectionProperties, new Properties());
+            } catch (RuntimeException x) {
+                // The string is stored raw. A connect parses it and reports the
+                // malformed value; the clear markers are left as they stand.
+                parsed = null;
+            }
+        } else {
+            parsed = getProperties(connectionProperties, new Properties());
+        }
         this.connectionProperties = connectionProperties;
+        if (parsed != null) {
+            // Writing a string that names a credential is a fresh declaration
+            // of that credential, so it re-enables a credential that was
+            // explicitly cleared before the string was written.
+            for (String key : parsed.stringPropertyNames()) {
+                if (PoolUtilities.isUsernameKey(key)) {
+                    usernameCleared = false;
+                }
+                if (PoolUtilities.isCredentialKey(key)) {
+                    passwordCleared = false;
+                }
+            }
+        }
         if (dbProps == null) {
             // The pairs have no collection to land in; nothing was contributed,
             // so there is nothing to track for a later removal either.
@@ -678,14 +768,29 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
         Properties writable = dbProps;
         // A configuration serialized before this field existed deserializes
         // with it null, as field initializers do not run on deserialization.
-        if (connectionPropertyKeys != null) {
-            for (String key : connectionPropertyKeys) {
-                writable.remove(key);
-                if (writable.getProperty(key) != null) {
-                    Properties copy = PoolUtilities.clone(writable);
-                    copy.remove(key);
-                    writable = copy;
+        // The previous string is still part of that serialized state, so the
+        // keys it contributed can be rebuilt from it instead of leaving them
+        // in the collection for the life of the reconfiguration.
+        if (connectionPropertyKeys == null) {
+            if (previousConnectionProperties != null) {
+                try {
+                    Properties previous = getProperties(previousConnectionProperties, new Properties());
+                    connectionPropertyKeys = new HashSet<>(previous.stringPropertyNames());
+                } catch (RuntimeException x) {
+                    // The old string is malformed and cannot name its keys; no
+                    // tracking can be reconstructed for it.
+                    connectionPropertyKeys = Collections.emptySet();
                 }
+            } else {
+                connectionPropertyKeys = Collections.emptySet();
+            }
+        }
+        for (String key : connectionPropertyKeys) {
+            writable.remove(key);
+            if (writable.getProperty(key) != null) {
+                Properties copy = PoolUtilities.clone(writable);
+                copy.remove(key);
+                writable = copy;
             }
         }
         @SuppressWarnings("null")
@@ -699,19 +804,26 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
         // when this string named the key - DataSourceFactory injects the
         // configured username/password over the string's pairs, so a
         // reconfigure that drops the keys from the string must not strip
-        // credentials the configuration still carries. With the field unset
-        // this parse re-asserts nothing and the entry is the string's own
-        // again. The entry can also be missing here although the string names
-        // the key, because clearing a credential takes the entry away whatever
-        // contributed it; this parse hands the pair back - writing the string
-        // is a fresh declaration of what it contributes.
+        // credentials the configuration still carries. The rule covers every
+        // spelling of the credential, as the credential setters themselves do:
+        // a pass, pwd, PASSWORD or USER pair the string carries must not
+        // survive next to the canonical entry the field sets, or a driver that
+        // recognizes one of those aliases can authenticate with the superseded
+        // value. With the field unset this parse re-asserts nothing and the
+        // entry is the string's own again. The entry can also be missing here
+        // although the string names the key, because clearing a credential
+        // takes the entry away whatever contributed it; this parse hands the
+        // pair back - writing the string is a fresh declaration of what it
+        // contributes.
+        dbProperties = writable;
         if (username != null) {
-            writable.setProperty(PoolUtilities.PROP_USER, username);
+            removeUsernameDbProperties(false);
+            dbProperties.setProperty(PoolUtilities.PROP_USER, username);
         }
         if (password != null) {
-            writable.setProperty(PoolUtilities.PROP_PASSWORD, password);
+            removeCredentialDbProperties(false);
+            dbProperties.setProperty(PoolUtilities.PROP_PASSWORD, password);
         }
-        dbProperties = writable;
         connectionPropertyKeys = keys;
     }
 
@@ -845,6 +957,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     @Override
     public synchronized void setPassword(String password) {
         this.password = password;
+        this.passwordCleared = password == null;
         if (this.dbProperties != null) {
             // A non-null password replaces every spelling of the credential, not only the canonical
             // lower-case key: an older pass, pwd or PASSWORD entry must not keep authenticating
@@ -900,7 +1013,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
             return;
         }
         for (String key : allPropertyKeys(props)) {
-            if (PoolUtilities.PROP_USER.equalsIgnoreCase(key.trim())) {
+            if (PoolUtilities.isUsernameKey(key)) {
                 removeDbProperty(key);
                 if (warnStringEntries) {
                     warnStringStillNamesCredential(key);
@@ -985,6 +1098,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     @Override
     public synchronized void setUsername(String username) {
         this.username = username;
+        this.usernameCleared = username == null;
         if (this.dbProperties != null) {
             // A non-null user name replaces every spelling of the key, so an older USER entry cannot keep
             // authenticating connections with the superseded identity.
@@ -1076,14 +1190,18 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                     PoolProperties.class.getClassLoader(), Thread.currentThread().getContextClassLoader());
             validator = validatorClass.getConstructor().newInstance();
         } catch (ClassNotFoundException e) {
-            log.warn(MessageFactory.get("poolProperties.validatorClassNotFound", className), e);
+            log.warn(MessageFactory.get("poolProperties.validatorClassNotFound",
+                    PoolUtilities.maskAndFlatten(className)), PoolUtilities.maskCredentials(e));
         } catch (ClassCastException e) {
-            log.warn(MessageFactory.get("poolProperties.validatorNotValidator", className), e);
+            log.warn(MessageFactory.get("poolProperties.validatorNotValidator",
+                    PoolUtilities.maskAndFlatten(className)), PoolUtilities.maskCredentials(e));
         } catch (IllegalAccessException e) {
-            log.warn(MessageFactory.get("poolProperties.validatorInaccessible", className), e);
+            log.warn(MessageFactory.get("poolProperties.validatorInaccessible",
+                    PoolUtilities.maskAndFlatten(className)), PoolUtilities.maskCredentials(e));
         } catch (ReflectiveOperationException | IllegalArgumentException | SecurityException e) {
             ExceptionUtils.handleThrowable(ExceptionUtils.unwrapInvocationTargetException(e));
-            log.warn(MessageFactory.get("poolProperties.validatorCannotInstantiate", className), e);
+            log.warn(MessageFactory.get("poolProperties.validatorCannotInstantiate",
+                    PoolUtilities.maskAndFlatten(className)), PoolUtilities.maskCredentials(e));
         }
 
         if (validator == null) {
@@ -1093,7 +1211,8 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
             // while validation in fact runs on the query path. Left at the
             // warning alone, that disagreement is invisible in the default
             // log.
-            log.error(MessageFactory.get("poolProperties.validatorNotInEffect", className));
+            log.error(MessageFactory.get("poolProperties.validatorNotInEffect",
+                    PoolUtilities.maskAndFlatten(className)));
         }
     }
 
@@ -1132,7 +1251,9 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
      * return and re-borrow does not rebuild it. The pool's lifecycle notifications follow the start, not the moment: the
      * close is delivered for the definitions configured when the pool started, whatever this property lists by then,
      * so removing a definition from a live pool does not strand what its registration at the pool's start put in
-     * place.
+     * place. A definition added on a live pool does not receive {@code poolStarted}: the start-time setup hooks are
+     * for the configuration the pool was created with. It is still told about the close, which is where a registration
+     * made by a chain it served is released.
      * </p>
      *
      * @param jdbcInterceptors the semicolon separated interceptor configuration,
@@ -1184,6 +1305,17 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                         m = getClass().getMethod(name);
                     } catch (NoSuchMethodException nm) {
                         continue;
+                    } catch (Throwable x) {
+                        // A lookup failure other than the method being absent -
+                        // an access-control SecurityException, for instance - is
+                        // this field's failure, not the dump's: report it in the
+                        // field and keep printing the rest.
+                        ExceptionUtils.handleThrowable(x);
+                        buf.append(field);
+                        buf.append('=');
+                        appendError(buf, x);
+                        buf.append("; ");
+                        break;
                     }
                     buf.append(field);
                     buf.append('=');
@@ -1236,15 +1368,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                     } catch (ReflectiveOperationException | RuntimeException | Error x) {
                         Throwable cause = ExceptionUtils.unwrapInvocationTargetException(x);
                         ExceptionUtils.handleThrowable(cause);
-                        try {
-                            buf.append("<error: ").append(sanitizeForLog(String.valueOf(cause))).append('>');
-                        } catch (Throwable hostile) {
-                            // A Throwable whose own toString() throws must
-                            // cost only its own field, not every field after
-                            // it: fall back to its class name.
-                            ExceptionUtils.handleThrowable(hostile);
-                            buf.append("<error: ").append(cause.getClass().getName()).append('>');
-                        }
+                        appendError(buf, cause);
                     }
                     buf.append("; ");
                     break;
@@ -1279,6 +1403,27 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
             return value;
         }
         return value.replace('\r', ' ').replace('\n', ' ');
+    }
+
+
+    /**
+     * Appends the failure of one configuration field to the dump, cost only to
+     * that field. A throwable whose own {@code toString()} throws falls back to
+     * its class name, so the failure cannot take the rest of the dump with it
+     * either.
+     *
+     * @param buf     the dump under construction
+     * @param failure the field's failure
+     */
+    private static void appendError(StringBuilder buf, Throwable failure) {
+        try {
+            buf.append("<error: ").append(PoolUtilities.maskAndFlatten(String.valueOf(failure))).append('>');
+        } catch (Throwable hostile) {
+            // A Throwable whose own toString() throws must cost only its own
+            // field, not every field after it: fall back to its class name.
+            ExceptionUtils.handleThrowable(hostile);
+            buf.append("<error: ").append(failure.getClass().getName()).append('>');
+        }
     }
 
 
@@ -1404,18 +1549,23 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
         }
         StringBuilder result = new StringBuilder(value.length());
         int segmentStart = 0;
-        while (segmentStart < value.length()) {
-            int segmentEnd = value.indexOf(';', segmentStart);
-            if (segmentEnd < 0) {
-                segmentEnd = value.length();
-            }
-            maskInterceptorSegment(value, segmentStart, segmentEnd, result);
-            if (segmentEnd < value.length()) {
-                // Keep the definition separator itself.
+        int depth = 0;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '(') {
+                depth++;
+            } else if (c == ')' && depth > 0) {
+                depth--;
+            } else if (c == ';' && depth == 0) {
+                // A separator only ends a definition outside every property
+                // list: a semicolon inside a value (a credential among them)
+                // is part of that value, not a new definition.
+                maskInterceptorSegment(value, segmentStart, i, result);
                 result.append(';');
+                segmentStart = i + 1;
             }
-            segmentStart = segmentEnd + 1;
         }
+        maskInterceptorSegment(value, segmentStart, value.length(), result);
         return result.toString();
     }
 
@@ -1596,54 +1746,51 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
         List<int[]> ranges = new ArrayList<>(2);
         // Every scheme:// authority in the string: a failover or logging URL
         // carried in a value is as credential-bearing as the URL in front of
-        // it, and the authority never contains "://" itself (the scan of one
-        // authority ends at the first '/'), so the search resumes after it.
+        // it. The scan of one URL runs until the next URL, a space, or the
+        // first path/query/host delimiter that follows a candidate userinfo;
+        // a delimiter before the '@' is part of the password, not the end of
+        // the authority, because a driver can accept those characters
+        // unencoded in a credential.
         int from = 0;
         int schemeEnd;
         while ((schemeEnd = value.indexOf("://", from)) >= 0) {
             int authorityStart = schemeEnd + 3;
-            int authorityEnd = authorityStart;
-            while (authorityEnd < value.length() && !isAuthorityTerminator(value.charAt(authorityEnd))) {
-                authorityEnd++;
-            }
-            // An unencoded '@' inside the password itself can only extend the
-            // userinfo, so the credential runs up to the last '@' of the
-            // authority, if any.
-            int at = value.lastIndexOf('@', authorityEnd - 1);
-            if (at >= authorityStart) {
+            int scanEnd = scanAuthority(value, authorityStart);
+            int at = lastUserinfoAt(value, authorityStart, scanEnd);
+            if (at >= 0 && at + 1 < scanEnd) {
                 int colon = value.indexOf(':', authorityStart);
                 if (colon >= 0 && colon < at) {
-                    ranges.add(new int[] { colon + 1, at });
+                    String secret = value.substring(colon + 1, at);
+                    // A '/', '#' or white space before the '@' means the scan
+                    // crossed into a path, fragment or another value rather
+                    // than reading userinfo.
+                    if (secret.indexOf('/') < 0 && secret.indexOf('#') < 0
+                            && !containsWhitespace(secret)) {
+                        ranges.add(new int[] { colon + 1, at });
+                    }
                 }
             }
-            from = authorityEnd;
+            from = Math.max(scanEnd, authorityStart + 1);
         }
         // Legacy Oracle form, e.g. jdbc:oracle:thin:user/password@host:1521:sid,
         // wherever it appears in the string - as the URL itself or as the
-        // value of a pair. Its scan is bounded by the segment the prefix
-        // starts in, so an '@' of a later URL cannot drag the mask across it.
+        // value of a pair. Its scan is bounded the same way, so an '@' of a
+        // later URL cannot drag the mask across it.
         String oraclePrefix = "jdbc:oracle:";
         for (int p = indexOfIgnoreCase(value, oraclePrefix, 0); p >= 0;
                 p = indexOfIgnoreCase(value, oraclePrefix, p + 1)) {
             int prefixEnd = p + oraclePrefix.length();
-            int segmentEnd = prefixEnd;
-            while (segmentEnd < value.length() && !isCredentialSegmentSeparator(value.charAt(segmentEnd))) {
-                segmentEnd++;
-            }
-            int firstAt = value.indexOf('@', prefixEnd);
-            if (firstAt >= 0 && firstAt < segmentEnd) {
-                int slash = value.indexOf('/', prefixEnd);
-                if (slash >= 0 && slash < firstAt) {
-                    // The section opens with the user/password pair. An
-                    // unencoded '@' inside the password itself can only
-                    // extend the credential, so as in the scheme:// pass
-                    // above it runs up to the last '@' of the segment; the
-                    // at-sign-only connect forms, which carry neither a user
-                    // nor a password, are already excluded by the slash
-                    // lying behind the first '@'.
-                    int at = value.lastIndexOf('@', segmentEnd - 1);
-                    ranges.add(new int[] { slash + 1, at });
-                }
+            int scanEnd = scanOracleAuthority(value, oraclePrefix, p, prefixEnd);
+            int slash = value.indexOf('/', prefixEnd);
+            int at = lastUserinfoAt(value, prefixEnd, scanEnd);
+            if (at >= 0 && slash >= 0 && slash < at && at + 1 < scanEnd) {
+                // The section opens with the user/password pair. An
+                // unencoded '@' inside the password itself can only extend
+                // the credential, so as in the scheme:// pass above it runs
+                // up to the last '@' of the section; the at-sign-only connect
+                // forms, which carry neither a user nor a password, are
+                // already excluded by the slash lying behind the first '@'.
+                ranges.add(new int[] { slash + 1, at });
             }
         }
         if (ranges.isEmpty()) {
@@ -1670,6 +1817,131 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
 
 
     /**
+     * Finds the end of one scheme:// URL scan. The scan runs until white space,
+     * a line break, a nested {@code ://}, the end of the string, or a
+     * path/query/fragment delimiter that follows a candidate '@'. Separators
+     * before that '@' are password characters: a URL password may carry them
+     * unencoded, and ending the authority at one would leave the password
+     * tail unmasked.
+     *
+     * @param value the raw configuration string
+     * @param start the first character after the {@code ://}
+     *
+     * @return the exclusive end of the scan
+     */
+    private static int scanAuthority(String value, int start) {
+        int at = -1;
+        int i = start;
+        while (i < value.length()) {
+            char c = value.charAt(i);
+            if (isWhitespace(c) || (i > start && value.startsWith("://", i))) {
+                return i;
+            }
+            if (c == '@') {
+                at = i;
+            } else if (at >= 0 && isAuthorityDelimiter(c)) {
+                return i;
+            }
+            i++;
+        }
+        return value.length();
+    }
+
+
+    /**
+     * Finds the end of one legacy Oracle URL scan. The same delimiters end it,
+     * with one exception: an additional {@code /} before the candidate '@' is
+     * part of the password, while the first {@code /} is the user/password
+     * separator.
+     *
+     * @param value        the raw configuration string
+     * @param oraclePrefix the legacy prefix
+     * @param prefixStart  the index of the prefix in the string
+     * @param start        the first character after the prefix
+     *
+     * @return the exclusive end of the scan
+     */
+    private static int scanOracleAuthority(String value, String oraclePrefix, int prefixStart, int start) {
+        int at = -1;
+        int i = start;
+        while (i < value.length()) {
+            char c = value.charAt(i);
+            if (isWhitespace(c) ||
+                    (i > prefixStart && value.regionMatches(true, i, oraclePrefix, 0, oraclePrefix.length()))) {
+                return i;
+            }
+            if (c == '@') {
+                at = i;
+            } else if (at >= 0 && isAuthorityDelimiter(c)) {
+                return i;
+            }
+            i++;
+        }
+        return value.length();
+    }
+
+
+    /**
+     * Returns the last '@' of a URL scan, or {@code -1} when the scan carries
+     * none.
+     *
+     * @param value the raw configuration string
+     * @param start the first character of the scanned section
+     * @param end   the exclusive end of the scan
+     *
+     * @return the index of the last '@', or {@code -1}
+     */
+    private static int lastUserinfoAt(String value, int start, int end) {
+        int at = value.lastIndexOf('@', end - 1);
+        return at >= start ? at : -1;
+    }
+
+
+    /**
+     * Whether the character ends the host/port part of a URL once a candidate
+     * userinfo has been seen. Before that candidate the same characters can be
+     * part of the password and do not end the scan.
+     *
+     * @param c the character to test
+     *
+     * @return {@code true} when the character is an authority delimiter
+     */
+    private static boolean isAuthorityDelimiter(char c) {
+        return c == '/' || c == '?' || c == ';' || c == '&' || c == '#' || c == ',' || c == '|';
+    }
+
+
+    /**
+     * Whether the character is white space or a line break for the URL scan.
+     *
+     * @param c the character to test
+     *
+     * @return {@code true} when the character separates values
+     */
+    private static boolean isWhitespace(char c) {
+        return c == ' ' || c == '\t' || c == '\f' || c == '\n' || c == '\r';
+    }
+
+
+    /**
+     * Whether a candidate credential contains white space, which means the
+     * scan crossed into a later value rather than reading userinfo.
+     *
+     * @param value the candidate credential
+     *
+     * @return {@code true} when it contains white space
+     */
+    private static boolean containsWhitespace(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            if (isWhitespace(value.charAt(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    /**
      * Finds the first occurrence of {@code needle} in {@code value} at or
      * after {@code from}, ignoring case.
      *
@@ -1686,19 +1958,6 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
             }
         }
         return -1;
-    }
-
-
-    /**
-     * Whether {@code c} ends the authority section of a URL, covering the path,
-     * query and the semicolon used as a parameter separator by some drivers.
-     *
-     * @param c the character to test
-     *
-     * @return {@code true} when the character ends the authority section
-     */
-    private static boolean isAuthorityTerminator(char c) {
-        return c == '/' || c == '?' || c == ';';
     }
 
 
@@ -1921,13 +2180,14 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
 
         /**
          * Returns the interceptor class, loading it if necessary. The configured class must extend
-         * {@link JdbcInterceptor}: a class that loads but does not extend it fails the pool start with a
-         * {@link ClassCastException} when this method returns.
+         * {@link JdbcInterceptor}. The cast to {@code Class<? extends JdbcInterceptor>} is erased, so a class that
+         * loads but does not extend {@link JdbcInterceptor} is returned from this method unchanged; the check is made
+         * later, when the pool instantiates it and assigns the new object to a {@link JdbcInterceptor}, and is
+         * reported as an interceptor-instantiation failure rather than as a {@link ClassCastException} here.
          *
-         * @return the interceptor class
+         * @return the loaded class, nominally an interceptor class
          *
          * @throws ClassNotFoundException if the class cannot be found
-         * @throws ClassCastException if the class does not extend {@link JdbcInterceptor}
          */
         @SuppressWarnings("unchecked")
         public Class<? extends JdbcInterceptor> getInterceptorClass() throws ClassNotFoundException {
@@ -2010,10 +2270,11 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
             if (value == null) {
                 return def;
             }
-            if ("true".equals(value)) {
+            String trimmed = value.trim();
+            if ("true".equalsIgnoreCase(trimmed)) {
                 return true;
             }
-            if ("false".equals(value)) {
+            if ("false".equalsIgnoreCase(trimmed)) {
                 return false;
             }
             return def;
@@ -2031,7 +2292,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                 return def;
             }
             try {
-                int v = Integer.parseInt(value);
+                int v = Integer.parseInt(value.trim());
                 return v;
             } catch (NumberFormatException nfe) {
                 return def;
@@ -2050,7 +2311,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                 return def;
             }
             try {
-                return Long.parseLong(value);
+                return Long.parseLong(value.trim());
             } catch (NumberFormatException nfe) {
                 return def;
             }
@@ -2068,7 +2329,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                 return def;
             }
             try {
-                return Byte.parseByte(value);
+                return Byte.parseByte(value.trim());
             } catch (NumberFormatException nfe) {
                 return def;
             }
@@ -2086,7 +2347,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                 return def;
             }
             try {
-                return Short.parseShort(value);
+                return Short.parseShort(value.trim());
             } catch (NumberFormatException nfe) {
                 return def;
             }
@@ -2104,7 +2365,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                 return def;
             }
             try {
-                return Float.parseFloat(value);
+                return Float.parseFloat(value.trim());
             } catch (NumberFormatException nfe) {
                 return def;
             }
@@ -2122,7 +2383,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                 return def;
             }
             try {
-                return Double.parseDouble(value);
+                return Double.parseDouble(value.trim());
             } catch (NumberFormatException nfe) {
                 return def;
             }
@@ -2251,7 +2512,14 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
                 // charset conversion takes place at all.
                 props.load(new StringReader(propText.replace(';', '\n')));
             } catch (IOException ioe) {
-                throw new RuntimeException(ioe);
+                throw new IllegalArgumentException(MessageFactory.get(
+                        "poolProperties.invalidConnectionProperties", ioe.getMessage()), ioe);
+            } catch (RuntimeException x) {
+                // Properties.load rejects a malformed Unicode escape with a
+                // bare IllegalArgumentException that does not name the value's
+                // owner; identify it as the connection properties string.
+                throw new IllegalArgumentException(MessageFactory.get(
+                        "poolProperties.invalidConnectionProperties", x.getMessage()), x);
             }
         }
         return props;
@@ -2361,6 +2629,97 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
     public void setUseStatementFacade(boolean useStatementFacade) {
         this.useStatementFacade = useStatementFacade;
     }
+
+    /**
+     * Creates the pool-private {@link PoolProperties} snapshot a pool reads from a configuration.
+     * <p>
+     * The snapshot is always a plain {@code PoolProperties}, never the subclass instance the caller supplied: a
+     * configuration subclass can override getters (the test fixtures use that to observe when a value is read) and
+     * carry instance fields that do not belong to the configuration. Copying the base fields directly keeps the
+     * snapshot values and the class stable while leaving the caller's builder untouched and still usable.
+     *
+     * @param source the configuration to copy
+     *
+     * @return a plain PoolProperties copy
+     */
+    static PoolProperties copyOf(PoolConfiguration source) {
+        if (!(source instanceof PoolProperties)) {
+            throw new IllegalArgumentException(MessageFactory.get(
+                    "connectionPool.unsupportedConfiguration", source.getClass().getName()));
+        }
+        PoolProperties from = (PoolProperties) source;
+        // The credential, connection-properties, validator and interceptor
+        // setters publish under the source monitor. Take the same monitor for
+        // the whole copy so the snapshot cannot capture a collection midway
+        // through a reconfiguration, or a string paired with the definitions
+        // of another generation.
+        synchronized (from) {
+            PoolProperties copy = new PoolProperties(from.name);
+            copy.dbProperties = from.dbProperties == null ? null : PoolUtilities.clone(from.dbProperties);
+            copy.url = from.url;
+            copy.driverClassName = from.driverClassName;
+            copy.defaultAutoCommit = from.defaultAutoCommit;
+            copy.defaultReadOnly = from.defaultReadOnly;
+            copy.defaultTransactionIsolation = from.defaultTransactionIsolation;
+            copy.defaultCatalog = from.defaultCatalog;
+            copy.connectionProperties = from.connectionProperties;
+            copy.connectionPropertyKeys = from.connectionPropertyKeys == null ? null
+                    : new HashSet<>(from.connectionPropertyKeys);
+            copy.initialSize = from.initialSize;
+            copy.maxActive = from.maxActive;
+            copy.maxIdle = from.maxIdle;
+            copy.minIdle = from.minIdle;
+            copy.maxWait = from.maxWait;
+            copy.validationQuery = from.validationQuery;
+            copy.validationQueryTimeout = from.validationQueryTimeout;
+            copy.validatorClassName = from.validatorClassName;
+            copy.validator = from.validator;
+            copy.testOnBorrow = from.testOnBorrow;
+            copy.testOnReturn = from.testOnReturn;
+            copy.testWhileIdle = from.testWhileIdle;
+            copy.timeBetweenEvictionRunsMillis = from.timeBetweenEvictionRunsMillis;
+            copy.numTestsPerEvictionRun = from.numTestsPerEvictionRun;
+            copy.minEvictableIdleTimeMillis = from.minEvictableIdleTimeMillis;
+            copy.accessToUnderlyingConnectionAllowed = from.accessToUnderlyingConnectionAllowed;
+            copy.removeAbandoned = from.removeAbandoned;
+            copy.removeAbandonedTimeout = from.removeAbandonedTimeout;
+            copy.logAbandoned = from.logAbandoned;
+            copy.password = from.password;
+            copy.passwordCleared = from.passwordCleared;
+            copy.username = from.username;
+            copy.usernameCleared = from.usernameCleared;
+            copy.validationInterval = from.validationInterval;
+            copy.jmxEnabled = from.jmxEnabled;
+            copy.initSQL = from.initSQL;
+            copy.testOnConnect = from.testOnConnect;
+            copy.jdbcInterceptors = from.jdbcInterceptors;
+            copy.fairQueue = from.fairQueue;
+            copy.useEquals = from.useEquals;
+            copy.abandonWhenPercentageFull = from.abandonWhenPercentageFull;
+            copy.maxAge = from.maxAge;
+            copy.useLock = from.useLock;
+            if (from.interceptors != null) {
+                InterceptorDefinition[] copies = new InterceptorDefinition[from.interceptors.length];
+                for (int i = 0; i < from.interceptors.length; i++) {
+                    copies[i] = from.interceptors[i] == null ? null : from.interceptors[i].copy();
+                }
+                copy.interceptors = copies;
+            }
+            copy.suspectTimeout = from.suspectTimeout;
+            copy.dataSource = from.dataSource;
+            copy.dataSourceJNDI = from.dataSourceJNDI;
+            copy.alternateUsernameAllowed = from.alternateUsernameAllowed;
+            copy.commitOnReturn = from.commitOnReturn;
+            copy.rollbackOnReturn = from.rollbackOnReturn;
+            copy.useDisposableConnectionFacade = from.useDisposableConnectionFacade;
+            copy.logValidationErrors = from.logValidationErrors;
+            copy.propagateInterruptState = from.propagateInterruptState;
+            copy.ignoreExceptionOnPreLoad = from.ignoreExceptionOnPreLoad;
+            copy.useStatementFacade = from.useStatementFacade;
+            return copy;
+        }
+    }
+
 
     /**
      * Returns a copy of the configuration, including a copy of the driver-properties collection so a defaults-backed

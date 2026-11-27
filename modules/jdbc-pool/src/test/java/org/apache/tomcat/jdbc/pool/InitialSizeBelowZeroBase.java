@@ -21,6 +21,7 @@ import java.sql.SQLException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -90,6 +91,71 @@ abstract class InitialSizeBelowZeroBase extends JdbcPoolBaseTest {
                 }
             }
             return false;
+        }
+    }
+
+    /**
+     * Stores a huge positive pre-load count after the construction check has
+     * read the value it compares against maxActive, so the store is past the
+     * correction that would otherwise bring it down. The allocation itself
+     * must still bound the count to maxActive instead of allocating the huge
+     * array.
+     */
+    private static final class HookedLargeInitialSizeProperties extends PoolProperties {
+
+        private static final long serialVersionUID = 1L;
+
+        private int constructionReads;
+
+        @Override
+        public int getInitialSize() {
+            if (fromConstructionCheck()) {
+                constructionReads++;
+                if (constructionReads == 4) {
+                    int before = super.getInitialSize();
+                    super.setInitialSize(Integer.MAX_VALUE);
+                    return before;
+                }
+            }
+            return super.getInitialSize();
+        }
+
+        private boolean fromConstructionCheck() {
+            StackTraceElement[] frames = new Throwable().getStackTrace();
+            for (int i = 1; i < frames.length - 1; i++) {
+                if ("checkPoolConfiguration".equals(frames[i].getMethodName())
+                        && "init".equals(frames[i + 1].getMethodName())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    @Test
+    void aHugeInitialSizeStoredAfterTheConstructionCheckIsBoundedAtAllocation() throws Exception {
+        DataSource ds = new DataSource();
+        HookedLargeInitialSizeProperties properties = new HookedLargeInitialSizeProperties();
+        properties.setUrl(getUrl());
+        properties.setDriverClassName("org.h2.Driver");
+        properties.setUsername("sa");
+        properties.setPassword("");
+        properties.setJmxEnabled(false);
+        properties.setInitialSize(1);
+        properties.setMaxActive(4);
+        properties.setMinIdle(0);
+        properties.setMaxIdle(4);
+        properties.setTimeBetweenEvictionRunsMillis(-1);
+        ds.setPoolProperties(properties);
+        manage(ds);
+
+        ds.createPool();
+
+        Assertions.assertNotNull(ds.getPool(), "the pool must be created despite the huge raced-in count");
+        Assertions.assertEquals(4, ds.getPoolSize(),
+                "the pre-load must be bounded by maxActive rather than by the raced-in initialSize");
+        try (Connection pooled = ds.getConnection()) {
+            Assertions.assertTrue(pooled.isValid(1), "a pool created after the bounded pre-load still works");
         }
     }
 
@@ -164,7 +230,7 @@ abstract class InitialSizeBelowZeroBase extends JdbcPoolBaseTest {
      * that never learns to run.
      */
     @Test
-    void aNegativeInitialSizeStoredWhileThePoolIsBeingBuiltDoesNotAbortTheCreation() throws Exception {
+    void anInitialSizeWriteRacingTheConstructionIsRejected() throws Exception {
         LifecycleInterceptor.started.set(0);
         LifecycleInterceptor.closed.set(0);
         DataSource ds = new DataSource();
@@ -184,6 +250,7 @@ abstract class InitialSizeBelowZeroBase extends JdbcPoolBaseTest {
 
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch finished = new CountDownLatch(1);
+        AtomicReference<Throwable> writeFailure = new AtomicReference<>();
         properties.release = release;
         properties.finished = finished;
         Thread racer = new Thread(() -> {
@@ -193,8 +260,13 @@ abstract class InitialSizeBelowZeroBase extends JdbcPoolBaseTest {
                 Thread.currentThread().interrupt();
                 return;
             }
-            ds.setInitialSize(-1);
-            finished.countDown();
+            try {
+                ds.setInitialSize(-1);
+            } catch (Throwable x) {
+                writeFailure.set(x);
+            } finally {
+                finished.countDown();
+            }
         }, "store-during-construction");
         racer.setDaemon(true);
         racer.start();
@@ -203,16 +275,17 @@ abstract class InitialSizeBelowZeroBase extends JdbcPoolBaseTest {
         ds.createPool();
         racer.join(TimeUnit.SECONDS.toMillis(10));
 
-        Assertions.assertEquals(0, ds.getPoolProperties().getInitialSize(),
-                "the pool must bound a pre-load count that raced in after the construction check, "
-                        + "not die on it");
+        Assertions.assertInstanceOf(UnsupportedOperationException.class, writeFailure.get(),
+                "a write to the pre-load count must be rejected while the pool is being built");
+        Assertions.assertEquals(1, ds.getPoolProperties().getInitialSize(),
+                "a rejected write must leave the configured pre-load count untouched");
         Assertions.assertEquals(1, LifecycleInterceptor.started.get(),
                 "precondition: the pool's interceptors were told it started");
         Assertions.assertEquals(0, LifecycleInterceptor.closed.get(),
                 "a pool that is running has not been closed");
         try (Connection pooled = ds.getConnection()) {
             Assertions.assertTrue(pooled.isValid(1),
-                    "a pool whose pre-load count arrived negative mid-creation still hands out sessions");
+                    "a pool whose pre-load write was refused still hands out sessions");
         }
         ds.close();
         Assertions.assertEquals(1, LifecycleInterceptor.closed.get(),
