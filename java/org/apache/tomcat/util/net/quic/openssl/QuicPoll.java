@@ -71,7 +71,9 @@ public final class QuicPoll {
     public static final long SSL_POLL_EVENT_F = 1L << 0;       // Failure (item could not be polled)
     public static final long SSL_POLL_EVENT_EL = 1L << 1;      // Listener error
     public static final long SSL_POLL_EVENT_EC = 1L << 2;      // Connection close
-    public static final long SSL_POLL_EVENT_ECD = 1L << 3;     // Connection closed
+    // Connection closed and drained (OpenSSL's "Exception on Conn Drained":
+    // the channel has reached the terminated state)
+    public static final long SSL_POLL_EVENT_ECD = 1L << 3;
     public static final long SSL_POLL_EVENT_ER = 1L << 4;      // Stream read error
     public static final long SSL_POLL_EVENT_EW = 1L << 5;      // Stream write error
     public static final long SSL_POLL_EVENT_R = 1L << 6;       // Readable
@@ -105,11 +107,11 @@ public final class QuicPoll {
 
     // SSL_accept_stream() flags (different from SSL_new_stream() flags)
     // OpenSSL ssl.h: SSL_ACCEPT_STREAM_UNI=2, SSL_ACCEPT_STREAM_BIDI=4.
-    // The directional filter is OpenSSL 4.x-only: OpenSSL 3.5 defines only
-    // SSL_ACCEPT_STREAM_NO_BLOCK and its ossl_quic_accept_stream() ignores
-    // unknown flag bits, accepting the next pending stream of any direction.
-    // Call sites must therefore route per-stream handling by the observed
-    // SSL_get_stream_type(), not by the flag they passed.
+    // OpenSSL 3.5 defines only SSL_ACCEPT_STREAM_NO_BLOCK and its
+    // ossl_quic_accept_stream() ignores unknown flag bits, accepting the next
+    // pending stream of any direction. The directional flags were added in
+    // OpenSSL 3.6. Call sites must therefore route per-stream handling by the
+    // observed SSL_get_stream_type(), not by the flag they passed.
     public static final long SSL_ACCEPT_STREAM_UNI = 2L;
     public static final long SSL_ACCEPT_STREAM_BIDI = 4L;
 

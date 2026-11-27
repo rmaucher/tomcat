@@ -95,8 +95,10 @@ public class QuicConnectionWrapper implements QuicConnection {
      * The SNI host name sent by the client. Read once on the poll thread
      * during connection setup and cached so worker threads never make a
      * native call on the connection SSL. {@code null} only if the
-     * setup-time read has not (successfully) happened; an empty string
-     * means the client sent no SNI.
+     * setup-time read has not (successfully) happened. An empty string is
+     * ambiguous: it means "the client sent no usable SNI" only once
+     * {@link #sniResolved} is set; before that it may mean the ClientHello
+     * has not been processed yet.
      */
     private volatile String sniHostName;
 
@@ -110,6 +112,16 @@ public class QuicConnectionWrapper implements QuicConnection {
      * that path stop re-reading on every stream event.
      */
     private volatile boolean sniResolved;
+
+    /**
+     * Sentinel returned by {@link #readSniHostNameNative(MemorySegment)} for an
+     * SNI that is present but contains characters that are not valid in a host
+     * name (ISO controls, line/paragraph separators, or Unicode format/bidi
+     * controls). It cannot collide with a real SNI because OpenSSL rejects
+     * embedded NUL bytes. Callers distinguish it from {@code null}, which means
+     * the client sent no SNI.
+     */
+    static final String INVALID_SNI = "\u0000";
 
     /**
      * Remote address (client).
@@ -274,10 +286,10 @@ public class QuicConnectionWrapper implements QuicConnection {
     /**
      * Number of client bidirectional and unidirectional streams accepted on
      * this connection so far. Retained so transport-limit reconciliation can
-     * recover the advertised initial limit at any time: the remaining remote
-     * credit plus the streams already accepted equals that initial limit,
-     * regardless of whether reconciliation happens during bootstrap or later
-     * when the ALPN result became readable.
+     * recover the advertised initial limit: the remaining remote credit plus
+     * the streams already accepted equals that initial limit once the peer's
+     * accept queue has been drained. While peer-opened streams are still
+     * queued for acceptance, that sum understates the initial limit.
      */
     private volatile int acceptedBidiStreams;
     private volatile int acceptedUniStreams;
@@ -551,11 +563,11 @@ public class QuicConnectionWrapper implements QuicConnection {
      * (early setup) or an unreachable poll thread the native object is not
      * touched.
      * <p>
-     * An empty cached value is <b>not</b> re-read here: it means "no usable
-     * SNI" (either the client sent none or the setup-time ClientHello was not
-     * processed yet). {@code ensureServedProtocol()} performs the explicit
-     * native retry once the handshake has progressed. Callers must therefore
-     * treat an empty result as "no usable SNI".
+     * An empty cached value is re-read while {@link #isSniResolved()} is
+     * {@code false}, because it may only mean the setup-time ClientHello was
+     * not processed yet. Once the cached value has been resolved (including
+     * an authoritative empty value), it is not re-read. Callers must
+     * therefore treat a resolved empty result as "no usable SNI".
      *
      * @return the SNI host name, or an empty string if none was sent or the
      *         value could not be determined; never {@code null}
@@ -563,7 +575,7 @@ public class QuicConnectionWrapper implements QuicConnection {
     @Override
     public String getSniHostName() {
         String result = sniHostName;
-        if (result == null) {
+        if (result == null || (result.isEmpty() && !sniResolved)) {
             QuicOpenSSLEndpoint endpoint = this.endpoint;
             if (endpoint == null || isClosed() || isFreed()) {
                 // No poll thread to hop the native call to (endpoint not
@@ -578,6 +590,15 @@ public class QuicConnectionWrapper implements QuicConnection {
             try {
                 result = endpoint.callOnPollThread(this::readSniHostNameCached);
             } catch (Throwable t) {
+                Throwable fatal =
+                        QuicOpenSSLEndpoint.findFatalBindingFailure(t);
+                if (fatal != null) {
+                    log.error(sm.getString(
+                            "quicEndpoint.bindingAssertionFailure",
+                            "getSniHostName"), fatal);
+                    endpoint.markPollLoopFailed();
+                    throw (Error) fatal;
+                }
                 // The poll thread is not (or no longer) reachable: the SNI
                 // host name is not critical, report "no SNI". Fatal VM
                 // errors still propagate.
@@ -585,13 +606,15 @@ public class QuicConnectionWrapper implements QuicConnection {
                 result = "";
             }
         }
-        return result;
+        return result == null ? "" : result;
     }
 
 
     /**
      * Reads the SNI host name from the native connection SSL and caches it.
-     * Must only be called on the QUIC poll thread.
+     * A non-empty value is marked resolved immediately; an empty value only
+     * becomes authoritative once the handshake has completed. Must only be
+     * called on the QUIC poll thread.
      */
     private String readSniHostNameCached() {
         if (isClosed() || isFreed()) {
@@ -604,7 +627,13 @@ public class QuicConnectionWrapper implements QuicConnection {
         }
         String value = readSniHostName();
         sniHostName = value;
-        sniResolved = true;
+        if (!value.isEmpty() || QuicBindings.SSL_is_init_finished(ssl) == 1) {
+            // A non-empty value is authoritative immediately. An empty value
+            // is authoritative only once the handshake is complete: before
+            // that the ClientHello (and therefore any SNI extension) may not
+            // have been processed yet.
+            sniResolved = true;
+        }
         return value;
     }
 
@@ -621,9 +650,15 @@ public class QuicConnectionWrapper implements QuicConnection {
      *
      * @param ssl The SSL object to read the server name from
      *
-     * @return the SNI host name, in lower case, or {@code null} if the client
-     *         sent no SNI (or a name containing control/line-separator
-     *         characters, which is rejected to keep it out of log output)
+     * @return the SNI host name, in lower case; {@code null} if the client sent
+     *         no SNI extension; or {@link #INVALID_SNI} if a name was present
+     *         but is empty or contains characters that are not valid in a host
+     *         name. The invalid
+     *         sentinel lets the certificate manager reject malformed names
+     *         fail-closed instead of treating them as "no SNI", while normal
+     *         callers map it to an empty string so the raw bytes are never
+     *         logged. A trailing-dot name is rejected separately by the
+     *         certificate manager.
      */
     public static String readSniHostNameNative(MemorySegment ssl) {
         MemorySegment namePtr = QuicBindings.SSL_get_servername(
@@ -634,17 +669,29 @@ public class QuicConnectionWrapper implements QuicConnection {
         // Host names are case-insensitive and the endpoint's SSL host config
         // look-ups are keyed by lower-cased names. Normalise at the source.
         String name = namePtr.getString(0).toLowerCase(Locale.ENGLISH);
-        // OpenSSL only rejects an empty name or embedded NUL; other control
-        // bytes are accepted. The name is logged by the certificate manager
-        // and the HTTP/3 processor, so a client could otherwise inject CR/LF
-        // into the log. Fail closed to "no SNI": a name containing control or
-        // line-separator characters is not a valid host name anyway.
+        if (name.isEmpty()) {
+            // OpenSSL accepts a present but zero-length SNI host name (it
+            // rejects only embedded NUL bytes and names longer than 255).
+            // Distinguish that malformed name from the NULL pointer above
+            // ("the client sent no SNI extension") and reject it like the
+            // other malformed names instead of falling back to the default
+            // identity.
+            return INVALID_SNI;
+        }
+        // OpenSSL accepts control bytes in the name. The name is logged by the
+        // certificate manager and the HTTP/3 processor, so a client could
+        // otherwise inject CR/LF or Unicode bidi controls into the log. Report
+        // malformed names with a sentinel so the certificate manager rejects
+        // them fail-closed, while the connection's cached SNI
+        // (readSniHostName()) maps the sentinel to an empty string and never
+        // logs the raw bytes.
         for (int i = 0; i < name.length(); i++) {
             char c = name.charAt(i);
-            if (Character.isISOControl(c) || Character.getType(c) ==
-                    Character.LINE_SEPARATOR || Character.getType(c) ==
-                    Character.PARAGRAPH_SEPARATOR) {
-                return null;
+            int type = Character.getType(c);
+            if (Character.isISOControl(c) || type == Character.LINE_SEPARATOR ||
+                    type == Character.PARAGRAPH_SEPARATOR ||
+                    type == Character.FORMAT) {
+                return INVALID_SNI;
             }
         }
         return name;
@@ -658,11 +705,12 @@ public class QuicConnectionWrapper implements QuicConnection {
      * does not call it for an already-cached empty value.
      *
      * @return the SNI host name, in lower case, or an empty string if the
-     *         client sent no SNI or the read failed
+     *         client sent no SNI, sent a malformed name, or the read failed.
+     *         Malformed names are never returned or logged through this path.
      */
     String readSniHostName() {
         String name = readSniHostNameNative(ssl);
-        return name == null ? "" : name;
+        return name == null || name == INVALID_SNI ? "" : name;
     }
 
 
@@ -714,6 +762,14 @@ public class QuicConnectionWrapper implements QuicConnection {
                 return null;
             });
         } catch (Throwable t) {
+            Throwable fatal = QuicOpenSSLEndpoint.findFatalBindingFailure(t);
+            if (fatal != null) {
+                log.error(sm.getString(
+                        "quicEndpoint.bindingAssertionFailure",
+                        "failConnection"), fatal);
+                endpoint.markPollLoopFailed();
+                throw (Error) fatal;
+            }
             // The hop timed out or was rejected. Mark the connection closed so
             // no new work starts on it, then arrange a best-effort poll-thread
             // teardown: the timed-out hop itself will hit the endpoint's
@@ -1360,6 +1416,9 @@ public class QuicConnectionWrapper implements QuicConnection {
             } catch (Throwable t) {
                 failed = true;
                 markStreamFreeFailed();
+                if (endpoint != null) {
+                    endpoint.recordFatalBindingFailure("closeAllStreams", t);
+                }
                 ExceptionUtils.handleThrowable(t);
                 log.warn(sm.getString("quicEndpoint.streamTeardownError",
                         Long.toHexString(stream.getSslAddress())), t);

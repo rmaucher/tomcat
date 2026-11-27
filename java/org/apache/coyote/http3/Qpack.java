@@ -270,11 +270,13 @@ final class Qpack {
      * <p>
      * The value MUST be within the encodable domain of the format,
      * {@code 0} to {@code 2^62 - 1} inclusive: this method performs no
-     * range check and silently mis-encodes anything outside it (a negative
-     * value falls into the one-byte branch and emits a truncated byte
-     * whose two-bit prefix names the eight-byte form, desynchronising any
-     * reader; a value of {@code 2^62} or greater overlays the two-bit
-     * prefix), so
+     * range check and silently mis-encodes anything outside it (any negative
+     * value falls into the one-byte branch because it compares less than 64,
+     * writing only the low byte of a value whose encoded length and prefix
+     * do not match; for example {@code -1} writes {@code 0xFF}, whose
+     * two-bit prefix announces an eight-byte encoding that is not present,
+     * desynchronising any reader; a value of {@code 2^62} or greater
+     * overlays the two-bit prefix), so
      * bounding the input is the caller's contract (the current callers
      * clamp or use known-bounded values).
      *
@@ -322,6 +324,11 @@ final class Qpack {
      *             buffer position is restored to just after the first byte.
      * @throws QpackValueTooLargeException If the integer exceeds
      *             {@link #MAX_IRP_VALUE}
+     * @throws QpackIntegerEncodingLimitException If the encoding uses a
+     *             continuation group at shift 63 or beyond (an RFC 9204
+     *             Section 7.4 implementation limit on the encoded length,
+     *             reported as a subclass so consumers can distinguish it
+     *             from a value-domain overflow)
      */
     public static long decodeIrp(ByteBuffer source, int n, int firstByte) throws QpackException {
         int maxInline = (1 << n) - 1;
@@ -383,6 +390,11 @@ final class Qpack {
      *             three-argument overload)
      * @throws QpackValueTooLargeException If the integer exceeds
      *             {@link #MAX_IRP_VALUE}
+     * @throws QpackIntegerEncodingLimitException If the encoding uses a
+     *             continuation group at shift 63 or beyond (an RFC 9204
+     *             Section 7.4 implementation limit on the encoded length,
+     *             reported as a subclass so consumers can distinguish it
+     *             from a value-domain overflow)
      */
     public static long decodeIrp(ByteBuffer source, int n) throws QpackException {
         if (source.remaining() == 0) {
@@ -439,6 +451,13 @@ final class Qpack {
      */
     public static void encodeIrp(ByteBuffer target, int upper, int n, long value) {
         int maxInline = (1 << n) - 1;
+        // RFC 7541 Section 5.1 sends value == maxInline to the continuation
+        // branch: it emits the all-ones prefix followed by a redundant 0x00
+        // continuation byte. That encoding is valid (and the decoder accepts
+        // it); only values strictly below the prefix maximum fit inline.
+        // Do not "simplify" this to value <= maxInline: the decoder treats an
+        // all-ones prefix as "continuation follows", so omitting the 0x00
+        // byte would corrupt the stream.
         if (value < maxInline) {
             target.put((byte) (upper | (int) value));
             return;

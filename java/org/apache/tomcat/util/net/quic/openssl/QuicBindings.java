@@ -99,13 +99,31 @@ public class QuicBindings {
      * Checks if QUIC support is available in the linked OpenSSL library.
      * The answer is computed (at the end of this class's static
      * initialisation, below) from the symbol failures recorded while the
-     * downcall handles were being created: every required symbol this class
-     * resolves is probed by the very call that binds it, so the availability
-     * check and the required-symbol set can never drift apart. Optional
+     * downcall handles were being created: every required symbol declared in
+     * this class is probed by the very call that binds it, so the availability
+     * check and this class's required-symbol set cannot drift apart. Optional
      * extension symbols bound by {@code createOptionalHandle()} are excluded
      * from this verdict and must be checked individually. A partially-complete
      * library is rejected at startup instead of leaving individual required
      * handles null and degrading specific features silently.
+     * <p>
+     * This verdict covers only the symbols bound by this class. The endpoint
+     * also calls symbols from the generated {@code openssl_h} bindings (for
+     * example {@code SSL_get0_alpn_selected}, {@code SSL_get_current_cipher},
+     * {@code SSL_get_session}, {@code SSL_get_version},
+     * {@code SSL_CTX_set_ciphersuites}, {@code i2d_X509} and
+     * {@code CRYPTO_free}) and the direct {@code SSL_CTX_set_alpn_select_cb}
+     * lookup. Those are resolved separately and can still fail on first use
+     * even when {@code QUIC_AVAILABLE} is true; they are not part of this
+     * probe.
+     * <p>
+     * If the generated {@code openssl_h} bindings cannot initialise at all
+     * (for example when {@code libssl} cannot be loaded), this class's static
+     * initialisation can fail before this field is assigned. Callers that need
+     * a non-throwing capability probe must use
+     * {@link QuicOpenSSLEndpoint#isAvailable()} (or guard the access with a
+     * {@code LinkageError} catch); reading this field directly may throw
+     * {@code ExceptionInInitializerError}/{@code NoClassDefFoundError}.
      */
     public static final boolean QUIC_AVAILABLE;
 
@@ -172,7 +190,7 @@ public class QuicBindings {
      * @param flags OpenSSL {@code SSL_LISTENER_FLAG_*} values. The endpoint
      *              passes {@code 0}, which keeps OpenSSL's default address
      *              validation enabled; {@code SSL_LISTENER_FLAG_NO_VALIDATE}
-     *              (OpenSSL 4.x) would disable it
+     *              (OpenSSL 3.5+) would disable it
      * @return The new listener object, or {@code NULL} on failure
      */
     public static MemorySegment SSL_new_listener(MemorySegment ctx, long flags) {
@@ -218,7 +236,7 @@ public class QuicBindings {
      *
      * @param listener The listener SSL object
      * @param flags    OpenSSL {@code SSL_ACCEPT_CONNECTION_*} values; the
-     *                 endpoint passes {@code 0}. OpenSSL 4.x defines
+     *                 endpoint passes {@code 0}. OpenSSL 3.5+ defines
      *                 {@code SSL_ACCEPT_CONNECTION_NO_BLOCK} for the non-blocking
      *                 accept case
      * @return The SSL object for the incoming connection, or {@code NULL} if none is pending
@@ -272,7 +290,7 @@ public class QuicBindings {
      *              QuicPoll#SSL_ACCEPT_STREAM_BIDI} only bidirectional ones,
      *              {@code 0} accepts whichever is pending next. ({@code
      *              SSL_ACCEPT_STREAM_NO_BLOCK} is not used here.) The
-     *              directional filter is OpenSSL 4.x-only: an OpenSSL 3.5
+     *              directional flags were added in OpenSSL 3.6: an OpenSSL 3.5
      *              library defines no such flags and ignores them, accepting
      *              the next pending stream of any direction.
      * @return The SSL object for the accepted stream, or {@code NULL} if none is pending
@@ -679,13 +697,23 @@ public class QuicBindings {
      *            {@link #SSL_VALUE_STREAM_WRITE_BUF_AVAIL}
      * @return The statistic, or {@code -1} if the library rejected the query
      *         (for example because the SSL object is not a QUIC stream or has
-     *         no send buffer)
+     *         no send buffer). The handled failure clears the OpenSSL error
+     *         queue so the rejection entry is not mistaken for a later
+     *         failure.
      */
     public static long SSL_get_stream_write_buf_stat(MemorySegment ssl, int id) {
         try (Arena localArena = Arena.ofConfined()) {
             MemorySegment value = localArena.allocate(ValueLayout.JAVA_LONG);
             value.set(ValueLayout.JAVA_LONG, 0, 0L);
             if (SSL_get_value_uint(ssl, SSL_VALUE_CLASS_GENERIC, id, value) != 1) {
+                // SSL_get_value_uint() raises SSL_R_UNSUPPORTED_CONFIG_VALUE
+                // when the statistic is unavailable. Callers treat the
+                // negative result as a handled condition (keep the stream and
+                // warn at most once), so drain the error-queue entry here:
+                // otherwise it can overwrite an older root cause in the
+                // fixed-size per-thread ERR ring or be misattributed in a
+                // later diagnostic dump.
+                QuicDiagnostics.clearErrorQueue();
                 return -1L;
             }
             return value.get(ValueLayout.JAVA_LONG, 0);
@@ -1509,6 +1537,35 @@ public class QuicBindings {
         }
     }
 
+    /** {@code ERR_LIB_SSL} from OpenSSL's {@code err.h}. */
+    private static final int ERR_LIB_SSL = 20;
+    /** {@code SSL_R_STREAM_COUNT_LIMITED} from OpenSSL's {@code sslerr.h}. */
+    private static final int SSL_R_STREAM_COUNT_LIMITED = 411;
+
+
+    /**
+     * Reports whether an OpenSSL error code is
+     * {@code SSL_R_STREAM_COUNT_LIMITED} from {@code ERR_LIB_SSL}. This is the
+     * expected, non-fatal result of a non-blocking {@code SSL_new_stream()}
+     * call when the peer has not granted stream credit. It allows the
+     * endpoint to distinguish that ordinary "not ready yet" result from a
+     * genuine {@code NULL} failure, including on libraries where the
+     * {@code SSL_VALUE_QUIC_STREAM_UNI_LOCAL_AVAIL} query is unavailable.
+     *
+     * @param errorCode The code returned by {@code ERR_peek_error()} or
+     *                  {@code ERR_get_error()}
+     *
+     * @return {@code true} if the code is {@code SSL_R_STREAM_COUNT_LIMITED}
+     */
+    public static boolean isStreamCountLimitedError(long errorCode) {
+        // ERR_GET_LIB()/ERR_GET_REASON() are inline in OpenSSL's err.h:
+        // lib is bits 23..30, reason is the low 23 bits.
+        int lib = (int) ((errorCode >> 23) & 0xFF);
+        int reason = (int) (errorCode & 0x7FFFFF);
+        return lib == ERR_LIB_SSL && reason == SSL_R_STREAM_COUNT_LIMITED;
+    }
+
+
     /**
      * {@code void ERR_error_string_n(unsigned long e, char *buf, size_t len)}
      */
@@ -1535,22 +1592,24 @@ public class QuicBindings {
     // -------------------------------------------------- Helpers
 
     private static MethodHandle createHandle(String symbol, FunctionDescriptor desc) {
-        MemorySegment addr = openssl_h.SYMBOL_LOOKUP.find(symbol).orElse(null);
-        if (addr == null) {
-            // The bind attempt itself is the availability probe: record the
-            // failure so QUIC_AVAILABLE turns false at the end of static
-            // initialisation (see the field's javadoc).
-            MISSING_OPENSSL_SYMBOLS.add(symbol);
-            return null;
-        }
         try {
+            MemorySegment addr = openssl_h.SYMBOL_LOOKUP.find(symbol).orElse(null);
+            if (addr == null) {
+                // The bind attempt itself is the availability probe: record the
+                // failure so QUIC_AVAILABLE turns false at the end of static
+                // initialisation (see the field's javadoc).
+                MISSING_OPENSSL_SYMBOLS.add(symbol);
+                return null;
+            }
             return Linker.nativeLinker().downcallHandle(addr, desc);
         } catch (Throwable e) {
             // Fatal VM errors (for example OOM) must not be misreported as a
             // binding failure.
             ExceptionUtils.handleThrowable(e);
-            // The symbol exists; the descriptor/layout is wrong. Keep this
-            // distinct from a missing symbol in the startup diagnostic.
+            // Either the symbol lookup itself failed (for example a linkage
+            // error from the generated bindings) or the symbol exists and its
+            // descriptor/layout is wrong. Keep this distinct from a missing
+            // symbol in the startup diagnostic.
             FAILED_OPENSSL_BINDINGS.add(symbol + " (" + e + ")");
             return null;
         }

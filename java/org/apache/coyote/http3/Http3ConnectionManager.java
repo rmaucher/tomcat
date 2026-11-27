@@ -401,10 +401,17 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * frame boundary. A stream that is closed before its stream type header
      * is received is not an error: RFC 9114 Section 6.2 requires the receiver
      * to tolerate that case.
+     * <p>
+     * RFC 9114 Section 7.1 only prescribes the truncated-final-frame error for
+     * a stream that terminates cleanly. Streams that terminate abruptly may
+     * be reset at any point in a frame, so an abrupt reset must not be
+     * classified as a frame or QPACK stream error; the caller passes
+     * {@code cleanFin=false} for a reset and the critical-stream closure
+     * error applies instead.
      */
     @Override
     public long getTruncatedClientUniStreamErrorCode(QuicConnection connection,
-            long streamId, boolean partialRetained) {
+            long streamId, boolean partialRetained, boolean cleanFin) {
         ConnectionState state = connections.get(connection);
         if (state == null) {
             return 0;
@@ -413,6 +420,13 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             // Client-initiated unidirectional stream IDs are 2 mod 4. This
             // method must never classify a BIDI or server-initiated stream as
             // a truncated client-uni stream.
+            return 0;
+        }
+        if (!cleanFin) {
+            // Abrupt termination may occur at any point in a frame
+            // (RFC 9114 Section 7.1), so only a clean FIN can make retained
+            // bytes a truncated-final-frame error. The caller maps the
+            // closure of a critical stream to H3_CLOSED_CRITICAL_STREAM.
             return 0;
         }
         long streamType = state.getClientUniStreamType(streamId);
@@ -504,6 +518,20 @@ public class Http3ConnectionManager implements QuicConnectionManager {
     static final int SERVER_STREAM_INDEX_CONTROL = 0;
     static final int SERVER_STREAM_INDEX_QPACK_ENCODER = 1;
     static final int SERVER_STREAM_INDEX_QPACK_DECODER = 2;
+
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * Request streams are parked until the server control stream carrying
+     * SETTINGS exists (RFC 9114 Section 7.2.4 requires SETTINGS to be sent
+     * immediately after connection establishment).
+     */
+    @Override
+    public boolean isReadyForRequestStreams(QuicConnection connection) {
+        ConnectionState state = connections.get(connection);
+        return state != null && state.isServerControlStreamCreated();
+    }
 
 
     /**
@@ -916,12 +944,16 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 if (log.isDebugEnabled()) {
                     log.debug(sm.getString(
                             "http3ConnectionManager.knownControlFrameBudget",
-                            Long.valueOf(frameType), Long.valueOf(frameLength)));
+                            Long.valueOf(frameType), Long.valueOf(frameLength),
+                            Integer.valueOf(MAX_KNOWN_CONTROL_FRAMES),
+                            Long.valueOf(MAX_KNOWN_CONTROL_FRAME_BYTES)));
                 }
                 throw new Http3Exception(
                         sm.getString(
                                 "http3ConnectionManager.knownControlFrameBudget",
-                                Long.valueOf(frameType), Long.valueOf(frameLength)),
+                                Long.valueOf(frameType), Long.valueOf(frameLength),
+                                Integer.valueOf(MAX_KNOWN_CONTROL_FRAMES),
+                                Long.valueOf(MAX_KNOWN_CONTROL_FRAME_BYTES)),
                         Http3Error.H3_EXCESSIVE_LOAD);
             }
 
@@ -938,8 +970,16 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                     // the connection state and applied when encoding
                     // response field sections (RFC 9114 Section 4.2.2).
                     Http3Settings clientSettings = new Http3Settings(settingsData);
-                    state.clientSettingsReceived = true;
+                    // Publish the negotiated limit before the flag that
+                    // tells other threads the SETTINGS have been consumed,
+                    // so an observer that trusts the flag cannot see the
+                    // stale default (-1, unlimited) peer limit. The limit
+                    // field is volatile; the flag is only read on the poll
+                    // thread today but is made volatile as well so the
+                    // "settings received" publication is well ordered for
+                    // any current or future cross-thread reader.
                     state.setPeerMaxFieldSectionSize(clientSettings.getMaxFieldSectionSize());
+                    state.clientSettingsReceived = true;
                     if (log.isTraceEnabled()) {
                         log.trace(sm.getString(
                                 "http3ConnectionManager.settingsReceived",
@@ -1313,7 +1353,8 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                         sm.getString(
                                 "http3ConnectionManager.qpackInstructionBudget",
                                 Long.valueOf(streamId),
-                                Integer.valueOf(MAX_QPACK_INSTRUCTIONS)),
+                                Integer.valueOf(MAX_QPACK_INSTRUCTIONS),
+                                Long.valueOf(MAX_QPACK_INSTRUCTION_BYTES)),
                         Http3Error.H3_EXCESSIVE_LOAD);
             }
         }
@@ -1443,12 +1484,16 @@ public class Http3ConnectionManager implements QuicConnectionManager {
 
     /**
      * Returns the snapshotted SETTINGS_MAX_FIELD_SECTION_SIZE value for this
-     * connection.
+     * connection, clamped to a non-negative value. A configured negative
+     * value is enforced and advertised as the explicit zero-byte limit, so
+     * the snapshot matches the effective value rather than exposing the raw
+     * configuration value.
      *
-     * @return The snapshotted maximum field section size
+     * @return The snapshotted maximum field section size, clamped to a
+     *         non-negative value
      */
     long getMaxFieldSectionSize() {
-        return settingsMaxFieldSectionSize;
+        return Constants.clampToNonNegativeInt(settingsMaxFieldSectionSize);
     }
 
 
@@ -1596,11 +1641,14 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      * endpoint reaches it through the {@link #flushPendingProtocolData} guard.
      *
      * @param connection The QUIC connection
+     *
+     * @return {@code true} if at least one byte was accepted by the decoder
+     *         stream write during this call
      */
-    private void flushPendingDecoderInstructions(QuicConnection connection) {
+    private boolean flushPendingDecoderInstructions(QuicConnection connection) {
         ConnectionState state = connections.get(connection);
         if (state == null) {
-            return;
+            return false;
         }
         synchronized (state) {
             // Serialize anything newly pending into the byte queue first.
@@ -1632,7 +1680,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                     }
                     connection.failConnection(Http3Error.H3_EXCESSIVE_LOAD.getCode(),
                             sm.getString("http3ConnectionManager.qpackDecoderInstructionBacklog"));
-                    return;
+                    return false;
                 }
                 // Build the instruction bytes:
                 // Section Acknowledgment (4.4.1): 1 + iRP(m=7) stream ID
@@ -1689,13 +1737,13 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // sets the mark after it queues, and the queueing happens
                 // under this same lock.
                 connection.setProtocolDataPending(false);
-                return;
+                return false;
             }
             QuicStream decoderStream = state.serverQpackDecoderStream;
             if (decoderStream == null) {
                 // The server QPACK decoder stream does not exist yet; the
                 // instructions are flushed on a later call.
-                return;
+                return false;
             }
             ByteBuffer pendingInit = decoderStream.getWriteBuffer();
             if (pendingInit != null && pendingInit.hasRemaining()) {
@@ -1703,16 +1751,21 @@ public class Http3ConnectionManager implements QuicConnectionManager {
                 // endpoint is retrying the init write); writing instructions
                 // before it would corrupt the stream. The flush is retried
                 // on a later call once the init bytes are out.
-                return;
+                return false;
             }
 
             // Drain the queue in wire order. A partial accept keeps the head
             // chunk queued with its position advanced past the accepted
             // prefix, so the next attempt re-presents exactly the bytes that
             // are still unsent.
+            boolean progress = false;
             while (!state.unsentInstructions.isEmpty()) {
                 ConnectionState.InstructionChunk chunk = state.unsentInstructions.peekFirst();
+                int before = chunk.buffer().position();
                 connection.writeToStream(decoderStream, chunk.buffer());
+                if (chunk.buffer().position() != before) {
+                    progress = true;
+                }
                 if (chunk.buffer().hasRemaining()) {
                     break;
                 }
@@ -1726,6 +1779,7 @@ public class Http3ConnectionManager implements QuicConnectionManager {
             } else if (log.isDebugEnabled()) {
                 log.debug("Deferred QPACK decoder instruction flush");
             }
+            return progress;
         }
     }
 
@@ -1744,16 +1798,22 @@ public class Http3ConnectionManager implements QuicConnectionManager {
      */
     @Override
     public void flushPendingProtocolData(QuicConnection connection) {
-        ConnectionState state = connections.get(connection);
-        if (state == null) {
-            return;
-        }
-        // Deliberately not clearing the transport's pending mark here even
-        // when nothing is pending: that check runs outside the state lock,
-        // and a clear could overwrite a mark set by a thread that queued
-        // after the check. The (poll-thread) flush clears the mark inside
-        // the state lock below.
         flushPendingDecoderInstructions(connection);
+    }
+
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * Reports whether the decoder-instruction write advanced. A blocked
+     * decoder stream (not created yet, or still waiting for its stream-type
+     * byte to leave the write buffer) or a write that accepts no bytes
+     * returns {@code false}, so the OpenSSL endpoint does not treat a
+     * no-progress flush as a successful flush that warrants an engine tick.
+     */
+    @Override
+    public boolean flushPendingProtocolDataProgress(QuicConnection connection) {
+        return flushPendingDecoderInstructions(connection);
     }
 
 
@@ -1824,7 +1884,9 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         // SETTINGS frame. Kept on the state so request validation follows the
         // negotiated value even if the connector property changes later.
         private final boolean enableConnectProtocol;
-        private boolean clientSettingsReceived;
+        // Volatile so the SETTINGS-received publication (and the peer limit
+        // written before it) is visible to readers outside the poll thread.
+        private volatile boolean clientSettingsReceived;
         private long maxPushId = -1;
         private long lastGoawayId = -1;
         // Volatile because it is written on the QUIC poll thread (when the
@@ -2359,6 +2421,17 @@ public class Http3ConnectionManager implements QuicConnectionManager {
         @Override
         public boolean isClientSettingsReceived() {
             return clientSettingsReceived;
+        }
+
+
+        /**
+         * Returns whether the server control stream has been created and
+         * registered.
+         *
+         * @return {@code true} if the server control stream has been created
+         */
+        public boolean isServerControlStreamCreated() {
+            return serverControlStreamCreated;
         }
 
 

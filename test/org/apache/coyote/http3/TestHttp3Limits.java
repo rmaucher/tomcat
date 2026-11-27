@@ -436,6 +436,94 @@ public class TestHttp3Limits extends Http3TestBase {
 
 
     @Test
+    public void testReservedSettingTakesPrecedenceOverDuplicate()
+            throws Exception {
+        // RFC 9114 Section 7.2.4.1 requires a reserved identifier to be a
+        // connection error of type H3_SETTINGS_ERROR. When the same reserved
+        // identifier appears twice, the reserved diagnostic must win over the
+        // duplicate diagnostic (both fail with H3_SETTINGS_ERROR, so the
+        // message distinguishes the classification).
+        ByteBuffer reserved = ByteBuffer.allocate(16);
+        Qpack.encodeQuicInteger(reserved, 0x02L);
+        Qpack.encodeQuicInteger(reserved, 0L);
+        Qpack.encodeQuicInteger(reserved, 0x02L);
+        Qpack.encodeQuicInteger(reserved, 0L);
+        reserved.flip();
+        try {
+            new Http3Settings(reserved);
+            Assert.fail("A reserved SETTINGS identifier was accepted");
+        } catch (Http3Exception e) {
+            Assert.assertEquals(Http3Error.H3_SETTINGS_ERROR, e.getError());
+            Assert.assertTrue("A repeated reserved identifier must report "
+                    + "the reserved diagnostic, not the duplicate one: "
+                    + e.getMessage(), e.getMessage().contains("Reserved"));
+        }
+
+        // A repeated genuinely-unknown identifier still reports the
+        // duplicate diagnostic (RFC 9114 Section 7.2.4).
+        ByteBuffer duplicate = ByteBuffer.allocate(16);
+        Qpack.encodeQuicInteger(duplicate, 0x99L);
+        Qpack.encodeQuicInteger(duplicate, 0L);
+        Qpack.encodeQuicInteger(duplicate, 0x99L);
+        Qpack.encodeQuicInteger(duplicate, 0L);
+        duplicate.flip();
+        try {
+            new Http3Settings(duplicate);
+            Assert.fail("A duplicate SETTINGS identifier was accepted");
+        } catch (Http3Exception e) {
+            Assert.assertEquals(Http3Error.H3_SETTINGS_ERROR, e.getError());
+            Assert.assertTrue("A repeated unknown identifier must report the "
+                    + "duplicate diagnostic: " + e.getMessage(),
+                    e.getMessage().contains("Duplicate"));
+        }
+    }
+
+
+    @Test
+    public void testReservedSettingAfterCountLimitUsesSettingsError()
+            throws Exception {
+        // RFC 9114 Section 7.2.4.1 requires a reserved identifier to be a
+        // connection error of type H3_SETTINGS_ERROR even when it is the
+        // identifier that pushes the frame past MAX_SETTINGS. The count
+        // limit must not replace the mandated reserved-identifier error with
+        // H3_EXCESSIVE_LOAD.
+        ByteBuffer payload = ByteBuffer.allocate(20000);
+        for (int i = 0; i < Http3Settings.MAX_SETTINGS; i++) {
+            Qpack.encodeQuicInteger(payload, 0x1000L + i);
+            Qpack.encodeQuicInteger(payload, 0);
+        }
+        Qpack.encodeQuicInteger(payload, 0x00L);
+        Qpack.encodeQuicInteger(payload, 0);
+        payload.flip();
+        try {
+            new Http3Settings(payload);
+            Assert.fail("A reserved SETTINGS identifier was accepted");
+        } catch (Http3Exception e) {
+            Assert.assertEquals("A reserved identifier after the count limit "
+                    + "must use the mandated SETTINGS error, not the "
+                    + "excessive-load resource-limit error",
+                    Http3Error.H3_SETTINGS_ERROR, e.getError());
+            Assert.assertTrue("A reserved identifier after the count limit "
+                    + "must report the reserved-identifier diagnostic: "
+                    + e.getMessage(), e.getMessage().contains("Reserved"));
+        }
+    }
+
+
+    @Test
+    public void testNegativeMaxFieldSectionSizeSnapshotIsClamped()
+            throws Exception {
+        // A negative configured limit is enforced and advertised as the
+        // explicit zero-byte limit; the connection snapshot must expose the
+        // same clamped effective value, not the raw negative configuration.
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        protocol.setMaxFieldSectionSize(-1);
+        Http3ConnectionManager manager = new Http3ConnectionManager(protocol);
+        Assert.assertEquals(0L, manager.getMaxFieldSectionSize());
+    }
+
+
+    @Test
     public void testSharedDecoderRequiresSetCapacityBeforeInsert()
             throws Exception {
         Http3ConnectionManager manager =

@@ -113,26 +113,37 @@ public interface QuicConnectionManager {
 
     /**
      * Returns the protocol-specific connection error code to use when a
-     * critical client-initiated unidirectional stream terminates with data
-     * that the protocol parser retained as an incomplete frame/instruction,
-     * or {@code 0} when the stream ended at a valid boundary (or the protocol
-     * has no specific truncated-stream error).
+     * critical client-initiated unidirectional stream terminates cleanly
+     * (FIN) with data that the protocol parser retained as an incomplete
+     * frame/instruction, or {@code 0} when the stream ended at a valid
+     * boundary, was reset abruptly, or the protocol has no specific
+     * truncated-stream error.
      * <p>
      * The endpoint uses this before mapping a terminal critical stream to the
      * generic "critical stream closed" error: RFC 9114 Section 7.1 requires a
-     * truncated final frame to be reported as {@code H3_FRAME_ERROR}, and
-     * RFC 9204 requires incomplete QPACK instructions to use the
-     * corresponding QPACK stream error.
+     * truncated final frame on a cleanly terminated stream to be reported as
+     * {@code H3_FRAME_ERROR}, and RFC 9204 requires incomplete QPACK
+     * instructions on a cleanly terminated stream to use the corresponding
+     * QPACK stream error. Section 7.1 also states that streams that terminate
+     * abruptly may be reset at any point in a frame, so an abrupt reset must
+     * not be mapped to a frame/QPACK stream error; the caller must pass
+     * {@code cleanFin=false} in that case and let the critical-stream closure
+     * error apply.
      *
      * @param connection The QUIC connection
      * @param streamId   The client unidirectional stream identifier
      * @param partialRetained Whether the endpoint retained unconsumed bytes
      *                        from the last protocol parse
+     * @param cleanFin Whether the stream ended cleanly (FIN) rather than
+     *                 abruptly (reset/connection close). Truncated-frame
+     *                 errors are only applicable to clean FIN termination.
      *
-     * @return The protocol error code, or 0 for a clean frame boundary
+     * @return The protocol error code, or 0 for a clean frame boundary,
+     *         abrupt termination, or a protocol-specific reason not to
+     *         override the critical-stream closure error
      */
     default long getTruncatedClientUniStreamErrorCode(QuicConnection connection,
-            long streamId, boolean partialRetained) {
+            long streamId, boolean partialRetained, boolean cleanFin) {
         return 0;
     }
 
@@ -162,6 +173,26 @@ public interface QuicConnectionManager {
      *         {@code -1} if none is required at this time
      */
     int nextServerUniStream(QuicConnection connection);
+
+
+    /**
+     * Returns whether the protocol is ready for the endpoint to promote and
+     * dispatch accepted bidirectional request streams.
+     * <p>
+     * The endpoint parks accepted request streams until the protocol allows
+     * promotion, so a protocol can commit its connection setup (for HTTP/3,
+     * the server control stream carrying SETTINGS) before request data is
+     * dispatched. Protocols that do not need any server-initiated stream may
+     * keep the default {@code true} implementation; protocols that do must
+     * override this method and return {@code true} once their setup is ready.
+     *
+     * @param connection The QUIC connection
+     *
+     * @return {@code true} if accepted request streams may be dispatched
+     */
+    default boolean isReadyForRequestStreams(QuicConnection connection) {
+        return true;
+    }
 
 
     /**
@@ -251,6 +282,25 @@ public interface QuicConnectionManager {
      * @param connection The QUIC connection
      */
     void flushPendingProtocolData(QuicConnection connection);
+
+
+    /**
+     * Emits pending protocol data and reports whether the flush made any
+     * progress, so the endpoint can distinguish "the flush could not move"
+     * from "the flush succeeded and produced output". Implementations that
+     * cannot track progress may keep the default, which reports progress for
+     * every successful call.
+     *
+     * @param connection The QUIC connection
+     *
+     * @return {@code true} if bytes were emitted (or the protocol does not
+     *         track progress), {@code false} if the pending data could not be
+     *         advanced in this call
+     */
+    default boolean flushPendingProtocolDataProgress(QuicConnection connection) {
+        flushPendingProtocolData(connection);
+        return true;
+    }
 
 
     /**

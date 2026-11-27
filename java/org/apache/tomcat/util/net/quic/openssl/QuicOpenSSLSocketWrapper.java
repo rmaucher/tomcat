@@ -92,6 +92,28 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     private final ReentrantLock writeLock = new ReentrantLock();
 
     /**
+     * Serializes every operation that touches the shared read side: the
+     * socket read buffer managed by {@code socketBufferHandler} and the
+     * stream's own pre-read buffer.
+     * <p>
+     * An asynchronous application may read from a non-container thread (the
+     * thread it started after {@code AsyncContext.start()}) while the
+     * endpoint's poll thread prefetches into the same socket read buffer from
+     * {@code dispatchStreamEvent()}. The stream's {@code processing} flag does
+     * not cover such an application read, and {@code hasReadWaiter()} is only
+     * set while the reader is parked in {@code awaitReadableData()}, not while
+     * it is copying bytes. Neither {@link SocketBufferHandler} nor
+     * {@link java.nio.ByteBuffer} is thread-safe, so without this lock the
+     * prefetch can flip, compact or fill the buffer while the application
+     * thread reads it, corrupting the request-body framing.
+     * <p>
+     * The poll thread's prefetch uses {@link #tryAcquireReadLock()} and skips
+     * the prefetch when a read is in progress, so the poll loop never blocks
+     * on a reader that may itself be waiting for a poll-thread hop.
+     */
+    private final ReentrantLock readLock = new ReentrantLock();
+
+    /**
      * Monotonic count of bytes accepted by the native stream write path. The
      * write-interest sweep compares snapshots across a non-blocking flush to
      * distinguish a flush that made progress from one that could not write
@@ -170,18 +192,17 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     /**
      * Returns the stream backing this wrapper iff its native {@code SSL*} is
-     * safe to touch, otherwise {@code null}. "Safe" is the full set of
-     * conditions that every native-accessing path must satisfy - the stream is
-     * present, has not been freed, and still holds a non-NULL {@code SSL*} -
-     * so that no call site has to re-decide (and can never accidentally omit)
-     * part of the check. A freed stream's {@code SSL*} may already be back in
-     * the allocator, so touching it is the use-after-free class of bug (F1)
-     * this guard exists to prevent.
+     * safe to touch from the wrapper-side paths, otherwise {@code null}. The
+     * checks are: the stream is present, has not been freed or deregistered,
+     * its owning connection has not recorded a failed/partial
+     * {@code SSL_free()}, and the stream still holds a non-NULL {@code SSL*}.
+     * A freed stream's {@code SSL*} may already be back in the allocator, so
+     * touching it is the use-after-free class of bug this guard prevents.
      * <p>
      * This is the wrapper-side entry guard; the endpoint-side equivalent is
-     * {@code QuicOpenSSLEndpoint.isStreamLive()} (which additionally rejects a
-     * closed or freed connection, because endpoint poll paths can be reached
-     * for streams whose connection is going away). Callers translate a
+     * {@code QuicOpenSSLEndpoint.isStreamLive()}, which additionally rejects a
+     * closed or freed connection because endpoint poll paths can be reached
+     * for streams whose connection is going away. Callers translate a
      * {@code null} result into their own contract: read paths throw
      * {@code EOFException}, write paths throw {@code IOException}, and
      * best-effort paths ({@code concludeStream}, {@code resetStream},
@@ -193,6 +214,12 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
     private QuicStreamWrapper liveStream() {
         QuicStreamWrapper stream = getSocket();
         if (stream == null || stream.isFreed() || stream.isDeregistered()) {
+            return null;
+        }
+        QuicConnectionWrapper conn = stream.getConnection();
+        if (conn != null && conn.hasConnectionFreeFailure()) {
+            // The connection SSL_free() failed and may have partially run; the
+            // stream SSL must not be driven through a partially freed parent.
             return null;
         }
         MemorySegment ssl = stream.getSsl();
@@ -252,9 +279,16 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             Throwable cause = (e instanceof ExecutionException ec && ec.getCause() != null)
                     ? ec.getCause() : e;
             if (cause instanceof Error err) {
-                // A failed native binding call (AssertionError from
-                // QuicBindings) means OpenSSL is broken: fatal, do not
-                // downgrade it to an IOException the caller may survive.
+                // A failed native binding call means OpenSSL is broken: fatal,
+                // do not downgrade it to an IOException the caller may survive.
+                Throwable fatal =
+                        QuicOpenSSLEndpoint.findFatalBindingFailure(cause);
+                if (fatal != null) {
+                    log.error(sm.getString(
+                            "quicEndpoint.bindingAssertionFailure",
+                            "native hop"), fatal);
+                    endpoint.markPollLoopFailed();
+                }
                 throw err;
             }
             if (cause instanceof IOException ioe) {
@@ -407,6 +441,33 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
     // ------------------------------------- Read
 
+    /**
+     * Attempts to acquire the read-side lock for the endpoint's poll-thread
+     * prefetch without blocking.
+     * <p>
+     * The poll thread must never wait for an application reader: the reader
+     * may itself be blocked in an {@code onPollThread()} hop that only the
+     * poll thread can service, so a blocking acquisition would deadlock the
+     * endpoint. A failed acquisition means a read is in progress and the
+     * prefetch is simply skipped; the handler's reads still drain the stream
+     * through the normal poll-thread hop.
+     *
+     * @return {@code true} if the lock was acquired and must be released with
+     *         {@link #releaseReadLock()}
+     */
+    boolean tryAcquireReadLock() {
+        return readLock.tryLock();
+    }
+
+
+    /**
+     * Releases the read-side lock acquired by {@link #tryAcquireReadLock()}.
+     */
+    void releaseReadLock() {
+        readLock.unlock();
+    }
+
+
     @Override
     public boolean isReadyForRead() throws IOException {
         checkNotClosed();
@@ -414,27 +475,52 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         if (handler == null) {
             throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
         }
-        handler.configureReadBufferForRead();
-        if (handler.getReadBuffer().remaining() > 0) {
-            return true;
+        // Serialize the probe with application reads and the poll-thread
+        // prefetch: all three mutate the same read buffer.
+        readLock.lock();
+        try {
+            handler.configureReadBufferForRead();
+            if (handler.getReadBuffer().remaining() > 0) {
+                return true;
+            }
+            // Once the transport has observed FIN, a subsequent read can report
+            // EOF immediately whether or not a pre-read buffer still holds
+            // bytes. Report ready in both cases without issuing a native read:
+            // for a FINISHED stream that read can only return zero and costs a
+            // poll-thread hop. This probe runs on the per-response fast-FIN
+            // path.
+            QuicStream stream = getQuicStream();
+            if (stream instanceof QuicStreamWrapper quicStream &&
+                    quicStream.getReadState() == QuicStream.ReadState.FINISHED) {
+                return true;
+            }
+            // The probe itself may discover EOF (fillReadBuffer() returns -1
+            // and leaves the stream FINISHED). SocketWrapperBase.isReadyForRead()
+            // documents that true may be returned at the end of the input
+            // because the next read can report EOF immediately; returning false
+            // here would delay that read by one more readiness cycle. A zero
+            // result is a would-block, not EOF.
+            return fillReadBuffer(handler) != 0;
+        } finally {
+            readLock.unlock();
         }
-        // Once the transport has observed FIN, a subsequent read can report
-        // EOF immediately whether or not a pre-read buffer still holds bytes.
-        // Report ready in both cases without issuing a native read: for a
-        // FINISHED stream that read can only return zero and costs a
-        // poll-thread hop. This probe runs on the per-response fast-FIN path.
-        QuicStream stream = getQuicStream();
-        if (stream instanceof QuicStreamWrapper quicStream &&
-                quicStream.getReadState() == QuicStream.ReadState.FINISHED) {
-            return true;
+    }
+
+
+    @Override
+    public boolean hasBufferedReadData() {
+        SocketBufferHandler handler = socketBufferHandler;
+        if (handler == null) {
+            return false;
         }
-        // The probe itself may discover EOF (fillReadBuffer() returns -1 and
-        // leaves the stream FINISHED). SocketWrapperBase.isReadyForRead()
-        // documents that true may be returned at the end of the input because
-        // the next read can report EOF immediately; returning false here
-        // would delay that read by one more readiness cycle. A zero result is
-        // a would-block, not EOF.
-        return fillReadBuffer(handler) != 0;
+        // Serialize with the poll-thread prefetch and application reads, which
+        // mutate the same read buffer.
+        readLock.lock();
+        try {
+            return !handler.isReadBufferEmpty();
+        } finally {
+            readLock.unlock();
+        }
     }
 
 
@@ -467,18 +553,28 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(blockingReadTimeoutMs())
                 : 0L;
         while (true) {
-            int nRead = populateReadBuffer(handler, b, off, len);
-            if (nRead > 0) {
-                return nRead;
+            int nRead;
+            // Hold the read-side lock while touching the socket read buffer
+            // (populate/fill/consume). The poll thread's prefetch acquires the
+            // same lock with tryLock() and skips its work while this read owns
+            // it. Release it before parking in awaitReadableData() so the
+            // poll thread can never wait on a reader it has to signal.
+            readLock.lock();
+            try {
+                nRead = populateReadBuffer(handler, b, off, len);
+                if (nRead == 0) {
+                    nRead = fillReadBuffer(handler);
+                    if (nRead > 0) {
+                        handler.configureReadBufferForRead();
+                        nRead = Math.min(nRead, len);
+                        handler.getReadBuffer().get(b, off, nRead);
+                    }
+                }
+            } finally {
+                readLock.unlock();
             }
-            nRead = fillReadBuffer(handler);
             if (nRead != 0) {
                 // Data (>0) or EOF (-1); either way this is the result.
-                if (nRead > 0) {
-                    handler.configureReadBufferForRead();
-                    nRead = Math.min(nRead, len);
-                    handler.getReadBuffer().get(b, off, nRead);
-                }
                 return nRead;
             }
             if (!block) {
@@ -510,29 +606,35 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(blockingReadTimeoutMs())
                 : 0L;
         while (true) {
-            int nRead = populateReadBuffer(handler, to);
-            if (nRead > 0) {
-                return nRead;
-            }
-            int limit = handler.getReadBufferSize();
-            if (to.remaining() >= limit) {
-                // Direct path: read straight from the QUIC stream into the
-                // caller's buffer, up to its full remaining space. Unlike the
-                // TCP path there is no socket read buffer that bounds the read,
-                // so clamping to its size would force one poll-thread hop per
-                // 8 KiB and throttle throughput.
-                nRead = fillReadBufferDirect(to);
-                if (nRead != 0) {
-                    return nRead;
-                }
-            } else {
-                nRead = fillReadBuffer(handler);
-                if (nRead != 0) {
-                    if (nRead > 0) {
-                        nRead = populateReadBuffer(handler, to);
+            int nRead;
+            // See the byte[] overload: the read-side lock covers every
+            // socket/stream read-buffer access and is released before the
+            // blocking wait.
+            readLock.lock();
+            try {
+                nRead = populateReadBuffer(handler, to);
+                if (nRead == 0) {
+                    int limit = handler.getReadBufferSize();
+                    if (to.remaining() >= limit) {
+                        // Direct path: read straight from the QUIC stream into
+                        // the caller's buffer, up to its full remaining space.
+                        // Unlike the TCP path there is no socket read buffer
+                        // that bounds the read, so clamping to its size would
+                        // force one poll-thread hop per 8 KiB and throttle
+                        // throughput.
+                        nRead = fillReadBufferDirect(to);
+                    } else {
+                        nRead = fillReadBuffer(handler);
+                        if (nRead > 0) {
+                            nRead = populateReadBuffer(handler, to);
+                        }
                     }
-                    return nRead;
                 }
+            } finally {
+                readLock.unlock();
+            }
+            if (nRead != 0) {
+                return nRead;
             }
             if (!block) {
                 return 0;
@@ -1013,6 +1115,12 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
         if (stream == null || stream.isFreed() || stream.isDeregistered()) {
             throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
         }
+        QuicConnectionWrapper conn = stream.getConnection();
+        if (conn != null && conn.hasConnectionFreeFailure()) {
+            // The connection SSL_free() failed and may have partially run; do
+            // not touch a stream SSL that still references it.
+            throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
+        }
         MemorySegment ssl = stream.getSsl();
         if (ssl == null || ssl.equals(MemorySegment.NULL)) {
             throw new EOFException(sm.getString("socketWrapper.quicStreamClosed"));
@@ -1306,6 +1414,18 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                 }
             }
         } catch (Throwable t) {
+            Throwable fatal = QuicOpenSSLEndpoint.findFatalBindingFailure(t);
+            if (fatal != null) {
+                // A generated-binding failure means the native bindings are
+                // broken; swallow only non-fatal close noise below. The
+                // package's fatal-binding policy is to fail the generation and
+                // propagate the Error rather than pretend the close succeeded.
+                log.error(sm.getString(
+                        "quicEndpoint.bindingAssertionFailure",
+                        "doClose"), fatal);
+                endpoint.markPollLoopFailed();
+                throw (Error) fatal;
+            }
             ExceptionUtils.handleThrowable(t);
             if (isInterrupted(t)) {
                 // The calling request handler was interrupted - by the
@@ -1466,6 +1586,22 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
 
 
         /**
+         * Applies {@code onPollThread()}'s fatal-Error policy to the getters'
+         * diagnostic catch blocks: a binding {@code AssertionError} means
+         * OpenSSL is broken and must not be downgraded to an empty attribute
+         * the caller may survive.
+         *
+         * @param t The caught failure
+         */
+        private static void rethrowIfError(Throwable t) {
+            ExceptionUtils.handleThrowable(t);
+            if (t instanceof Error e) {
+                throw e;
+            }
+        }
+
+
+        /**
          * The underlying stream.
          */
         private QuicStreamWrapper stream() {
@@ -1502,7 +1638,8 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     // or session, so the connection-level handle must be
                     // used here.
                     QuicConnectionWrapper c = connection();
-                    if (c == null || c.isClosed() || c.isFreed()) {
+                    if (c == null || c.isClosed() || c.isFreed() ||
+                            c.hasConnectionFreeFailure()) {
                         return null;
                     }
                     MemorySegment ssl = c.getSsl();
@@ -1520,7 +1657,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
             } catch (IOException ioe) {
                 return null;
             } catch (Throwable t) {
-                ExceptionUtils.handleThrowable(t);
+                rethrowIfError(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Failed to read the QUIC cipher suite", t);
                 }
@@ -1542,7 +1679,8 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                         // connection's SSL, not the per-stream SSL
                         // (see getCipherSuite()).
                         QuicConnectionWrapper c = connection();
-                        if (c == null || c.isClosed() || c.isFreed()) {
+                        if (c == null || c.isClosed() || c.isFreed() ||
+                                c.hasConnectionFreeFailure()) {
                             return null;
                         }
                         MemorySegment ssl = c.getSsl();
@@ -1648,7 +1786,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                         conn.setCachedPeerCerts(result);
                         return result;
                     } catch (Throwable t) {
-                        ExceptionUtils.handleThrowable(t);
+                        rethrowIfError(t);
                         // Cache the failure so i2d_X509 is not re-run on
                         // every request
                         if (log.isDebugEnabled()) {
@@ -1662,7 +1800,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     }
                 });
             } catch (Throwable t) {
-                ExceptionUtils.handleThrowable(t);
+                rethrowIfError(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Failed to hop the QUIC peer certificate read to the poll thread", t);
                 }
@@ -1690,7 +1828,8 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     // The session is held by the connection's SSL, not the
                     // per-stream SSL (see getCipherSuite()).
                     QuicConnectionWrapper c = connection();
-                    if (c == null || c.isClosed() || c.isFreed()) {
+                    if (c == null || c.isClosed() || c.isFreed() ||
+                            c.hasConnectionFreeFailure()) {
                         return null;
                     }
                     MemorySegment ssl = c.getSsl();
@@ -1721,7 +1860,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     }
                 });
             } catch (Throwable t) {
-                ExceptionUtils.handleThrowable(t);
+                rethrowIfError(t);
                 if (log.isDebugEnabled()) {
                     log.debug("Failed to read the QUIC session id", t);
                 }
@@ -1738,7 +1877,8 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     // the negotiated version are connection-level (see
                     // getCipherSuite()).
                     QuicConnectionWrapper c = connection();
-                    if (c != null && !c.isClosed() && !c.isFreed()) {
+                    if (c != null && !c.isClosed() && !c.isFreed() &&
+                            !c.hasConnectionFreeFailure()) {
                         MemorySegment ssl = c.getSsl();
                         if (!ssl.equals(MemorySegment.NULL)) {
                             return openssl_h.SSL_get_version(ssl).getString(0);
@@ -1758,7 +1898,7 @@ public class QuicOpenSSLSocketWrapper extends QuicSocketWrapper
                     return version;
                 }
             } catch (Throwable t) {
-                ExceptionUtils.handleThrowable(t);
+                rethrowIfError(t);
                 // Fall through
             }
             return "QUIC";

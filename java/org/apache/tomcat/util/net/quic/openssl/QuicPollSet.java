@@ -20,6 +20,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
@@ -115,6 +116,15 @@ public class QuicPollSet {
     private final ConcurrentHashMap<Long, QuicPollItem> items = new ConcurrentHashMap<>();
 
     /**
+     * Optional callback invoked with the stale item evicted when a different
+     * item is registered for the same SSL address. The owning endpoint uses it
+     * to remove the item from its own stream-item/linger bookkeeping, which is
+     * otherwise left retaining a disposed item. Poll-thread only; may be
+     * {@code null} for standalone/test sets.
+     */
+    private volatile Consumer<QuicPollItem> evictedItemListener;
+
+    /**
      * Active items by slot. While the set has count members,
      * slots[0..count-1] are the current members; the remaining slots are
      * unused.
@@ -176,6 +186,17 @@ public class QuicPollSet {
 
 
     /**
+     * Sets the callback invoked with a stale item when it is evicted by a
+     * duplicate-address add. Called only on the poll thread.
+     *
+     * @param evictedItemListener The callback, or {@code null}
+     */
+    void setEvictedItemListener(Consumer<QuicPollItem> evictedItemListener) {
+        this.evictedItemListener = evictedItemListener;
+    }
+
+
+    /**
      * Closes an arena while constructing or resizing, ignoring a close
      * failure: the original allocation error is the one that must propagate.
      *
@@ -195,18 +216,28 @@ public class QuicPollSet {
 
     /**
      * Adds a poll item to the set.
+     * <p>
+     * A different item already registered for the same {@code SSL*} address
+     * is treated as stale: it is evicted and the new item is disposed. Callers
+     * must not continue registering wrappers/streams around an item that was
+     * not accepted: such objects would exist in the Java bookkeeping but never
+     * be polled. The eviction of the stale item prevents a reused native
+     * address from being polled with stale application state.
      *
      * @param item The poll item to add
+     *
+     * @return {@code true} if the item is now in the set (including the same
+     *         item already being present), {@code false} if the item was
+     *         disposed or another item already owns its SSL address
      */
-    public void add(QuicPollItem item) {
+    public boolean add(QuicPollItem item) {
         if (item == null || item.isDisposed()) {
-            return;
+            return false;
         }
         long key = item.getSsl().address();
         QuicPollItem previous = items.get(key);
         if (previous != null) {
-            handleDuplicateAdd(item, previous);
-            return;
+            return handleDuplicateAdd(item, previous);
         }
         if (count == capacity) {
             grow();
@@ -216,38 +247,57 @@ public class QuicPollSet {
         // was never placed in the slots/native array.
         previous = items.putIfAbsent(key, item);
         if (previous != null) {
-            handleDuplicateAdd(item, previous);
-            return;
+            return handleDuplicateAdd(item, previous);
         }
         slots[count] = item;
         item.setSlot(count);
         count++;
         changed = true;
+        return true;
     }
 
 
     /**
-     * Handles an address that is already tracked in the set. Re-adding a
-     * tracked address is not supported: the existing item's want-events mask
-     * is managed cooperatively by the endpoint (dispatchStreamEvent strips
-     * R/W, the processor re-arms them). Overwriting that mask with the fresh
-     * item's initial mask loses the current interest, and disposing the
-     * caller's item can make its later setWantEvents() calls ineffective.
-     * Report the regression and keep the existing item unchanged; re-adding
-     * the same item itself still marks the set changed so the next poll pass
-     * observes a want-events update made just before the call.
+     * Handles an address that is already tracked in the set. Re-adding the
+     * same item marks the set changed so the next poll pass observes a
+     * want-events update made just before the call.
+     * <p>
+     * A different item for the same {@code SSL*} address is a regression: the
+     * address has been reused, or an old item survived a failed removal while
+     * its SSL object was released. Keeping the old item would make the new
+     * stream/connection unpolled and, once the native address is reused, could
+     * poll the new SSL with stale application state. The stale item is
+     * therefore evicted and the new item is disposed; the caller must abort or
+     * clean up the new object rather than continue with an unregistered item.
      *
      * @param item     The item being added
      * @param previous The item already tracked for the same SSL address
+     *
+     * @return {@code true} if {@code item} is the already-tracked item,
+     *         {@code false} after evicting the stale item and disposing the
+     *         new one
      */
-    private void handleDuplicateAdd(QuicPollItem item, QuicPollItem previous) {
+    private boolean handleDuplicateAdd(QuicPollItem item, QuicPollItem previous) {
         log.warn(sm.getString("quicPollSet.duplicateAdd",
                 Long.toHexString(item.getSsl().address())));
         if (previous != item) {
             item.dispose();
-        } else {
-            changed = true;
+            Consumer<QuicPollItem> listener = evictedItemListener;
+            if (listener != null) {
+                try {
+                    listener.accept(previous);
+                } catch (Throwable t) {
+                    ExceptionUtils.handleThrowable(t);
+                    log.warn(sm.getString("quicPollSet.evictedItemListenerError"), t);
+                }
+            }
+            // Evict the stale item so it cannot keep polling an SSL address
+            // that the new (rejected) registration attempted to use.
+            remove(item.getSsl().address());
+            return false;
         }
+        changed = true;
+        return true;
     }
 
 

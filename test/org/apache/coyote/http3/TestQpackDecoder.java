@@ -277,6 +277,24 @@ public class TestQpackDecoder {
 
 
     @Test
+    public void testEncoderInstructionRejectedWithZeroMaximumCapacity()
+            throws Exception {
+        // RFC 9204 Section 3.2.3: with a maximum table capacity of zero the
+        // encoder MUST NOT send any encoder instructions, including the
+        // Set Dynamic Table Capacity instruction with capacity zero.
+        QpackDecoder decoder = new QpackDecoder(0, 0);
+        try {
+            decoder.processInstruction(ByteBuffer.wrap(new byte[] { 0x20 }));
+            Assert.fail("Expected an encoder instruction with zero maximum "
+                    + "capacity to be rejected");
+        } catch (QpackException e) {
+            Assert.assertTrue("Expected the zero-capacity diagnostic: "
+                    + e.getMessage(), e.getMessage().contains("zero"));
+        }
+    }
+
+
+    @Test
     public void testSetCapacityEvicts() throws Exception {
         QpackDecoder decoder = new QpackDecoder(256, 4096);
         insertSeries(decoder, 4);

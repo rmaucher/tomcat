@@ -538,6 +538,16 @@ class Http3Processor extends AbstractProcessor
      */
     private StringBuilder trailerCookieHeader = null;
 
+    /*
+     * Buffer for concatenating multiple Priority field lines into the
+     * comma-separated combined field value required by RFC 9110 Sections
+     * 5.2 and 5.3. Each line is appended and the complete value received so
+     * far is parsed, so a split dictionary still applies all of its
+     * parameters (RFC 9218 Section 5). Cleared when the field section
+     * completes and by recycle().
+     */
+    private StringBuilder priorityHeader = null;
+
     private static final int PSEUDO_METHOD = 1;
     private static final int PSEUDO_SCHEME = 2;
     private static final int PSEUDO_PATH = 4;
@@ -579,7 +589,7 @@ class Http3Processor extends AbstractProcessor
             "authorization", "proxy-authorization", "set-cookie",
             "www-authenticate", "proxy-authenticate",
             "expect", "if-match", "if-none-match", "if-modified-since",
-            "if-unmodified-since", "if-range", "range",
+            "if-unmodified-since", "if-range", "range", "max-forwards",
             "content-language", "content-location", "content-disposition");
 
     /*
@@ -1893,7 +1903,10 @@ class Http3Processor extends AbstractProcessor
 
     /**
      * Sends an HTTP/3 error response with the given status code.
-     * Sends a minimal HEADERS frame with :status pseudo-header.
+     * Sends a HEADERS frame with the :status pseudo-header plus the standard
+     * common response fields (Date, Server and Alt-Svc) applied by
+     * {@link #addCommonResponseHeaders(MimeHeaders, int)}; application
+     * :status values are replaced with the supplied status.
      *
      * @param socketWrapper The socket wrapper to write to
      * @param statusCode    The HTTP status code
@@ -3021,10 +3034,14 @@ class Http3Processor extends AbstractProcessor
      * read paths (see {@link BodyFrameKind}).
      * <p>
      * RFC 9114 Section 4.4 permits only DATA frames (and extension frames
-     * specifically permitted by their definition) after the CONNECT header
-     * section. A second HEADERS frame on a CONNECT request is therefore not
-     * a trailer section: classify it as control-only so the existing
-     * H3_FRAME_UNEXPECTED connection-error handling applies.
+     * specifically permitted by their definition) once the CONNECT method has
+     * completed (a 2xx response has established the tunnel). This classifier
+     * runs while reading the request message, before the response is sent.
+     * It deliberately treats a second HEADERS frame on a CONNECT request as
+     * control-only rather than as a trailer section: RFC 9110 Section 9.3.6
+     * says a CONNECT request message does not have content, so a trailer
+     * section (which follows content) cannot be valid for that message. The
+     * existing H3_FRAME_UNEXPECTED connection-error handling then applies.
      *
      * @param frameType The (already varint-decoded) frame type to classify
      * @param connectRequest Whether this request is a CONNECT request
@@ -3451,6 +3468,16 @@ class Http3Processor extends AbstractProcessor
     }
 
 
+    /**
+     * Whether the request body has been fully read (or is delimited as
+     * complete) and the read path may report end-of-data. A truncated
+     * Content-Length body, buffered or partial body bytes, and an abort before
+     * completion all report {@code false}, so the readiness probe and the read
+     * path agree on when the body is finished.
+     *
+     * @return {@code true} if the request body is complete and no buffered
+     *         body data remains
+     */
     @Override
     protected boolean isRequestBodyFullyRead() {
         Http3InputBuffer h3Input = (Http3InputBuffer) request.getInputBuffer();
@@ -3583,12 +3610,15 @@ class Http3Processor extends AbstractProcessor
      * frame can still be reset at stream scope first.
      * <p>
      * The probe is serialised with body reads and inspects the protocol parser
-     * state. It does not consume bytes from the QUIC wrapper, but the
-     * wrapper's {@code isReadyForRead()} check may fill the wrapper read
-     * buffer from the native stream so that a trailing frame cannot be missed
-     * by the fast path; those bytes stay available for the after-response
-     * scan. The scan remains responsible for consuming and classifying any
-     * bytes still held by the transport.
+     * state. It does not consume bytes from the QUIC wrapper; it checks the
+     * wrapper's {@code hasBufferedReadData()} probe, which reports only bytes
+     * already buffered in the wrapper and does not fill the buffer from the
+     * native stream. The wrapper's {@code isReadyForRead()} probe is
+     * deliberately not used here: it may report true at end-of-stream (the
+     * OpenSSL wrapper does), so it cannot distinguish pending bytes from EOF
+     * readiness. Bytes still in the native transport are picked up by the
+     * after-response scan, which always runs after this probe and remains
+     * responsible for consuming and classifying them.
      *
      * @return {@code true} if the response stream may be concluded before
      *         the after-response request scan
@@ -3626,15 +3656,15 @@ class Http3Processor extends AbstractProcessor
             }
             // The transport read state FINISHED only means that the peer has
             // sent the last byte. Bytes may still be waiting in the QUIC
-            // wrapper (for example a malformed trailing frame). Peek the
-            // wrapper so the after-response scan still gets the chance to
-            // classify them before the response stream is concluded.
-            try {
-                if (getSocketWrapper().isReadyForRead()) {
-                    return false;
-                }
-            } catch (IOException ioe) {
-                // Let the normal scan/error path handle the read failure.
+            // wrapper (for example a malformed trailing frame). Check the
+            // wrapper's buffered bytes directly: isReadyForRead() may also
+            // report true at end-of-stream (OpenSSL does, so that the next
+            // read can deliver EOF), which must not be mistaken for pending
+            // data because it would disable this fast path for every cleanly
+            // finished stream. Bytes still in the native transport are picked
+            // up by the after-response scan, which always runs after this
+            // probe.
+            if (qw.hasBufferedReadData()) {
                 return false;
             }
             Http3InputBuffer inBuf =
@@ -4141,10 +4171,12 @@ class Http3Processor extends AbstractProcessor
      * local buffering limit at stream scope (RESET_STREAM H3_FRAME_ERROR).
      * H3_FRAME_ERROR is used deliberately rather than the connection-scoped
      * H3_EXCESSIVE_LOAD suggested for local resource limits in RFC 9114
-     * Section 10.5: this failure is scoped to the offending request stream,
-     * and a stream reset with H3_FRAME_ERROR lets the client distinguish this
-     * local buffering limit from a protocol-level frame-format error without
-     * tearing down the other streams on the connection.
+     * Section 10.5: RFC 9114 Section 8.1 defines H3_FRAME_ERROR for a frame
+     * with an invalid size, which covers a frame larger than this receiver is
+     * willing to accept, and this failure is scoped to the offending request
+     * stream. A stream reset with H3_FRAME_ERROR lets the client distinguish
+     * this local buffering limit from a protocol-level frame-format error
+     * without tearing down the other streams on the connection.
      */
     private void checkBufferedFrameLength(long frameType, long frameLength)
             throws Http3StreamException {
@@ -4433,10 +4465,13 @@ class Http3Processor extends AbstractProcessor
      * Processes a complete HTTP/3 frame.
      * <p>
      * The frame type is a {@code long} (QUIC variable-length integers are
-     * up to 62 bits, RFC 9000 Section 16). Before dispatching it is
-     * narrowed to a non-negative {@code int}; frame types that do not fit
-     * are unknown and receive the default (ignore) handling required by
-     * RFC 9114 Section 9.
+     * up to 62 bits, RFC 9000 Section 16). The DATA/control-only rejection is
+     * evaluated on the {@code long} value before any narrowing, because
+     * reserved frame types can exceed the {@code int} range and the check
+     * must not alias them into a defined type. For dispatch, frame types that
+     * do not fit in a non-negative {@code int} are mapped to an impossible
+     * value and receive the default (ignore) handling required by RFC 9114
+     * Section 9.
      */
     private void processFrame(long frameType) throws Http3Exception, Http3StreamException, QpackException {
         if (log.isTraceEnabled()) {
@@ -4583,10 +4618,15 @@ class Http3Processor extends AbstractProcessor
         }
         // Determine whether the field section references the dynamic
         // table (Required Insert Count > 0) from the first byte of the
-        // field section prefix (RFC 9204 Section 4.5.1): the Required
-        // Insert Count is an 8-bit prefix integer occupying the entire
-        // first byte, so it is non-zero iff the first byte is non-zero.
-        boolean ricNonZero = payload.get(0) != 0;
+        // field section prefix (RFC 9204 Section 4.5.1). The Required Insert
+        // Count is an iRP with an 8-bit prefix (Section 4.5.1.1): the value
+        // zero is encoded as a single zero first byte, so the first byte is
+        // non-zero exactly when the count is non-zero. Larger values
+        // continue in the following bytes. Read at the current position
+        // rather than at absolute index 0: every current caller supplies the
+        // block in read mode at its start, but the decoder contract permits a
+        // block that does not start at position zero.
+        boolean ricNonZero = payload.get(payload.position()) != 0;
         trailerMode = trailerSection;
         try {
             if (trailerSection) {
@@ -4645,6 +4685,42 @@ class Http3Processor extends AbstractProcessor
             }
         } finally {
             trailerMode = false;
+            priorityHeader = null;
+        }
+    }
+
+
+    /*
+     * Appends one Priority field line to the combined field value and parses
+     * the complete value received so far (RFC 9110 Sections 5.2 and 5.3,
+     * RFC 9218 Section 5). The lines are consumed whether or not they parse,
+     * and a PRIORITY_UPDATE remains the most recently received signal and
+     * wins over the request's older header value (RFC 9218 Section 7).
+     */
+    private void applyPriorityHeader(String value) {
+        if (priorityHeader == null) {
+            priorityHeader = new StringBuilder(value.length());
+        } else {
+            priorityHeader.append(", ");
+        }
+        priorityHeader.append(value);
+        String combined = priorityHeader.toString();
+        try {
+            Priority p = Priority.parsePriority(new StringReader(combined));
+            synchronized (prioritySignalLock) {
+                if (!priorityFromUpdate) {
+                    setUrgency(p.getUrgency());
+                    setIncremental(p.getIncremental());
+                }
+            }
+        } catch (IOException ioe) {
+            // Not possible with StringReader
+        } catch (IllegalArgumentException iae) {
+            if (log.isTraceEnabled()) {
+                log.trace(sm.getString("http3Processor.priorityHeaderInvalid",
+                        Long.valueOf(streamId), Http3Log.printable(combined)),
+                        iae);
+            }
         }
     }
 
@@ -4729,11 +4805,12 @@ class Http3Processor extends AbstractProcessor
      * while the insert count already covers its declared (snapshotted)
      * Required Insert Count, and every dynamic reference at or above that
      * RIC is rejected as a decompression failure (RFC 9204 Section 2.2.3)
-     * before the blocked check could apply. A field section
-     * that blocks a second time after the wait - the sender under-declared
-     * its Required Insert Count - or one that cannot be unblocked within
-     * the timeout or beyond the per-connection blocked-stream limit is
-     * treated as a decompression failure.
+     * before the blocked check could apply. A field section that blocks a
+     * second time after the wait (for example because the sender under-declared
+     * its Required Insert Count, or because reconstructing the count after
+     * further inserts selects a larger value), or one that cannot be
+     * unblocked within the timeout or beyond the per-connection blocked-stream
+     * limit, is conservatively treated as a decompression failure.
      */
     private void decodeFieldSection(ByteBuffer payload)
             throws Http3Exception, QpackException {
@@ -4912,9 +4989,11 @@ class Http3Processor extends AbstractProcessor
      * <p>
      * A reset after the response FIN was handed to the transport is left
      * unsignalled by this method: the complete response is preserved for
-     * response-side failures detected after conclusion. Request errors use
-     * {@link #resetStreamAfterFin} instead, because they must still be
-     * communicated (RFC 9114 Section 4.1.2, RFC 9204 Section 7.4).
+     * response-side failures detected after conclusion. Request errors (HTTP/3
+     * message errors) use {@link #resetStreamAfterFin} instead, because they
+     * must still be communicated (RFC 9114 Section 4.1.2, RFC 9204 Section
+     * 7.4). This plain variant is used for response-side I/O failures, where
+     * discarding a complete response would be wrong.
      *
      * @param socketWrapper The stream wrapper
      * @param error         The stream error code
@@ -5034,11 +5113,11 @@ class Http3Processor extends AbstractProcessor
                 // encoded and is dropped, as an invalid name is on the
                 // decode path.
                 if (!HttpParser.isToken(trailerName)) {
-                    if (log.isDebugEnabled()) {
-                        log.debug(sm.getString(
-                                "http3Processor.trailerInvalidName",
-                                Http3Log.printable(trailerName)));
-                    }
+                    // Match the HTTP/2 response path's warning for a removed
+                    // invalid header rather than silently dropping an
+                    // application-supplied trailer field.
+                    log.warn(sm.getString("http3Processor.trailerInvalidName",
+                            Http3Log.printable(trailerName)));
                     continue;
                 }
                 if (isTrailerFieldDisallowed(trailerName)) {
@@ -5083,6 +5162,19 @@ class Http3Processor extends AbstractProcessor
             }
         }
         if (!encodableField) {
+            // No field reaches QpackEncoder.encode(), so its per-field
+            // invalid-value warning never runs. Emit the same diagnostic for
+            // each dropped value here; the field names were already
+            // validated above, so an unencodable field at this point is an
+            // invalid value.
+            for (int i = 0; i < limitedTrailers.size(); i++) {
+                String name = limitedTrailers.getName(i).toString();
+                String value = limitedTrailers.getValue(i).toString();
+                if (HttpParser.isToken(name) &&
+                        !QpackEncoder.isEncodableField(name, value)) {
+                    QpackEncoder.logInvalidValueSkipped(name);
+                }
+            }
             trailersSent = true;
             return;
         }
@@ -5936,12 +6028,13 @@ class Http3Processor extends AbstractProcessor
         if (!inBuf.isTrailersReceived()) {
             return;
         }
-        if (streamReset.get() || connectionFailed) {
-            // A local reset or a failed connection already abandoned the
-            // stream. Parsing its remaining bytes could misclassify
-            // already-abandoned data as a frame sequence violation and fail
-            // the connection again; the terminal outcome is final. Same guard
-            // as decodeTrailerSectionAfterResponse().
+        if (streamReset.get() || connectionFailed || inBuf.isStreamAborted()) {
+            // A local reset, a failed connection or an abandoned read side
+            // (for example a saved-request body replay) already ended this
+            // stream's exchange. Parsing its remaining bytes could
+            // misclassify already-abandoned data as a frame sequence
+            // violation and fail the connection again; the terminal outcome
+            // is final. Same guard as decodeTrailerSectionAfterResponse().
             return;
         }
         while (true) {
@@ -6076,6 +6169,15 @@ class Http3Processor extends AbstractProcessor
         }
         Http3InputBuffer inBuf =
                 (Http3InputBuffer) request.getInputBuffer();
+        if (inBuf.isStreamAborted()) {
+            // The read side was abandoned (for example the saved-request body
+            // replay in insertReplayedBody()). The bytes still on the wire
+            // belong to the replaced request and must not be decoded into the
+            // restored request or escalated to a connection error. The QPACK
+            // Stream Cancellation was queued when the stream was abandoned,
+            // so no further field-section bookkeeping is owed here.
+            return;
+        }
         if (inBuf.isTrailersReceived()) {
             // The read paths decoded the trailer section (and acknowledged
             // it); the after-trailer scan owns anything that follows.
@@ -6724,35 +6826,14 @@ class Http3Processor extends AbstractProcessor
                 // Extensible priorities (RFC 9218 Section 5): the Priority
                 // request header field is consumed as priority signal input
                 // and is not forwarded to the application (same as HTTP/2,
-                // Stream.java 532-547). Invalid values (not a valid
-                // Structured Fields Dictionary, wrong types, out of range)
-                // are ignored per RFC 9218 Section 4; the field itself is
-                // consumed either way.
-                try {
-                    Priority p = Priority.parsePriority(new StringReader(value));
-                    // A PRIORITY_UPDATE (pre-open buffered frame applied at
-                    // wiring, or a live update) is the most recently received
-                    // signal and overrides any other, including this request's
-                    // own (older) Priority header field (RFC 9218 Section 7).
-                    // The field is consumed (not forwarded) either way. The
-                    // flag test and the stores are one atomic step under the
-                    // signal lock, so an update landing here cannot be
-                    // overwritten by this (older) value.
-                    synchronized (prioritySignalLock) {
-                        if (!priorityFromUpdate) {
-                            setUrgency(p.getUrgency());
-                            setIncremental(p.getIncremental());
-                        }
-                    }
-                } catch (IOException ioe) {
-                    // Not possible with StringReader
-                } catch (IllegalArgumentException iae) {
-                    if (log.isTraceEnabled()) {
-                        log.trace(sm.getString("http3Processor.priorityHeaderInvalid",
-                                Long.valueOf(streamId), Http3Log.printable(value)),
-                                iae);
-                    }
-                }
+                // Stream.java 532-547). RFC 9110 Sections 5.2 and 5.3 define
+                // the combined field value of repeated field lines as the
+                // values concatenated in field order with commas, so the
+                // lines are accumulated and the complete value is parsed.
+                // Invalid values (not a valid Structured Fields Dictionary,
+                // wrong types, out of range) are ignored per RFC 9218
+                // Section 4; the field itself is consumed either way.
+                applyPriorityHeader(value);
             } else if (trailerMode) {
                 // Trailer fields go into the dedicated trailer fields
                 // container, not the regular request headers (same as
@@ -7164,6 +7245,7 @@ class Http3Processor extends AbstractProcessor
         trailerMode = false;
         cookieHeader = null;
         trailerCookieHeader = null;
+        priorityHeader = null;
         streamCancellationSent = false;
         // Drop any per-response compression state so the next request
         // handled by this (pooled) processor starts uncompressed. This is
@@ -7684,9 +7766,11 @@ class Http3Processor extends AbstractProcessor
 
         /**
          * Marks the stream as ended by a reset or connection close observed
-         * from the transport state rather than from a read exception. The
-         * abort classification is explicit so readiness/trailer probes do
-         * not mistake the state-detected end for a clean FIN.
+         * from the transport state rather than from a read exception, or by
+         * the local decision to abandon a stalled read (the caller resets the
+         * stream immediately). The abort classification is explicit so
+         * readiness/trailer probes do not mistake the state-detected end for
+         * a clean FIN.
          */
         void setStreamAborted() {
             streamEndClassified = true;
@@ -7781,9 +7865,12 @@ class Http3Processor extends AbstractProcessor
                         // A stall is not end of stream: the QUIC stream is
                         // still open and the declared body may be incomplete.
                         // Returning -1 here made a truncated content-length
-                        // request look complete to the application. Fail the
-                        // stream and surface an I/O error instead.
-                        markStreamClosed();
+                        // request look complete to the application. Record
+                        // the abort explicitly (the caller resets the stream
+                        // immediately below) rather than calling
+                        // markStreamClosed(), which classifies a transport
+                        // end that has not been observed.
+                        setStreamAborted();
                         Http3Error error = processor.requestContentLength >
                                 processor.totalDataReceived
                                         ? Http3Error.H3_REQUEST_INCOMPLETE

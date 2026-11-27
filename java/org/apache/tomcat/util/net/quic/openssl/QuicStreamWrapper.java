@@ -21,6 +21,7 @@ import java.lang.ref.Cleaner;
 import java.nio.ByteBuffer;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
@@ -32,8 +33,10 @@ import org.apache.tomcat.util.res.StringManager;
  * Wraps a QUIC stream (an {@code SSL *} representing a bidirectional or
  * unidirectional stream on a QUIC connection).
  * <p>
- * Each stream is associated with a parent {@link QuicConnectionWrapper} and
- * has its own {@link QuicPollItem} for event-driven I/O.
+ * Each stream is associated with a parent {@link QuicConnectionWrapper}.
+ * Normally it also has its own {@link QuicPollItem} for event-driven I/O;
+ * a stream that is rejected before registration (for example at the
+ * concurrent-stream limit) has no poll item and is freed without being polled.
  */
 public class QuicStreamWrapper implements QuicStream {
 
@@ -81,6 +84,15 @@ public class QuicStreamWrapper implements QuicStream {
      * Write buffer for pending data to send on the stream.
      */
     private ByteBuffer writeBuffer;
+
+    /**
+     * Absolute time (System.currentTimeMillis()) after which the deferred
+     * stream SSL free must not be postponed for unacknowledged send bytes.
+     * Zero until the stream is first queued for a deferred drain. Atomic so
+     * concurrent first enqueues cannot extend the deadline: the first CAS
+     * wins and later enqueues leave the original bound in place.
+     */
+    private final AtomicLong streamDrainDeadlineMs = new AtomicLong();
 
     /**
      * Current read state of the stream.
@@ -290,6 +302,33 @@ public class QuicStreamWrapper implements QuicStream {
     @Override
     public QuicConnectionWrapper getConnection() {
         return connection;
+    }
+
+
+    /**
+     * Returns the absolute deadline after which a deferred stream-SSL free
+     * must no longer wait for the peer to acknowledge the stream's send
+     * buffer, or {@code 0} while the stream has not been queued for a
+     * deferred drain.
+     *
+     * @return The drain deadline in {@link System#currentTimeMillis()} terms
+     */
+    long getStreamDrainDeadlineMs() {
+        return streamDrainDeadlineMs.get();
+    }
+
+
+    /**
+     * Sets the deferred-drain deadline if none has been set yet. Called when
+     * the stream is first queued for a deferred drain, so the bound starts at
+     * first enqueue and cannot be extended by later re-queues. The atomic
+     * compare-and-set makes concurrent first enqueues keep the earliest
+     * deadline rather than overwriting it.
+     *
+     * @param deadline The absolute deadline
+     */
+    void setStreamDrainDeadlineIfUnset(long deadline) {
+        streamDrainDeadlineMs.compareAndSet(0L, deadline);
     }
 
 

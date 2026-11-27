@@ -37,9 +37,13 @@ final class Http3Log {
 
 
     /**
-     * Returns a printable representation of the given value. Visible ASCII
-     * characters are preserved; bytes outside 0x20-0x7E are rendered as
-     * {@code 0xNN}. A null value is rendered as {@code null}.
+     * Returns a printable representation of the given value. The value is
+     * first converted to ISO-8859-1 bytes: visible ASCII characters are
+     * preserved, and bytes outside 0x20-0x7E are rendered as {@code 0xNN}.
+     * Characters that have no ISO-8859-1 representation are replaced with
+     * {@code ?} by the charset encoder before rendering, so they appear as a
+     * literal question mark rather than as {@code 0xNN}. A null value is
+     * rendered as {@code null}.
      *
      * @param value The value to render
      *

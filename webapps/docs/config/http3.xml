@@ -428,8 +428,8 @@
       reports as due. Values outside the range <code>0</code> to
       <code>60000</code> are rejected with a warning and the previous value
       is retained. If not specified, a default of <code>50</code> is used.
-      The quiche endpoint has no due-tick floor and does not support this
-      attribute.</p>
+      The quiche and ngtcp2 endpoints have no due-tick floor and do not
+      support this attribute.</p>
     </attribute>
 
   </attributes>

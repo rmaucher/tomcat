@@ -26,6 +26,8 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -59,11 +61,16 @@ import org.apache.tomcat.util.res.StringManager;
  * is also used by the ngtcp2 transport adapter with a normal
  * {@code TLS_server_method()} context.
  * <p>
- * Server certificates and TLS 1.3 pre-shared keys are supported. Client
- * certificate verification is not implemented (optional verification is
- * warned about; required verification fails the build). OCSP stapling and
- * CRL/revocation configuration are not loaded; configuring them produces a
- * warning because the settings would otherwise be silently ignored.
+ * Server certificates and TLS 1.3 pre-shared keys are supported. On the
+ * OpenSSL QUIC method a pre-shared-key handshake always uses the
+ * forward-secret PSK-DHE key exchange, because OpenSSL masks
+ * {@code SSL_OP_ALLOW_NO_DHE_KEX} for QUIC connection TLS objects; the
+ * regular TLS stack used by ngtcp2 can enable the no-DHE mode for a
+ * pre-shared-key-only endpoint. Client certificate verification is not
+ * implemented (optional verification is warned about; required verification
+ * fails the build). OCSP stapling and CRL/revocation configuration are not
+ * loaded; configuring them produces a warning because the settings would
+ * otherwise be silently ignored.
  */
 public class QuicCertificateManager {
 
@@ -111,7 +118,24 @@ public class QuicCertificateManager {
     private final Supplier<QuicProtocol> protocolSupplier;
     private final Function<String, SSLHostConfig> hostResolver;
 
+    /**
+     * Optional callback for a fatal native-binding failure detected inside an
+     * FFM upcall. The endpoint uses it to fail the QUIC generation closed;
+     * it must not throw across the native boundary. May be {@code null}.
+     */
+    private volatile Consumer<Throwable> fatalFailureHandler;
+
     private final MemorySegment sslMethod;
+
+    /**
+     * Whether this manager creates an OpenSSL QUIC TLS method context rather
+     * than a regular {@code TLS_server_method()} context (the ngtcp2 adapter).
+     * OpenSSL masks a QUIC connection TLS object's options with
+     * {@code OSSL_QUIC_PERMITTED_OPTIONS_CONN}, which does not include
+     * {@code SSL_OP_ALLOW_NO_DHE_KEX}; the no-DHE pre-shared-key mode can
+     * therefore only be enabled on the regular TLS stack.
+     */
+    private boolean quicTlsMethod;
 
     /**
      * Set once the PSK-only SSL option could not be aligned with the current
@@ -129,8 +153,9 @@ public class QuicCertificateManager {
     private volatile boolean pskOptionMisaligned;
 
     /**
-     * Set once the PSK-only (no-DHE) forward-secrecy tradeoff was reported, so
-     * a certificate reload or context re-initialisation does not repeat it.
+     * Set once the pre-shared-key-only key-exchange limitation or its
+     * forward-secrecy tradeoff was reported, so a certificate reload or
+     * context re-initialisation does not repeat it.
      */
     private boolean pskOnlyNoDheWarned;
 
@@ -210,6 +235,40 @@ public class QuicCertificateManager {
 
 
     /**
+     * Sets the callback used to report a fatal native-binding failure from an
+     * FFM upcall. The handler must not throw; the upcall still has to reject
+     * the handshake.
+     *
+     * @param fatalFailureHandler The fatal-binding handler, or {@code null}
+     */
+    void setFatalFailureHandler(Consumer<Throwable> fatalFailureHandler) {
+        this.fatalFailureHandler = fatalFailureHandler;
+    }
+
+
+    /**
+     * Reports a possible fatal binding failure to the endpoint, if configured.
+     * The handler only marks the generation failed; nothing escapes the
+     * native callback.
+     *
+     * @param t The caught failure
+     */
+    private void reportFatalFailure(Throwable t) {
+        Consumer<Throwable> handler = fatalFailureHandler;
+        if (handler != null) {
+            try {
+                handler.accept(t);
+            } catch (Throwable handlerFailure) {
+                // The handler must not throw into the native callback.
+                ExceptionUtils.handleThrowable(handlerFailure);
+                log.warn(sm.getString("quicEndpoint.sniCallbackError"),
+                        handlerFailure);
+            }
+        }
+    }
+
+
+    /**
      * Installs the initial certificate snapshot and creates the native
      * {@code SSL_CTX} with its ALPN and SNI callbacks. Called once from the
      * endpoint's {@code initialiseSsl()} before the per-host TLS information
@@ -282,6 +341,18 @@ public class QuicCertificateManager {
      */
     private void createNativeSslContext() throws Exception {
         MemorySegment method = sslMethod != null ? sslMethod : QuicBindings.OSSL_QUIC_server_method();
+        // The ngtcp2 adapter passes TLS_server_method(); the OpenSSL QUIC
+        // endpoint uses OSSL_QUIC_server_method() (the default when no
+        // explicit method was supplied). Only call the QUIC binding when it
+        // was resolved: a library without the QUIC API must still serve the
+        // ngtcp2 transport with TLS_server_method().
+        if (sslMethod == null) {
+            quicTlsMethod = true;
+        } else if (QuicBindings.OSSL_QUIC_server_method$handle == null) {
+            quicTlsMethod = false;
+        } else {
+            quicTlsMethod = sslMethod.equals(QuicBindings.OSSL_QUIC_server_method());
+        }
 
         sslCtx = openssl_h.SSL_CTX_new(method);
         if (sslCtx.equals(MemorySegment.NULL)) {
@@ -379,24 +450,35 @@ public class QuicCertificateManager {
      * Aligns the native context's pre-shared-key options with the current
      * configuration snapshot.
      * <p>
-     * With no certificate anywhere on the endpoint, a pre-shared key
-     * handshake is the only handshake possible and the pre-shared key alone
-     * must authenticate the server. TLS 1.3 puts the server in the (no DHE)
-     * key exchange mode for that, which OpenSSL only lets the server select
-     * when SSL_OP_ALLOW_NO_DHE_KEX is set. Without the option (a mixed
-     * certificate + pre-shared key endpoint) a resolved identity still
-     * produces a pre-shared key handshake, but in the DHE mode. When the
-     * serving host also has a certificate, that certificate is an additional
-     * authenticator (the forward-secure shape preferred for hosts that have a
-     * certificate); a mixed endpoint whose serving host has no certificate
-     * gets a DHE PSK handshake without a certificate.
+     * With no certificate anywhere on the endpoint, a pre-shared key handshake
+     * is the only handshake possible and the pre-shared key alone must
+     * authenticate the server. On the regular TLS stack (the ngtcp2 adapter)
+     * TLS 1.3 can use the (no DHE) key exchange mode for that, which OpenSSL
+     * only lets the server select when {@code SSL_OP_ALLOW_NO_DHE_KEX} is set.
+     * Without the option a resolved identity still produces a pre-shared key
+     * handshake, but in the forward-secret DHE mode. When the serving host also
+     * has a certificate, that certificate is an additional authenticator; a
+     * mixed endpoint whose serving host has no certificate gets a DHE PSK
+     * handshake without a certificate.
      * <p>
-     * The option is applied to the context, so it governs connections created
-     * from now on; already handshaken connections keep the options they
-     * inherited at creation. Must be re-applied whenever the snapshot is
-     * swapped, not only at context creation, or a reload that turns the
-     * endpoint pre-shared-key-only (or restores certificates) is served
-     * inconsistently until restart.
+     * OpenSSL QUIC connections cannot use the no-DHE mode: when OpenSSL creates
+     * the QUIC connection TLS object it masks the inherited options with
+     * {@code OSSL_QUIC_PERMITTED_OPTIONS_CONN}, which does not include
+     * {@code SSL_OP_ALLOW_NO_DHE_KEX}; {@code SSL_set_options()} on a QUIC
+     * connection applies the same mask and there is no supported way to install
+     * the option on the connection TLS object. For the QUIC method this method
+     * therefore does not pretend the option is active: PSK-only endpoints keep
+     * the forward-secret PSK-DHE exchange, and a client that offers only the
+     * {@code psk_ke} key exchange mode cannot complete the handshake (warned
+     * once). PSK selection stays enabled because interoperable clients offer
+     * {@code psk_dhe_ke}.
+     * <p>
+     * On the regular TLS stack the option is applied to the context, so it
+     * governs connections created from now on; already handshaken connections
+     * keep the options they inherited at creation. Must be re-applied whenever
+     * the snapshot is swapped, not only at context creation, or a reload that
+     * turns the endpoint pre-shared-key-only (or restores certificates) is
+     * served inconsistently until restart.
      */
     private void applyPskOnlyOptions() {
         if (sslCtx == null || sslCtx.equals(MemorySegment.NULL)) {
@@ -405,6 +487,18 @@ public class QuicCertificateManager {
         }
         QuicCertConfig config = certConfig;
         boolean wantOption = config != null && config.pskOnly;
+        if (quicTlsMethod) {
+            // The option is masked for every QUIC connection TLS object, so
+            // installing it on the context would only misreport the no-DHE
+            // mode as active. Warn about the real limitation instead and leave
+            // PSK selection enabled (normal clients use PSK-DHE).
+            if (wantOption && !pskOnlyNoDheWarned) {
+                pskOnlyNoDheWarned = true;
+                log.warn(sm.getString("quicEndpoint.pskOnlyNoDheUnsupported"));
+            }
+            pskOptionMisaligned = false;
+            return;
+        }
         if (wantOption) {
             if (!pskOnlyNoDheWarned) {
                 pskOnlyNoDheWarned = true;
@@ -488,6 +582,35 @@ public class QuicCertificateManager {
      *         must not release it again
      */
     public synchronized void swapConfig(QuicCertConfig newConfig, String reason) {
+        swapConfig(newConfig, reason, null);
+    }
+
+
+    /**
+     * Swaps in the new certificate configuration and frees the native objects
+     * of the previous one, recording whether ownership of {@code newConfig}
+     * was transferred to the manager. The ownership flag is set atomically
+     * with the {@code certConfig} assignment, before any cleanup that can
+     * throw, so a failing caller can distinguish "still owns the snapshot and
+     * must discard it" from "the snapshot is installed and must not be
+     * double-freed".
+     *
+     * @param newConfig           The configuration to install
+     * @param reason              A short description of what triggered the
+     *                            reload
+     * @param ownershipTransferred Set to {@code true} when the snapshot was
+     *                            installed as the current configuration, or
+     *                            {@code null} when the caller does not need the
+     *                            outcome
+     *
+     * @throws IllegalArgumentException If the cipher policy cannot be parsed;
+     *         the caller still owns {@code newConfig}
+     * @throws IllegalStateException If the manager has already been released;
+     *         {@code newConfig} is discarded and freed here, so the caller
+     *         must not release it again
+     */
+    public synchronized void swapConfig(QuicCertConfig newConfig, String reason,
+            AtomicBoolean ownershipTransferred) {
         if (sslCtx == null || sslCtx.equals(MemorySegment.NULL)) {
             // A swap after release() would replace certConfig with a snapshot
             // that nothing will ever free (the context and arena owner is
@@ -508,6 +631,9 @@ public class QuicCertificateManager {
         applyCipherSuites(newConfig);
         QuicCertConfig oldConfig = certConfig;
         certConfig = newConfig;
+        if (ownershipTransferred != null) {
+            ownershipTransferred.set(true);
+        }
         if (oldConfig != null && oldConfig != newConfig) {
             // Installing the same snapshot again must not free the live
             // configuration now referenced by certConfig (see initialize()).
@@ -728,9 +854,12 @@ public class QuicCertificateManager {
                 }
             }
         } catch (Throwable t) {
-            ExceptionUtils.handleThrowable(t);
-            // Must not throw across the native boundary; report and reject
-            // the handshake instead of failing silently.
+            // Must not throw across the native boundary, including Errors:
+            // an exception escaping an FFM upcall is unrecoverable. Report and
+            // reject the handshake instead. (ExceptionUtils.handleThrowable()
+            // would rethrow VirtualMachineError, so it is deliberately not
+            // used inside this upcall.)
+            reportFatalFailure(t);
             log.warn(sm.getString("quicEndpoint.alpnSelectError"), t);
         }
         // For an endpoint that only serves one application protocol family,
@@ -814,8 +943,12 @@ public class QuicCertificateManager {
      * default) and applies that host's certificate(s) to this connection. The
      * callback is invoked for every connection, including those without an
      * SNI extension (in which case the host name is {@code null} and the
-     * default host is used). The name is always accepted so that unknown host
-     * names simply fall back to the default certificate.
+     * default host is used). A syntactically valid name is always accepted so
+     * that unknown host names simply fall back to the default certificate.
+     * An invalid name (an empty name, a trailing-dot name, or one containing
+     * control/line-separator or Unicode format/bidi characters) is rejected
+     * with a fatal alert instead of silently falling back to the default
+     * identity.
      * <p>
      * This runs on the poll thread during the handshake. The native
      * certificate objects applied here belong to the current
@@ -847,9 +980,11 @@ public class QuicCertificateManager {
             }
             String hostKey = resolveServingHostKey(ssl, config);
             if (hostKey == null) {
-                // Invalid SNI (a trailing period is rejected by RFC 6066, like
-                // Tomcat's TLSClientHelloExtractor). Fail the handshake rather
-                // than silently serving the default certificate.
+                // Invalid SNI (a present-but-empty name, a trailing period
+                // rejected by RFC 6066 like Tomcat's TLSClientHelloExtractor,
+                // or control/line-separator/Unicode format/bidi characters).
+                // Fail the handshake rather than silently serving the default
+                // certificate.
                 long count = ++invalidSniNameCount;
                 long now = System.currentTimeMillis();
                 if (now - lastInvalidSniNameLogMs >=
@@ -875,12 +1010,14 @@ public class QuicCertificateManager {
             }
             return QuicBindings.SSL_TLSEXT_ERR_OK;
         } catch (Throwable t) {
-            ExceptionUtils.handleThrowable(t);
+            reportFatalFailure(t);
             if (log.isErrorEnabled()) {
                 log.error(sm.getString("quicEndpoint.sniCallbackError"), t);
             }
-            // A throwable escaping an FFM upcall ends the process. Reject the
-            // handshake instead of continuing without the configured material.
+            // A throwable escaping an FFM upcall ends the process, including a
+            // VirtualMachineError that ExceptionUtils.handleThrowable() would
+            // rethrow. Reject the handshake instead of letting anything cross
+            // the native boundary.
             setSniAlert(al, QuicBindings.SSL_AD_INTERNAL_ERROR);
             return QuicBindings.SSL_TLSEXT_ERR_ALERT_FATAL;
         }
@@ -903,7 +1040,8 @@ public class QuicCertificateManager {
             al.reinterpret(ValueLayout.JAVA_INT.byteSize())
                     .set(ValueLayout.JAVA_INT, 0, alert);
         } catch (Throwable t) {
-            ExceptionUtils.handleThrowable(t);
+            // This helper runs inside the SNI upcall, so even fatal Errors must
+            // not escape. Best-effort alert writing failure is only diagnosed.
             if (log.isDebugEnabled()) {
                 log.debug("Could not set QUIC SNI alert", t);
             }
@@ -941,8 +1079,9 @@ public class QuicCertificateManager {
         // configuration builder rejects a host that also has pre-shared keys,
         // so no PSK selector can make this handshake succeed. Presenting the
         // default host's certificate would silently serve a name-mismatched
-        // identity; apply nothing so the handshake fails visibly for this
-        // host.
+        // identity. Apply nothing instead: this callback returns OK, and the
+        // TLS layer rejects the handshake later when it cannot select a
+        // certificate, rather than the SNI callback failing immediately.
         long now = System.currentTimeMillis();
         if (now - lastSniMissingLogMs >= SNI_MISSING_LOG_INTERVAL_MS) {
             lastSniMissingLogMs = now;
@@ -965,10 +1104,11 @@ public class QuicCertificateManager {
      *
      * @return The lower-cased key of the serving host in the snapshot maps;
      *         {@link QuicCertConfig#defaultHostName} when no SNI was sent or
-     *         the name resolved to no host at all; {@code null} for an invalid
-     *         trailing-dot SNI, which callers treat as a failed handshake (SNI
-     *         callback) or as "do not offer a PSK identity" (find-session
-     *         callback)
+     *         the name resolved to no host at all; {@code null} for a malformed
+     *         SNI (empty name, trailing dot or invalid control/format
+     *         characters), which
+     *         callers treat as a failed handshake (SNI callback) or as "do not
+     *         offer a PSK identity" (find-session callback)
      */
     private String resolveServingHostKey(MemorySegment ssl, QuicCertConfig config) {
         // Single shared SNI read (TLSEXT_NAMETYPE_HOST_NAME + lower-casing),
@@ -977,6 +1117,12 @@ public class QuicCertificateManager {
 
         if (name == null) {
             return config.defaultHostName;
+        }
+        if (name == QuicConnectionWrapper.INVALID_SNI) {
+            // Malformed SNI (control/line-separator or Unicode format/bidi
+            // characters): fail closed instead of treating it as no SNI and
+            // falling back to the default identity.
+            return null;
         }
         if (name.endsWith(".")) {
             // RFC 6066 server names do not have a trailing period; Tomcat's
@@ -1068,6 +1214,7 @@ public class QuicCertificateManager {
                     }
                 }
             } catch (Throwable t) {
+                reportFatalFailure(t);
                 ExceptionUtils.handleThrowable(t);
                 // Applying this entry failed; keep trying the remaining
                 // entries but report the failure to the caller so the

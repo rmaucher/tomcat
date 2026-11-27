@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 import org.apache.tomcat.util.net.AbstractEndpoint;
+import org.apache.tomcat.util.net.SocketBufferHandler;
 import org.apache.tomcat.util.net.SocketWrapperBase;
 import org.apache.tomcat.util.res.StringManager;
 
@@ -143,6 +144,24 @@ public abstract class QuicSocketWrapper extends SocketWrapperBase<QuicStream> {
      *         transport delivers a regular read event once data does arrive
      */
     public abstract boolean awaitReadableData(long deadlineNanos);
+
+
+    /**
+     * Returns whether this wrapper's read buffer already contains data.
+     * <p>
+     * This deliberately differs from {@link #isReadyForRead()}, which may
+     * report ready at end-of-stream so that the next read can deliver EOF.
+     * Callers that need to know whether bytes are actually pending (for
+     * example the HTTP/3 clean-FIN probe) must use this method instead of
+     * treating EOF readiness as buffered data.
+     *
+     * @return {@code true} if at least one buffered byte is waiting to be
+     *         read from this wrapper
+     */
+    public boolean hasBufferedReadData() {
+        SocketBufferHandler handler = getSocketBufferHandler();
+        return handler != null && !handler.isReadBufferEmpty();
+    }
 
 
     /**

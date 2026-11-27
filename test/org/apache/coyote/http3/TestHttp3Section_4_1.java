@@ -1743,7 +1743,8 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
     public void testAllowedProhibitedTrailerFieldsAreIgnored() throws Exception {
         startHttp3Server(this::addTrailerEchoServlet);
         ((AbstractHttp3Protocol) connector.getProtocolHandler())
-                .setAllowedTrailerHeaders("x-ok, host, te, content-encoding");
+                .setAllowedTrailerHeaders(
+                        "x-ok, host, te, content-encoding, max-forwards");
 
         // RFC 9110 Section 6.5.1: fields needed for message framing, routing,
         // request modifiers, authentication, response control data or payload
@@ -1756,6 +1757,7 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         String trailers = buildFieldSection("x-ok", "yes",
                 "host", "evil.example:443",
                 "te", "trailers",
+                "max-forwards", "5",
                 "content-encoding", "gzip");
         ClientOutput output = runClient(
                 rawCommandWith("--headers", initial,
@@ -1776,6 +1778,9 @@ public class TestHttp3Section_4_1 extends Http3TestBase {
         Assert.assertFalse("A prohibited trailer field must be ignored even "
                 + "when allow-listed: " + body,
                 body.contains("content-encoding="));
+        Assert.assertFalse("The request-modifier Max-Forwards trailer field "
+                + "must be ignored even when allow-listed: " + body,
+                body.contains("max-forwards="));
     }
 
 

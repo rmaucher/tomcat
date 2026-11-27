@@ -82,6 +82,10 @@ public enum Http3Error {
      * through {@code Http3StreamException} or {@code handleStreamError()}.
      * The classification drives the base-{@link Http3Exception} dispatch in
      * {@code service()} and {@code isTrailerFieldsReady()}.
+     * <p>
+     * Maintenance note: this list is kept in sync by hand. If a new
+     * stream-scoped code can reach the base-exception dispatch, update both
+     * {@link #isStreamError()} and this javadoc together.
      *
      * @return {@code true} if the processor layer emits this code only as a
      *         stream error

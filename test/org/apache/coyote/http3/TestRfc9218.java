@@ -315,6 +315,38 @@ public class TestRfc9218 extends Http3TestBase {
     }
 
 
+    /**
+     * RFC 9110 Sections 5.2 and 5.3 define a repeated field name's combined
+     * value as its field-line values concatenated in field order with commas.
+     * A Priority dictionary split across field lines therefore carries the
+     * complete parameter set (RFC 9218 Section 5); parsing the lines in
+     * isolation would lose parameters from earlier lines.
+     */
+    @Test
+    public void testSplitPriorityFieldLinesAreCombined() throws Exception {
+        AbstractHttp3Protocol protocol = newHttp3Protocol();
+        Http3Processor processor = new Http3Processor(protocol, null);
+        processor.setStreamId(0);
+
+        processor.emitHeader("priority", "u=5");
+        processor.emitHeader("priority", "i");
+        Assert.assertEquals("The urgency from the first field line must "
+                + "survive the second line", 5, processor.getUrgency());
+        Assert.assertTrue("The incremental parameter from the second field "
+                + "line must apply", processor.getIncremental());
+
+        Http3Processor reverse = new Http3Processor(protocol, null);
+        reverse.setStreamId(0);
+        reverse.emitHeader("priority", "i");
+        reverse.emitHeader("priority", "u=5");
+        Assert.assertEquals("The urgency from the second field line must "
+                + "apply", 5, reverse.getUrgency());
+        Assert.assertTrue("The incremental parameter from the first field "
+                + "line must survive the second line",
+                reverse.getIncremental());
+    }
+
+
     @Test
     public void testEmptyPriorityUpdateAppliesDefaults() throws Exception {
         AbstractHttp3Protocol protocol = newHttp3Protocol();

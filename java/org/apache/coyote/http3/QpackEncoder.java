@@ -17,7 +17,6 @@
 package org.apache.coyote.http3;
 
 import java.nio.ByteBuffer;
-import java.util.Locale;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
@@ -159,35 +158,47 @@ public class QpackEncoder {
 
         while (it < currentHeaders.size()) {
             String name = currentHeaders.getName(it).toString();
-            if (forceLowerCase) {
-                name = toLowerCase(name);
-            }
 
             boolean skip = false;
 
             // Field names must be non-empty tokens (RFC 7230 Section 3.2,
             // RFC 9114 Section 4.2); pseudo-header fields are identified by
-            // their leading ':' and are not tokens. Reject a name that
-            // cannot carry either form before looking at its first
-            // character (an empty name has none): the decode path
-            // (emitHeader) rejects such fields on receipt, and dropping the
-            // field here keeps a container-supplied invalid name (for
-            // example an empty-named trailer built straight from the
-            // servlet trailer map) from aborting the response mid-flight.
+            // their leading ':' and are not tokens. Validate the original
+            // name before any case conversion: lower-casing first can fold a
+            // non-ASCII character into a different ASCII name (for example
+            // U+212A KELVIN SIGN becomes "k") and silently turn an invalid
+            // name into a valid one. Reject a name that cannot carry either
+            // form before looking at its first character (an empty name has
+            // none): the decode path (emitHeader) rejects such fields on
+            // receipt, and dropping the field here keeps a container-supplied
+            // invalid name (for example an empty-named trailer built straight
+            // from the servlet trailer map) from aborting the response
+            // mid-flight.
             boolean pseudo = !name.isEmpty() && name.charAt(0) == ':';
             if (!pseudo && !HttpParser.isToken(name)) {
                 skip = true;
-                if (log.isDebugEnabled()) {
-                    log.debug(sm.getString("qpackEncoder.invalidNameSkipped",
+                // The HTTP/2 response path logs a warning when it removes an
+                // invalid header. Match that visibility here rather than
+                // silently dropping an application-supplied field (which may
+                // be a security header such as CSP or HSTS). The invalid
+                // header is visited in both encoder passes, so warn only in
+                // the first pass to avoid a duplicate diagnostic.
+                if (firstPass) {
+                    log.warn(sm.getString("qpackEncoder.invalidNameSkipped",
                             Http3Log.printable(name)));
                 }
-            } else if (firstPass) {
-                if (!pseudo) {
-                    skip = true;
-                }
             } else {
-                if (pseudo) {
-                    skip = true;
+                if (forceLowerCase) {
+                    name = toLowerCase(name);
+                }
+                if (firstPass) {
+                    if (!pseudo) {
+                        skip = true;
+                    }
+                } else {
+                    if (pseudo) {
+                        skip = true;
+                    }
                 }
             }
 
@@ -199,12 +210,11 @@ public class QpackEncoder {
                     // valid HTTP field value. Narrowing a wider character
                     // would change the value (for example U+010A would
                     // become LF), so drop the field rather than silently
-                    // corrupting it or emitting an invalid field line.
-                    if (log.isDebugEnabled()) {
-                        log.debug(sm.getString(
-                                "qpackEncoder.invalidValueSkipped",
-                                Http3Log.printable(name)));
-                    }
+                    // corrupting it or emitting an invalid field line. Log
+                    // at warning level, as the HTTP/2 response path does for
+                    // an invalid header, so an application-supplied security
+                    // field is not lost without any diagnostic.
+                    logInvalidValueSkipped(name);
                 } else {
                     // HTTP field values are byte strings (RFC 9110 Section
                     // 5.5, obs-text). Tomcat stores them as ISO-8859-1
@@ -218,8 +228,15 @@ public class QpackEncoder {
                     StaticTableMatch match = lookupStaticTable(name, value);
                     // Worst case per header: 2 byte field prefix + iRP
                     // continuation bytes for the name index/name length/value
-                    // length.
-                    int required = 22 + nameBytes.length + valueBytes.length;
+                    // length. 22 bytes of slack covers the widest current
+                    // representation (a literal name plus an int-range value
+                    // length: 1 representation byte, up to 2 index bytes and
+                    // up to 10 length continuation bytes). Use long so two
+                    // near-Integer.MAX_VALUE strings cannot overflow the sum
+                    // into a negative value and bypass the capacity check.
+                    // Revisit the slack if a representation with a larger
+                    // fixed overhead is added.
+                    long required = 22L + nameBytes.length + valueBytes.length;
 
                     if (target.remaining() < required) {
                         headersIterator = it;
@@ -372,19 +389,25 @@ public class QpackEncoder {
 
 
     /*
-     * Lower-cases a field name only when it actually contains an ASCII
-     * uppercase character. Response header names supplied by Tomcat are
-     * already lower case, so the common path avoids String.toLowerCase() and
-     * its allocation.
+     * Lower-cases only ASCII A-Z characters in a field name. Response header
+     * names supplied by Tomcat are already lower case, so the common path
+     * avoids the allocation. ASCII-only folding is deliberate: the HTTP/3
+     * field-name grammar is ASCII (RFC 9114 Section 4.2), and a Unicode-aware
+     * lower-case operation could change an invalid non-ASCII name into a
+     * different valid ASCII name.
      */
     private static String toLowerCase(String name) {
+        StringBuilder result = null;
         for (int i = 0; i < name.length(); i++) {
             char c = name.charAt(i);
             if (c >= 'A' && c <= 'Z') {
-                return name.toLowerCase(Locale.US);
+                if (result == null) {
+                    result = new StringBuilder(name);
+                }
+                result.setCharAt(i, (char) (c + ('a' - 'A')));
             }
         }
-        return name;
+        return result == null ? name : result.toString();
     }
 
 
@@ -397,6 +420,18 @@ public class QpackEncoder {
     static boolean isEncodableField(String name, String value) {
         return name != null && HttpParser.isToken(name) &&
                 isEncodableValue(value);
+    }
+
+
+    /*
+     * Emits the diagnostic for an application-supplied field value that
+     * cannot be represented on the wire. Shared by encode() and the trailer
+     * send path: when every trailer value is filtered out, encode() is never
+     * called, but the dropped fields must still produce the same warning.
+     */
+    static void logInvalidValueSkipped(String name) {
+        log.warn(sm.getString("qpackEncoder.invalidValueSkipped",
+                Http3Log.printable(name)));
     }
 
 
@@ -441,9 +476,11 @@ public class QpackEncoder {
      * Line (RFC 9204 Section 4.5.2) rather than as a Literal Field Line with
      * Name Reference (Section 4.5.4). This is only a choice between two
      * representations of the static table; the encoder never inserts into a
-     * dynamic table. Values that are sensitive (authorization/set-cookie/
-     * cookie), connection framing metadata (content-length/date/etag) or
-     * likely to vary use the literal name-reference form.
+     * dynamic table. Connection framing metadata (content-length/date/etag)
+     * and values likely to vary use the literal name-reference form. The
+     * sensitive-name cases (authorization/set-cookie/cookie) are defensive:
+     * their static entries have empty values, so they cannot produce the
+     * non-null exact match that reaches this method.
      *
      * @param name  The (lower-cased) field name
      * @param value The field value

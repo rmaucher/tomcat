@@ -75,10 +75,12 @@ public final class Constants {
     /**
      * Maximum declared payload size of a DATA or HEADERS frame on a request
      * stream. HTTP/3 has no negotiated frame-size limit, so this is a local
-     * implementation limit. A DATA frame above the limit is rejected with
-     * {@code RESET_STREAM H3_FRAME_ERROR} at stream scope even though its
-     * payload could otherwise be streamed; HEADERS frames above the limit
-     * cannot be buffered. The limit also bounds the largest field section the
+     * implementation limit. A DATA or HEADERS frame above the limit is
+     * rejected with {@code RESET_STREAM H3_FRAME_ERROR} at stream scope. The
+     * distinction is about the payload: a DATA payload within the limit can
+     * be streamed to the application, while a HEADERS payload must be
+     * buffered whole for decoding, but both oversize cases use the same
+     * classification. The limit also bounds the largest field section the
      * receiver can actually accept.
      */
     public static final int MAX_FRAME_LENGTH = 16 * 1024 * 1024;
@@ -99,7 +101,11 @@ public final class Constants {
      * Returns the worst-case wire size (the maximum undecoded length) of a
      * field section whose decoded size is at most {@code decodedLimit}
      * bytes. The bound is 15/4 of the decoded size plus the two prefix iRPs
-     * and a little slack. A negative limit is clamped to zero so the
+     * and a little slack. The multiplication is integer-truncated toward
+     * zero, so for very small limits the bound can be slightly below the
+     * mathematical worst case; that rounding direction is intentional (the
+     * preflight rejects earlier rather than later) and must not be "fixed"
+     * into an over-estimate. A negative limit is clamped to zero so the
      * configured-limit paths agree. The frame-length preflight uses this
      * function; the settings clamp uses its inverse,
      * {@link #maxDecodedFieldSectionSizeForFrameLimit()}, evaluated once at
@@ -154,8 +160,10 @@ public final class Constants {
      * HTTP/2 that have no meaning in HTTP/3 (RFC 9114 Sections 7.2.8 and
      * 11.2.1: receipt of one MUST be treated as a connection error of type
      * H3_FRAME_UNEXPECTED, unlike genuinely unknown types which are
-     * ignored). The values 0x00 (DATA) and 0x01 (HEADERS) overlap with
-     * defined HTTP/3 frames and are therefore not reserved identifiers.
+     * ignored). The other low HTTP/2 frame types overlap with defined HTTP/3
+     * frames and are therefore not reserved identifiers: 0x00 (DATA),
+     * 0x01 (HEADERS), 0x03 (RST_STREAM/CANCEL_PUSH), 0x04 (SETTINGS),
+     * 0x05 (PUSH_PROMISE) and 0x07 (GOAWAY).
      *
      * @param frameType The frame type to classify
      *

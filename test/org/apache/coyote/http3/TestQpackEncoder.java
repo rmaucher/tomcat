@@ -21,6 +21,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import org.junit.Assert;
 import org.junit.Test;
@@ -202,12 +207,64 @@ public class TestQpackEncoder {
 
 
     @Test
+    public void testInvalidHeaderNameWarnedOnce() throws Exception {
+        // The two-pass encoder visits a regular header twice. The invalid-name
+        // warning must still be emitted once, not once per pass.
+        Logger logger = Logger.getLogger("org.apache.coyote.http3.QpackEncoder");
+        AtomicInteger warnings = new AtomicInteger();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getLevel() == Level.WARNING &&
+                        record.getMessage() != null &&
+                        record.getMessage().contains("bad name")) {
+                    warnings.incrementAndGet();
+                }
+            }
+
+            @Override
+            public void flush() {
+                // NO-OP
+            }
+
+            @Override
+            public void close() {
+                // NO-OP
+            }
+        };
+        logger.addHandler(handler);
+        try {
+            encodeFully(new QpackEncoder(), headers("bad name", "v"));
+        } finally {
+            logger.removeHandler(handler);
+        }
+        Assert.assertEquals("An invalid header name must be warned about "
+                + "once, not once per encoder pass", 1, warnings.get());
+    }
+
+
+    @Test
     public void testLowerCaseNamesByDefault() throws Exception {
         byte[] encoded = encodeFully(new QpackEncoder(),
                 headers("X-Custom-Header", "v"));
         String asLatin1 = new String(encoded, StandardCharsets.ISO_8859_1);
         Assert.assertTrue("Name must be lower cased, got: " + asLatin1,
                 asLatin1.contains("x-custom-header"));
+    }
+
+
+    @Test
+    public void testUnicodeCaseFoldingDoesNotAliasInvalidName()
+            throws Exception {
+        // U+212A KELVIN SIGN lower-cases to ASCII "k". A Unicode-aware
+        // String.toLowerCase() would turn the invalid name "X\u212A" into the
+        // valid name "xk" and emit it under a different name. Only ASCII A-Z
+        // may be folded; the original name must be validated first and the
+        // invalid field dropped.
+        List<String[]> emitted = decode(encodeFully(new QpackEncoder(),
+                headers("X\u212A", "v", "x-valid", "v")));
+
+        assertEmitted(emitted, "x-valid", "v");
     }
 
 

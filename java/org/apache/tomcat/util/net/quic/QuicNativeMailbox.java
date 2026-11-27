@@ -106,6 +106,13 @@ public class QuicNativeMailbox {
      */
     private volatile Runnable waker;
 
+    /**
+     * Optional handler for a task failure. When set, the handler owns the
+     * logging and may rethrow a fatal binding failure; when {@code null}, the
+     * mailbox logs and continues.
+     */
+    private final Consumer<Throwable> taskFailureHandler;
+
 
     /**
      * Creates the mailbox.
@@ -115,7 +122,23 @@ public class QuicNativeMailbox {
      *                         (or stopped-poll-thread) confinement invariant
      */
     public QuicNativeMailbox(Consumer<String> confinementCheck) {
+        this(confinementCheck, null);
+    }
+
+
+    /**
+     * Creates the mailbox with a task-failure handler.
+     *
+     * @param confinementCheck  applied at the start of every drain with the
+     *                          operation name; asserts the poll-thread
+     *                          (or stopped-poll-thread) confinement invariant
+     * @param taskFailureHandler handles a task failure instead of the default
+     *                          log-and-continue behaviour; may be {@code null}
+     */
+    public QuicNativeMailbox(Consumer<String> confinementCheck,
+            Consumer<Throwable> taskFailureHandler) {
         this.confinementCheck = confinementCheck;
+        this.taskFailureHandler = taskFailureHandler;
     }
 
 
@@ -224,8 +247,12 @@ public class QuicNativeMailbox {
                 try {
                     ((DiscardListener) task).onDiscard();
                 } catch (Throwable t) {
-                    ExceptionUtils.handleThrowable(t);
-                    log.warn(sm.getString("mailbox.pollTaskError"), t);
+                    if (taskFailureHandler != null) {
+                        taskFailureHandler.accept(t);
+                    } else {
+                        ExceptionUtils.handleThrowable(t);
+                        log.warn(sm.getString("mailbox.pollTaskError"), t);
+                    }
                 }
             }
         }
@@ -261,8 +288,12 @@ public class QuicNativeMailbox {
             try {
                 task.run();
             } catch (Throwable t) {
-                ExceptionUtils.handleThrowable(t);
-                log.warn(sm.getString("mailbox.pollTaskError"), t);
+                if (taskFailureHandler != null) {
+                    taskFailureHandler.accept(t);
+                } else {
+                    ExceptionUtils.handleThrowable(t);
+                    log.warn(sm.getString("mailbox.pollTaskError"), t);
+                }
             }
         }
         return ranAny;

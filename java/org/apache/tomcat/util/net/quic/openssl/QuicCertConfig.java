@@ -111,7 +111,9 @@ public class QuicCertConfig {
     public final String cipherSuites;
 
     /**
-     * Arena holding every native object in this snapshot.
+     * Arena owning the DER staging allocations of this snapshot. The native
+     * X.509 and private-key objects are allocated on the OpenSSL heap and are
+     * released by {@link #free()}, not by closing this arena.
      */
     public final Arena arena;
 

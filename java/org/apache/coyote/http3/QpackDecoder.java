@@ -192,14 +192,21 @@ public class QpackDecoder {
      * (RFC 7541 Section 5.1 Figure 3), with the high bit as continuation
      * flag.
      * <p>
-     * This narrowing shim is used only for values whose domain is an
-     * implementation limit - the lengths of literal name/value strings on
-     * the encoder and request streams. Table indexes and the encoded field
-     * section prefix must be decoded to {@code long} instead: a value above
-     * {@code Integer.MAX_VALUE} there is an invalid reference or an
-     * impossible Encoded Insert Count, i.e. a connection error (RFC 9204
-     * Sections 2.2.3, 3.1 and 4.5.1.1), not the stream-scoped
-     * RFC 9204 Section 7.4 value-too-large error.
+     * This narrowing shim is used for the int-bounded values of this
+     * decoder: literal name/value lengths on both the encoder and request
+     * streams, the Set Dynamic Table Capacity value, and the table indexes of
+     * encoder instructions (Insert with Name Reference and Duplicate). A
+     * value above {@code Integer.MAX_VALUE} is reported as a QPACK
+     * implementation-limit failure (RFC 9204 Section 7.4; the caller scopes
+     * it to a stream or connection error according to the stream the
+     * instruction arrived on).
+     * <p>
+     * Field-section table indexes and the encoded field section prefix are
+     * decoded to {@code long} instead (see decodeFieldIndex() and the prefix
+     * decoder): a value above {@code Integer.MAX_VALUE} there is an invalid
+     * reference or an impossible Encoded Insert Count, i.e. a connection
+     * error (RFC 9204 Sections 2.2.3, 3.1 and 4.5.1.1), not the RFC 9204
+     * Section 7.4 value-too-large error.
      *
      * @param buffer    Buffer to read continuation bytes from
      * @param n         Prefix size in bits (1-8)
@@ -269,6 +276,15 @@ public class QpackDecoder {
     public synchronized void processInstruction(ByteBuffer buffer) throws QpackException {
         if (buffer.remaining() < 1) {
             return;
+        }
+        if (maxTableSizeHard == 0) {
+            // RFC 9204 Section 3.2.3: when the maximum table capacity is
+            // zero, the encoder MUST NOT insert entries and MUST NOT send any
+            // encoder instructions. Any such instruction is therefore an
+            // encoding error, including the otherwise-valid Set Dynamic
+            // Table Capacity instruction with capacity zero.
+            throw new QpackException(
+                    sm.getString("qpackdecoder.encoderInstructionZeroCapacity"));
         }
 
         int sp = buffer.position();

@@ -34,8 +34,8 @@ final class Http3Settings {
     private static final StringManager sm = StringManager.getManager(Http3Settings.class);
 
     /**
-     * SETTINGS identifiers reserved by RFC 9114 Table 3 (HTTP/2
-     * identifiers with no HTTP/3 counterpart). Per RFC 9114
+     * SETTINGS identifiers reserved by RFC 9114 Table 3 (0x00 and the
+     * HTTP/2 identifiers with no HTTP/3 counterpart). Per RFC 9114
      * Section 7.2.4.1 their receipt MUST be treated as a connection
      * error of type H3_SETTINGS_ERROR.
      */
@@ -44,8 +44,8 @@ final class Http3Settings {
     /**
      * Maximum number of setting identifiers accepted in one SETTINGS frame.
      * Unknown settings must be ignored (RFC 9114 Section 7.2.4), so they do
-     * not need to be retained; this bound prevents a tiny SETTINGS payload
-     * from creating thousands of map entries before the unknown entries are
+     * not need to be retained; this bound prevents a SETTINGS payload from
+     * creating unbounded map entries before the unknown entries are
      * discarded.
      */
     static final int MAX_SETTINGS = 4096;
@@ -68,6 +68,18 @@ final class Http3Settings {
                 throw error(Http3Error.H3_FRAME_ERROR, "http3Settings.incomplete");
             }
             settingCount++;
+            // Per RFC 9114 Section 7.2.4.1, setting identifiers that were
+            // defined in HTTP/2 where there is no corresponding HTTP/3
+            // setting are reserved; their receipt MUST be treated as a
+            // connection error of type H3_SETTINGS_ERROR. Checked before the
+            // count limit so the mandated error wins even when the reserved
+            // identifier is the one that exceeds MAX_SETTINGS. Checked before
+            // the duplicate check too, so a repeated reserved identifier is
+            // reported with the required reserved-identifier diagnostic.
+            if (isReservedSettingIdentifier(identifier)) {
+                throw error(Http3Error.H3_SETTINGS_ERROR, "http3Settings.reservedIdentifier",
+                        Long.valueOf(identifier));
+            }
             if (settingCount > MAX_SETTINGS) {
                 // Resource limit: unknown settings are ignored anyway, so a
                 // frame with an excessive number of identifiers is rejected
@@ -110,20 +122,22 @@ final class Http3Settings {
         // of unlimited) from an explicit value of 0 (a zero-byte limit).
         maxFieldSectionSize = maxFieldSection != null ?
                 maxFieldSection.longValue() : -1;
+    }
 
-        // Per RFC 9114 Section 7.2.4.1, setting identifiers that were
-        // defined in HTTP/2 where there is no corresponding HTTP/3 setting
-        // are reserved; their receipt MUST be treated as a connection
-        // error of type H3_SETTINGS_ERROR. Genuinely unknown identifiers
-        // (the remaining entries) MUST be ignored per RFC 9114
-        // Section 7.2.4.
+
+    /*
+     * Returns whether the identifier was defined in HTTP/2 but has no
+     * corresponding HTTP/3 setting (RFC 9114 Section 7.2.4.1, Table 3).
+     * Genuinely unknown identifiers are not reserved and MUST be ignored
+     * (RFC 9114 Section 7.2.4).
+     */
+    private static boolean isReservedSettingIdentifier(long identifier) {
         for (long reserved : RESERVED_SETTING_IDENTIFIERS) {
-            if (settings.containsKey(reserved)) {
-                throw error(Http3Error.H3_SETTINGS_ERROR, "http3Settings.reservedIdentifier",
-                        Long.valueOf(reserved));
+            if (identifier == reserved) {
+                return true;
             }
         }
-
+        return false;
     }
 
 

@@ -683,3 +683,134 @@ between the variants (about 94 % and 500–518 % respectively). No
 code-path cause was found, and the benchmark base's original
 `tomcat-coyote-ffm.jar` was restored afterwards.
 
+## 17. Final review-fix regression check (2026-11-25)
+
+A quick check covered the complete OpenSSL QUIC review-fix series on top of
+`c9ca6766bc` (`Remvoe defects`). The benchmark base was
+`/home/opencode/tomcat-http3`; only `tomcat-coyote.jar` and
+`tomcat-coyote-ffm.jar` were swapped, and the server was restarted between
+variants. The parent jars were built from `c9ca6766bc` in a separate worktree.
+The documented `8x25` load case (`connections=8`, `streams=25`, `procs=8`,
+3 s warm-up, 12 s window) was run after a `1x32` JVM-warming run. Host load
+average was 4.4-13.5 during the runs, with a shared host; absolute rps is
+therefore noisy, but the A/B variants were interleaved on the same host window.
+
+| tree | runs (rps) | mean rps | us/req |
+|---|---:|---:|---:|
+| current review-fix tree | 92,143.6 / 92,728.8 / 92,218.6 | 92,363.7 | 10.1 |
+| parent `c9ca6766bc` | 88,252.6 / 92,534.0 / 93,961.1 | 91,582.6 | 10.4 |
+| Section 16 current defect-fix tree | — | 93,290.8 | 10.15 |
+
+The current tree is about 0.9 % faster than its parent and about 1.0 % below
+the Section 16 report, with 0.05 µs/req lower poller cost; all differences are
+inside the shared-host spread. JVM CPU was 503 % versus 498 % on the parent,
+and poller CPU was 93 % in both. The extra cost of the review fixes is limited
+to the added volatile/connection-liveness checks on existing wrapper native
+paths; no allocation or extra native hop was added to the steady-state request
+path.
+
+The `32x32` shape was also run for context, but was not a reliable A/B in
+this window: the current tree measured 75.8-82.3k rps / 11.8-13.0 µs/req
+(within the 74.3-81.3k range reported in Sections 13-14), while one parent run
+measured 88.3k / 9.5 and another was client-bound at 101.0k / 4.2 (poller
+42.8 %, client 99.9 %). The parent `32x32` spread is therefore host/client
+scheduling noise, not a transport regression. No measurable regression was
+found, and the benchmark base's original jars were restored afterwards.
+
+
+## 18. Unpushed-fix endpoint regression check (2026-11-27)
+
+A quick regression check covered the sequential HTTP/3 defect fixes applied on
+top of parent `dc7f5c7ca8` (`Remove defects`). The benchmark base was
+`/home/opencode/tomcat-http3`; only `tomcat-coyote.jar` was swapped, and the
+server was restarted between variants. The `tomcat-coyote-ffm.jar` files built
+from the current and parent trees are byte-identical (neither tree changed the
+FFM transport code), so the A/B isolates the current `org.apache.coyote.http3`
+changes. The documented `8x25` load case (`connections=8`, `streams=25`,
+`procs=8`, 3 s warm-up, 12 s window) was run after a `1x32` JVM-warming run,
+with the current and parent variants interleaved on the same host window.
+Host load average was about 12-20 during the runs, within the shared-host
+caveat in Section 2.
+
+The fixes are documentation plus cold-path code: SETTINGS ordering/flag
+publication, a read-stall abort classification, the reserved-identifier check
+order, a snapshot getter clamp, the encoder size-estimate type and a debug
+message. None adds work to the steady-state request path beyond a branch in
+the snapshot getter.
+
+| endpoint | variant | runs (rps) | mean rps | us/req |
+|---|---|---:|---:|---:|
+| OpenSSL | current | 92,165.9 / 91,722.1 | 91,944.0 | 10.3 |
+| OpenSSL | parent | 92,431.0 / 92,163.7 | 92,297.4 | 10.25 |
+| quiche | current | 90,630.5 / 90,782.6 | 90,706.6 | 10.9 |
+| quiche | parent | 89,790.1 / 90,743.0 | 90,266.6 | 10.95 |
+| ngtcp2 | current | 79,527.2 / 77,960.1 / 78,349.6 / 82,321.1 | 79,539.5 | 12.4 |
+| ngtcp2 | parent | 82,881.8 / 78,095.8 / 80,402.9 / 75,622.1 | 79,250.7 | 12.475 |
+
+All runs had zero errors. On the same host window the current tree is within
+0.4-0.5% of its parent on OpenSSL and quiche and 0.4% faster on ngtcp2; the
+ngtcp2 ranges overlap heavily (75.6-82.9k on the parent, 78.0-82.3k on the
+current tree), matching the run-to-run spread reported in Section 8.
+
+Against the report, the current OpenSSL result is about 0.5% below Section 17
+(92,363.7 / 10.1) and 1.4% below Section 16 (93,290.8 / 10.15), but the parent
+measured in the same window is also about 0.1% below Section 17, so the gap is
+host state rather than the unpushed changes. quiche matches Section 8/9
+(90,404.3-91,062.9 / 10.85-10.94). ngtcp2 sits inside the documented spread
+(Sections 8-11 range 76.2-84.1k / 11.85-13.06) with the same absolute level as
+its parent.
+
+No measurable regression attributable to the unpushed fixes was found. The
+full HTTP/3 suite is green on all three endpoints (595 tests, 0 failures;
+2/21/6 skipped for OpenSSL/quiche/ngtcp2). Repeated runs of the timing-sensitive
+classes (`TestAsyncError`, `TestHttp3RequestStatistics`, `TestAsyncTimeout`,
+`TestHttp3QpackBlockedStreams`, `TestAsync`, `TestHttp3Limits`,
+`TestHttp3ReplayBody`) showed no intermittent failure. The benchmark base's
+original jar and connector configuration were restored afterwards.
+
+## 19. Post-fix all-endpoint performance check (2026-11-27)
+
+A final quick check covered the HTTP/3 fixes applied on top of parent
+`ea6182185e`. The benchmark base was `/home/opencode/tomcat-http3`; only
+`tomcat-coyote.jar` was swapped, and the server was restarted between
+variants. The base's OpenSSL/quiche/ngtcp2 native transport jars were held
+fixed, so the A/B isolates the changes in `org.apache.coyote.http3`.
+
+The parent jar was built from `ea6182185e` in a separate worktree. Comparing
+the two jars shows differences only in the `org.apache.coyote.http3` classes,
+as expected: `Http3Processor`, `Http3Settings`, `QpackDecoder`, `QpackEncoder`
+and `LocalStrings.properties`. There is no transport or AJP/HTTP/2 delta.
+
+The documented `8x25` load case (`connections=8`, `streams=25`, `procs=8`,
+3 s warm-up, 12 s window) was run after a `1x32` JVM-warming run. Current and
+parent variants were run in adjacent windows with the server restarted between
+them. Host load average was about 11-25 during the runs; the poller was
+98.6-99.0 % on every load row and all runs had zero errors.
+
+| endpoint | variant | runs (rps) | mean rps | us/req |
+|---|---|---:|---:|---:|
+| OpenSSL | current | 98,910.8 / 99,705.8 | 99,308.3 | 10.0 / 9.9 |
+| OpenSSL | parent `ea6182185e` | 98,257.8 / 99,743.3 | 99,000.6 | 10.1 / 9.9 |
+| quiche | current | 90,348.0 / 90,741.4 | 90,544.7 | 10.9 / 10.9 |
+| quiche | parent `ea6182185e` | 90,125.9 / 90,755.2 | 90,440.6 | 11.0 / 10.9 |
+| ngtcp2 | current | 83,566.9 / 83,360.5 | 83,463.7 | 11.8 / 11.8 |
+| ngtcp2 | parent `ea6182185e` | 83,611.7 / 78,420.5 | 81,016.1 | 11.8 / 12.6 |
+
+On the same host window the current tree is 0.3 % faster than its parent on
+OpenSSL and 0.1 % faster on quiche, with 0.05-0.1 µs/req lower poller cost.
+ngtcp2 is 3 % faster in mean rps, but the parent's 78.4k / 12.6 run explains
+that difference; the current and parent low-noise runs are identical at
+83.5-83.6k / 11.8 µs/req, matching the documented ngtcp2 spread.
+
+Against the report, quiche matches Section 18 exactly (90.5k / 10.9). OpenSSL
+is about 8 % above Section 18 in rps and 0.3 µs/req lower; ngtcp2 is about
+5 % above in rps and 0.6 µs/req lower. The host load was lower in this window
+than the Section 18 runs, so those absolute differences are host state, not a
+code effect; the interleaved parent A/B is the regression check.
+
+No measurable regression attributable to the unpushed fixes was found, so no
+source bisection was required. The only steady-state request-path addition is
+the `isStreamAborted()` guard on the after-response scans (two volatile reads
+per completed request); the other fixes are cold-path or diagnostic. Raw
+shards are `/home/opencode/h3bench/out.perf2-*.json`. The benchmark base's
+original jar and connector configuration were restored afterwards.

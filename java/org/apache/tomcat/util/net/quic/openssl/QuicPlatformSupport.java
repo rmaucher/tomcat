@@ -56,6 +56,20 @@ abstract class QuicPlatformSupport {
     private static final StringManager sm =
             StringManager.getManager(QuicOpenSSLEndpoint.class);
 
+    /*
+     * Optional platform-selection properties, in priority order:
+     *
+     * org.apache.tomcat.util.net.quic.openssl.platform
+     *      "linux" forces the Linux implementation; "none" disables QUIC;
+     *      "macos"/"bsd"/"windows" force the named unavailable placeholder;
+     *      "auto" or blank falls through to the class property/automatic
+     *      selection. Any other value fails closed (QUIC unavailable).
+     *
+     * org.apache.tomcat.util.net.quic.openssl.platformClass
+     *      The fully-qualified name of a QuicPlatformSupport subclass to
+     *      instantiate instead of automatic selection. Load or construction
+     *      failures also fail closed.
+     */
     private static final String PLATFORM_PROPERTY =
             "org.apache.tomcat.util.net.quic.openssl.platform";
     private static final String PLATFORM_CLASS_PROPERTY =

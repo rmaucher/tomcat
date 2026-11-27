@@ -3863,8 +3863,28 @@ public class QuicheEndpoint extends QuicEndpoint<Long> {
         if (terminal) {
             QuicConnectionManager.ConnectionState state = connManager.getState(conn);
             if (state != null && state.isCriticalClientUniStream(streamId)) {
-                failConnection(conn, state.getClosedCriticalStreamErrorCode(),
-                        "Critical client unidirectional stream closed");
+                // The protocol parser compacts unconsumed bytes back to the
+                // start of the stream read buffer after each round. A
+                // non-zero position therefore means an incomplete frame or
+                // QPACK instruction was retained.
+                ByteBuffer retained = stream.getReadBuffer();
+                boolean retainedPartial = retained != null &&
+                        retained.position() > 0;
+                boolean cleanFin = stream.getReadState() ==
+                        QuicStream.ReadState.FINISHED;
+                long truncatedCode = connManager.getTruncatedClientUniStreamErrorCode(
+                        conn, streamId, retainedPartial, cleanFin);
+                if (truncatedCode != 0) {
+                    // RFC 9114 Section 7.1 / RFC 9204: a cleanly terminated
+                    // stream ending inside a frame or QPACK instruction is a
+                    // frame/QPACK stream error, not the generic
+                    // critical-stream-closed error.
+                    failConnection(conn, truncatedCode,
+                            "Truncated critical client unidirectional stream");
+                } else {
+                    failConnection(conn, state.getClosedCriticalStreamErrorCode(),
+                            "Critical client unidirectional stream closed");
+                }
             } else if (state != null) {
                 state.clientUniStreamClosed(streamId);
             }

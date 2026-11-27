@@ -4062,12 +4062,18 @@ public class Ngtcp2Endpoint extends QuicEndpoint<Long> {
             QuicConnectionManager.ConnectionState state = connManager.getState(conn);
             if (state != null && state.isCriticalClientUniStream(streamId)) {
                 long errorCode = state.getClosedCriticalStreamErrorCode();
+                // Only a clean FIN can make retained bytes a truncated-final-
+                // frame error (RFC 9114 Section 7.1). An abrupt reset may
+                // occur anywhere in a frame and must fall through to the
+                // critical-stream closure error.
                 long truncatedCode = connManager.getTruncatedClientUniStreamErrorCode(
-                        conn, streamId, retainedPartial);
+                        conn, streamId, retainedPartial,
+                        stream.getReadState() == QuicStream.ReadState.FINISHED);
                 if (truncatedCode != 0) {
-                    // RFC 9114 Section 7.1 / RFC 9204: a stream ending inside
-                    // a frame or QPACK instruction is a frame/QPACK stream
-                    // error, not the generic critical-stream-closed error.
+                    // RFC 9114 Section 7.1 / RFC 9204: a cleanly terminated
+                    // stream ending inside a frame or QPACK instruction is a
+                    // frame/QPACK stream error, not the generic
+                    // critical-stream-closed error.
                     errorCode = truncatedCode;
                 }
                 failConnection(conn, errorCode,

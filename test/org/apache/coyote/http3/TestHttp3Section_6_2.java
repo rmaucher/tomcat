@@ -106,6 +106,74 @@ public class TestHttp3Section_6_2 extends Http3TestBase {
 
 
     @Test
+    public void testClientControlStreamTruncatedFrameFin() throws Exception {
+        startHttp3Server();
+
+        // A clean FIN after an incomplete control-stream frame header is a
+        // truncated final frame: RFC 9114 Section 7.1 requires H3_FRAME_ERROR,
+        // not the generic critical-stream closure error.
+        String control = withRawTail(buildSettingsFrameB64(1, 4096),
+                (byte) 0x40);
+        ClientOutput output = runClient(rawCommandWith(
+                "--control", control,
+                "--fin-control",
+                "--no-request", "--timeout", "3"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_FRAME_ERROR);
+    }
+
+
+    @Test
+    public void testClientControlStreamResetInFrame() throws Exception {
+        startHttp3Server();
+
+        // Streams that terminate abruptly may be reset at any point in a
+        // frame (RFC 9114 Section 7.1). A reset inside a control-stream frame
+        // is therefore the generic critical-stream closure error, not a
+        // truncated-frame error.
+        String control = withRawTail(buildSettingsFrameB64(1, 4096),
+                (byte) 0x40);
+        ClientOutput output = runClient(rawCommandWith(
+                "--control", control,
+                "--reset-control", "1",
+                "--no-request", "--timeout", "8"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_CLOSED_CRITICAL_STREAM);
+    }
+
+
+    @Test
+    public void testClientQpackEncoderStreamTruncatedFin() throws Exception {
+        startHttp3Server();
+
+        // A clean FIN in the middle of a QPACK encoder instruction is the
+        // QPACK encoder stream error (RFC 9204 Section 6), not the generic
+        // critical-stream closure error.
+        byte[] encoderPayload = new byte[] {
+                0x20, (byte) 0x80 };
+        ClientOutput output = runClient(rawCommandWith(
+                "--no-qpack-streams",
+                "--uni", "2," + Base64.getEncoder().encodeToString(
+                        encoderPayload) + ",1",
+                "--no-request", "--timeout", "3"),
+                CLIENT_TIMEOUT_SECONDS);
+
+        assertConnectionError(output, H3_QPACK_ENCODER_STREAM_ERROR);
+    }
+
+
+    private static String withRawTail(String base64Frame, byte... tail) {
+        byte[] frame = Base64.getDecoder().decode(base64Frame);
+        byte[] result = new byte[frame.length + tail.length];
+        System.arraycopy(frame, 0, result, 0, frame.length);
+        System.arraycopy(tail, 0, result, frame.length, tail.length);
+        return Base64.getEncoder().encodeToString(result);
+    }
+
+
+    @Test
     public void testClientPushStreamRejected() throws Exception {
         startHttp3Server();
 
